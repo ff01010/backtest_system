@@ -1,0 +1,110 @@
+# -*- coding: utf-8 -*-
+"""测试按运行周期解析 K 线文件。"""
+
+from pathlib import Path
+
+import pytest
+
+from backend import settings
+from backend.services import data_manager, data_repository
+from backend.services import state_store
+
+
+def test_resolve_kline_path_uses_timeframe_directory(tmp_path: Path, monkeypatch) -> None:
+  symbol_dir = tmp_path / "1m" / "688981_SH"
+  symbol_dir.mkdir(parents=True)
+  minute_file = symbol_dir / "688981_SH_1m.csv"
+  minute_file.write_text("datetime\n", encoding="utf-8")
+  monkeypatch.setattr(settings, "KLINE_ROOT", str(tmp_path))
+
+  resolved = settings.resolve_kline_path("688981.SH", "1m", "20260622")
+
+  assert resolved == str(minute_file)
+
+
+def test_missing_requested_timeframe_returns_none(tmp_path: Path, monkeypatch) -> None:
+  symbol_dir = tmp_path / "5m" / "688981_SH"
+  symbol_dir.mkdir(parents=True)
+  (symbol_dir / "688981_SH_5m.csv").write_text("datetime\n", encoding="utf-8")
+  monkeypatch.setattr(settings, "KLINE_ROOT", str(tmp_path))
+
+  resolved = settings.resolve_kline_path("688981.SH", "1m")
+
+  assert resolved is None
+
+
+def test_backtest_timeframes_are_explicit() -> None:
+  assert settings.validate_backtest_timeframe("1m")
+  assert settings.validate_backtest_timeframe("5m")
+  assert not settings.validate_backtest_timeframe("2m")
+
+
+def test_backtest_timeframe_availability_requires_local_coverage(
+  tmp_path: Path,
+  monkeypatch,
+) -> None:
+  symbol_dir = tmp_path / "1m" / "688981_SH"
+  symbol_dir.mkdir(parents=True)
+  (symbol_dir / "688981_SH_1m.csv").write_text(
+    "time,open,high,low,close,volume\n202607270930,10,10,10,10,100\n",
+    encoding="utf-8",
+  )
+  monkeypatch.setattr(settings, "KLINE_ROOT", str(tmp_path))
+
+  items = data_repository.get_backtest_timeframes("688981.SH", "20260727", "20260727")
+
+  assert items[0]["timeframe"] == "1m"
+  assert items[0]["available"] is True
+  assert items[1]["timeframe"] == "5m"
+  assert items[1]["available"] is False
+  with pytest.raises(ValueError, match="本地没有"):
+    data_repository.validate_backtest_coverage("688981.SH", "5m", "20260727", "20260727")
+
+
+def test_data_manager_uses_same_timeframe_path_layout(tmp_path: Path, monkeypatch) -> None:
+  monkeypatch.setattr(settings, "KLINE_ROOT", str(tmp_path))
+
+  path = data_manager.get_kline_path("688981.SH", "1m")
+
+  assert path == str(tmp_path / "1m" / "688981_SH" / "688981_SH_1m.csv")
+
+
+def test_backtest_run_insert_has_matching_placeholder_count() -> None:
+  class Cursor:
+    def __init__(self) -> None:
+      self.lastrowid = 1
+
+    def execute(self, query: str, params: tuple[object, ...]) -> None:
+      assert query.count("%s") == len(params)
+
+  class CursorContext:
+    def __enter__(self) -> Cursor:
+      return Cursor()
+
+    def __exit__(self, *_args: object) -> None:
+      return None
+
+  class Connection:
+    def cursor(self) -> CursorContext:
+      return CursorContext()
+
+  class ConnectionContext:
+    def __enter__(self) -> Connection:
+      return Connection()
+
+    def __exit__(self, *_args: object) -> None:
+      return None
+
+  payload = {
+    "symbol": "688981.SH",
+    "timeframe": "1m",
+    "strategy": "user_script",
+    "startDate": "20260727",
+    "endDate": "20260727",
+  }
+  original_db = state_store._db
+  state_store._db = lambda: ConnectionContext()  # type: ignore[assignment]
+  try:
+    assert state_store.create_backtest_run(payload) == 1
+  finally:
+    state_store._db = original_db  # type: ignore[assignment]
