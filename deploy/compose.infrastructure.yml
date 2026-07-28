@@ -1,0 +1,65 @@
+name: quant-backtest-platform
+
+services:
+  postgres:
+    image: postgres:17.4-alpine
+    container_name: quant-backtest-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      APP_DB_NAME: ${APP_DB_NAME}
+      APP_DB_USER: ${APP_DB_USER}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+    volumes:
+      - quant-backtest-postgres-data:/var/lib/postgresql/data
+      - ../db/init:/docker-entrypoint-initdb.d:ro
+      - ../db/migrations:/migrations:ro
+    networks:
+      - quant-backtest-net
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  migrate:
+    image: postgres:17.4-alpine
+    profiles: ['migration']
+    restart: 'no'
+    env_file:
+      - .env
+    environment:
+      PGHOST: postgres
+      PGPORT: '5432'
+      PGDATABASE: ${APP_DB_NAME}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      APP_DB_USER: ${APP_DB_USER}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../db/migrations:/migrations:ro
+    command:
+      - sh
+      - -ec
+      - >-
+        psql -v ON_ERROR_STOP=1 --set=app_db_user="$${APP_DB_USER}"
+        -c 'SET ROLE quant_backtest_owner'
+        -f /migrations/001_initial_schema.sql
+    networks:
+      - quant-backtest-net
+
+volumes:
+  quant-backtest-postgres-data:
+    name: quant-backtest-postgres-data
+
+networks:
+  quant-backtest-net:
+    name: quant-backtest-net
+    driver: bridge
