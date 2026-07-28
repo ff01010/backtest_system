@@ -1,0 +1,88 @@
+# -*- coding: utf-8 -*-
+"""数据目录路径常量 — 硬编码, 不接受用户输入"""
+
+import os
+
+# K 线数据根目录。各周期位于 {KLINE_ROOT}/{timeframe}/{symbol}/ 下。
+KLINE_ROOT = r"C:\Users\zhongying\code\data\bars\backtest_data\zigzag"
+
+# 信号数据根目录
+SIGNAL_ROOT = r"C:\Users\zhongying\code\strategies\trend_grid\data"
+
+# 支持的 K 线周期：部分周期由 1m/5m 拟合生成。
+TIMEFRAMES = ["1m", "2m", "3m", "4m", "5m", "10m", "15m", "30m", "45m", "60m", "1d"]
+
+# 回测引擎已验证的运行周期。图表和数据管理可继续使用 TIMEFRAMES 中的其它周期。
+BACKTEST_TIMEFRAMES = ("1m", "5m")
+
+# 信号文件命名模板
+SIGNAL_FILENAME = "signal_{strategy}_{date}.csv"
+SIGNAL_FILENAME_LEGACY = "signal_{date}.csv"
+
+STRATEGIES = ["trend_grid", "trend_grid_both"]
+
+# MySQL 状态库配置：保存 viewer 自定义标的、回测账号和回测记录。
+MYSQL_HOST = os.getenv("TREND_GRID_MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("TREND_GRID_MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("TREND_GRID_MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("TREND_GRID_MYSQL_PASSWORD", "123456")
+MYSQL_DATABASE = os.getenv("TREND_GRID_MYSQL_DATABASE", "trend_grid_viewer")
+
+
+def resolve_kline_path(symbol: str, timeframe: str, date: str | None = None) -> str | None:
+  """根据标的和周期解析 K 线文件路径, 不存在返回 None
+
+  symbol: "688981.SH"
+  timeframe: "5m"
+  返回: 完整 CSV 路径 或 None
+  """
+  code, market = symbol.split(".")
+  code_market = f"{code}_{market}"
+  path = os.path.join(KLINE_ROOT, timeframe, code_market, f"{code_market}_{timeframe}.csv")
+  return path if os.path.exists(path) else None
+
+
+def resolve_signal_path(date: str, symbol: str, strategy: str = "trend_grid") -> str:
+  """根据日期和标的解析信号文件路径
+
+  date: "20260622"
+  symbol: "688981.SH"
+  strategy: "trend_grid" | "trend_grid_both"
+  查找顺序: bar/{code_market}_bar_{date}.csv → tick/{code_market}_tick_{date}.csv
+  """
+  code_market = symbol.replace(".", "_")
+
+  # bar 子目录
+  bar_path = os.path.join(SIGNAL_ROOT, "bar", f"{code_market}_bar_{date}.csv")
+  if os.path.exists(bar_path):
+    return bar_path
+
+  # tick 子目录
+  tick_path = os.path.join(SIGNAL_ROOT, "tick", f"{code_market}_tick_{date}.csv")
+  if os.path.exists(tick_path):
+    return tick_path
+
+  # 兜底：返回 bar 路径（调用方用 os.path.exists 判断是否存在）
+  return bar_path
+
+
+def validate_symbol(symbol: str) -> bool:
+  """校验标的格式: 6位数字.SH 或 6位数字.SZ"""
+  import re
+  return bool(re.match(r"^\d{6}\.(SH|SZ)$", symbol))
+
+
+def validate_date(date: str) -> bool:
+  """校验日期格式: YYYYMMDD"""
+  import re
+  return bool(re.match(r"^\d{8}$", date))
+
+
+def validate_timeframe(tf: str) -> bool:
+  """校验周期是否在白名单中"""
+  return tf in TIMEFRAMES
+
+
+def validate_backtest_timeframe(tf: str) -> bool:
+  """校验周期是否被当前回测引擎支持。"""
+  return tf in BACKTEST_TIMEFRAMES
