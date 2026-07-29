@@ -48,16 +48,66 @@ services:
     command:
       - sh
       - -ec
-      - >-
-        psql -v ON_ERROR_STOP=1 --set=app_db_user="$${APP_DB_USER}"
-        -c 'SET ROLE quant_backtest_owner'
-        -f /migrations/001_initial_schema.sql
+      - |
+        for file in /migrations/*.sql; do
+          psql -v ON_ERROR_STOP=1 --set=app_db_user="$${APP_DB_USER}" \
+            -c 'SET ROLE quant_backtest_owner' \
+            -f "$$file";
+        done
+    networks:
+      - quant-backtest-net
+
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: quant-backtest-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
+      TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_KLINE_ROOT: /data/kline
+      TREND_GRID_SIGNAL_ROOT: /data/signals
+      TREND_GRID_CODE_ROOT: /code
+      TREND_GRID_OUTPUT_ROOT: /runtime/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${TREND_GRID_HOST_KLINE_ROOT}:/data/kline:ro
+      - ${TREND_GRID_HOST_SIGNAL_ROOT}:/data/signals:ro
+      - ${TREND_GRID_HOST_CODE_ROOT}:/code:ro
+      - quant-backtest-artifacts:/runtime/artifacts
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - quant-backtest-net
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+    container_name: quant-backtest-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - '${APP_HTTP_PORT:-8080}:80'
     networks:
       - quant-backtest-net
 
 volumes:
   quant-backtest-postgres-data:
     name: quant-backtest-postgres-data
+  quant-backtest-artifacts:
+    name: quant-backtest-artifacts
 
 networks:
   quant-backtest-net:

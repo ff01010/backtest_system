@@ -17,7 +17,6 @@ if _viewer_dir not in sys.path:
 
 from fastapi import Body, FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import pymysql
 
 from backend import settings
 from backend import schemas
@@ -240,7 +239,7 @@ def _validate_versioned_script(version: dict) -> None:
   if not expected_hash or script_id is None:
     return
   try:
-    script = state_store.get_strategy_script(int(script_id))
+    script = state_store.get_strategy_script(str(script_id))
   except KeyError as error:
     raise HTTPException(422, "策略方案绑定的脚本不存在") from error
   actual_hash = hashlib.sha256(script["code"].encode("utf-8")).hexdigest()
@@ -281,11 +280,11 @@ def _validate_backtest_request(request: dict) -> None:
     raise HTTPException(422, f"不支持的策略: {request['strategy']}")
 
   if request.get("configId") and not request.get("configVersionId"):
-    latest_version = state_store.get_latest_strategy_config_version(int(request["configId"]))
+    latest_version = state_store.get_latest_strategy_config_version(str(request["configId"]))
     request["configVersionId"] = latest_version["id"] if latest_version else None
   if request.get("configVersionId"):
     try:
-      version = state_store.get_strategy_config_version(int(request["configVersionId"]))
+      version = state_store.get_strategy_config_version(str(request["configVersionId"]))
     except KeyError as error:
       raise HTTPException(404, "策略方案版本不存在") from error
     if version["timeframe"] != request["timeframe"]:
@@ -384,8 +383,8 @@ def create_instrument(payload: schemas.InstrumentCreate):
   try:
     item = state_store.upsert_instrument(_model_dump(payload))
     return {"instrument": item}
-  except pymysql.err.MySQLError as e:
-    raise HTTPException(500, f"MySQL 写入标的失败: {e}")
+  except state_store.DatabaseError as e:
+    raise HTTPException(500, f"PostgreSQL 写入标的失败: {e}")
 
 
 @app.put("/api/instruments/{symbol}")
@@ -398,8 +397,8 @@ def update_instrument(
   try:
     item = state_store.update_instrument(symbol, _model_dump(payload))
     return {"instrument": item}
-  except pymysql.err.MySQLError as e:
-    raise HTTPException(500, f"MySQL 更新标的失败: {e}")
+  except state_store.DatabaseError as e:
+    raise HTTPException(500, f"PostgreSQL 更新标的失败: {e}")
 
 
 @app.delete("/api/instruments/{symbol}")
@@ -420,10 +419,10 @@ def create_account(payload: schemas.BacktestAccountCreate):
   try:
     account = state_store.create_account(_model_dump(payload))
     return {"account": account}
-  except pymysql.err.IntegrityError:
+  except state_store.ConflictError:
     raise HTTPException(409, f"账号名称已存在: {payload.name}")
-  except pymysql.err.MySQLError as e:
-    raise HTTPException(500, f"MySQL 写入账号失败: {e}")
+  except state_store.DatabaseError as e:
+    raise HTTPException(500, f"PostgreSQL 写入账号失败: {e}")
 
 
 @app.put("/api/accounts/{account_id}")
@@ -433,10 +432,10 @@ def update_account(account_id: int, payload: schemas.BacktestAccountUpdate):
     return {"account": account}
   except KeyError:
     raise HTTPException(404, f"账号不存在: {account_id}")
-  except pymysql.err.IntegrityError:
+  except state_store.ConflictError:
     raise HTTPException(409, f"账号名称已存在: {payload.name}")
-  except pymysql.err.MySQLError as e:
-    raise HTTPException(500, f"MySQL 更新账号失败: {e}")
+  except state_store.DatabaseError as e:
+    raise HTTPException(500, f"PostgreSQL 更新账号失败: {e}")
 
 
 @app.delete("/api/accounts/{account_id}")
@@ -457,14 +456,14 @@ def create_strategy_script(payload: schemas.StrategyScriptCreate):
   try:
     script = state_store.create_strategy_script(request)
     return {"script": script}
-  except pymysql.err.IntegrityError:
+  except state_store.ConflictError:
     raise HTTPException(409, f"策略脚本名称已存在: {payload.name}")
-  except pymysql.err.MySQLError as e:
-    raise HTTPException(500, f"MySQL 写入策略脚本失败: {e}")
+  except state_store.DatabaseError as e:
+    raise HTTPException(500, f"PostgreSQL 写入策略脚本失败: {e}")
 
 
 @app.put("/api/strategy-scripts/{script_id}")
-def update_strategy_script(script_id: int, payload: schemas.StrategyScriptUpdate):
+def update_strategy_script(script_id: str, payload: schemas.StrategyScriptUpdate):
   request = _model_dump(payload)
   _validate_strategy_script(request)
   try:
@@ -472,14 +471,14 @@ def update_strategy_script(script_id: int, payload: schemas.StrategyScriptUpdate
     return {"script": script}
   except KeyError:
     raise HTTPException(404, f"策略脚本不存在: {script_id}")
-  except pymysql.err.IntegrityError:
+  except state_store.ConflictError:
     raise HTTPException(409, f"策略脚本名称已存在: {payload.name}")
-  except pymysql.err.MySQLError as e:
-    raise HTTPException(500, f"MySQL 更新策略脚本失败: {e}")
+  except state_store.DatabaseError as e:
+    raise HTTPException(500, f"PostgreSQL 更新策略脚本失败: {e}")
 
 
 @app.delete("/api/strategy-scripts/{script_id}")
-def delete_strategy_script(script_id: int):
+def delete_strategy_script(script_id: str):
   deleted = state_store.delete_strategy_script(script_id)
   return {"deleted": deleted}
 
@@ -501,14 +500,14 @@ def create_strategy_config(payload: schemas.StrategyConfigCreate):
   try:
     config = state_store.create_strategy_config(request)
     return {"config": config}
-  except pymysql.err.IntegrityError:
+  except state_store.ConflictError:
     raise HTTPException(409, f"策略配置名称已存在: {payload.name}")
-  except pymysql.err.MySQLError as e:
-    raise HTTPException(500, f"MySQL 写入策略配置失败: {e}")
+  except state_store.DatabaseError as e:
+    raise HTTPException(500, f"PostgreSQL 写入策略配置失败: {e}")
 
 
 @app.put("/api/strategy-configs/{config_id}")
-def update_strategy_config(config_id: int, payload: schemas.StrategyConfigUpdate):
+def update_strategy_config(config_id: str, payload: schemas.StrategyConfigUpdate):
   request = _model_dump(payload)
   if not settings.validate_symbol(request["symbol"]):
     raise HTTPException(422, f"非法标的: {request['symbol']}")
@@ -521,31 +520,31 @@ def update_strategy_config(config_id: int, payload: schemas.StrategyConfigUpdate
     return {"config": config}
   except KeyError:
     raise HTTPException(404, f"策略配置不存在: {config_id}")
-  except pymysql.err.IntegrityError:
+  except state_store.ConflictError:
     raise HTTPException(409, f"策略配置名称已存在: {payload.name}")
-  except pymysql.err.MySQLError as e:
-    raise HTTPException(500, f"MySQL 更新策略配置失败: {e}")
+  except state_store.DatabaseError as e:
+    raise HTTPException(500, f"PostgreSQL 更新策略配置失败: {e}")
 
 
 @app.post("/api/strategy-configs/{config_id}/publish")
-def publish_strategy_config(config_id: int):
+def publish_strategy_config(config_id: str):
   try:
     version, created = state_store.publish_strategy_config(config_id)
     return {"version": version, "created": created}
   except KeyError as error:
     raise HTTPException(404, "策略配置不存在") from error
-  except pymysql.err.MySQLError as error:
-    raise HTTPException(500, f"MySQL 发布策略版本失败: {error}") from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"PostgreSQL 发布策略版本失败: {error}") from error
 
 
 @app.delete("/api/strategy-configs/{config_id}")
-def delete_strategy_config(config_id: int):
+def delete_strategy_config(config_id: str):
   deleted = state_store.delete_strategy_config(config_id)
   return {"deleted": deleted}
 
 
 @app.get("/api/strategy-configs/{config_id}/versions")
-def strategy_config_versions(config_id: int):
+def strategy_config_versions(config_id: str):
   try:
     state_store.get_strategy_config(config_id)
   except KeyError:
@@ -556,13 +555,13 @@ def strategy_config_versions(config_id: int):
 @app.get("/api/backtest/runs")
 def backtest_runs(
   limit: int = Query(30, ge=1, le=100),
-  config_id: int | None = Query(default=None, alias="configId"),
+  config_id: str | None = Query(default=None, alias="configId"),
 ):
   return {"runs": state_store.list_backtest_runs(limit, config_id)}
 
 
 @app.get("/api/backtest/runs/{run_id}")
-def backtest_run_detail(run_id: int):
+def backtest_run_detail(run_id: str):
   try:
     return {"run": state_store.get_backtest_run(run_id)}
   except KeyError:
@@ -570,7 +569,7 @@ def backtest_run_detail(run_id: int):
 
 
 @app.put("/api/backtest/runs/{run_id}")
-def update_backtest_run_meta(run_id: int, payload: schemas.BacktestRunMetaUpdate):
+def update_backtest_run_meta(run_id: str, payload: schemas.BacktestRunMetaUpdate):
   try:
     run = state_store.update_backtest_run_meta(run_id, payload.note.strip(), payload.tags)
     return {"run": run}

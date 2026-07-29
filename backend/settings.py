@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""数据目录路径常量 — 硬编码, 不接受用户输入"""
+"""数据路径和 PostgreSQL 连接配置。"""
 
 import os
 
 # K 线数据根目录。各周期位于 {KLINE_ROOT}/{timeframe}/{symbol}/ 下。
-KLINE_ROOT = r"C:\Users\zhongying\code\data\bars\backtest_data\zigzag"
+KLINE_ROOT = os.getenv("TREND_GRID_KLINE_ROOT", "./runtime/kline")
 
-# 信号数据根目录
-SIGNAL_ROOT = r"C:\Users\zhongying\code\strategies\trend_grid\data"
+# 信号数据根目录。
+SIGNAL_ROOT = os.getenv("TREND_GRID_SIGNAL_ROOT", "./runtime/signals")
 
 # 支持的 K 线周期：部分周期由 1m/5m 拟合生成。
 TIMEFRAMES = ["1m", "2m", "3m", "4m", "5m", "10m", "15m", "30m", "45m", "60m", "1d"]
@@ -21,12 +21,12 @@ SIGNAL_FILENAME_LEGACY = "signal_{date}.csv"
 
 STRATEGIES = ["trend_grid", "trend_grid_both"]
 
-# MySQL 状态库配置：保存 viewer 自定义标的、回测账号和回测记录。
-MYSQL_HOST = os.getenv("TREND_GRID_MYSQL_HOST", "127.0.0.1")
-MYSQL_PORT = int(os.getenv("TREND_GRID_MYSQL_PORT", "3306"))
-MYSQL_USER = os.getenv("TREND_GRID_MYSQL_USER", "root")
-MYSQL_PASSWORD = os.getenv("TREND_GRID_MYSQL_PASSWORD", "123456")
-MYSQL_DATABASE = os.getenv("TREND_GRID_MYSQL_DATABASE", "trend_grid_viewer")
+# PostgreSQL 状态库。数据库、角色和表由 deploy 中的迁移创建。
+DATABASE_URL = os.getenv("TREND_GRID_DATABASE_URL", "")
+DEFAULT_USER_ID = os.getenv(
+  "TREND_GRID_DEFAULT_USER_ID",
+  "00000000-0000-0000-0000-000000000001",
+)
 
 
 def resolve_kline_path(symbol: str, timeframe: str, date: str | None = None) -> str | None:

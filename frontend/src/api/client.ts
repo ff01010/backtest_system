@@ -92,9 +92,9 @@ export async function createAccount(payload: BacktestAccountPayload): Promise<Ba
 }
 
 export interface BacktestRunPayload {
-  configId: number | null;
-  configVersionId: number | null;
-  scriptId: number | null;
+  configId: string | null;
+  configVersionId: string | null;
+  scriptId: string | null;
   accountId: number | null;
   account: string;
   mode: 'backtest' | 'live';
@@ -119,10 +119,10 @@ export async function runBacktest(payload: BacktestRunPayload): Promise<Backtest
 }
 
 export interface LiveStrategyResponse {
-  runId: number | null;
-  configId: number | null;
-  configVersionId: number | null;
-  scriptId: number | null;
+  runId: string | null;
+  configId: string | null;
+  configVersionId: string | null;
+  scriptId: string | null;
   status: string;
   message: string;
 }
@@ -133,7 +133,7 @@ export async function runLiveStrategy(payload: BacktestRunPayload): Promise<Live
 
 export async function fetchBacktestRuns(
   limit = 30,
-  configId: number | null = null
+  configId: string | null = null
 ): Promise<BacktestRunHistory[]> {
   const search = new URLSearchParams({ limit: String(limit) });
   if (configId != null) search.set('configId', String(configId));
@@ -143,13 +143,13 @@ export async function fetchBacktestRuns(
   return data.runs;
 }
 
-export async function fetchBacktestRun(runId: number): Promise<BacktestRunHistory> {
+export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistory> {
   const data = await fetchJson<{ run: BacktestRunHistory }>(`${BASE}/backtest/runs/${runId}`);
   return data.run;
 }
 
 export async function updateBacktestRunMeta(
-  runId: number,
+  runId: string,
   payload: { note: string; tags: string[] }
 ): Promise<BacktestRunHistory> {
   const data = await sendJson<{ run: BacktestRunHistory }>(
@@ -222,7 +222,7 @@ export async function createStrategyScript(payload: StrategyScriptPayload): Prom
 }
 
 export async function updateStrategyScript(
-  scriptId: number,
+  scriptId: string,
   payload: StrategyScriptPayload
 ): Promise<StrategyScript> {
   const data = await sendJson<{ script: StrategyScript }>(
@@ -233,7 +233,7 @@ export async function updateStrategyScript(
   return data.script;
 }
 
-export async function deleteStrategyScript(scriptId: number): Promise<boolean> {
+export async function deleteStrategyScript(scriptId: string): Promise<boolean> {
   const data = await fetch(`${BASE}/strategy-scripts/${scriptId}`, { method: 'DELETE' });
   if (!data.ok) throw new Error(`API ${data.status}: ${await data.text()}`);
   return (await data.json()).deleted;
@@ -241,7 +241,7 @@ export async function deleteStrategyScript(scriptId: number): Promise<boolean> {
 
 export interface StrategyConfigPayload {
   name: string;
-  scriptId: number | null;
+  scriptId: string | null;
   strategy: string;
   mode: string;
   symbol: string;
@@ -258,7 +258,7 @@ export async function fetchStrategyConfigs(): Promise<StrategyConfig[]> {
   return data.configs;
 }
 
-export async function fetchStrategyConfigVersions(configId: number): Promise<StrategyConfigVersion[]> {
+export async function fetchStrategyConfigVersions(configId: string): Promise<StrategyConfigVersion[]> {
   const data = await fetchJson<{ versions: StrategyConfigVersion[] }>(
     `${BASE}/strategy-configs/${configId}/versions`
   );
@@ -275,7 +275,7 @@ export async function createStrategyConfig(payload: StrategyConfigPayload): Prom
 }
 
 export async function updateStrategyConfig(
-  configId: number,
+  configId: string,
   payload: StrategyConfigPayload
 ): Promise<StrategyConfig> {
   const data = await sendJson<{ config: StrategyConfig }>(
@@ -287,7 +287,7 @@ export async function updateStrategyConfig(
 }
 
 export async function publishStrategyConfig(
-  configId: number
+  configId: string
 ): Promise<{ version: StrategyConfigVersion; created: boolean }> {
   return sendJson<{ version: StrategyConfigVersion; created: boolean }>(
     `${BASE}/strategy-configs/${configId}/publish`,
@@ -296,7 +296,7 @@ export async function publishStrategyConfig(
   );
 }
 
-export async function deleteStrategyConfig(configId: number): Promise<boolean> {
+export async function deleteStrategyConfig(configId: string): Promise<boolean> {
   const data = await fetch(`${BASE}/strategy-configs/${configId}`, { method: 'DELETE' });
   if (!data.ok) throw new Error(`API ${data.status}: ${await data.text()}`);
   return (await data.json()).deleted;

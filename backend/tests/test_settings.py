@@ -72,10 +72,16 @@ def test_data_manager_uses_same_timeframe_path_layout(tmp_path: Path, monkeypatc
 def test_backtest_run_insert_has_matching_placeholder_count() -> None:
   class Cursor:
     def __init__(self) -> None:
-      self.lastrowid = 1
+      self.query = ""
 
     def execute(self, query: str, params: tuple[object, ...]) -> None:
       assert query.count("%s") == len(params)
+      self.query = query
+
+    def fetchone(self) -> dict[str, object]:
+      if "market_instrument" in self.query:
+        return {"id": 1}
+      return {"id": "00000000-0000-0000-0000-000000000002"}
 
   class CursorContext:
     def __enter__(self) -> Cursor:
@@ -105,6 +111,6 @@ def test_backtest_run_insert_has_matching_placeholder_count() -> None:
   original_db = state_store._db
   state_store._db = lambda: ConnectionContext()  # type: ignore[assignment]
   try:
-    assert state_store.create_backtest_run(payload) == 1
+    assert state_store.create_backtest_run(payload) == "00000000-0000-0000-0000-000000000002"
   finally:
     state_store._db = original_db  # type: ignore[assignment]
