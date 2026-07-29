@@ -144,10 +144,15 @@ def test_backtest_request_preserves_strategy_params() -> None:
 
 def test_strategy_config_uses_backend_generated_code_hash(monkeypatch: pytest.MonkeyPatch) -> None:
   code = "def on_bar(bar, state):\n  return []\n"
-  monkeypatch.setattr(state_store, "get_strategy_script", lambda _: {"code": code})
+  monkeypatch.setattr(state_store, "get_strategy_script", lambda _: {
+    "id": "00000000-0000-0000-0000-000000000011",
+    "name": "测试脚本",
+    "code": code,
+    "entryType": "on_bar",
+  })
 
   normalized = state_store._with_script_code_hash({
-    "scriptId": 11,
+    "scriptId": "00000000-0000-0000-0000-000000000011",
     "paramsJson": {"params": {"window": "20"}},
   })
 
@@ -160,10 +165,10 @@ def test_backtest_version_rejects_changed_locked_params(monkeypatch: pytest.Monk
   code = "def on_bar(bar, state):\n  return []\n"
   code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
   version = {
-    "id": 7,
+    "id": "00000000-0000-0000-0000-000000000007",
     "timeframe": "5m",
     "strategy": "user_script",
-    "scriptId": 11,
+    "scriptId": "00000000-0000-0000-0000-000000000011",
     "paramsJson": {
       "params": {
         "allowLong": False,
@@ -179,9 +184,9 @@ def test_backtest_version_rejects_changed_locked_params(monkeypatch: pytest.Monk
   monkeypatch.setattr(api_app.state_store, "get_strategy_script", lambda _: {"code": code})
   monkeypatch.setattr(api_app.data_repository, "validate_backtest_coverage", lambda *args: None)
   request = {
-    "configId": 3,
+    "configId": "00000000-0000-0000-0000-000000000003",
     "configVersionId": None,
-    "scriptId": 11,
+    "scriptId": "00000000-0000-0000-0000-000000000011",
     "symbol": "000001.SZ",
     "benchmarkSymbol": "000001.SZ",
     "strategy": "user_script",
@@ -200,7 +205,7 @@ def test_backtest_version_rejects_changed_locked_params(monkeypatch: pytest.Monk
   }
 
   api_app._validate_backtest_request(request)
-  assert request["configVersionId"] == 7
+  assert request["configVersionId"] == "00000000-0000-0000-0000-000000000007"
 
   request["strategyParams"]["window"] = "10"
   with pytest.raises(HTTPException, match="window"):

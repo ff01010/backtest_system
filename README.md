@@ -1,136 +1,74 @@
-# Trend Grid Viewer
+# Quant Backtest Platform
 
-趋势网格策略工作台，包含两个页面：
-
-- 信号可视化：查看 5m K 线、策略信号、实际触发点和理论触发点。
-- 策略回测：管理回测账号和标的，提交参数运行回测，查看收益摘要、净值曲线和交易明细。
+趋势网格策略工作台，提供信号可视化、策略方案管理与回测历史查询。
 
 ## 目录结构
 
 ```text
-viewer/
-  backend/      FastAPI 后端，负责数据读取、MySQL 状态管理和回测 API
-  frontend/     Vite + React 前端，负责可视化页面和回测页面
+backend/       FastAPI 后端和回测引擎
+frontend/      Vite + React 前端
+db/            PostgreSQL 初始化和版本化迁移
+deploy/        Docker Compose 基础设施配置
 ```
 
-## 数据来源
+## 数据库
 
-5m K 线数据读取自：
+页面状态、策略、方案版本和回测记录全部使用 PostgreSQL。`db/migrations/001_initial_schema.sql`
+是核心规范模型，`002_backtest_workspace.sql` 只补充回测工作台实体；不再使用 MySQL，
+也不保留 `viewer_*` 表。
+
+策略、方案、方案版本和回测记录均使用 UUID，前后端 API 以字符串传递这些 ID。回测账号
+是独立业务实体，继续使用 bigint 自增 ID。
+
+在服务器上配置数据库：
+
+```bash
+cd /opt/projects/quant_backtest_platform_git
+cp deploy/.env.example deploy/.env
+# 编辑 deploy/.env，替换所有示例密码和数据目录
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml up -d postgres
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml --profile migration run --rm migrate
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml up -d --build backend frontend
+```
+
+迁移服务会按文件名顺序执行 `db/migrations/*.sql`。后端不执行 DDL；若迁移尚未完成，
+启动检查会直接报错。
+
+容器运行时会将宿主机 K 线、信号和策略代码目录只读挂载到应用中。策略代码根目录必须
+包含 `shared/` 以及 `strategies/trend_grid/engine.py`。回测产物写入 Docker 卷
+`quant-backtest-artifacts`。QMT 数据同步脚本不在本仓库且不能在 Linux 容器中运行，
+服务器部署后应由采集端先把数据写入 K 线挂载目录。
+
+## 后端配置与启动
+
+后端需要以下环境变量：
 
 ```text
-C:\Users\zhongying\code\data\bars\backtest_data\zigzag\5m
+TREND_GRID_DATABASE_URL=postgresql://quant_backtest_app:密码@127.0.0.1:5432/quant_backtest_platform
+TREND_GRID_DEFAULT_USER_ID=00000000-0000-0000-0000-000000000001
+TREND_GRID_KLINE_ROOT=/srv/quant-backtest/data/kline
+TREND_GRID_SIGNAL_ROOT=/srv/quant-backtest/data/signals
 ```
 
-标的 `688981.SH` 对应文件示例：
-
-```text
-C:\Users\zhongying\code\data\bars\backtest_data\zigzag\5m\688981_SH\688981_SH_5m.csv
-```
-
-信号数据读取自：
-
-```text
-C:\Users\zhongying\code\strategies\trend_grid\data
-```
-
-后端配置位置：
-
-```text
-backend/settings.py
-```
-
-## MySQL
-
-viewer 使用 MySQL 保存页面状态和回测记录，不保存 K 线大数据。
-
-默认数据库：
-
-```text
-trend_grid_viewer
-```
-
-默认连接配置：
-
-```text
-host: 127.0.0.1
-port: 3306
-user: root
-password: 123456
-```
-
-可通过环境变量覆盖：
-
-```text
-TREND_GRID_MYSQL_HOST
-TREND_GRID_MYSQL_PORT
-TREND_GRID_MYSQL_USER
-TREND_GRID_MYSQL_PASSWORD
-TREND_GRID_MYSQL_DATABASE
-```
-
-后端会自动创建数据库和基础表：
-
-- `viewer_instruments`：自定义标的
-- `viewer_accounts`：回测账号参数
-- `viewer_backtest_runs`：回测运行记录和摘要
-
-## 后端启动
-
-进入后端目录：
+本地开发可在 Python 虚拟环境中安装锁定依赖并启动：
 
 ```powershell
-cd C:\Users\zhongying\code\strategies\trend_grid\viewer\backend
+cd C:\Users\zhongying\backtest_system
+python -m pip install -r backend\requirements.txt
+$env:TREND_GRID_DATABASE_URL = 'postgresql://quant_backtest_app:密码@127.0.0.1:5432/quant_backtest_platform'
+python backend\app.py
 ```
 
-如果当前虚拟环境缺少 MySQL 驱动，先安装：
-
-```powershell
-python -m pip install PyMySQL==1.1.2
-```
-
-启动：
-
-```powershell
-python app.py
-```
-
-后端地址：
-
-```text
-http://127.0.0.1:8000
-```
-
-健康检查：
-
-```text
-GET http://127.0.0.1:8000/api/health
-```
+后端健康检查：`GET http://127.0.0.1:8000/api/health`。
 
 ## 前端启动
 
-进入前端目录：
-
 ```powershell
-cd C:\Users\zhongying\code\strategies\trend_grid\viewer\frontend
-```
-
-启动：
-
-```powershell
+cd C:\Users\zhongying\backtest_system\frontend
 npm run dev
 ```
 
-默认地址：
-
-```text
-http://127.0.0.1:5174
-```
-
-如果端口被占用，可以指定端口：
-
-```powershell
-npm run dev -- --port 5175 --host 127.0.0.1
-```
+默认地址为 `http://127.0.0.1:5174`。
 
 ## API 概览
 
@@ -195,11 +133,11 @@ npm run dev -- --port 5175 --host 127.0.0.1
 - 可视化编辑初始资金、手续费、滑点、仓位模式、单笔金额、单笔比例、是否允许做空。
 - 调用现有 `BacktestEngine` 运行同步回测。
 - 展示总收益、最大回撤、胜率、交易次数、净值曲线和交易明细。
-- 回测记录写入 MySQL。
+- 回测记录写入 PostgreSQL。
 
 ## 已知边界
 
-- K 线和信号仍读取 CSV 文件，不写入 MySQL。
+- K 线和信号仍读取 CSV 文件，不写入 PostgreSQL。
 - 手续费参数会保存到回测记录；当前引擎仍使用 `shared.cost` 中的全局成本常量。
 - `allowShort=false` 暂未真正改变引擎行为，当前引擎仍按策略默认双向逻辑执行。
 - 交易明细中的 `time` 字段当前由引擎输出为空，页面会显示 `-`。
@@ -207,14 +145,14 @@ npm run dev -- --port 5175 --host 127.0.0.1
 
 ## 常见问题
 
-### ModuleNotFoundError: No module named 'pymysql'
+### ModuleNotFoundError: No module named 'psycopg'
 
-原因是当前 `.venv` 中没有安装 `PyMySQL`。
+原因是当前虚拟环境尚未安装后端锁定依赖。
 
 解决：
 
 ```powershell
-python -m pip install PyMySQL==1.1.2
+python -m pip install -r backend\requirements.txt
 ```
 
 ### 前端请求接口失败
@@ -236,5 +174,5 @@ frontend/vite.config.ts
 确认对应标的文件存在。例如：
 
 ```text
-C:\Users\zhongying\code\data\bars\backtest_data\zigzag\5m\688981_SH\688981_SH_5m.csv
+%TREND_GRID_KLINE_ROOT%\5m\688981_SH\688981_SH_5m.csv
 ```

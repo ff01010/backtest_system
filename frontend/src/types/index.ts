@@ -167,10 +167,10 @@ export interface DailyHoldingPoint {
 }
 
 export interface BacktestRunResponse {
-  runId: number | null;
-  configId: number | null;
-  configVersionId: number | null;
-  scriptId: number | null;
+  runId: string | null;
+  configId: string | null;
+  configVersionId: string | null;
+  scriptId: string | null;
   outputDir: string;
   summary: BacktestSummary;
   equity: EquityPoint[];
@@ -208,7 +208,7 @@ export interface ExperimentManifest {
 }
 
 export interface StrategyScript {
-  id: number;
+  id: string;
   name: string;
   description: string;
   language: string;
@@ -245,9 +245,9 @@ export interface StrategyParameterSchemaResponse {
 }
 
 export interface StrategyConfig {
-  id: number;
+  id: string;
   name: string;
-  scriptId: number | null;
+  scriptId: string | null;
   strategy: string;
   mode: 'backtest' | 'live' | string;
   symbol: string;
@@ -262,11 +262,11 @@ export interface StrategyConfig {
 }
 
 export interface StrategyConfigVersion {
-  id: number;
-  configId: number;
+  id: string;
+  configId: string;
   versionNo: number;
   name: string;
-  scriptId: number | null;
+  scriptId: string | null;
   strategy: string;
   mode: 'backtest' | 'live' | string;
   symbol: string;
@@ -279,10 +279,10 @@ export interface StrategyConfigVersion {
 }
 
 export interface BacktestRunHistory {
-  id: number;
-  configId: number | null;
-  configVersionId: number | null;
-  scriptId: number | null;
+  id: string;
+  configId: string | null;
+  configVersionId: string | null;
+  scriptId: string | null;
   accountId: number | null;
   symbol: string;
   timeframe: string;

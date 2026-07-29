@@ -112,9 +112,9 @@ class BacktestAccountUpdate(BaseModel):
 
 
 class BacktestRunRequest(BaseModel):
-  configId: int | None = None
-  configVersionId: int | None = None
-  scriptId: int | None = None
+  configId: str | None = None
+  configVersionId: str | None = None
+  scriptId: str | None = None
   accountId: int | None = None
   account: str = "default"
   mode: str = Field(default="backtest", pattern=r"^(backtest|live)$")
@@ -207,10 +207,10 @@ class DailyHoldingPoint(BaseModel):
 
 
 class BacktestRunResponse(BaseModel):
-  runId: int | None
-  configId: int | None = None
-  configVersionId: int | None = None
-  scriptId: int | None = None
+  runId: str | None
+  configId: str | None = None
+  configVersionId: str | None = None
+  scriptId: str | None = None
   outputDir: str
   summary: BacktestSummary
   equity: list[EquityPoint]
@@ -225,7 +225,7 @@ class BacktestRunResponse(BaseModel):
 
 
 class StrategyScript(BaseModel):
-  id: int
+  id: str
   name: str
   description: str
   language: str
@@ -253,9 +253,9 @@ class StrategyScriptUpdate(BaseModel):
 
 
 class StrategyConfig(BaseModel):
-  id: int
+  id: str
   name: str
-  scriptId: int | None
+  scriptId: str | None
   strategy: str
   mode: str
   symbol: str
@@ -270,11 +270,11 @@ class StrategyConfig(BaseModel):
 
 
 class StrategyConfigVersion(BaseModel):
-  id: int
-  configId: int
+  id: str
+  configId: str
   versionNo: int
   name: str
-  scriptId: int | None
+  scriptId: str | None
   strategy: str
   mode: str
   symbol: str
@@ -287,10 +287,10 @@ class StrategyConfigVersion(BaseModel):
 
 
 class BacktestRunHistory(BaseModel):
-  id: int
-  configId: int | None
-  configVersionId: int | None
-  scriptId: int | None
+  id: str
+  configId: str | None
+  configVersionId: str | None
+  scriptId: str | None
   accountId: int | None
   symbol: str
   timeframe: str = "5m"
@@ -319,7 +319,7 @@ class BacktestRunMetaUpdate(BaseModel):
 
 class StrategyConfigCreate(BaseModel):
   name: str = Field(min_length=1, max_length=64)
-  scriptId: int | None = None
+  scriptId: str | None = None
   strategy: str = "trend_grid"
   mode: str = Field(default="backtest", pattern=r"^(backtest|live)$")
   symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
@@ -333,7 +333,7 @@ class StrategyConfigCreate(BaseModel):
 
 class StrategyConfigUpdate(BaseModel):
   name: str = Field(min_length=1, max_length=64)
-  scriptId: int | None = None
+  scriptId: str | None = None
   strategy: str = "trend_grid"
   mode: str = Field(default="backtest", pattern=r"^(backtest|live)$")
   symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
