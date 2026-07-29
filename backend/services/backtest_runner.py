@@ -114,7 +114,7 @@ def run_trend_grid_backtest(payload: dict[str, Any]) -> dict[str, Any]:
 def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
   """运行已保存的 on_bar 自定义策略脚本。"""
   script_id = payload.get("scriptId")
-  if not isinstance(script_id, int):
+  if not isinstance(script_id, str) or not script_id:
     raise ValueError("自定义脚本回测必须选择策略代码")
   version_snapshot = payload.get("versionScriptSnapshot")
   if isinstance(version_snapshot, dict) and isinstance(version_snapshot.get("code"), str):
@@ -140,7 +140,7 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     "codeHash": code_hash,
     "entryType": "on_bar",
     "sources": [{
-      "path": f"database:viewer_strategy_scripts/{script_id}",
+      "path": f"database:user_strategy/{script_id}",
       "code": script["code"],
     }],
   }
@@ -402,7 +402,11 @@ def _build_config(payload: dict[str, Any]) -> dict[str, Any]:
     f"{payload['strategy']}_{payload['symbol']}_"
     f"{payload['startDate']}_{payload['endDate']}"
   )
-  bc["output_dir"] = os.path.join(_STRATEGY_DIR, "output", run_name)
+  output_root = os.getenv(
+    "TREND_GRID_OUTPUT_ROOT",
+    os.path.join(_STRATEGY_DIR, "output"),
+  )
+  bc["output_dir"] = os.path.join(output_root, run_name)
 
   slippage = float(payload.get("slippage") or 0)
   if slippage > 0:

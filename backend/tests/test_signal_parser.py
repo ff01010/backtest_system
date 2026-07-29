@@ -23,12 +23,12 @@ class TestIsTradeType:
         assert is_trade_type("止损平多")
 
     def test_non_trade_types(self):
-        assert not is_trade_type("谷点-首谷")
-        assert not is_trade_type("尖点-首峰")
-        assert not is_trade_type("尖点-卖出")
-        assert not is_trade_type("谷点-买入")
-        assert not is_trade_type("尖点-tick卖出")
-        assert not is_trade_type("谷点-tick买入")
+        assert is_trade_type("谷点-首谷")
+        assert is_trade_type("尖点-首峰")
+        assert is_trade_type("尖点-卖出")
+        assert is_trade_type("谷点-买入")
+        assert is_trade_type("尖点-tick卖出")
+        assert is_trade_type("谷点-tick买入")
         assert not is_trade_type("止损触发-空")
         assert not is_trade_type("止损触发-多")
         assert not is_trade_type("平仓触发-空")
@@ -55,7 +55,7 @@ class TestClassifyTrade:
         assert classify_trade("平仓成交-空-尾盘") == ("BUY", "CLOSE")
 
     def test_non_trade(self):
-        assert classify_trade("尖点-首峰") is None
+        assert classify_trade("尖点-首峰") == ("SELL", "OPEN")
         assert classify_trade("谷点-tick买入") is None
 
 
@@ -165,7 +165,11 @@ class TestParseSignalRow:
     def test_non_trade_row(self):
         row = {"time": "09:50:01", "code": "688449.SH", "module": "A",
                "type": "谷点-首谷", "detail": "valley=75.67"}
-        assert parse_signal_row(row) is None
+        result = parse_signal_row(row)
+        assert result is not None
+        assert result["side"] == "BUY"
+        assert result["action"] == "OPEN"
+        assert result["exec_price"] == 75.67
 
     def test_sell_close_row(self):
         row = {"time": "11:05:21", "code": "688981.SH", "module": "A",

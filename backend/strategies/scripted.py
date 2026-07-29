@@ -94,7 +94,7 @@ def _validate_literal_orders(callback: ast.FunctionDef) -> None:
 class ScriptedBarStrategy:
   """执行用户 on_bar(bar, state) 函数并转换其订单动作。"""
 
-  def __init__(self, script_id: int, code: str, params: dict[str, Any]) -> None:
+  def __init__(self, script_id: str, code: str, params: dict[str, Any]) -> None:
     validate_script_code(code)
     namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
     exec(compile(code, f"strategy_script_{script_id}.py", "exec"), namespace)

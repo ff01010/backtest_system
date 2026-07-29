@@ -703,16 +703,16 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const [strategySourceError, setStrategySourceError] = useState('');
   const [configVersions, setConfigVersions] = useState<StrategyConfigVersion[]>([]);
   const [backtestRuns, setBacktestRuns] = useState<BacktestRunHistory[]>([]);
-  const [selectedHistoryRunId, setSelectedHistoryRunId] = useState<number | ''>('');
-  const [compareHistoryRunId, setCompareHistoryRunId] = useState<number | ''>('');
+  const [selectedHistoryRunId, setSelectedHistoryRunId] = useState<string | ''>('');
+  const [compareHistoryRunId, setCompareHistoryRunId] = useState<string | ''>('');
   const [historyQuery, setHistoryQuery] = useState('');
   const [historySymbolFilter, setHistorySymbolFilter] = useState('');
   const [historyPage, setHistoryPage] = useState(1);
   const [historyPageSize, setHistoryPageSize] = useState(10);
   const [historyNoteDraft, setHistoryNoteDraft] = useState('');
   const [historyTagsDraft, setHistoryTagsDraft] = useState('');
-  const [selectedScriptId, setSelectedScriptId] = useState<number | ''>('');
-  const [selectedConfigId, setSelectedConfigId] = useState<number | ''>('');
+  const [selectedScriptId, setSelectedScriptId] = useState<string | ''>('');
+  const [selectedConfigId, setSelectedConfigId] = useState<string | ''>('');
   const [versionDirty, setVersionDirty] = useState(false);
   const [publishedFingerprint, setPublishedFingerprint] = useState('');
   const [configName, setConfigName] = useState('');
@@ -793,12 +793,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   }, []);
 
   useEffect(() => {
-    if (typeof selectedConfigId !== 'number' || !publishedFingerprint) return;
+    if (typeof selectedConfigId !== 'string' || !publishedFingerprint) return;
     setVersionDirty(draftFingerprint !== publishedFingerprint);
   }, [draftFingerprint, publishedFingerprint, selectedConfigId]);
 
   useEffect(() => {
-    if (typeof selectedConfigId !== 'number' || configVersions.length === 0) return;
+    if (typeof selectedConfigId !== 'string' || configVersions.length === 0) return;
     const latestVersion = configVersions[0];
     const versionParams = asHistoryRecord(latestVersion.paramsJson.params);
     const scriptSnapshot = asHistoryRecord(latestVersion.paramsJson.scriptSnapshot);
@@ -922,7 +922,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   }, [tradeSideFilter, tradePnlFilter, tradePageSize, result]);
 
   useEffect(() => {
-    if (typeof selectedConfigId === 'number') {
+    if (typeof selectedConfigId === 'string') {
       refreshConfigVersions(selectedConfigId);
     } else {
       setConfigVersions([]);
@@ -935,10 +935,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       setCompareHistoryRunId('');
       return;
     }
-    if (typeof selectedHistoryRunId !== 'number') {
+    if (typeof selectedHistoryRunId !== 'string') {
       setSelectedHistoryRunId(backtestRuns[0].id);
     }
-    if (typeof compareHistoryRunId !== 'number') {
+    if (typeof compareHistoryRunId !== 'string') {
       setCompareHistoryRunId(backtestRuns[1]?.id || backtestRuns[0].id);
     }
   }, [backtestRuns]);
@@ -952,7 +952,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   }, [selectedHistoryRunId, compareHistoryRunId, backtestRuns]);
 
   useEffect(() => {
-    if (typeof selectedHistoryRunId !== 'number') {
+    if (typeof selectedHistoryRunId !== 'string') {
       setHistoryNoteDraft('');
       setHistoryTagsDraft('');
       return;
@@ -1010,7 +1010,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     setStrategyConfigs(configs);
   };
 
-  const refreshConfigVersions = async (configId: number) => {
+  const refreshConfigVersions = async (configId: string) => {
     const versions = await fetchStrategyConfigVersions(configId);
     setConfigVersions(versions);
   };
@@ -1091,7 +1091,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   };
 
   const buildStrategyConfigPayload = (
-    scriptId: number,
+    scriptId: string,
     name: string,
     strategyId = selectedStrategy,
   ) => ({
@@ -1261,7 +1261,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   };
 
   const handleScriptSelect = (value: string) => {
-    const scriptId = value ? Number(value) : '';
+    const scriptId = value || '';
     setSelectedScriptId(scriptId);
     const script = strategyScripts.find((item) => item.id === scriptId);
     if (!script) return;
@@ -1280,7 +1280,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       setConfigName('');
       return;
     }
-    const config = strategyConfigs.find((item) => item.id === Number(value));
+    const config = strategyConfigs.find((item) => item.id === value);
     if (config) applyStrategyConfig(config);
   };
 
@@ -1311,7 +1311,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         code: scriptForm.code,
         entryType: scriptForm.entryType,
       };
-      const script = typeof selectedScriptId === 'number'
+      const script = typeof selectedScriptId === 'string'
         ? await updateStrategyScript(selectedScriptId, payload)
         : await createStrategyScript(payload);
       await refreshStrategyAssets();
@@ -1322,7 +1322,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         code: script.code,
         entryType: script.entryType,
       });
-      if (typeof selectedConfigId === 'number') {
+      if (typeof selectedConfigId === 'string') {
         setStatus(`已保存策略脚本 ${script.name}，请保存策略草稿后发布新版本`);
       } else {
         setStatus(`已保存策略脚本 ${script.name}`);
@@ -1333,7 +1333,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   };
 
   const handleDeleteScript = async () => {
-    if (typeof selectedScriptId !== 'number') return;
+    if (typeof selectedScriptId !== 'string') return;
     setError('');
     setStatus('');
     try {
@@ -1347,7 +1347,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     }
   };
 
-  const handleSaveConfig = async (): Promise<number | null> => {
+  const handleSaveConfig = async (): Promise<string | null> => {
     setError('');
     setStatus('');
     const strategyName = configName.trim() || scriptForm.name.trim();
@@ -1377,7 +1377,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
           ? 'on_bar'
           : (strategySource ? `catalog:${strategySource.id}` : scriptForm.entryType),
       };
-      const savedScript = typeof selectedScriptId === 'number'
+      const savedScript = typeof selectedScriptId === 'string'
         ? await updateStrategyScript(selectedScriptId, scriptPayload)
         : await createStrategyScript(scriptPayload);
       const strategyId = isCustomScript ? 'user_script' : selectedStrategy;
@@ -1390,10 +1390,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         publish: false,
       };
       const existingConfig = strategyConfigs.find((item) => item.name === strategyName);
-      const targetConfigId = typeof selectedConfigId === 'number'
+      const targetConfigId = typeof selectedConfigId === 'string'
         ? selectedConfigId
         : existingConfig?.id;
-      const config = typeof targetConfigId === 'number'
+      const config = typeof targetConfigId === 'string'
         ? await updateStrategyConfig(targetConfigId, payload)
         : await createStrategyConfig(payload);
       await refreshStrategyAssets();
@@ -1434,7 +1434,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   };
 
   const handleDeleteConfig = async () => {
-    if (typeof selectedConfigId !== 'number') return;
+    if (typeof selectedConfigId !== 'string') return;
     setError('');
     setStatus('');
     try {
@@ -1492,7 +1492,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const handleRunBacktest = async () => {
     setError('');
     setStatus('');
-    if (typeof selectedConfigId !== 'number') {
+    if (typeof selectedConfigId !== 'string') {
       setError('请先选择策略方案，再运行回测');
       return;
     }
@@ -1522,9 +1522,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     try {
       const account = accounts.find((item) => item.id === selectedAccountId);
       const payload: BacktestRunPayload = {
-        configId: typeof selectedConfigId === 'number' ? selectedConfigId : null,
+        configId: typeof selectedConfigId === 'string' ? selectedConfigId : null,
         configVersionId: null,
-        scriptId: typeof selectedScriptId === 'number' ? selectedScriptId : null,
+        scriptId: typeof selectedScriptId === 'string' ? selectedScriptId : null,
         accountId: typeof selectedAccountId === 'number' ? selectedAccountId : null,
         account: account?.name || 'default',
         mode,
@@ -1844,7 +1844,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const historyGridColumns = 'minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 74px';
   const activePanelLabel = resultTabs.find((item) => item.id === activePanel)?.label || '概览';
   const hasPublishedVersion = configVersions.length > 0;
-  const runDisabled = running || typeof selectedConfigId !== 'number' || !hasPublishedVersion || versionDirty || !runPreflightReady;
+  const runDisabled = running || typeof selectedConfigId !== 'string' || !hasPublishedVersion || versionDirty || !runPreflightReady;
   const statusMessage = error || status || (versionDirty
     ? '策略草稿与已发布版本不同，请发布新版本后运行'
     : !hasPublishedVersion
@@ -1963,7 +1963,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   };
 
   const handleSaveHistoryMeta = async () => {
-    if (typeof selectedHistoryRunId !== 'number') return;
+    if (typeof selectedHistoryRunId !== 'string') return;
     setError('');
     setStatus('');
     try {
@@ -2069,7 +2069,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         <button
           onClick={handleRunBacktest}
           disabled={runDisabled}
-          title={typeof selectedConfigId !== 'number'
+          title={typeof selectedConfigId !== 'string'
             ? '请先选择策略方案'
             : versionDirty
               ? '请先发布新版本'
@@ -2096,7 +2096,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
           }}
         >
           <Play size={15} />
-          {running ? '处理中...' : typeof selectedConfigId !== 'number' ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
+          {running ? '处理中...' : typeof selectedConfigId !== 'string' ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
         </button>
       </header>
 
@@ -2577,15 +2577,15 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     </button>
                     <button
                       onClick={handleDeleteConfig}
-                      disabled={typeof selectedConfigId !== 'number'}
+                      disabled={typeof selectedConfigId !== 'string'}
                       style={{
                         height: 34,
                         borderRadius: 4,
                         border: '1px solid #cbd5e1',
                         background: '#ffffff',
                         color: '#64748b',
-                        cursor: typeof selectedConfigId === 'number' ? 'pointer' : 'not-allowed',
-                        opacity: typeof selectedConfigId === 'number' ? 1 : 0.55,
+                        cursor: typeof selectedConfigId === 'string' ? 'pointer' : 'not-allowed',
+                        opacity: typeof selectedConfigId === 'string' ? 1 : 0.55,
                       }}
                     >
                       删除策略
@@ -2815,7 +2815,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       opacity: runDisabled ? 0.7 : 1,
                     }} onClick={handleRunBacktest} disabled={runDisabled} title={versionDirty ? '请先发布新版本' : !hasPublishedVersion ? '请先发布首个版本' : !runPreflightReady ? '请等待运行前检查通过' : undefined}>
                       <Play size={14} />
-                      {running ? '处理中...' : typeof selectedConfigId !== 'number' ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
+                      {running ? '处理中...' : typeof selectedConfigId !== 'string' ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
                     </button>
                     <button style={{
                       width: 38,
@@ -3463,7 +3463,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                               <div style={labelStyle}>对比对象</div>
                               <select
                                 value={compareHistoryRunId}
-                                onChange={(e) => setCompareHistoryRunId(Number(e.target.value))}
+                                onChange={(e) => setCompareHistoryRunId(e.target.value)}
                                 style={fieldStyle}
                               >
                                 {backtestRuns
@@ -3807,12 +3807,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               </button>
               <button
                 onClick={handleDeleteConfig}
-                disabled={typeof selectedConfigId !== 'number'}
+                disabled={typeof selectedConfigId !== 'string'}
                 style={{
                   height: 32, borderRadius: 4, border: '1px solid #cbd5e1',
                   background: '#f8fafc', color: '#64748b',
-                  cursor: typeof selectedConfigId === 'number' ? 'pointer' : 'not-allowed',
-                  opacity: typeof selectedConfigId === 'number' ? 1 : 0.55,
+                  cursor: typeof selectedConfigId === 'string' ? 'pointer' : 'not-allowed',
+                  opacity: typeof selectedConfigId === 'string' ? 1 : 0.55,
                 }}
               >
                 删除策略
@@ -3867,12 +3867,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               </button>
               <button
                 onClick={handleDeleteConfig}
-                disabled={typeof selectedConfigId !== 'number'}
+                disabled={typeof selectedConfigId !== 'string'}
                 style={{
                   height: 32, borderRadius: 4, border: '1px solid #cbd5e1',
                   background: '#f8fafc', color: '#64748b',
-                  cursor: typeof selectedConfigId === 'number' ? 'pointer' : 'not-allowed',
-                  opacity: typeof selectedConfigId === 'number' ? 1 : 0.55,
+                  cursor: typeof selectedConfigId === 'string' ? 'pointer' : 'not-allowed',
+                  opacity: typeof selectedConfigId === 'string' ? 1 : 0.55,
                 }}
               >
                 删除

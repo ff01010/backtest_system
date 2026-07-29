@@ -10,7 +10,7 @@ from backend.strategies.scripted import ScriptedBarStrategy, validate_script_cod
 
 
 def _qmt_script_strategy(
-  script_id: int,
+  script_id: str,
   params: dict[str, bool] | None = None,
 ) -> ScriptedBarStrategy:
   code = Path("backend/strategies/trend_follow_qmt_1m_close_fill.py").read_text(encoding="utf-8")
