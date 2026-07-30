@@ -39,17 +39,13 @@ def test_backtest_timeframes_are_explicit() -> None:
   assert not settings.validate_backtest_timeframe("2m")
 
 
-def test_backtest_timeframe_availability_requires_local_coverage(
-  tmp_path: Path,
-  monkeypatch,
-) -> None:
-  symbol_dir = tmp_path / "1m" / "688981_SH"
-  symbol_dir.mkdir(parents=True)
-  (symbol_dir / "688981_SH_1m.csv").write_text(
-    "time,open,high,low,close,volume\n202607270930,10,10,10,10,100\n",
-    encoding="utf-8",
-  )
-  monkeypatch.setattr(settings, "KLINE_ROOT", str(tmp_path))
+def test_backtest_timeframe_availability_uses_database_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+  expected = [
+    {"timeframe": "1m", "available": True, "reason": "", "dataStart": "20260727", "dataEnd": "20260727"},
+    {"timeframe": "5m", "available": False, "reason": "东财不可用", "dataStart": None, "dataEnd": None},
+  ]
+  monkeypatch.setattr(data_repository.market_data, "timeframe_status", lambda *_args: expected)
+  monkeypatch.setattr(data_repository.market_data, "ensure_cached", lambda *_args: {"status": "cache_hit"})
 
   items = data_repository.get_backtest_timeframes("688981.SH", "20260727", "20260727")
 
@@ -57,8 +53,7 @@ def test_backtest_timeframe_availability_requires_local_coverage(
   assert items[0]["available"] is True
   assert items[1]["timeframe"] == "5m"
   assert items[1]["available"] is False
-  with pytest.raises(ValueError, match="本地没有"):
-    data_repository.validate_backtest_coverage("688981.SH", "5m", "20260727", "20260727")
+  data_repository.validate_backtest_coverage("688981.SH", "1m", "20260727", "20260727")
 
 
 def test_data_manager_uses_same_timeframe_path_layout(tmp_path: Path, monkeypatch) -> None:

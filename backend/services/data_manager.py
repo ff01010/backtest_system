@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from backend import settings
+from backend.services import market_data
 
 EXPECTED_BARS_PER_DAY = {
   "1m": 240,
@@ -33,6 +34,12 @@ def get_kline_path(symbol: str, timeframe: str) -> str:
 
 
 def get_status(symbol: str, timeframe: str = "5m", preview_limit: int = 20) -> dict[str, Any]:
+  """返回 PostgreSQL 分钟缓存状态。"""
+  return market_data.status(symbol, timeframe, preview_limit)
+
+
+def get_csv_status(symbol: str, timeframe: str = "5m", preview_limit: int = 20) -> dict[str, Any]:
+  """保留旧 CSV 状态扫描，供迁移期排查使用。"""
   path = get_kline_path(symbol, timeframe)
   empty = {
     "symbol": symbol,

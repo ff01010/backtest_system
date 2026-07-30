@@ -21,8 +21,7 @@ from backend.backtesting import Bar, BarBacktestEngine, RecordedPriceExecutionMo
 from backend.backtesting.legacy import fill_to_api_trade
 from backend.strategies.catalog import create_bar_strategy, get_strategy_source_snapshot
 from backend.strategies.external_engine import load_external_engine
-from backend.strategies.scripted import ScriptedBarStrategy
-from backend.services import state_store
+from backend.services import market_data, state_store, strategy_worker
 
 _BACKTEST_SYSTEM_ROOT = os.path.dirname(
   os.path.dirname(os.path.dirname(__file__))
@@ -36,10 +35,13 @@ if _PROJECT_ROOT not in sys.path:
   sys.path.insert(0, _PROJECT_ROOT)
 
 from backend import settings
-from shared.calendar import is_trading_time
-
 _ENGINE_VERSION = "bar-portfolio-v1"
 _RANDOM_SEED_VERSION = "bar-signal-v1"
+
+
+def is_trading_time(hhmm: int) -> bool:
+  """A 股分钟 K 线仅保留上午与下午连续竞价时段。"""
+  return 930 <= hhmm <= 1130 or 1300 <= hhmm <= 1500
 
 
 def __getattr__(name: str) -> Any:
@@ -112,7 +114,7 @@ def run_trend_grid_backtest(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
-  """运行已保存的 on_bar 自定义策略脚本。"""
+  """将脚本快照交给隔离容器运行，后端只持有数据和结果。"""
   script_id = payload.get("scriptId")
   if not isinstance(script_id, str) or not script_id:
     raise ValueError("自定义脚本回测必须选择策略代码")
@@ -128,12 +130,11 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     script = state_store.get_strategy_script(script_id)
   if script["entryType"] != "on_bar":
     raise ValueError("所选策略代码不是可执行的 on_bar 脚本")
-  config = _build_config(payload)
   bars = _load_bars(
     payload["symbol"], payload.get("timeframe", "5m"), payload["startDate"], payload["endDate"],
   )
-  manifest = _build_experiment_manifest(payload, config, bars)
   code_hash = hashlib.sha256(script["code"].encode("utf-8")).hexdigest()
+  manifest = _build_script_experiment_manifest(payload, bars, script_id, script["name"], code_hash)
   manifest["strategySource"] = {
     "id": f"script:{script_id}",
     "name": script["name"],
@@ -144,19 +145,120 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
       "code": script["code"],
     }],
   }
-  core_bars = _to_backtest_bars(bars, payload["symbol"])
-  strategy = ScriptedBarStrategy(script_id, script["code"], payload.get("strategyParams", {}))
-  core_engine = BarBacktestEngine(
-    initial_cash=float(payload["initialCapital"]),
-    commission_rate=float(payload["commissionRate"]),
-    execution_model=RecordedPriceExecutionModel(),
-    holding_policy=str(config["backtest"]["holding_policy"]),
+  worker_result = strategy_worker.run_script({
+    "scriptId": script_id,
+    "code": script["code"],
+    "params": {
+      **payload.get("strategyParams", {}),
+      "allowLong": payload.get("allowLong", True),
+      "allowShort": payload.get("allowShort", True),
+    },
+    "bars": [
+      {"time": str(row.time), "symbol": payload["symbol"], "open": float(row.open),
+       "high": float(row.high), "low": float(row.low), "close": float(row.close),
+       "volume": float(row.volume)}
+      for row in bars.itertuples(index=False)
+    ],
+    "initialCapital": float(payload["initialCapital"]),
+    "commissionRate": float(payload["commissionRate"]),
+    "holdingPolicy": "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday",
+  })
+  daily_holdings = _build_worker_daily_holdings(
+    bars, worker_result["portfolioSnapshots"], payload["symbol"], float(payload["initialCapital"]),
   )
-  core_result = core_engine.run(strategy, core_bars)
-  response = _build_bar_backtest_response(payload, config, bars, core_result, manifest)
-  response["skippedSignals"] = strategy.skipped_signals
-  response["warnings"] += strategy.direction_warnings
-  return response
+  summary = _build_worker_summary(float(payload["initialCapital"]), worker_result["trades"], daily_holdings)
+  benchmark_symbol = payload.get("benchmarkSymbol") or payload["symbol"]
+  benchmark_equity, benchmark_warnings = _build_benchmark_equity(
+    benchmark_symbol, payload.get("timeframe", "5m"), payload["startDate"], payload["endDate"],
+    float(payload["initialCapital"]),
+  )
+  benchmark_return = _compute_benchmark_return(benchmark_equity)
+  return {
+    "outputDir": _script_output_dir(payload),
+    "summary": summary,
+    "equity": _build_portfolio_equity(daily_holdings),
+    "benchmarkSymbol": benchmark_symbol,
+    "benchmarkEquity": benchmark_equity,
+    "benchmarkReturn": benchmark_return,
+    "excessReturn": round(summary["totalReturn"] - benchmark_return, 6),
+    "dailyHoldings": daily_holdings,
+    "trades": worker_result["trades"],
+    "skippedSignals": worker_result["skippedSignals"],
+    "experimentManifest": manifest,
+    "warnings": _build_warnings(payload) + benchmark_warnings + worker_result["warnings"],
+  }
+
+
+def _script_output_dir(payload: dict[str, Any]) -> str:
+  root = os.getenv("TREND_GRID_OUTPUT_ROOT", "./runtime/artifacts")
+  return os.path.join(root, f"user_script_{payload['symbol']}_{payload['startDate']}_{payload['endDate']}")
+
+
+def _build_script_experiment_manifest(
+  payload: dict[str, Any], bars: pd.DataFrame, script_id: str, script_name: str, code_hash: str,
+) -> dict[str, Any]:
+  data_snapshot = market_data.snapshot(
+    payload["symbol"], payload.get("timeframe", "5m"), payload["startDate"], payload["endDate"],
+  )
+  return {
+    "engineVersion": "isolated-script-worker-v1",
+    "strategySource": {"id": f"script:{script_id}", "name": script_name, "codeHash": code_hash},
+    "dataHash": data_snapshot["hash"],
+    "databaseSnapshot": data_snapshot,
+    "barCount": int(len(bars)),
+    "barRange": {"start": str(bars.iloc[0]["time"]) if not bars.empty else "", "end": str(bars.iloc[-1]["time"]) if not bars.empty else ""},
+    "executionEnvironment": "strategy-worker",
+  }
+
+
+def _build_worker_daily_holdings(
+  bars: pd.DataFrame, snapshots: list[dict[str, Any]], symbol: str, initial_capital: float,
+) -> list[dict[str, Any]]:
+  if len(bars) != len(snapshots):
+    raise ValueError("策略执行容器返回的账本快照数量异常")
+  items: list[dict[str, Any]] = []
+  previous_total = initial_capital
+  for index, row in enumerate(bars.itertuples(index=False)):
+    date = str(row.time)[:8]
+    if index + 1 < len(bars) and str(bars.iloc[index + 1]["time"])[:8] == date:
+      continue
+    snapshot = snapshots[index]
+    long_position = snapshot["longPositions"].get(symbol, {})
+    short_position = snapshot["shortPositions"].get(symbol, {})
+    long_qty = int(long_position.get("quantity", 0))
+    short_qty = int(short_position.get("quantity", 0))
+    total_equity = float(snapshot["equity"])
+    items.append({
+      "date": date, "close": round(float(row.close), 4), "longQty": long_qty, "shortQty": short_qty,
+      "cash": round(float(snapshot["cash"]), 2), "longMarketValue": round(long_qty * float(row.close), 2),
+      "shortMarketValue": round(short_qty * float(row.close), 2),
+      "marketValue": round((long_qty - short_qty) * float(row.close), 2),
+      "totalEquity": round(total_equity, 2), "dailyPnl": round(total_equity - previous_total, 2),
+    })
+    previous_total = total_equity
+  return items
+
+
+def _build_worker_summary(
+  initial_capital: float, trades: list[dict[str, Any]], daily_holdings: list[dict[str, Any]],
+) -> dict[str, Any]:
+  realized_pnl = [float(item.get("pnl", 0)) for item in trades if abs(float(item.get("pnl", 0))) > 1e-8]
+  wins = [value for value in realized_pnl if value > 0]
+  losses = [value for value in realized_pnl if value < 0]
+  daily_pnl = {item["date"]: float(item["dailyPnl"]) for item in daily_holdings}
+  performance = _compute_performance_stats(initial_capital, daily_pnl)
+  final_equity = daily_holdings[-1]["totalEquity"] if daily_holdings else initial_capital
+  return {
+    "totalPnl": round(final_equity - initial_capital, 2), "totalReturn": round(final_equity / initial_capital - 1, 6),
+    "maxDrawdown": round(_max_drawdown_amount(initial_capital, daily_holdings), 2), **performance,
+    "winRate": round(len(wins) / len(realized_pnl), 4) if realized_pnl else 0.0,
+    "dailyWinRate": round(sum(value > 0 for value in daily_pnl.values()) / len(daily_pnl), 4) if daily_pnl else 0.0,
+    "tradeCount": len(trades), "winningTrades": len(wins), "losingTrades": len(losses),
+    "avgWin": round(sum(wins) / len(wins), 2) if wins else None,
+    "avgLoss": round(sum(losses) / len(losses), 2) if losses else None,
+    "profitLossRatio": round(abs(sum(wins) / sum(losses)), 4) if wins and losses else None,
+    "finalEquity": round(final_equity, 2),
+  }
 
 
 def _build_bar_backtest_response(
@@ -329,19 +431,19 @@ def _build_experiment_manifest(
   bars: pd.DataFrame,
 ) -> dict[str, Any]:
   timeframe = str(payload.get("timeframe", "5m"))
-  primary_path = settings.resolve_kline_path(
-    payload["symbol"], timeframe, payload["startDate"],
-  )
   code_files = [
     _file_fingerprint(os.path.join(_STRATEGY_DIR, "engine.py")),
     _file_fingerprint(os.path.join(_STRATEGY_DIR, "config.yaml")),
   ]
   data_files = [
-    _file_fingerprint(primary_path),
+    None,
     _file_fingerprint(config["backtest"].get("htf_data_path")),
   ]
   strategy_hash = _fingerprint_hash(code_files)
-  data_hash = _fingerprint_hash(data_files)
+  database_snapshot = market_data.snapshot(
+    payload["symbol"], timeframe, payload["startDate"], payload["endDate"],
+  )
+  data_hash = database_snapshot["hash"]
   seed_material = {
     "payload": payload,
     "strategyHash": strategy_hash,
@@ -367,6 +469,7 @@ def _build_experiment_manifest(
     "configHash": config_hash,
     "dataHash": data_hash,
     "dataFiles": [item for item in data_files if item is not None],
+    "databaseSnapshot": database_snapshot,
     "strategyFiles": [item for item in code_files if item is not None],
     "barCount": int(len(bars)),
     "barRange": {
@@ -428,17 +531,7 @@ def _apply_position_params(strategy: dict[str, Any], payload: dict[str, Any]) ->
 
 
 def _load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
-  path = settings.resolve_kline_path(symbol, timeframe, start_date)
-  if not path:
-    raise FileNotFoundError(f"K 线数据不存在: {symbol} {timeframe}")
-
-  df = pd.read_csv(path)
-  if "time" not in df.columns and "datetime" in df.columns:
-    df.rename(columns={"datetime": "time"}, inplace=True)
-  df["time"] = df["time"].astype(str)
-  df = df[(df["time"].str[:8] >= start_date) & (df["time"].str[:8] <= end_date)]
-  if df.empty:
-    raise ValueError(f"区间内无 K 线: {symbol} {start_date}-{end_date}")
+  df = market_data.load_bars(symbol, timeframe, start_date, end_date)
   df["hhmm"] = df["time"].str[8:12].astype(int)
   df = df[df["hhmm"].apply(is_trading_time)]
   return df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)

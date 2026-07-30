@@ -58,6 +58,7 @@ interface Props {
   strategy: string;
   strategies: string[];
   instruments: InstrumentItem[];
+  isAdmin: boolean;
 }
 
 const panelStyle = {
@@ -670,7 +671,7 @@ function buildStrategyDraftFingerprint(input: {
   }));
 }
 
-export default function BacktestPage({ symbol, strategy, strategies, instruments }: Props) {
+export default function BacktestPage({ symbol, strategy, strategies, instruments, isAdmin }: Props) {
   const [instrumentList, setInstrumentList] = useState<InstrumentItem[]>(instruments);
   const [accounts, setAccounts] = useState<BacktestAccount[]>([]);
   const [selectedSymbol, setSelectedSymbol] = useState(symbol);
@@ -1496,26 +1497,18 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       setError('请先选择策略方案，再运行回测');
       return;
     }
-    if (versionDirty) {
+    const runDraft = isAdmin && (versionDirty || configVersions.length === 0);
+    if (versionDirty && !isAdmin) {
       setError('策略草稿与已发布版本不同，请先发布新版本');
       return;
     }
-    if (configVersions.length === 0) {
+    if (configVersions.length === 0 && !isAdmin) {
       setError('策略草稿尚未发布，请先发布首个版本');
       return;
     }
     const validationErrors = validateParams(params);
     if (validationErrors.length > 0) {
       setError(validationErrors.join('；'));
-      return;
-    }
-    if (!runPreflightReady) {
-      setError(`运行前检查未通过：${dataCoverage.text}；${benchmarkCoverage.text}`);
-      return;
-    }
-    const timeframe = backtestTimeframes.find((item) => item.timeframe === selectedTimeframe);
-    if (!timeframe?.available) {
-      setError(timeframe?.reason || `当前没有可运行的 ${selectedTimeframe} K 线数据`);
       return;
     }
     setRunning(true);
@@ -1542,6 +1535,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         holdingPolicy: params.holdingPolicy === 'overnight' ? 'overnight' : 'intraday',
         isDefault: false,
         strategyParams: params,
+        runDraft,
       };
       if (mode === 'live') {
         const data = await runLiveStrategy(payload);
@@ -1582,7 +1576,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   ) => {
     if (loading) return { tone: 'info', text: `正在检查${label} ${selectedTimeframe} K 线覆盖...` };
     if (statusError) return { tone: 'warn', text: `${label}数据状态读取失败：${statusError}` };
-    if (!statusData || !statusData.exists) return { tone: 'warn', text: `未找到${label} ${selectedTimeframe} K 线，不能运行回测` };
+    if (!statusData || !statusData.exists) {
+      return { tone: 'ok', text: `${label} ${selectedTimeframe} 尚未缓存，首次回测将自动从东财拉取` };
+    }
     if (!isValidDate(params.startDate) || !isValidDate(params.endDate)) {
       return { tone: 'warn', text: '日期格式正确后再检查数据覆盖' };
     }
@@ -1844,11 +1840,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const historyGridColumns = 'minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 74px';
   const activePanelLabel = resultTabs.find((item) => item.id === activePanel)?.label || '概览';
   const hasPublishedVersion = configVersions.length > 0;
-  const runDisabled = running || typeof selectedConfigId !== 'string' || !hasPublishedVersion || versionDirty || !runPreflightReady;
+  const draftRunAllowed = isAdmin && (versionDirty || !hasPublishedVersion);
+  const runDisabled = running || typeof selectedConfigId !== 'string' || (!hasPublishedVersion && !isAdmin) || (versionDirty && !isAdmin);
   const statusMessage = error || status || (versionDirty
-    ? '策略草稿与已发布版本不同，请发布新版本后运行'
+    ? (isAdmin ? '管理员将以草稿快照试跑；结果会标注 draft_test。' : '策略草稿与已发布版本不同，请发布新版本后运行')
     : !hasPublishedVersion
-      ? '策略草稿尚未发布，不能运行回测'
+      ? (isAdmin ? '管理员可试跑未发布草稿；结果会标注 draft_test。' : '策略草稿尚未发布，不能运行回测')
     : activeConfig ? `策略方案：${activeConfig.name}` : '当前策略方案未保存');
   const statusColor = error ? '#b91c1c' : status ? '#0f766e' : '#94a3b8';
   const statusBackground = error ? '#fef2f2' : status ? '#ecfdf5' : '#f8fafc';

@@ -70,15 +70,16 @@ services:
       TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
       TREND_GRID_KLINE_ROOT: /data/kline
       TREND_GRID_SIGNAL_ROOT: /data/signals
-      TREND_GRID_CODE_ROOT: /code
       TREND_GRID_OUTPUT_ROOT: /runtime/artifacts
+      TREND_GRID_STRATEGY_WORKER_URL: http://strategy-worker:8001
     depends_on:
       postgres:
+        condition: service_healthy
+      strategy-worker:
         condition: service_healthy
     volumes:
       - ${TREND_GRID_HOST_KLINE_ROOT}:/data/kline:ro
       - ${TREND_GRID_HOST_SIGNAL_ROOT}:/data/signals:ro
-      - ${TREND_GRID_HOST_CODE_ROOT}:/code:ro
       - quant-backtest-artifacts:/runtime/artifacts
     healthcheck:
       test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
@@ -88,6 +89,29 @@ services:
       start_period: 20s
     networks:
       - quant-backtest-net
+      - quant-backtest-worker-net
+
+  strategy-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+    container_name: quant-backtest-strategy-worker
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - quant-backtest-worker-net
 
   frontend:
     build:
@@ -113,3 +137,7 @@ networks:
   quant-backtest-net:
     name: quant-backtest-net
     driver: bridge
+  quant-backtest-worker-net:
+    name: quant-backtest-worker-net
+    driver: bridge
+    internal: true
