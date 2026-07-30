@@ -20,13 +20,14 @@ interface Props {
 }
 
 const panelStyle = {
-  background: '#141b2d',
-  border: '1px solid #26324f',
-  borderRadius: 6,
+  background: 'var(--surface)',
+  border: '1px solid var(--border)',
+  borderRadius: 8,
+  boxShadow: '0 4px 18px rgba(26, 53, 77, .04)',
 } as const;
 
 const labelStyle = {
-  color: '#7c8aa5',
+  color: 'var(--text-muted)',
   fontSize: 13,
   marginBottom: 6,
 } as const;
@@ -34,9 +35,9 @@ const labelStyle = {
 const fieldStyle = {
   width: '100%',
   height: 34,
-  background: '#0f172a',
-  color: '#e5e7eb',
-  border: '1px solid #334155',
+  background: 'var(--surface-muted)',
+  color: 'var(--text)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 4,
   padding: '0 10px',
   fontSize: 14,
@@ -225,15 +226,15 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
 
   return (
     <div style={{
-      flex: 1, overflow: 'auto', background: '#0f0f23',
+      flex: 1, overflow: 'auto', background: 'var(--canvas)',
       padding: 16, display: 'grid',
       gridTemplateColumns: '330px minmax(0, 1fr)',
       gap: 16,
     }}>
       <aside style={{ ...panelStyle, padding: 14, alignSelf: 'start' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
-          <Database size={16} color="#00D2D3" />
-          <div style={{ color: '#e5e7eb', fontSize: typography.xl, fontWeight: 700 }}>
+          <Database size={16} color="#0f766e" />
+          <div style={{ color: 'var(--text)', fontSize: typography.xl, fontWeight: 700 }}>
             数据管理
           </div>
         </div>
@@ -333,9 +334,9 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
 
           {activeTask && (
             <div style={{
-              color: '#9ca3af',
-              background: '#0f172a',
-              border: '1px solid #334155',
+              color: 'var(--text-muted)',
+              background: 'var(--surface-muted)',
+              border: '1px solid var(--border)',
               borderRadius: 4,
               padding: '8px 10px',
               fontSize: 12,
@@ -347,9 +348,9 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
 
           {(status || error) && (
             <div style={{
-              color: error ? '#fca5a5' : '#8dd8d8',
-              background: error ? '#431515' : '#0d2f35',
-              border: `1px solid ${error ? '#7f1d1d' : '#155e75'}`,
+              color: error ? 'var(--danger)' : 'var(--success)',
+              background: error ? 'var(--danger-soft)' : 'var(--surface-accent)',
+              border: `1px solid ${error ? '#f3c6c0' : '#b5e0d6'}`,
               borderRadius: 4, padding: '8px 10px', fontSize: 12,
             }}>
               {error || status}
@@ -360,13 +361,13 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
 
       <main style={{ display: 'flex', flexDirection: 'column', gap: 16, minWidth: 0 }}>
         <section style={{ ...panelStyle, padding: 14 }}>
-          <div style={{ color: '#e5e7eb', fontSize: typography.lg, fontWeight: 700, marginBottom: 12 }}>
+          <div style={{ color: 'var(--text)', fontSize: typography.lg, fontWeight: 700, marginBottom: 12 }}>
             本地数据状态
           </div>
           <div style={{
             display: 'grid',
             gridTemplateColumns: '32px 130px 70px 90px 90px 90px 100px 90px 1fr',
-            color: '#7c8aa5', fontSize: 12, borderBottom: '1px solid #26324f',
+            color: 'var(--text-muted)', fontSize: 12, borderBottom: '1px solid var(--border)',
             paddingBottom: 8,
           }}>
             <span />
@@ -390,12 +391,12 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
                   display: 'grid',
                   gridTemplateColumns: '32px 130px 70px 90px 90px 90px 100px 90px 1fr',
                   alignItems: 'center',
-                  color: selected ? '#e5e7eb' : '#cbd5e1',
+                  color: selected ? 'var(--text)' : '#40556a',
                   fontSize: 12,
-                  borderBottom: '1px solid #1f2a44',
+                  borderBottom: '1px solid var(--border)',
                   padding: '8px 0',
                   cursor: 'pointer',
-                  background: selected ? 'rgba(0, 210, 211, 0.06)' : 'transparent',
+                  background: selected ? 'var(--surface-accent)' : 'transparent',
                 }}
               >
                 <input
@@ -410,7 +411,7 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
                 <span>{data?.lastDate || '--'}</span>
                 <span>{data?.barCount ?? '--'}</span>
                 <span>{data ? formatSize(data.fileSize) : '--'}</span>
-                <span style={{ color: data && data.gapDates.length > 0 ? '#f0a040' : '#64748b' }}>
+                <span style={{ color: data && data.gapDates.length > 0 ? 'var(--warning)' : 'var(--text-muted)' }}>
                   {data ? data.gapDates.length : '--'}
                 </span>
                 <span title={data?.path || ''} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -423,15 +424,15 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
 
         <section style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 360px', gap: 16 }}>
           <div style={{ ...panelStyle, padding: 14, minWidth: 0 }}>
-            <div style={{ color: '#e5e7eb', fontSize: typography.lg, fontWeight: 700, marginBottom: 12 }}>
+            <div style={{ color: 'var(--text)', fontSize: typography.lg, fontWeight: 700, marginBottom: 12 }}>
               最近 20 行 K 线
             </div>
             {selectedStatus?.preview?.length ? (
               <div style={{ overflowX: 'auto' }}>
                 <div style={{
                   display: 'grid', gridTemplateColumns: '150px repeat(5, 90px)',
-                  color: '#7c8aa5', fontSize: 12, paddingBottom: 8,
-                  borderBottom: '1px solid #26324f',
+                  color: 'var(--text-muted)', fontSize: 12, paddingBottom: 8,
+                  borderBottom: '1px solid var(--border)',
                 }}>
                   <span>time</span><span>open</span><span>high</span><span>low</span><span>close</span><span>volume</span>
                 </div>
@@ -440,8 +441,8 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
                     key={row.time}
                     style={{
                       display: 'grid', gridTemplateColumns: '150px repeat(5, 90px)',
-                      color: '#cbd5e1', fontSize: 12,
-                      borderBottom: '1px solid #1f2a44', padding: '7px 0',
+                      color: '#40556a', fontSize: 12,
+                      borderBottom: '1px solid var(--border)', padding: '7px 0',
                     }}
                   >
                     <span>{row.time}</span>
@@ -454,38 +455,38 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
                 ))}
               </div>
             ) : (
-              <div style={{ color: '#64748b', fontSize: 13, padding: '20px 0' }}>
+              <div style={{ color: 'var(--text-muted)', fontSize: 13, padding: '20px 0' }}>
                 选择有本地数据的标的后显示预览
               </div>
             )}
           </div>
 
           <div style={{ ...panelStyle, padding: 14 }}>
-            <div style={{ color: '#e5e7eb', fontSize: typography.lg, fontWeight: 700, marginBottom: 12 }}>
+            <div style={{ color: 'var(--text)', fontSize: typography.lg, fontWeight: 700, marginBottom: 12 }}>
               最近同步
             </div>
             {runs.length > 0 ? runs.map((run) => (
               <div key={run.id} style={{
-                borderBottom: '1px solid #1f2a44',
-                padding: '8px 0', fontSize: 12, color: '#cbd5e1',
+                borderBottom: '1px solid var(--border)',
+                padding: '8px 0', fontSize: 12, color: '#40556a',
               }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
                   <span>{run.symbol} {run.timeframe}</span>
-                  <span style={{ color: run.status === 'error' ? '#fca5a5' : '#8dd8d8' }}>{run.status}</span>
+                  <span style={{ color: run.status === 'error' ? 'var(--danger)' : 'var(--success)' }}>{run.status}</span>
                 </div>
-                <div style={{ color: '#7c8aa5', marginTop: 3 }}>
+                <div style={{ color: 'var(--text-muted)', marginTop: 3 }}>
                   {run.createdAt} | 新增 {run.newRows} 行
                 </div>
-                {run.message && <div style={{ color: '#f0a040', marginTop: 3 }}>{run.message}</div>}
+                {run.message && <div style={{ color: 'var(--warning)', marginTop: 3 }}>{run.message}</div>}
                 {(run.sourceTimeframe || run.elapsedMs > 0) && (
-                  <div style={{ color: '#64748b', marginTop: 3 }}>
+                  <div style={{ color: 'var(--text-muted)', marginTop: 3 }}>
                     {run.sourceTimeframe ? `源周期 ${run.sourceTimeframe} | ` : ''}
                     {run.elapsedMs > 0 ? `${run.elapsedMs} ms` : ''}
                   </div>
                 )}
               </div>
             )) : (
-              <div style={{ color: '#64748b', fontSize: 13, padding: '12px 0' }}>
+              <div style={{ color: 'var(--text-muted)', fontSize: 13, padding: '12px 0' }}>
                 暂无同步记录
               </div>
             )}
@@ -500,9 +501,9 @@ const iconButtonStyle = {
   width: 36,
   height: 34,
   borderRadius: 4,
-  border: '1px solid #334155',
-  background: '#0f172a',
-  color: '#00D2D3',
+  border: '1px solid var(--border-strong)',
+  background: 'var(--surface-muted)',
+  color: 'var(--accent)',
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
@@ -513,9 +514,9 @@ const primaryButtonStyle = {
   flex: 1,
   height: 34,
   borderRadius: 4,
-  border: '1px solid #00D2D3',
-  background: '#12313f',
-  color: '#e6fffb',
+  border: '1px solid var(--accent)',
+  background: 'var(--accent)',
+  color: '#ffffff',
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
@@ -526,8 +527,8 @@ const primaryButtonStyle = {
 const secondaryButtonStyle = {
   height: 34,
   borderRadius: 4,
-  border: '1px solid #334155',
-  background: '#0f172a',
-  color: '#cbd5e1',
+  border: '1px solid var(--border-strong)',
+  background: 'var(--surface)',
+  color: 'var(--text-muted)',
   cursor: 'pointer',
 } as const;

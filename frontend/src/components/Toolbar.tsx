@@ -55,7 +55,7 @@ export default function Toolbar({
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: '12px', padding: '10px 16px',
-      background: '#16213e', borderBottom: '1px solid #2a2a4a',
+      background: 'var(--surface)', borderBottom: '1px solid var(--border)',
       flexWrap: 'wrap',
     }}>
       {/* Symbol selector */}
@@ -63,7 +63,7 @@ export default function Toolbar({
           value={symbol}
         onChange={(e) => onSymbolChange(e.target.value)}
           style={{
-            background: '#1a1a2e', color: '#e0e0e0', border: '1px solid #3a3a5a',
+            background: 'var(--surface-muted)', color: 'var(--text)', border: '1px solid var(--border-strong)',
             borderRadius: '4px', padding: '6px 10px', fontSize: typography.base,
             fontFamily: 'Consolas, monospace', minWidth: '140px',
           }}
@@ -80,8 +80,8 @@ export default function Toolbar({
         <button
           onClick={onPrevDay} disabled={!canPrev}
           style={{
-            background: '#1a1a2e', color: canPrev ? '#8892b0' : '#3a3a5a',
-            border: '1px solid #3a3a5a', borderRadius: '4px',
+            background: 'var(--surface-muted)', color: canPrev ? 'var(--text-muted)' : '#b9c4ce',
+            border: '1px solid var(--border-strong)', borderRadius: '4px',
             padding: '6px 10px', cursor: canPrev ? 'pointer' : 'default',
             fontSize: typography.base,
           }}
@@ -93,7 +93,7 @@ export default function Toolbar({
           value={date}
           onChange={(e) => onDateChange(e.target.value)}
           style={{
-            background: '#1a1a2e', color: '#e0e0e0', border: '1px solid #3a3a5a',
+            background: 'var(--surface-muted)', color: 'var(--text)', border: '1px solid var(--border-strong)',
             borderRadius: '4px', padding: '6px 10px', fontSize: typography.md,
             fontFamily: 'Consolas, monospace', minWidth: '120px',
           }}
@@ -108,8 +108,8 @@ export default function Toolbar({
         <button
           onClick={onNextDay} disabled={!canNext}
           style={{
-            background: '#1a1a2e', color: canNext ? '#8892b0' : '#3a3a5a',
-            border: '1px solid #3a3a5a', borderRadius: '4px',
+            background: 'var(--surface-muted)', color: canNext ? 'var(--text-muted)' : '#b9c4ce',
+            border: '1px solid var(--border-strong)', borderRadius: '4px',
             padding: '6px 10px', cursor: canNext ? 'pointer' : 'default',
             fontSize: typography.base,
           }}
@@ -120,7 +120,7 @@ export default function Toolbar({
 
       {/* Timeframe */}
       <span style={{
-        background: '#1a1a2e', color: '#8892b0', border: '1px solid #3a3a5a',
+        background: 'var(--surface-muted)', color: 'var(--text-muted)', border: '1px solid var(--border-strong)',
         borderRadius: '4px', padding: '6px 10px', fontSize: typography.base,
         fontFamily: 'Consolas, monospace',
       }}>
@@ -133,8 +133,8 @@ export default function Toolbar({
         disabled={syncing}
         title="同步 K 线数据"
         style={{
-          background: '#1a1a2e', color: syncing ? '#ffaa00' : '#8892b0',
-          border: '1px solid #3a3a5a', borderRadius: '4px',
+          background: 'var(--surface-muted)', color: syncing ? 'var(--warning)' : 'var(--text-muted)',
+          border: '1px solid var(--border-strong)', borderRadius: '4px',
           padding: '6px 10px', cursor: syncing ? 'wait' : 'pointer',
           display: 'flex', alignItems: 'center', gap: '4px',
         }}
@@ -148,7 +148,7 @@ export default function Toolbar({
         onClick={onRefresh}
         disabled={loading}
         style={{
-          background: '#1a1a2e', color: '#8892b0', border: '1px solid #3a3a5a',
+          background: 'var(--surface-muted)', color: 'var(--text-muted)', border: '1px solid var(--border-strong)',
           borderRadius: '4px', padding: '6px 10px', cursor: 'pointer',
           display: 'flex', alignItems: 'center', gap: '4px',
         }}
@@ -161,7 +161,7 @@ export default function Toolbar({
         value={strategy}
         onChange={(e) => onStrategyChange(e.target.value)}
         style={{
-          background: '#1a1a2e', color: '#e0e0e0', border: '1px solid #3a3a5a',
+          background: 'var(--surface-muted)', color: 'var(--text)', border: '1px solid var(--border-strong)',
           borderRadius: '4px', padding: '6px 10px', fontSize: typography.sm,
           fontFamily: 'Consolas, monospace',
         }}
@@ -176,8 +176,8 @@ export default function Toolbar({
         value={signalFile}
         onChange={(e) => onSignalFileChange(e.target.value)}
         style={{
-          background: '#1a1a2e', color: signalFile ? '#ffaa00' : '#8892b0',
-          border: '1px solid #3a3a5a', borderRadius: '4px',
+          background: 'var(--surface-muted)', color: signalFile ? 'var(--warning)' : 'var(--text-muted)',
+          border: '1px solid var(--border-strong)', borderRadius: '4px',
           padding: '6px 10px', fontSize: typography.xs,
           fontFamily: 'Consolas, monospace', maxWidth: '220px',
         }}
@@ -189,7 +189,7 @@ export default function Toolbar({
       </select>
 
       {/* Symbol name */}
-      <span style={{ color: '#667', fontSize: typography.base, marginLeft: 'auto' }}>
+      <span style={{ color: 'var(--text-subtle)', fontSize: typography.base, marginLeft: 'auto' }}>
         {symbol}
       </span>
     </div>

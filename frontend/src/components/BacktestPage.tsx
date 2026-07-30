@@ -2633,8 +2633,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                         onChange={(e) => updateScriptForm({ code: e.target.value })}
                         spellCheck={false}
                         style={{
-                          width: '100%', minHeight: 420, resize: 'vertical', background: '#0f172a',
-                          color: '#dbeafe', border: '1px solid #1e3a5f', borderRadius: 6, padding: 14,
+                          width: '100%', minHeight: 420, resize: 'vertical', background: '#f8fafc',
+                          color: '#334155', border: '1px solid #cbd5e1', borderRadius: 6, padding: 14,
                           fontSize: 13, lineHeight: 1.55, fontFamily: 'Consolas, monospace', outline: 'none',
                         }}
                       />
@@ -3601,7 +3601,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
 
   /* return (
     <div style={{
-      flex: 1, overflow: 'auto', background: '#0f0f23',
+      flex: 1, overflow: 'auto', background: 'var(--canvas)',
       padding: 16, display: 'grid',
       gridTemplateColumns: '320px minmax(0, 1fr)',
       gap: 16,
