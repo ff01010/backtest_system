@@ -32,23 +32,13 @@ class FakeAdapter:
 
 
 def test_registered_strategy_ids_match_current_viewer_options() -> None:
-  assert strategy_adapters.list_strategy_ids() == [
-    "trend_follow",
-    "grid_mean_reversion",
-    "trend_grid",
-    "user_script",
-    "midcap_earnings",
-  ]
+  assert strategy_adapters.list_strategy_ids() == ["user_script"]
 
 
 def test_strategy_summaries_have_stable_shape() -> None:
   summaries = strategy_adapters.list_strategy_summaries()
 
-  assert summaries[0] == {"id": "trend_follow", "name": "趋势跟踪"}
-  assert summaries[1] == {"id": "grid_mean_reversion", "name": "网格均值回归"}
-  assert summaries[2] == {"id": "trend_grid", "name": "趋势网格组合"}
-  assert summaries[3] == {"id": "user_script", "name": "自定义脚本"}
-  assert summaries[4] == {"id": "midcap_earnings", "name": "中盘盈利增长"}
+  assert summaries == [{"id": "user_script", "name": "自定义脚本"}]
 
 
 def test_unknown_strategy_adapter_raises_key_error() -> None:
@@ -56,19 +46,15 @@ def test_unknown_strategy_adapter_raises_key_error() -> None:
     strategy_adapters.get_strategy_adapter("missing")
 
 
-def test_parameter_schema_returns_trend_grid_fields() -> None:
-  schema = strategy_adapters.get_parameter_schema("trend_grid")
+def test_parameter_schema_returns_user_script_fields() -> None:
+  schema = strategy_adapters.get_parameter_schema("user_script")
 
   assert schema == {}
 
 
-def test_parameter_schema_returns_midcap_editable_fields() -> None:
-  schema = strategy_adapters.get_parameter_schema("midcap_earnings")
-
-  assert schema["maxPositions"]["label"] == "最大持仓数"
-  assert schema["minMarketCap"]["type"] == "number"
-  assert schema["rebalanceMonths"]["type"] == "text"
-  assert schema["indexTrendFilter"]["type"] == "boolean"
+def test_removed_builtin_strategy_has_no_adapter() -> None:
+  with pytest.raises(KeyError):
+    strategy_adapters.get_strategy_adapter("trend_grid")
 
 
 def test_midcap_strategy_params_override_runtime_config() -> None:
@@ -119,9 +105,9 @@ def test_midcap_strategy_params_override_runtime_config() -> None:
 
 
 def test_strategy_parameters_endpoint_returns_schema() -> None:
-  result = api_app.strategy_parameters("trend_grid")
+  result = api_app.strategy_parameters("user_script")
 
-  assert result["strategy"] == "trend_grid"
+  assert result["strategy"] == "user_script"
   assert result["parameters"] == {}
 
 
@@ -182,6 +168,8 @@ def test_backtest_version_rejects_changed_locked_params(monkeypatch: pytest.Monk
   monkeypatch.setattr(api_app.state_store, "get_latest_strategy_config_version", lambda _: version)
   monkeypatch.setattr(api_app.state_store, "get_strategy_config_version", lambda _: version)
   monkeypatch.setattr(api_app.state_store, "get_strategy_script", lambda _: {"code": code})
+  monkeypatch.setattr(api_app.market_data, "ensure_cached", lambda *_: {"status": "cache_hit", "rowCount": 0, "fetchedDates": []})
+  monkeypatch.setattr(api_app.state_store, "log_data_sync_run", lambda *_: 1)
   monkeypatch.setattr(api_app.data_repository, "validate_backtest_coverage", lambda *args: None)
   request = {
     "configId": "00000000-0000-0000-0000-000000000003",

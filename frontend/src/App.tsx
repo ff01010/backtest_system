@@ -5,20 +5,22 @@ import KlineChart from './components/KlineChart';
 import StatusBar from './components/StatusBar';
 import BacktestPage from './components/BacktestPage';
 import DataPage from './components/DataPage';
-import { fetchInstruments, fetchDates, fetchChart, fetchStrategies, fetchSignalFiles, syncKline } from './api/client';
-import type { SignalFileItem } from './api/client';
+import LoginPage from './components/LoginPage';
+import UserManagementPage from './components/UserManagementPage';
+import { fetchCurrentUser, fetchInstruments, fetchDates, fetchChart, fetchStrategies, fetchSignalFiles, logout, syncKline } from './api/client';
+import type { SessionUser, SignalFileItem } from './api/client';
 import { useUrlState, readPrefs, savePrefs } from './hooks/useUrlState';
 import type { InstrumentItem, DateItem, ChartResponse } from './types';
 import type { ViewerPrefs } from './hooks/useUrlState';
 import { typography } from './styles/typography';
 
-export default function App() {
-  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'data'>('backtest');
+function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogout: () => void }) {
+  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'data' | 'users'>('backtest');
   const [urlParams, setUrlParams] = useUrlState();
   const [prefs, setPrefs] = useState<ViewerPrefs>(readPrefs);
 
   const [instruments, setInstruments] = useState<InstrumentItem[]>([]);
-  const [strategies, setStrategies] = useState<string[]>(['trend_grid']);
+  const [strategies, setStrategies] = useState<string[]>(['user_script']);
   const [signalFiles, setSignalFiles] = useState<SignalFileItem[]>([]);
   const [signalFile, setSignalFile] = useState('');
   const [dates, setDates] = useState<DateItem[]>([]);
@@ -34,7 +36,7 @@ export default function App() {
   );
   const signalStrategy = signalStrategies.includes(urlParams.strategy)
     ? urlParams.strategy
-    : (signalStrategies[0] || 'trend_grid');
+    : (signalStrategies[0] || 'user_script');
 
   // update prefs
   const handlePrefsChange = useCallback((newPrefs: ViewerPrefs) => {
@@ -160,6 +162,7 @@ export default function App() {
           { key: 'backtest' as const, label: '策略回测' },
           { key: 'signals' as const, label: '信号可视化' },
           { key: 'data' as const, label: '数据管理' },
+          ...(currentUser.role === 'admin' ? [{ key: 'users' as const, label: '人员管理' }] : []),
         ].map((item) => {
           const active = activePage === item.key;
           return (
@@ -178,6 +181,10 @@ export default function App() {
             </button>
           );
         })}
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10, color: '#9db0c3', fontSize: typography.sm }}>
+          <span>{currentUser.displayName} · {currentUser.role === 'admin' ? '管理员' : '普通用户'}</span>
+          <button onClick={onLogout} style={{ border: '1px solid #365067', borderRadius: 4, padding: '4px 9px', background: '#111d2e', color: '#d4e1e8', cursor: 'pointer' }}>退出</button>
+        </div>
       </div>
 
       {activePage === 'signals' ? (
@@ -272,14 +279,40 @@ export default function App() {
           strategy={urlParams.strategy}
           strategies={strategies}
           instruments={instruments}
+          isAdmin={currentUser.role === 'admin'}
         />
-      ) : (
+      ) : activePage === 'data' ? (
         <DataPage
           symbol={urlParams.symbol}
           instruments={instruments}
           onInstrumentsChange={setInstruments}
         />
+      ) : (
+        <UserManagementPage />
       )}
     </div>
   );
+}
+
+export default function App() {
+  const [currentUser, setCurrentUser] = useState<SessionUser | null>(null);
+  const [checkingSession, setCheckingSession] = useState(true);
+
+  useEffect(() => {
+    fetchCurrentUser().then(setCurrentUser).catch(() => setCurrentUser(null)).finally(() => setCheckingSession(false));
+  }, []);
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+    } finally {
+      setCurrentUser(null);
+    }
+  };
+
+  if (checkingSession) {
+    return <div style={{ height: '100vh', display: 'grid', placeItems: 'center', background: '#090f1d', color: '#91a8ba' }}>正在检查登录状态…</div>;
+  }
+  if (!currentUser) return <LoginPage onLogin={setCurrentUser} />;
+  return <Workspace currentUser={currentUser} onLogout={() => { void handleLogout(); }} />;
 }

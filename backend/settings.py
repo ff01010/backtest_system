@@ -28,6 +28,9 @@ DEFAULT_USER_ID = os.getenv(
   "00000000-0000-0000-0000-000000000001",
 )
 
+# 当前部署尚未配置 HTTPS，默认关闭 Secure 以保证同源 HTTP 登录可用。
+AUTH_COOKIE_SECURE = os.getenv("TREND_GRID_AUTH_COOKIE_SECURE", "false").lower() == "true"
+
 
 def resolve_kline_path(symbol: str, timeframe: str, date: str | None = None) -> str | None:
   """根据标的和周期解析 K 线文件路径, 不存在返回 None
