@@ -38,3 +38,22 @@ def test_parse_rows_rejects_invalid_numeric_value() -> None:
     assert "数值非法" in str(error)
   else:
     raise AssertionError("应拒绝非法数值")
+
+
+def test_parse_market_instrument_keeps_valid_shenzhen_and_shanghai_stocks() -> None:
+  shanghai = eastmoney_client._parse_market_instrument({"f12": "600519", "f13": 1, "f14": "贵州茅台"})
+  shenzhen = eastmoney_client._parse_market_instrument({"f12": "300750", "f13": 0, "f14": "宁德时代"})
+  beijing = eastmoney_client._parse_market_instrument({"f12": "430047", "f13": 0, "f14": "诺思兰德"})
+
+  assert shanghai is not None
+  assert shanghai.exchange == "SH"
+  assert shanghai.eastmoney_secid == "1.600519"
+  assert shenzhen is not None
+  assert shenzhen.exchange == "SZ"
+  assert shenzhen.board == "chinext"
+  assert beijing is not None
+  assert beijing.exchange == "BJ"
+
+
+def test_parse_market_instrument_skips_incomplete_rows() -> None:
+  assert eastmoney_client._parse_market_instrument({"f12": "600519", "f13": 1, "f14": ""}) is None

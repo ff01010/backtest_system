@@ -39,7 +39,7 @@ export default function Sidebar({
 
   const style = {
     container: {
-      background: '#16213e', borderRight: '1px solid #2a2a4a',
+      background: 'var(--surface)', borderRight: '1px solid var(--border)',
       padding: open ? '12px' : '12px 6px',
       width: open ? '200px' : '44px',
       transition: 'width 0.2s',
@@ -48,20 +48,20 @@ export default function Sidebar({
       display: 'flex', flexDirection: 'column' as const, gap: '16px',
     },
     section: { display: 'flex', flexDirection: 'column' as const, gap: '6px' },
-    label: { color: '#667', fontSize: typography.sm, textTransform: 'uppercase' as const, letterSpacing: '1px', marginBottom: '2px' },
+    label: { color: 'var(--text-subtle)', fontSize: typography.sm, textTransform: 'uppercase' as const, letterSpacing: '1px', marginBottom: '2px' },
     checkboxRow: {
       display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer',
-      color: '#8892b0', fontSize: typography.base, opacity: open ? 1 : 0,
+      color: 'var(--text-muted)', fontSize: typography.base, opacity: open ? 1 : 0,
       transition: 'opacity 0.15s', whiteSpace: 'nowrap' as const,
     },
     toggleBtn: {
-      background: 'none', border: 'none', color: '#667', cursor: 'pointer',
+      background: 'none', border: 'none', color: 'var(--text-subtle)', cursor: 'pointer',
       padding: '2px', alignSelf: 'flex-end' as const,
     },
   };
 
   const A_COLOR = '#FF6B6B';
-  const B_COLOR = '#00D2D3';
+  const B_COLOR = '#0f766e';
 
   return (
     <div style={style.container}>
@@ -116,7 +116,7 @@ export default function Sidebar({
               value={prefs.markerSize}
               onChange={(e) => onPrefsChange({ ...prefs, markerSize: e.target.value as ViewerPrefs['markerSize'] })}
               style={{
-                background: '#1a1a2e', color: '#e0e0e0', border: '1px solid #3a3a5a',
+                background: 'var(--surface-muted)', color: 'var(--text)', border: '1px solid var(--border-strong)',
                 borderRadius: '4px', padding: '4px 8px', fontSize: '13px', width: '100%',
               }}
             >
@@ -133,7 +133,7 @@ export default function Sidebar({
               value={prefs.autoRefresh}
               onChange={(e) => onPrefsChange({ ...prefs, autoRefresh: e.target.value as ViewerPrefs['autoRefresh'] })}
               style={{
-                background: '#1a1a2e', color: '#e0e0e0', border: '1px solid #3a3a5a',
+                background: 'var(--surface-muted)', color: 'var(--text)', border: '1px solid var(--border-strong)',
                 borderRadius: '4px', padding: '4px 8px', fontSize: '13px', width: '100%',
               }}
             >

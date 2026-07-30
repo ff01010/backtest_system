@@ -28,7 +28,7 @@ interface Props {
 const MARKER_SIZE_MAP = { small: 1, normal: 2, large: 3 };
 
 const A_COLOR = '#FF6B6B';
-const B_COLOR = '#00D2D3';
+const B_COLOR = '#0f766e';
 
 export default function KlineChart({ data, modules, sides, showPrices, markerSize, signalSource, label, labelColor }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -54,16 +54,16 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
 
     const chart = createChart(containerRef.current, {
       layout: {
-        background: { type: ColorType.Solid, color: '#1a1a2e' },
-        textColor: '#8892b0',
+        background: { type: ColorType.Solid, color: '#ffffff' },
+        textColor: '#64748b',
       },
       grid: {
-        vertLines: { color: '#2a2a4a' },
-        horzLines: { color: '#2a2a4a' },
+        vertLines: { color: '#edf2f5' },
+        horzLines: { color: '#edf2f5' },
       },
       crosshair: { mode: 0 },
       rightPriceScale: {
-        borderColor: '#3a3a5a',
+        borderColor: '#d7e0e8',
         scaleMargins: { top: 0.05, bottom: 0.22 },
       },
       localization: {
@@ -78,7 +78,7 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
         },
       },
       timeScale: {
-        borderColor: '#3a3a5a',
+        borderColor: '#d7e0e8',
         timeVisible: true,
         secondsVisible: false,
         barSpacing: 12,
@@ -98,7 +98,7 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
     candleSeriesRef.current = candleSeries;
 
     const closeSeries = chart.addLineSeries({
-      color: '#ffffff',
+      color: '#40556a',
       lineWidth: 1,
       lastValueVisible: false,
       priceLineVisible: false,
@@ -107,7 +107,7 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
     closeSeriesRef.current = closeSeries;
 
     const volumeSeries = chart.addHistogramSeries({
-      color: '#3a3a6a',
+      color: '#c7d5e0',
       priceFormat: { type: 'volume' },
       priceScaleId: 'volume',
     });
@@ -141,9 +141,9 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
     const tooltip = document.createElement('div');
     tooltip.style.cssText = `
       display: none; position: absolute; z-index: 1000;
-      background: #16213e; color: #e0e0e0; padding: 8px 12px;
+      background: #ffffff; color: #14263a; padding: 8px 12px;
       border-radius: 6px; font-size: 12px; font-family: Consolas, monospace;
-      border: 1px solid #3a3a5a; pointer-events: none; max-width: 300px;
+      border: 1px solid #d7e0e8; box-shadow: 0 8px 22px rgba(26, 53, 77, .12); pointer-events: none; max-width: 300px;
       line-height: 1.5;
     `;
     containerRef.current.appendChild(tooltip);
@@ -314,8 +314,8 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
       {label && (
         <div style={{
           position: 'absolute', top: 6, left: 8, zIndex: 5,
-          color: labelColor || '#8892b0', fontSize: 12, fontWeight: 'bold',
-          background: 'rgba(15,15,35,0.8)', padding: '2px 8px', borderRadius: 3,
+          color: labelColor || '#64748b', fontSize: 12, fontWeight: 'bold',
+          background: 'rgba(255,255,255,.88)', border: '1px solid #d7e0e8', padding: '2px 8px', borderRadius: 3,
           pointerEvents: 'none',
         }}>
           {label}
@@ -325,10 +325,10 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
         position: 'absolute', top: 6, right: 56, zIndex: 5,
         display: 'flex', flexDirection: 'column', gap: 2,
         padding: '3px 6px', borderRadius: 3,
-        background: 'rgba(15, 15, 35, 0.75)', color: '#8892b0',
+        background: 'rgba(255, 255, 255, .9)', color: '#64748b', border: '1px solid #d7e0e8',
         fontSize: 10, lineHeight: 1.4, pointerEvents: 'none',
       }}>
-        <span style={{ color: '#ffffff' }}>━ 收盘</span>
+        <span style={{ color: '#40556a' }}>━ 收盘</span>
         <span style={{ color: A_COLOR }}>▲▼ A</span>
         <span style={{ color: B_COLOR }}>▲▼ B</span>
       </div>

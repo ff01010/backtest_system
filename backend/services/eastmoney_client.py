@@ -29,6 +29,17 @@ class MinuteBar:
   amount: float | None
 
 
+@dataclass(frozen=True)
+class MarketInstrument:
+  """东财证券目录中的沪深 A 股元数据。"""
+
+  symbol: str
+  exchange: str
+  display_name: str
+  board: str
+  eastmoney_secid: str
+
+
 def fetch_minute_bars(
   symbol: str,
   timeframe: str,
@@ -60,6 +71,48 @@ def fetch_minute_bars(
   if rows is None:
     raise EastmoneyError("东财分钟行情响应缺少 kline 数据")
   return _parse_rows(rows, start_date, end_date)
+
+
+def fetch_a_share_instruments(timeout_seconds: int = 20) -> list[MarketInstrument]:
+  """拉取沪深 A 股证券目录；仅返回元数据，不请求行情。"""
+  params = {
+    "pn": "1", "pz": "10000", "po": "1", "np": "1", "fltt": "2", "invt": "2",
+    "fid": "f3", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
+    "fields": "f12,f13,f14",
+  }
+  url = f"https://push2.eastmoney.com/api/qt/clist/get?{urlencode(params)}"
+  payload = _fetch_json(url, timeout_seconds)
+  rows = payload.get("data", {}).get("diff")
+  if not isinstance(rows, list):
+    raise EastmoneyError("东财证券目录响应缺少 diff 数据")
+  items = [_parse_market_instrument(row) for row in rows]
+  return sorted((item for item in items if item is not None), key=lambda item: item.symbol)
+
+
+def _fetch_json(url: str, timeout_seconds: int) -> dict[str, Any]:
+  request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+  try:
+    with urlopen(request, timeout=timeout_seconds) as response:
+      payload = json.loads(response.read().decode("utf-8"))
+  except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
+    raise EastmoneyError(f"东财请求失败: {error}") from error
+  if not isinstance(payload, dict):
+    raise EastmoneyError("东财响应格式无效")
+  return payload
+
+
+def _parse_market_instrument(row: object) -> MarketInstrument | None:
+  if not isinstance(row, dict):
+    return None
+  code = str(row.get("f12") or "")
+  exchange_code = row.get("f13")
+  name = str(row.get("f14") or "").strip()
+  exchange = "SH" if exchange_code == 1 else "BJ" if code.startswith(("4", "8")) else "SZ" if exchange_code == 0 else ""
+  if not code.isdigit() or len(code) != 6 or not exchange or not name:
+    return None
+  board = "star" if code.startswith("688") else "chinext" if code.startswith("3") else "main"
+  secid_prefix = "1" if exchange == "SH" else "0"
+  return MarketInstrument(code, exchange, name, board, f"{secid_prefix}.{code}")
 
 
 def _secid(symbol: str) -> str:

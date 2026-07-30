@@ -113,6 +113,52 @@ def _instrument_id(cur: Any, symbol: str, name: str = "") -> int:
   return int(cur.fetchone()["id"])
 
 
+def search_market_instruments(query: str, limit: int = 20) -> list[dict[str, Any]]:
+  """按代码或名称搜索全局证券目录，不受当前用户范围限制。"""
+  keyword = query.strip()
+  pattern = f"%{keyword}%"
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT symbol, exchange, display_name, instrument_type, board
+        FROM market_instrument
+        WHERE is_active=true
+          AND (%s = '' OR symbol ILIKE %s OR display_name ILIKE %s)
+        ORDER BY CASE WHEN symbol = %s THEN 0 WHEN symbol ILIKE %s THEN 1 ELSE 2 END,
+                 exchange, symbol
+        LIMIT %s
+      """, (keyword, pattern, pattern, keyword, f"{keyword}%", limit))
+      return [{
+        "symbol": f"{row['symbol']}.{row['exchange']}",
+        "name": row["display_name"],
+        "market": row["exchange"],
+        "instrumentType": row["instrument_type"],
+        "board": row["board"],
+      } for row in cur.fetchall()]
+
+
+def upsert_market_instruments(items: list[Any]) -> int:
+  """幂等更新全局证券目录，仅由管理员刷新入口调用。"""
+  if not items:
+    return 0
+  rows = [(item.symbol, item.exchange, item.display_name, item.board, item.eastmoney_secid) for item in items]
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.executemany("""
+        INSERT INTO market_instrument (
+          symbol, exchange, display_name, instrument_type, board, eastmoney_secid, is_active
+        ) VALUES (%s, %s, %s, 'stock', %s, %s, true)
+        ON CONFLICT (exchange, symbol) DO UPDATE SET
+          display_name=EXCLUDED.display_name,
+          instrument_type=EXCLUDED.instrument_type,
+          board=EXCLUDED.board,
+          eastmoney_secid=EXCLUDED.eastmoney_secid,
+          is_active=true,
+          updated_at=now()
+      """, rows)
+  return len(rows)
+
+
 def _normalize_account(row: dict[str, Any]) -> dict[str, Any]:
   return {
     "id": int(row["id"]),
@@ -232,74 +278,6 @@ def seed_default_account_for_user(user_id: str) -> None:
 def seed_default_account() -> None:
   """为当前用户补齐默认回测账户。"""
   seed_default_account_for_user(current_user_id())
-
-
-def list_instruments() -> list[dict[str, Any]]:
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        SELECT i.symbol, i.exchange, i.display_name, ui.enabled, ui.note
-        FROM user_instrument ui
-        JOIN market_instrument i ON i.id = ui.instrument_id
-        WHERE ui.owner_user_id = %s
-        ORDER BY i.exchange, i.symbol
-      """, (current_user_id(),))
-      return [{
-        "symbol": f"{row['symbol']}.{row['exchange']}",
-        "name": row["display_name"],
-        "market": row["exchange"],
-        "enabled": bool(row["enabled"]),
-        "note": row["note"],
-        "hasKline": False,
-        "hasSignal": False,
-      } for row in cur.fetchall()]
-
-
-def upsert_instrument(payload: dict[str, Any]) -> dict[str, Any]:
-  symbol = payload["symbol"]
-  with _db() as conn:
-    with conn.cursor() as cur:
-      instrument_id = _instrument_id(cur, symbol, payload.get("name", ""))
-      cur.execute("""
-        INSERT INTO user_instrument (owner_user_id, instrument_id, enabled, note)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (owner_user_id, instrument_id) DO UPDATE
-          SET enabled = EXCLUDED.enabled, note = EXCLUDED.note, updated_at = now()
-      """, (current_user_id(), instrument_id, payload.get("enabled", True), payload.get("note", "")))
-  return get_instrument(symbol)
-
-
-def update_instrument(symbol: str, payload: dict[str, Any]) -> dict[str, Any]:
-  return upsert_instrument({**payload, "symbol": symbol})
-
-
-def get_instrument(symbol: str) -> dict[str, Any]:
-  code, exchange, _ = _symbol_parts(symbol)
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        SELECT i.display_name, ui.enabled, ui.note
-        FROM user_instrument ui JOIN market_instrument i ON i.id = ui.instrument_id
-        WHERE ui.owner_user_id = %s AND i.symbol = %s AND i.exchange = %s
-      """, (current_user_id(), code, exchange))
-      row = cur.fetchone()
-      if not row:
-        raise KeyError(symbol)
-      return {"symbol": symbol, "name": row["display_name"], "market": exchange,
-              "enabled": bool(row["enabled"]), "note": row["note"],
-              "hasKline": False, "hasSignal": False}
-
-
-def delete_instrument(symbol: str) -> bool:
-  code, exchange, _ = _symbol_parts(symbol)
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        DELETE FROM user_instrument ui USING market_instrument i
-        WHERE ui.instrument_id = i.id AND ui.owner_user_id = %s
-          AND i.symbol = %s AND i.exchange = %s
-      """, (current_user_id(), code, exchange))
-      return cur.rowcount > 0
 
 
 def list_accounts() -> list[dict[str, Any]]:
