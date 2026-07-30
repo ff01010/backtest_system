@@ -8,6 +8,7 @@
 import sys
 import os
 import ast
+from datetime import datetime, timedelta
 import hashlib
 import re
 
@@ -25,6 +26,7 @@ from backend.strategies.scripted import validate_script_code
 from backend.services import (
   backtest_runner,
   data_manager,
+  market_data,
   data_repository,
   data_sync_tasks,
   state_store,
@@ -72,62 +74,28 @@ def _merge_instruments(
 
 
 def _run_sync_script(request: dict) -> dict:
-  import json
-  import subprocess
-  import time
-
-  sync_script = os.path.join(
-    os.path.dirname(_viewer_dir), "scripts", "sync_kline.py",
-  )
-  cmd = [
-    sys.executable,
-    sync_script,
-    request["symbol"],
-    "--timeframe",
-    request.get("timeframe", "5m"),
-    "--mode",
-    request.get("mode", "incremental"),
-    "--json",
-  ]
-  if request.get("startDate"):
-    cmd.extend(["--start-date", request["startDate"]])
-  if request.get("endDate"):
-    cmd.extend(["--end-date", request["endDate"]])
-
-  started = time.perf_counter()
+  """通过东财补齐分钟缓存，兼容旧数据同步 API。"""
+  end_date = request.get("endDate") or datetime.now().strftime("%Y%m%d")
+  start_date = request.get("startDate") or (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
   try:
-    proc = subprocess.run(
-      cmd,
-      capture_output=True, text=True, timeout=180,
+    result = market_data.ensure_cached(
+      request["symbol"], request.get("timeframe", "5m"), start_date, end_date,
     )
-  except subprocess.TimeoutExpired:
+  except market_data.MarketDataError as error:
     return {
       "status": "error",
       "symbol": request["symbol"],
       "timeframe": request.get("timeframe", "5m"),
-      "message": "同步超时，请检查 QMT 是否运行",
+      "message": str(error),
       "new_rows": 0,
       "new_dates": [],
     }
-  output_lines = proc.stdout.strip().splitlines()
-  if not output_lines:
-    return {
-      "status": "error",
-      "symbol": request["symbol"],
-      "timeframe": request.get("timeframe", "5m"),
-      "message": proc.stderr or "同步脚本无输出",
-    }
-  try:
-    result = json.loads(output_lines[-1])
-    result["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
-    return result
-  except json.JSONDecodeError:
-    return {
-      "status": "error",
-      "symbol": request["symbol"],
-      "timeframe": request.get("timeframe", "5m"),
-      "message": f"同步脚本输出异常: {proc.stderr or proc.stdout[-500:]}",
-    }
+  return {
+    "status": "ok", "symbol": request["symbol"], "timeframe": request.get("timeframe", "5m"),
+    "from": start_date, "to": end_date, "new_rows": result["rowCount"],
+    "new_dates": result["fetchedDates"], "cacheStatus": result["status"],
+    "message": "数据库缓存命中" if result["status"] == "cache_hit" else "东财分钟行情已缓存",
+  }
 
 
 def _validate_sync_request(request: dict) -> None:

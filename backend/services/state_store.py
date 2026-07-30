@@ -690,18 +690,20 @@ def log_data_sync_run(payload: dict[str, Any], result: dict[str, Any]) -> int:
   with _db() as conn:
     with conn.cursor() as cur:
       instrument_id = _instrument_id(cur, payload["symbol"])
-      outcome = "fetched" if result.get("status") in {"ok", "partial_error"} else "failed"
-      details = {"timeframe": payload.get("timeframe", "5m"), "sourceTimeframe": result.get("source_timeframe", ""),
+      outcome = result.get("cacheStatus") if result.get("status") == "ok" else "failed"
+      if outcome not in {"cache_hit", "fetched", "failed"}:
+        outcome = "fetched" if result.get("status") == "ok" else "failed"
+      details = {"timeframe": payload.get("timeframe", "5m"), "sourceTimeframe": payload.get("timeframe", "5m"),
                  "mode": payload.get("mode", "incremental"), "newDates": result.get("new_dates", []),
-                 "outputPath": result.get("output_path", ""), "elapsedMs": result.get("elapsed_ms", 0),
+                 "outputPath": "postgresql://market_minute_bar", "elapsedMs": result.get("elapsed_ms", 0),
                  "message": result.get("message", "")}
       cur.execute("""
         INSERT INTO market_fetch_log (
           instrument_id, requested_by_user_id, period, adjustment, source, requested_from,
           requested_to, outcome, row_count, error_message, finished_at, details
-        ) VALUES (%s,%s,'1d','none','local',%s,%s,%s,%s,%s,now(),%s) RETURNING id
-      """, (instrument_id, settings.DEFAULT_USER_ID, _date_value(payload.get("startDate")),
-             _date_value(payload.get("endDate")), outcome, int(result.get("new_rows", 0)),
+        ) VALUES (%s,%s,%s,'none','eastmoney',%s,%s,%s,%s,%s,now(),%s) RETURNING id
+      """, (instrument_id, settings.DEFAULT_USER_ID, payload.get("timeframe", "5m"),
+             _date_value(payload.get("startDate")), _date_value(payload.get("endDate")), outcome, int(result.get("new_rows", 0)),
              result.get("message") if outcome == "failed" else None, Jsonb(details)))
       return int(cur.fetchone()["id"])
 

@@ -357,6 +357,11 @@ def test_experiment_manifest_is_deterministic(
     "resolve_kline_path",
     lambda *_args: str(data_path),
   )
+  monkeypatch.setattr(
+    backtest_runner.market_data,
+    "snapshot",
+    lambda *_args: {"hash": "database-cache-hash", "barCount": 1},
+  )
   payload = {
     "strategy": "trend_grid",
     "timeframe": "1m",

@@ -22,7 +22,7 @@ from backend.backtesting.legacy import fill_to_api_trade
 from backend.strategies.catalog import create_bar_strategy, get_strategy_source_snapshot
 from backend.strategies.external_engine import load_external_engine
 from backend.strategies.scripted import ScriptedBarStrategy
-from backend.services import state_store
+from backend.services import market_data, state_store
 
 _BACKTEST_SYSTEM_ROOT = os.path.dirname(
   os.path.dirname(os.path.dirname(__file__))
@@ -329,19 +329,19 @@ def _build_experiment_manifest(
   bars: pd.DataFrame,
 ) -> dict[str, Any]:
   timeframe = str(payload.get("timeframe", "5m"))
-  primary_path = settings.resolve_kline_path(
-    payload["symbol"], timeframe, payload["startDate"],
-  )
   code_files = [
     _file_fingerprint(os.path.join(_STRATEGY_DIR, "engine.py")),
     _file_fingerprint(os.path.join(_STRATEGY_DIR, "config.yaml")),
   ]
   data_files = [
-    _file_fingerprint(primary_path),
+    None,
     _file_fingerprint(config["backtest"].get("htf_data_path")),
   ]
   strategy_hash = _fingerprint_hash(code_files)
-  data_hash = _fingerprint_hash(data_files)
+  database_snapshot = market_data.snapshot(
+    payload["symbol"], timeframe, payload["startDate"], payload["endDate"],
+  )
+  data_hash = database_snapshot["hash"]
   seed_material = {
     "payload": payload,
     "strategyHash": strategy_hash,
@@ -367,6 +367,7 @@ def _build_experiment_manifest(
     "configHash": config_hash,
     "dataHash": data_hash,
     "dataFiles": [item for item in data_files if item is not None],
+    "databaseSnapshot": database_snapshot,
     "strategyFiles": [item for item in code_files if item is not None],
     "barCount": int(len(bars)),
     "barRange": {
@@ -428,17 +429,7 @@ def _apply_position_params(strategy: dict[str, Any], payload: dict[str, Any]) ->
 
 
 def _load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
-  path = settings.resolve_kline_path(symbol, timeframe, start_date)
-  if not path:
-    raise FileNotFoundError(f"K 线数据不存在: {symbol} {timeframe}")
-
-  df = pd.read_csv(path)
-  if "time" not in df.columns and "datetime" in df.columns:
-    df.rename(columns={"datetime": "time"}, inplace=True)
-  df["time"] = df["time"].astype(str)
-  df = df[(df["time"].str[:8] >= start_date) & (df["time"].str[:8] <= end_date)]
-  if df.empty:
-    raise ValueError(f"区间内无 K 线: {symbol} {start_date}-{end_date}")
+  df = market_data.load_bars(symbol, timeframe, start_date, end_date)
   df["hhmm"] = df["time"].str[8:12].astype(int)
   df = df[df["hhmm"].apply(is_trading_time)]
   return df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)

@@ -16,7 +16,7 @@ from typing import Any
 
 import pandas as pd
 
-from backend.services import signal_parser, time_mapper, zigzag_detector
+from backend.services import market_data, signal_parser, time_mapper, zigzag_detector
 from backend import settings
 
 
@@ -113,17 +113,8 @@ def list_dates(symbol: str, timeframe: str) -> list[dict[str, Any]]:
       except Exception:
         pass
 
-  # K 线日期：扫描 {code}_{market}/ 目录
-  code, market = symbol.split(".")
-  code_market = f"{code}_{market}"
-  all_kline_dates: set[str] = set()
-  dir_path = os.path.join(settings.KLINE_ROOT, timeframe, code_market)
-  if os.path.isdir(dir_path):
-    for fname in os.listdir(dir_path):
-      if not fname.endswith(".csv") or timeframe not in fname:
-        continue
-      path = os.path.join(dir_path, fname)
-      all_kline_dates |= _read_kline_dates(path)
+  # K 线日期从 PostgreSQL 分钟缓存读取。
+  all_kline_dates = {item["date"] for item in market_data.list_dates(symbol, timeframe)}
 
   # 合并
   for d in all_kline_dates:
@@ -140,36 +131,8 @@ def get_backtest_timeframes(
   start_date: str | None = None,
   end_date: str | None = None,
 ) -> list[dict[str, Any]]:
-  """返回引擎支持的周期及本地数据覆盖情况。"""
-  items: list[dict[str, Any]] = []
-  for timeframe in settings.BACKTEST_TIMEFRAMES:
-    path = settings.resolve_kline_path(symbol, timeframe)
-    if not path:
-      items.append({
-        "timeframe": timeframe,
-        "available": False,
-        "reason": f"本地没有 {symbol} 的 {timeframe} K 线文件",
-        "dataStart": None,
-        "dataEnd": None,
-      })
-      continue
-    dates = sorted(_read_kline_dates(path))
-    covered = bool(dates)
-    reason = ""
-    if covered and start_date and end_date:
-      covered = dates[0] <= start_date and dates[-1] >= end_date
-      if not covered:
-        reason = f"数据范围为 {dates[0]} 至 {dates[-1]}，未覆盖 {start_date} 至 {end_date}"
-    elif not covered:
-      reason = f"{timeframe} K 线文件没有可识别日期"
-    items.append({
-      "timeframe": timeframe,
-      "available": covered,
-      "reason": reason,
-      "dataStart": dates[0] if dates else None,
-      "dataEnd": dates[-1] if dates else None,
-    })
-  return items
+  """返回引擎支持周期及 PostgreSQL 缓存覆盖情况。"""
+  return market_data.timeframe_status(symbol, start_date, end_date)
 
 
 def validate_backtest_coverage(
@@ -178,17 +141,10 @@ def validate_backtest_coverage(
   start_date: str,
   end_date: str,
 ) -> None:
-  """在回测前拒绝不受支持、缺文件或日期范围不足的数据。"""
+  """在回测前按需拉取缺失分钟数据，并拒绝不完整结果。"""
   if not settings.validate_backtest_timeframe(timeframe):
     raise ValueError(f"当前回测引擎不支持 {timeframe}，仅支持 {', '.join(settings.BACKTEST_TIMEFRAMES)}")
-  item = next(
-    (value for value in get_backtest_timeframes(symbol, start_date, end_date)
-     if value["timeframe"] == timeframe),
-    None,
-  )
-  if item is None or not item["available"]:
-    reason = item["reason"] if item else "无法读取数据状态"
-    raise ValueError(f"{symbol} {timeframe} K 线不可用于回测：{reason}")
+  market_data.ensure_cached(symbol, timeframe, start_date, end_date)
 
 
 def load_chart_data(symbol: str, date: str, timeframe: str, strategy: str = "trend_grid",
@@ -201,25 +157,13 @@ def load_chart_data(symbol: str, date: str, timeframe: str, strategy: str = "tre
   bars: list[dict[str, Any]] = []
   markers: list[dict[str, Any]] = []
 
-  # — 加载 K 线 —
-  kline_path = settings.resolve_kline_path(symbol, timeframe, date)
-  kline_mtime = None
-  if not kline_path:
-    return {"error": f"K 线数据不存在: {symbol} {timeframe}"}
-  kline_mtime = _format_mtime(kline_path)
-
+  # — 从 PostgreSQL 加载 K 线 —
+  kline_mtime = "database"
   try:
-    df = pd.read_csv(kline_path)
-    # 兼容旧格式 "datetime" 和新格式 "time" 列名
-    if "time" in df.columns and "datetime" not in df.columns:
-      df.rename(columns={"time": "datetime"}, inplace=True)
-    df["datetime"] = df["datetime"].astype(str)
-    df = df[df["datetime"].str.startswith(date)]
-    df = df.drop_duplicates(subset="datetime", keep="last")
-    df = df.sort_values("datetime")
+    df = market_data.load_bars(symbol, timeframe, date, date)
 
     for _, row in df.iterrows():
-      dt = row["datetime"]
+      dt = str(row["time"])
       # "20260622093500" → ISO 格式
       ts = f"{dt[:4]}-{dt[4:6]}-{dt[6:8]}T{dt[8:10]}:{dt[10:12]}:00"
       bars.append({
@@ -230,8 +174,8 @@ def load_chart_data(symbol: str, date: str, timeframe: str, strategy: str = "tre
         "close": float(row["close"]),
         "volume": int(row.get("volume", 0)),
       })
-  except Exception as e:
-    return {"error": f"K 线读取失败: {e}"}
+  except (market_data.MarketDataError, ValueError) as error:
+    return {"error": f"K 线读取失败: {error}"}
 
   # 构建 bar datetime → index 映射
   bar_time_set = {b["time"] for b in bars}
