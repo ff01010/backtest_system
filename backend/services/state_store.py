@@ -723,7 +723,7 @@ def list_data_sync_runs(limit: int = 20) -> list[dict[str, Any]]:
           "id": int(row["id"]), "symbol": f"{row['symbol']}.{row['exchange']}",
           "timeframe": details.get("timeframe", "5m"), "sourceTimeframe": details.get("sourceTimeframe", ""),
           "startDate": row["requested_from"].strftime("%Y%m%d"), "endDate": row["requested_to"].strftime("%Y%m%d"),
-          "mode": details.get("mode", "incremental"), "status": "ok" if row["outcome"] == "fetched" else "error",
+          "mode": details.get("mode", "incremental"), "status": "ok" if row["outcome"] in {"fetched", "cache_hit"} else "error",
           "newRows": int(row["row_count"]), "newDates": details.get("newDates", []),
           "outputPath": details.get("outputPath", ""), "elapsedMs": int(details.get("elapsedMs", 0)),
           "message": details.get("message", row.get("error_message") or ""), "createdAt": _format_time(row["started_at"]),

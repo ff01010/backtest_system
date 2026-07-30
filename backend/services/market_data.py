@@ -32,7 +32,10 @@ def ensure_cached(symbol: str, timeframe: str, start_date: str, end_date: str) -
       instrument_id = state_store._instrument_id(cur, symbol)
       dates = _date_range(start_date, end_date)
       covered = _coverage_status(cur, instrument_id, timeframe, dates)
-      missing = [item for item in dates if item not in covered]
+      missing = [
+        item for item in dates
+        if covered.get(item) not in {"complete", "empty"}
+      ]
       if not missing:
         _log_fetch(cur, instrument_id, timeframe, start_date, end_date, "cache_hit", 0, None)
         return {"status": "cache_hit", "fetchedDates": [], "rowCount": 0}
@@ -74,18 +77,13 @@ def load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd
 
 
 def timeframe_status(symbol: str, start_date: str | None, end_date: str | None) -> list[dict[str, Any]]:
-  """返回回测可用周期及其数据库覆盖状态。"""
+  """返回回测周期的缓存状态，不触发上游行情请求。"""
   items: list[dict[str, Any]] = []
   for timeframe in settings.BACKTEST_TIMEFRAMES:
     if not start_date or not end_date:
       items.append({"timeframe": timeframe, "available": False, "reason": "请选择回测日期", "dataStart": None, "dataEnd": None})
       continue
-    try:
-      ensure_cached(symbol, timeframe, start_date, end_date)
-      frame = load_bars(symbol, timeframe, start_date, end_date)
-      items.append({"timeframe": timeframe, "available": not frame.empty, "reason": "", "dataStart": str(frame.iloc[0]["time"])[:8], "dataEnd": str(frame.iloc[-1]["time"])[:8]})
-    except MarketDataError as error:
-      items.append({"timeframe": timeframe, "available": False, "reason": str(error), "dataStart": None, "dataEnd": None})
+    items.append(_cached_timeframe_status(symbol, timeframe, start_date, end_date))
   return items
 
 
@@ -168,6 +166,32 @@ def _require_complete(symbol: str, timeframe: str, start_date: str, end_date: st
   invalid = [item.strftime("%Y%m%d") for item in dates if statuses.get(item) in {"incomplete", "failed"}]
   if invalid:
     raise MarketDataError(f"{symbol} {timeframe} 行情不完整: {', '.join(invalid)}")
+
+
+def _cached_timeframe_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:
+  """检查缓存状态，缺失数据保持可运行以便回测时按需拉取。"""
+  with state_store._db() as conn:
+    with conn.cursor() as cur:
+      instrument_id = state_store._instrument_id(cur, symbol)
+      dates = _date_range(start_date, end_date)
+      statuses = _coverage_status(cur, instrument_id, timeframe, dates)
+      cur.execute("""
+        SELECT min(trade_date) AS first_date, max(trade_date) AS last_date
+        FROM market_minute_bar
+        WHERE instrument_id=%s AND period=%s AND adjustment=%s
+          AND trade_date BETWEEN %s AND %s
+      """, (instrument_id, timeframe, _ADJUSTMENT, dates[0], dates[-1]))
+      row = cur.fetchone()
+  invalid = [item.strftime("%Y%m%d") for item, status in statuses.items() if status in {"incomplete", "failed"}]
+  if invalid:
+    return {"timeframe": timeframe, "available": True, "reason": f"将重试补齐: {', '.join(invalid)}", "dataStart": None, "dataEnd": None}
+  if len(statuses) == len(dates):
+    return {
+      "timeframe": timeframe, "available": True, "reason": "数据库缓存可用",
+      "dataStart": row["first_date"].strftime("%Y%m%d") if row["first_date"] else None,
+      "dataEnd": row["last_date"].strftime("%Y%m%d") if row["last_date"] else None,
+    }
+  return {"timeframe": timeframe, "available": True, "reason": "首次回测时将自动拉取东财分钟行情", "dataStart": None, "dataEnd": None}
 
 
 def _coverage_status(cur: Any, instrument_id: int, timeframe: str, dates: list[date]) -> dict[date, str]:

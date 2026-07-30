@@ -1582,7 +1582,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   ) => {
     if (loading) return { tone: 'info', text: `正在检查${label} ${selectedTimeframe} K 线覆盖...` };
     if (statusError) return { tone: 'warn', text: `${label}数据状态读取失败：${statusError}` };
-    if (!statusData || !statusData.exists) return { tone: 'warn', text: `未找到${label} ${selectedTimeframe} K 线，不能运行回测` };
+    if (!statusData || !statusData.exists) {
+      return { tone: 'ok', text: `${label} ${selectedTimeframe} 尚未缓存，首次回测将自动从东财拉取` };
+    }
     if (!isValidDate(params.startDate) || !isValidDate(params.endDate)) {
       return { tone: 'warn', text: '日期格式正确后再检查数据覆盖' };
     }

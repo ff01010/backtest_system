@@ -41,3 +41,16 @@ def test_coverage_marks_complete_and_incomplete_days() -> None:
 
   assert cursor.rows[0][5:7] == ("complete", 240)
   assert cursor.rows[1][5:7] == ("incomplete", 1)
+
+
+def test_missing_dates_include_failed_and_incomplete_cache() -> None:
+  dates = market_data._date_range("20260727", "20260730")
+  coverage = {
+    dates[0]: "complete",
+    dates[1]: "empty",
+    dates[2]: "incomplete",
+  }
+
+  missing = [item for item in dates if coverage.get(item) not in {"complete", "empty"}]
+
+  assert missing == [dates[2], dates[3]]
