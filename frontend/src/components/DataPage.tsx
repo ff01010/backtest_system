@@ -1,17 +1,16 @@
-import { Database, DownloadCloud, Plus, RefreshCw } from 'lucide-react';
+import { Database, DownloadCloud, RefreshCw } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import {
-  createInstrument,
   fetchDataStatus,
   fetchDataSyncRuns,
   fetchDataSyncTask,
-  fetchInstruments,
   refillDataGaps,
   runDataSync,
   startDataSyncTask,
 } from '../api/client';
 import type { DataStatus, DataSyncRun, DataSyncTask, InstrumentItem } from '../types';
 import { typography } from '../styles/typography';
+import InstrumentSearchField from './InstrumentSearchField';
 
 interface Props {
   symbol: string;
@@ -50,8 +49,6 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const [mode, setMode] = useState<'incremental' | 'range'>('incremental');
-  const [newSymbol, setNewSymbol] = useState('');
-  const [newSymbolName, setNewSymbolName] = useState('');
   const [statuses, setStatuses] = useState<Record<string, DataStatus>>({});
   const [runs, setRuns] = useState<DataSyncRun[]>([]);
   const [status, setStatus] = useState('');
@@ -98,38 +95,12 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
     }
   };
 
-  const refreshInstruments = async () => {
-    const items = await fetchInstruments();
-    onInstrumentsChange(items);
-    return items;
-  };
-
   const toggleSymbol = (item: string) => {
     setSelectedSymbols((prev) => (
       prev.includes(item)
         ? prev.filter((x) => x !== item)
         : [...prev, item]
     ));
-  };
-
-  const handleCreateInstrument = async () => {
-    setError('');
-    setStatus('');
-    try {
-      const item = await createInstrument({
-        symbol: newSymbol.trim().toUpperCase(),
-        name: newSymbolName.trim(),
-        enabled: true,
-      });
-      await refreshInstruments();
-      setSelectedSymbol(item.symbol);
-      setSelectedSymbols((prev) => [...new Set([...prev, item.symbol])]);
-      setNewSymbol('');
-      setNewSymbolName('');
-      setStatus(`已添加标的 ${item.symbol}`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '添加标的失败');
-    }
   };
 
   const syncPayload = (item: string) => ({
@@ -240,41 +211,14 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <label>
-            <div style={labelStyle}>当前标的</div>
-            <select
-              value={selectedSymbol}
-              onChange={(e) => {
-                setSelectedSymbol(e.target.value);
-                setSelectedSymbols((prev) => [...new Set([...prev, e.target.value])]);
-              }}
-              style={fieldStyle}
-            >
-              {enabledInstruments.map((item) => (
-                <option key={item.symbol} value={item.symbol}>
-                  {item.symbol}{item.name ? ` ${item.name}` : ''}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 8 }}>
-            <input
-              value={newSymbol}
-              onChange={(e) => setNewSymbol(e.target.value)}
-              placeholder="新增标的"
-              style={fieldStyle}
-            />
-            <input
-              value={newSymbolName}
-              onChange={(e) => setNewSymbolName(e.target.value)}
-              placeholder="名称"
-              style={fieldStyle}
-            />
-            <button onClick={handleCreateInstrument} title="添加标的" style={iconButtonStyle}>
-              <Plus size={15} />
-            </button>
-          </div>
+          <InstrumentSearchField
+            label="当前标的"
+            value={selectedSymbol}
+            onChange={(item) => {
+              setSelectedSymbol(item);
+              setSelectedSymbols((prev) => [...new Set([...prev, item])]);
+            }}
+          />
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <label>

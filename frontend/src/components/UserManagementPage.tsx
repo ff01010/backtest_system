@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
-import { createUser, fetchUsers, resetUserPassword, updateUser } from '../api/client';
+import { createUser, fetchUsers, refreshMarketInstruments, resetUserPassword, updateUser } from '../api/client';
 import type { ManagedUser } from '../api/client';
 
 export default function UserManagementPage() {
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [error, setError] = useState('');
+  const [directoryStatus, setDirectoryStatus] = useState('');
+  const [refreshingDirectory, setRefreshingDirectory] = useState(false);
   const [draft, setDraft] = useState({ username: '', displayName: '', password: '', role: 'user' });
 
   const refresh = async () => {
@@ -49,12 +51,30 @@ export default function UserManagementPage() {
     }
   };
 
+  const refreshDirectory = async () => {
+    setRefreshingDirectory(true);
+    setError('');
+    try {
+      const count = await refreshMarketInstruments();
+      setDirectoryStatus(`证券目录已更新，共 ${count} 个沪深 A 股标的。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '更新证券目录失败');
+    } finally {
+      setRefreshingDirectory(false);
+    }
+  };
+
   return (
     <section style={{ padding: 28, overflow: 'auto', height: '100%', background: 'var(--canvas)' }}>
       <div style={{ maxWidth: 1100, margin: '0 auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', marginBottom: 20 }}>
           <div><div style={{ color: 'var(--accent)', fontSize: 12, letterSpacing: 1.5, fontWeight: 750 }}>ACCESS CONTROL</div><h2 style={{ marginTop: 5, color: 'var(--text)' }}>人员管理</h2></div>
-          <div style={{ color: 'var(--text-muted)' }}>仅管理员可创建、禁用及重置账号密码</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <span style={{ color: 'var(--text-muted)' }}>仅管理员可创建、禁用及重置账号密码</span>
+            <button type="button" onClick={() => void refreshDirectory()} disabled={refreshingDirectory} style={directoryButtonStyle}>
+              {refreshingDirectory ? '正在更新目录…' : '更新证券目录'}
+            </button>
+          </div>
         </div>
         <form onSubmit={addUser} style={panelStyle}>
           <strong style={{ color: 'var(--text)' }}>创建人员</strong>
@@ -67,6 +87,7 @@ export default function UserManagementPage() {
           </div>
         </form>
         {error && <div style={{ margin: '14px 0', color: 'var(--danger)' }}>{error}</div>}
+        {directoryStatus && <div style={{ margin: '14px 0', color: 'var(--success)' }}>{directoryStatus}</div>}
         <div style={{ ...panelStyle, padding: 0, overflow: 'hidden' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', color: 'var(--text)' }}><thead><tr style={{ color: 'var(--text-muted)', background: 'var(--surface-muted)' }}>
             <th style={cellStyle}>用户名</th><th style={cellStyle}>姓名</th><th style={cellStyle}>角色</th><th style={cellStyle}>状态</th><th style={cellStyle}>最近登录</th><th style={cellStyle}>操作</th>
@@ -89,3 +110,4 @@ const buttonStyle = { border: 0, borderRadius: 6, padding: '0 16px', background:
 const statusButton = { background: 'transparent', border: '1px solid var(--border-strong)', borderRadius: 5, padding: '5px 9px', cursor: 'pointer' };
 const linkButton = { background: 'transparent', border: 0, color: 'var(--accent)', cursor: 'pointer' };
 const cellStyle = { padding: '12px 14px', textAlign: 'left' as const, fontWeight: 'normal' };
+const directoryButtonStyle = { border: '1px solid var(--accent)', borderRadius: 6, padding: '6px 10px', background: 'var(--surface)', color: 'var(--accent)', cursor: 'pointer', fontWeight: 700 };

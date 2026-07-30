@@ -27,6 +27,7 @@ from backend.strategies.scripted import validate_script_code
 from backend.services import (
   backtest_runner,
   data_manager,
+  eastmoney_client,
   market_data,
   data_repository,
   data_sync_tasks,
@@ -488,44 +489,22 @@ def signal_files():
 
 @app.get("/api/instruments")
 def instruments():
-  items = _merge_instruments(
-    data_repository.list_instruments(),
-    state_store.list_instruments(),
-  )
-  return {"instruments": items}
+  return {"instruments": data_repository.list_instruments()}
 
 
-@app.post("/api/instruments")
-def create_instrument(payload: schemas.InstrumentCreate):
-  if not settings.validate_symbol(payload.symbol):
-    raise HTTPException(422, f"非法标的: {payload.symbol}")
+@app.get("/api/market-instruments/search")
+def search_market_instruments(q: str = Query("", max_length=64), limit: int = Query(20, ge=1, le=50)):
+  return {"instruments": state_store.search_market_instruments(q, limit)}
+
+
+@app.post("/api/admin/market-instruments/refresh")
+def refresh_market_instruments(request: Request):
+  _require_admin(request)
   try:
-    item = state_store.upsert_instrument(_model_dump(payload))
-    return {"instrument": item}
-  except state_store.DatabaseError as e:
-    raise HTTPException(500, f"PostgreSQL 写入标的失败: {e}")
-
-
-@app.put("/api/instruments/{symbol}")
-def update_instrument(
-  symbol: str,
-  payload: schemas.InstrumentUpdate,
-):
-  if not settings.validate_symbol(symbol):
-    raise HTTPException(422, f"非法标的: {symbol}")
-  try:
-    item = state_store.update_instrument(symbol, _model_dump(payload))
-    return {"instrument": item}
-  except state_store.DatabaseError as e:
-    raise HTTPException(500, f"PostgreSQL 更新标的失败: {e}")
-
-
-@app.delete("/api/instruments/{symbol}")
-def delete_instrument(symbol: str):
-  if not settings.validate_symbol(symbol):
-    raise HTTPException(422, f"非法标的: {symbol}")
-  deleted = state_store.delete_instrument(symbol)
-  return {"deleted": deleted}
+    count = state_store.upsert_market_instruments(eastmoney_client.fetch_a_share_instruments())
+  except eastmoney_client.EastmoneyError as error:
+    raise HTTPException(502, str(error)) from error
+  return {"count": count}
 
 
 @app.get("/api/accounts")
@@ -698,7 +677,7 @@ def update_backtest_run_meta(run_id: str, payload: schemas.BacktestRunMetaUpdate
 
 @app.get("/api/backtest/timeframes")
 def backtest_timeframes(
-  symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ)$"),
+  symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   start_date: str | None = Query(default=None, alias="startDate"),
   end_date: str | None = Query(default=None, alias="endDate"),
 ):
@@ -726,7 +705,7 @@ def backtest_timeframes_batch(
   requested = list(dict.fromkeys(item.strip() for item in symbols.split(",") if item.strip()))
   if not requested or len(requested) > 100:
     raise HTTPException(422, "标的数量必须在 1 至 100 之间")
-  if any(re.fullmatch(r"\d{6}\.(SH|SZ)", item) is None for item in requested):
+  if any(re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", item) is None for item in requested):
     raise HTTPException(422, "标的格式必须为 6 位代码.交易所")
   return {
     "timeframesBySymbol": {
@@ -791,7 +770,7 @@ def create_live_run(payload: schemas.BacktestRunRequest):
 
 @app.get("/api/dates")
 def dates(
-  symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ)$"),
+  symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   timeframe: str = Query("5m"),
 ):
   if not settings.validate_timeframe(timeframe):
@@ -802,7 +781,7 @@ def dates(
 
 @app.get("/api/chart")
 def chart(
-  symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ)$"),
+  symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   date: str = Query(..., pattern=r"^\d{8}$"),
   timeframe: str = Query("5m"),
   strategy: str = Query("trend_grid"),
@@ -822,7 +801,7 @@ def chart(
 
 @app.get("/api/data/status")
 def data_status(
-  symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ)$"),
+  symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   timeframe: str = Query("5m"),
 ):
   if not settings.validate_timeframe(timeframe):

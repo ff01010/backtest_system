@@ -79,6 +79,14 @@ export interface InstrumentItem {
   hasSignal: boolean;
 }
 
+export interface MarketInstrument {
+  symbol: string;
+  name: string;
+  market: string;
+  instrumentType: string;
+  board: string;
+}
+
 export interface DateItem {
   date: string;
   hasKline: boolean;

@@ -70,9 +70,9 @@ def resolve_signal_path(date: str, symbol: str, strategy: str = "trend_grid") ->
 
 
 def validate_symbol(symbol: str) -> bool:
-  """校验标的格式: 6位数字.SH 或 6位数字.SZ"""
+  """校验标的格式: 6位数字.SH、.SZ 或 .BJ。"""
   import re
-  return bool(re.match(r"^\d{6}\.(SH|SZ)$", symbol))
+  return bool(re.match(r"^\d{6}\.(SH|SZ|BJ)$", symbol))
 
 
 def validate_date(date: str) -> bool:
