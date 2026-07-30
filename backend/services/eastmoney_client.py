@@ -74,19 +74,33 @@ def fetch_minute_bars(
 
 
 def fetch_a_share_instruments(timeout_seconds: int = 20) -> list[MarketInstrument]:
-  """拉取沪深 A 股证券目录；仅返回元数据，不请求行情。"""
+  """分页拉取完整证券目录；东财单次最多返回 100 条。"""
+  items: list[MarketInstrument] = []
+  page = 1
+  total = None
+  while total is None or len(items) < total:
+    payload = _fetch_market_directory_page(page, timeout_seconds)
+    data = payload.get("data", {})
+    rows = data.get("diff") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+      raise EastmoneyError("东财证券目录响应缺少 diff 数据")
+    items.extend(item for item in (_parse_market_instrument(row) for row in rows) if item is not None)
+    total_value = data.get("total") if isinstance(data, dict) else None
+    total = int(total_value) if isinstance(total_value, int | str) and str(total_value).isdigit() else None
+    if not rows or total is None:
+      break
+    page += 1
+  return sorted({item.eastmoney_secid: item for item in items}.values(), key=lambda item: item.symbol)
+
+
+def _fetch_market_directory_page(page: int, timeout_seconds: int) -> dict[str, Any]:
   params = {
-    "pn": "1", "pz": "10000", "po": "1", "np": "1", "fltt": "2", "invt": "2",
+    "pn": str(page), "pz": "100", "po": "1", "np": "1", "fltt": "2", "invt": "2",
     "fid": "f3", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
     "fields": "f12,f13,f14",
   }
   url = f"https://push2.eastmoney.com/api/qt/clist/get?{urlencode(params)}"
-  payload = _fetch_json(url, timeout_seconds)
-  rows = payload.get("data", {}).get("diff")
-  if not isinstance(rows, list):
-    raise EastmoneyError("东财证券目录响应缺少 diff 数据")
-  items = [_parse_market_instrument(row) for row in rows]
-  return sorted((item for item in items if item is not None), key=lambda item: item.symbol)
+  return _fetch_json(url, timeout_seconds)
 
 
 def _fetch_json(url: str, timeout_seconds: int) -> dict[str, Any]:
