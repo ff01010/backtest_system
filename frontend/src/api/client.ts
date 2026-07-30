@@ -8,6 +8,7 @@ import type {
   DataSyncRun,
   DataSyncTask,
   InstrumentItem,
+  MarketInstrument,
   DateItem,
   StrategyConfig,
   StrategyParameterSchemaResponse,
@@ -96,20 +97,17 @@ export async function fetchInstruments(): Promise<InstrumentItem[]> {
   return data.instruments;
 }
 
-export interface InstrumentPayload {
-  symbol: string;
-  name: string;
-  note?: string;
-  enabled?: boolean;
+export async function searchMarketInstruments(query: string): Promise<MarketInstrument[]> {
+  const search = new URLSearchParams({ q: query, limit: '20' });
+  const data = await fetchJson<{ instruments: MarketInstrument[] }>(
+    `${BASE}/market-instruments/search?${search.toString()}`
+  );
+  return data.instruments;
 }
 
-export async function createInstrument(payload: InstrumentPayload): Promise<InstrumentItem> {
-  const data = await sendJson<{ instrument: InstrumentItem }>(
-    `${BASE}/instruments`,
-    'POST',
-    payload
-  );
-  return data.instrument;
+export async function refreshMarketInstruments(): Promise<number> {
+  const data = await sendJson<{ count: number }>(`${BASE}/admin/market-instruments/refresh`, 'POST', {});
+  return data.count;
 }
 
 export interface BacktestAccountPayload {

@@ -20,9 +20,8 @@ import {
   fetchAccounts,
   fetchBacktestRuns,
   fetchBacktestRun,
-  fetchBacktestTimeframesBatch,
+  fetchBacktestTimeframes,
   fetchDataStatus,
-  fetchInstruments,
   fetchStrategyParameterSchema,
   fetchStrategySource,
   publishStrategyConfig,
@@ -52,6 +51,7 @@ import type {
 } from '../types';
 import { typography } from '../styles/typography';
 import BacktestTabs from './BacktestTabs';
+import InstrumentSearchField from './InstrumentSearchField';
 
 interface Props {
   symbol: string;
@@ -677,7 +677,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const [selectedSymbol, setSelectedSymbol] = useState(symbol);
   const [selectedTimeframe, setSelectedTimeframe] = useState('5m');
   const [backtestTimeframes, setBacktestTimeframes] = useState<BacktestTimeframeAvailability[]>([]);
-  const [timeframesBySymbol, setTimeframesBySymbol] = useState<Record<string, BacktestTimeframeAvailability[]>>({});
   const [selectedBenchmarkSymbol, setSelectedBenchmarkSymbol] = useState(symbol);
   const [selectedStrategy, setSelectedStrategy] = useState(strategy);
   const [selectedAccountId, setSelectedAccountId] = useState<number | ''>('');
@@ -688,7 +687,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const [result, setResult] = useState<BacktestRunResponse | null>(null);
   const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
   const [benchmarkDataStatus, setBenchmarkDataStatus] = useState<DataStatus | null>(null);
-  const [dataReadySymbols, setDataReadySymbols] = useState<Set<string> | null>(null);
   const [dataStatusError, setDataStatusError] = useState('');
   const [benchmarkDataStatusError, setBenchmarkDataStatusError] = useState('');
   const [loadingDataStatus, setLoadingDataStatus] = useState(false);
@@ -740,16 +738,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     price: true,
     pnl: true,
   });
-  const timeframeAvailabilityRequests = useRef(
-    new Map<string, Promise<Record<string, BacktestTimeframeAvailability[]>>>()
-  );
-
-  const availableInstruments = useMemo(
-    () => instrumentList.filter((item) => item.enabled !== false && (
-      dataReadySymbols == null || dataReadySymbols.has(item.symbol)
-    )),
-    [dataReadySymbols, instrumentList]
-  );
   const strategyParameterFields = useMemo(
     () => Object.entries(strategyParameterSchema || {}),
     [strategyParameterSchema]
@@ -788,7 +776,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   }, [instruments]);
 
   useEffect(() => {
-    refreshInstruments();
     refreshStrategyAssets();
     refreshBacktestRuns();
   }, []);
@@ -847,51 +834,20 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   useEffect(() => {
     if (!shouldFetchBacktestTimeframes(params.startDate, params.endDate)) {
       setBacktestTimeframes([]);
-      setTimeframesBySymbol({});
-      setDataReadySymbols(null);
-      return;
-    }
-    const symbols = instrumentList
-      .filter((item) => item.enabled !== false)
-      .map((item) => item.symbol)
-      .sort();
-    if (symbols.length === 0) {
-      setTimeframesBySymbol({});
-      setDataReadySymbols(new Set());
       return;
     }
     let cancelled = false;
-    const cacheKey = buildTimeframeAvailabilityCacheKey(symbols, params.startDate, params.endDate);
-    let request = timeframeAvailabilityRequests.current.get(cacheKey);
-    if (!request) {
-      request = fetchBacktestTimeframesBatch(symbols, params.startDate, params.endDate);
-      timeframeAvailabilityRequests.current.set(cacheKey, request);
-    }
-    request.then((items) => {
+    fetchBacktestTimeframes(selectedSymbol, params.startDate, params.endDate).then((items) => {
       if (!cancelled) {
-        setTimeframesBySymbol(items);
-        setDataReadySymbols(new Set(Object.entries(items)
-          .filter(([, timeframes]) => timeframes.some((timeframe) => timeframe.available))
-          .map(([symbol]) => symbol)));
+        setBacktestTimeframes(items);
       }
     }).catch((requestError) => {
-      timeframeAvailabilityRequests.current.delete(cacheKey);
       if (!cancelled) setDataStatusError(
         requestError instanceof Error ? requestError.message : '读取可用周期失败'
       );
     });
     return () => { cancelled = true; };
-  }, [instrumentList, params.startDate, params.endDate]);
-
-  useEffect(() => {
-    const items = timeframesBySymbol[selectedSymbol] || [];
-    setBacktestTimeframes(items);
-    const current = items.find((item) => item.timeframe === selectedTimeframe);
-    if (!current?.available) {
-      const fallback = items.find((item) => item.available);
-      if (fallback) setSelectedTimeframe(fallback.timeframe);
-    }
-  }, [selectedSymbol, selectedTimeframe, timeframesBySymbol]);
+  }, [params.startDate, params.endDate, selectedSymbol]);
 
   useEffect(() => {
     refreshStrategyParameterSchema(selectedStrategy);
@@ -995,11 +951,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       setSelectedAccountId(picked.id);
       applyAccount(picked);
     }
-  };
-
-  const refreshInstruments = async () => {
-    const data = await fetchInstruments();
-    setInstrumentList(data);
   };
 
   const refreshStrategyAssets = async () => {
@@ -2139,34 +2090,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               <section style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700 }}>市场</div>
-                <label>
-                  <div style={labelStyle}>运行标的</div>
-                  <select
-                    value={selectedSymbol}
-                    onChange={(e) => setSelectedSymbol(e.target.value)}
-                    style={fieldStyle}
-                  >
-                    {availableInstruments.map((item) => (
-                      <option key={item.symbol} value={item.symbol}>
-                        {item.symbol}{item.name ? ` ${item.name}` : ''}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  <div style={labelStyle}>基准标的</div>
-                  <select
-                    value={selectedBenchmarkSymbol}
-                    onChange={(e) => setSelectedBenchmarkSymbol(e.target.value)}
-                    style={fieldStyle}
-                  >
-                    {availableInstruments.map((item) => (
-                      <option key={item.symbol} value={item.symbol}>
-                        {item.symbol}{item.name ? ` ${item.name}` : ''}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <InstrumentSearchField label="运行标的" value={selectedSymbol} onChange={setSelectedSymbol} />
+                <InstrumentSearchField label="基准标的" value={selectedBenchmarkSymbol} onChange={setSelectedBenchmarkSymbol} />
               </section>
 
               <section style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -2633,8 +2558,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                         onChange={(e) => updateScriptForm({ code: e.target.value })}
                         spellCheck={false}
                         style={{
-                          width: '100%', minHeight: 420, resize: 'vertical', background: '#0f172a',
-                          color: '#dbeafe', border: '1px solid #1e3a5f', borderRadius: 6, padding: 14,
+                          width: '100%', minHeight: 420, resize: 'vertical', background: '#f8fafc',
+                          color: '#334155', border: '1px solid #cbd5e1', borderRadius: 6, padding: 14,
                           fontSize: 13, lineHeight: 1.55, fontFamily: 'Consolas, monospace', outline: 'none',
                         }}
                       />
@@ -2678,20 +2603,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                   overflow: 'auto',
                 }}>
                   <div style={{ color: '#0f172a', fontSize: 14, fontWeight: 700 }}>参数与运行</div>
-                  <label>
-                    <div style={labelStyle}>运行标的</div>
-                    <select
-                      value={selectedSymbol}
-                      onChange={(e) => setSelectedSymbol(e.target.value)}
-                      style={fieldStyle}
-                    >
-                      {availableInstruments.map((item) => (
-                        <option key={item.symbol} value={item.symbol}>
-                          {item.symbol} {item.name ? `· ${item.name}` : ''}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                  <InstrumentSearchField label="运行标的" value={selectedSymbol} onChange={setSelectedSymbol} />
                   <label>
                     <div style={labelStyle}>运行周期</div>
                     <select
@@ -2700,31 +2612,18 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       style={fieldStyle}
                     >
                       {backtestTimeframes.map((item) => (
-                        <option key={item.timeframe} value={item.timeframe} disabled={!item.available}>
-                          {item.timeframe}{item.available ? '' : `（不可用：${item.reason}）`}
+                        <option key={item.timeframe} value={item.timeframe}>
+                          {item.timeframe}{item.available ? '（已缓存）' : '（首次运行自动拉取）'}
                         </option>
                       ))}
                     </select>
                     {backtestTimeframes.length === 0 && (
                       <div style={{ color: '#b45309', fontSize: 12, marginTop: 5 }}>
-                        正在读取引擎支持且本地可用的周期。
+                        正在读取回测引擎支持的周期。
                       </div>
                     )}
                   </label>
-                  <label>
-                    <div style={labelStyle}>基准标的</div>
-                    <select
-                      value={selectedBenchmarkSymbol}
-                      onChange={(e) => setSelectedBenchmarkSymbol(e.target.value)}
-                      style={fieldStyle}
-                    >
-                      {availableInstruments.map((item) => (
-                        <option key={item.symbol} value={item.symbol}>
-                          {item.symbol} {item.name ? `· ${item.name}` : ''}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                  <InstrumentSearchField label="基准标的" value={selectedBenchmarkSymbol} onChange={setSelectedBenchmarkSymbol} />
                   <div>
                     <div style={labelStyle}>策略</div>
                     <div style={{
@@ -3601,7 +3500,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
 
   /* return (
     <div style={{
-      flex: 1, overflow: 'auto', background: '#0f0f23',
+      flex: 1, overflow: 'auto', background: 'var(--canvas)',
       padding: 16, display: 'grid',
       gridTemplateColumns: '320px minmax(0, 1fr)',
       gap: 16,

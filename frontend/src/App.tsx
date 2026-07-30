@@ -142,19 +142,19 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', height: '100vh',
-      background: '#0f0f23', color: '#e0e0e0',
+      background: 'var(--canvas)', color: 'var(--text)',
       fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif',
       fontSize: typography.base,
       lineHeight: 1.5,
     }}>
       <div style={{
         display: 'flex', alignItems: 'center', gap: '4px',
-        padding: '8px 14px', background: '#0b1020',
-        borderBottom: '1px solid #26324f', flexShrink: 0,
+        padding: '10px 18px', background: 'rgba(255, 255, 255, .96)',
+        borderBottom: '1px solid var(--border)', boxShadow: '0 1px 12px rgba(26, 53, 77, .05)', flexShrink: 0,
       }}>
         <div style={{
-          color: '#e5e7eb', fontSize: typography.lg, fontWeight: 700,
-          marginRight: 12, letterSpacing: 0,
+          color: 'var(--text)', fontSize: typography.lg, fontWeight: 750,
+          marginRight: 14, letterSpacing: '.02em', fontFamily: 'ui-serif, "Songti SC", "Noto Serif SC", serif',
         }}>
           玄龄量化回测系统
         </div>
@@ -170,10 +170,10 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
               key={item.key}
               onClick={() => setActivePage(item.key)}
               style={{
-                height: 30, padding: '0 12px', borderRadius: 4,
-                border: `1px solid ${active ? '#00D2D3' : '#26324f'}`,
-                background: active ? '#12313f' : '#111827',
-                color: active ? '#e6fffb' : '#9ca3af',
+                height: 32, padding: '0 12px', borderRadius: 5,
+                border: `1px solid ${active ? 'var(--accent)' : 'transparent'}`,
+                background: active ? 'var(--accent-soft)' : 'transparent',
+                color: active ? 'var(--accent-strong)' : 'var(--text-muted)',
                 fontSize: typography.base, cursor: 'pointer',
               }}
             >
@@ -181,9 +181,9 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
             </button>
           );
         })}
-        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10, color: '#9db0c3', fontSize: typography.sm }}>
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: typography.sm }}>
           <span>{currentUser.displayName} · {currentUser.role === 'admin' ? '管理员' : '普通用户'}</span>
-          <button onClick={onLogout} style={{ border: '1px solid #365067', borderRadius: 4, padding: '4px 9px', background: '#111d2e', color: '#d4e1e8', cursor: 'pointer' }}>退出</button>
+          <button onClick={onLogout} style={{ border: '1px solid var(--border-strong)', borderRadius: 5, padding: '5px 10px', background: 'var(--surface)', color: 'var(--text-muted)', cursor: 'pointer' }}>退出</button>
         </div>
       </div>
 
@@ -225,7 +225,8 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
                 {error && !loading && (
                   <div style={{
                     position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10,
-                    background: '#7f1d1d', color: '#fca5a5', padding: '6px 16px',
+                    background: 'var(--danger-soft)', color: 'var(--danger)', padding: '7px 16px',
+                    borderBottom: '1px solid #f6c7c2',
                     fontSize: '13px', display: 'flex', alignItems: 'center', gap: '8px',
                   }}>
                     <span>⚠</span>
@@ -242,7 +243,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
                         showPrices={prefs.showPrices}
                         markerSize={prefs.markerSize}
                         label="实盘实际触发"
-                        labelColor="#e0e0e0"
+                        labelColor="#14263a"
                       />
                     </div>
                     <div style={{ flex: 1, position: 'relative' }}>
@@ -254,7 +255,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
                         markerSize={prefs.markerSize}
                         signalSource="theoretical"
                         label="策略标准执行"
-                        labelColor="#ffaa00"
+                        labelColor="#a16207"
                       />
                     </div>
                   </div>
@@ -311,7 +312,7 @@ export default function App() {
   };
 
   if (checkingSession) {
-    return <div style={{ height: '100vh', display: 'grid', placeItems: 'center', background: '#090f1d', color: '#91a8ba' }}>正在检查登录状态…</div>;
+    return <div style={{ height: '100vh', display: 'grid', placeItems: 'center', background: 'var(--canvas)', color: 'var(--text-muted)' }}>正在检查登录状态…</div>;
   }
   if (!currentUser) return <LoginPage onLogin={setCurrentUser} />;
   return <Workspace currentUser={currentUser} onLogout={() => { void handleLogout(); }} />;

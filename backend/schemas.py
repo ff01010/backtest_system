@@ -62,7 +62,7 @@ class InstrumentItem(BaseModel):
 
 
 class InstrumentCreate(BaseModel):
-  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
+  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   name: str = ""
   note: str = ""
   enabled: bool = True
@@ -118,8 +118,8 @@ class BacktestRunRequest(BaseModel):
   accountId: int | None = None
   account: str = "default"
   mode: str = Field(default="backtest", pattern=r"^(backtest|live)$")
-  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
-  benchmarkSymbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ)$")
+  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
+  benchmarkSymbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   strategy: str = "user_script"
   timeframe: str = "5m"
   startDate: str = Field(pattern=r"^\d{8}$")
@@ -323,9 +323,9 @@ class StrategyConfigCreate(BaseModel):
   scriptId: str | None = None
   strategy: str = "user_script"
   mode: str = Field(default="backtest", pattern=r"^(backtest|live)$")
-  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
+  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   timeframe: str = "5m"
-  benchmarkSymbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ)$")
+  benchmarkSymbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   accountId: int | None = None
   paramsJson: dict[str, Any] = Field(default_factory=dict)
   enabled: bool = True
@@ -337,16 +337,16 @@ class StrategyConfigUpdate(BaseModel):
   scriptId: str | None = None
   strategy: str = "user_script"
   mode: str = Field(default="backtest", pattern=r"^(backtest|live)$")
-  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
+  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   timeframe: str = "5m"
-  benchmarkSymbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ)$")
+  benchmarkSymbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   accountId: int | None = None
   paramsJson: dict[str, Any] = Field(default_factory=dict)
   enabled: bool = True
 
 
 class DataSyncRequest(BaseModel):
-  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
+  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   timeframe: str = "5m"
   startDate: str | None = Field(default=None, pattern=r"^\d{8}$")
   endDate: str | None = Field(default=None, pattern=r"^\d{8}$")
@@ -362,7 +362,7 @@ class DataSyncBatchRequest(BaseModel):
 
 
 class DataRefillRequest(BaseModel):
-  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
+  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   timeframe: str = "5m"
   dates: list[str]
 
