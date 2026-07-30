@@ -120,7 +120,7 @@ class BacktestRunRequest(BaseModel):
   mode: str = Field(default="backtest", pattern=r"^(backtest|live)$")
   symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
   benchmarkSymbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ)$")
-  strategy: str = "trend_grid"
+  strategy: str = "user_script"
   timeframe: str = "5m"
   startDate: str = Field(pattern=r"^\d{8}$")
   endDate: str = Field(pattern=r"^\d{8}$")
@@ -134,6 +134,7 @@ class BacktestRunRequest(BaseModel):
   allowShort: bool = True
   holdingPolicy: Literal["intraday", "overnight"] = "intraday"
   strategyParams: dict[str, Any] = Field(default_factory=dict)
+  runDraft: bool = False
 
   @model_validator(mode="after")
   def validate_trade_direction(self) -> "BacktestRunRequest":
@@ -320,7 +321,7 @@ class BacktestRunMetaUpdate(BaseModel):
 class StrategyConfigCreate(BaseModel):
   name: str = Field(min_length=1, max_length=64)
   scriptId: str | None = None
-  strategy: str = "trend_grid"
+  strategy: str = "user_script"
   mode: str = Field(default="backtest", pattern=r"^(backtest|live)$")
   symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
   timeframe: str = "5m"
@@ -328,13 +329,13 @@ class StrategyConfigCreate(BaseModel):
   accountId: int | None = None
   paramsJson: dict[str, Any] = Field(default_factory=dict)
   enabled: bool = True
-  publish: bool = True
+  publish: bool = False
 
 
 class StrategyConfigUpdate(BaseModel):
   name: str = Field(min_length=1, max_length=64)
   scriptId: str | None = None
-  strategy: str = "trend_grid"
+  strategy: str = "user_script"
   mode: str = Field(default="backtest", pattern=r"^(backtest|live)$")
   symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ)$")
   timeframe: str = "5m"
@@ -374,3 +375,25 @@ class DateItem(BaseModel):
 
 class ErrorResponse(BaseModel):
   error: str
+
+
+class LoginRequest(BaseModel):
+  username: str = Field(min_length=1, max_length=64)
+  password: str = Field(min_length=1, max_length=256)
+
+
+class UserCreate(BaseModel):
+  username: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+  displayName: str = Field(min_length=1, max_length=128)
+  password: str = Field(min_length=6, max_length=256)
+  role: Literal["admin", "user"] = "user"
+
+
+class UserUpdate(BaseModel):
+  displayName: str = Field(min_length=1, max_length=128)
+  role: Literal["admin", "user"]
+  status: Literal["active", "disabled"]
+
+
+class PasswordReset(BaseModel):
+  password: str = Field(min_length=6, max_length=256)

@@ -14,6 +14,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend import settings
+from backend.services.user_context import get_current_user
 
 
 class DatabaseError(RuntimeError):
@@ -30,6 +31,16 @@ def _translate_error(error: Exception) -> DatabaseError:
   return DatabaseError(str(error))
 
 
+def current_user_id() -> str:
+  """返回请求绑定的用户 ID。"""
+  return get_current_user().id
+
+
+def current_user_is_admin() -> bool:
+  """返回请求绑定用户是否拥有管理员权限。"""
+  return get_current_user().is_admin
+
+
 @contextmanager
 def _db() -> Iterator[psycopg.Connection[Any]]:
   if not settings.DATABASE_URL:
@@ -39,7 +50,11 @@ def _db() -> Iterator[psycopg.Connection[Any]]:
       with conn.cursor() as cur:
         cur.execute(
           "SELECT set_config('app.current_user_id', %s, false)",
-          (settings.DEFAULT_USER_ID,),
+          (current_user_id(),),
+        )
+        cur.execute(
+          "SELECT set_config('app.current_is_admin', %s, false)",
+          ("true" if current_user_is_admin() else "false",),
         )
       yield conn
   except psycopg.Error as error:
@@ -184,11 +199,12 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
     "paramsSnapshot": _json(row.get("params_snapshot"), {}),
     "dataVersion": _json(row.get("market_data_snapshot"), None),
     "benchmarkSymbol": row.get("benchmark_symbol") or request.get("benchmarkSymbol"),
-    "strategy": request.get("strategy", "trend_grid"),
+    "strategy": request.get("strategy", "user_script"),
     "startDate": request.get("startDate", ""),
     "endDate": request.get("endDate", ""),
     "paramsJson": request,
     "status": {"succeeded": "ok", "failed": "error"}.get(row["status"], row["status"]),
+    "executionKind": row.get("execution_kind", "published"),
     "summaryJson": _json(row.get("result_summary"), {}),
     "outputDir": row.get("output_dir", ""),
     "note": row.get("note", ""),
@@ -199,7 +215,7 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
   }
 
 
-def seed_default_account() -> None:
+def seed_default_account_for_user(user_id: str) -> None:
   with _db() as conn:
     with conn.cursor() as cur:
       cur.execute("""
@@ -210,7 +226,12 @@ def seed_default_account() -> None:
         WHERE NOT EXISTS (
           SELECT 1 FROM backtest_account WHERE owner_user_id = %s
         )
-      """, (settings.DEFAULT_USER_ID, settings.DEFAULT_USER_ID))
+      """, (user_id, user_id))
+
+
+def seed_default_account() -> None:
+  """为当前用户补齐默认回测账户。"""
+  seed_default_account_for_user(current_user_id())
 
 
 def list_instruments() -> list[dict[str, Any]]:
@@ -222,7 +243,7 @@ def list_instruments() -> list[dict[str, Any]]:
         JOIN market_instrument i ON i.id = ui.instrument_id
         WHERE ui.owner_user_id = %s
         ORDER BY i.exchange, i.symbol
-      """, (settings.DEFAULT_USER_ID,))
+      """, (current_user_id(),))
       return [{
         "symbol": f"{row['symbol']}.{row['exchange']}",
         "name": row["display_name"],
@@ -244,7 +265,7 @@ def upsert_instrument(payload: dict[str, Any]) -> dict[str, Any]:
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (owner_user_id, instrument_id) DO UPDATE
           SET enabled = EXCLUDED.enabled, note = EXCLUDED.note, updated_at = now()
-      """, (settings.DEFAULT_USER_ID, instrument_id, payload.get("enabled", True), payload.get("note", "")))
+      """, (current_user_id(), instrument_id, payload.get("enabled", True), payload.get("note", "")))
   return get_instrument(symbol)
 
 
@@ -260,7 +281,7 @@ def get_instrument(symbol: str) -> dict[str, Any]:
         SELECT i.display_name, ui.enabled, ui.note
         FROM user_instrument ui JOIN market_instrument i ON i.id = ui.instrument_id
         WHERE ui.owner_user_id = %s AND i.symbol = %s AND i.exchange = %s
-      """, (settings.DEFAULT_USER_ID, code, exchange))
+      """, (current_user_id(), code, exchange))
       row = cur.fetchone()
       if not row:
         raise KeyError(symbol)
@@ -277,14 +298,14 @@ def delete_instrument(symbol: str) -> bool:
         DELETE FROM user_instrument ui USING market_instrument i
         WHERE ui.instrument_id = i.id AND ui.owner_user_id = %s
           AND i.symbol = %s AND i.exchange = %s
-      """, (settings.DEFAULT_USER_ID, code, exchange))
+      """, (current_user_id(), code, exchange))
       return cur.rowcount > 0
 
 
 def list_accounts() -> list[dict[str, Any]]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("SELECT * FROM backtest_account WHERE owner_user_id = %s ORDER BY is_default DESC, id", (settings.DEFAULT_USER_ID,))
+      cur.execute("SELECT * FROM backtest_account WHERE owner_user_id = %s ORDER BY is_default DESC, id", (current_user_id(),))
       return [_normalize_account(row) for row in cur.fetchall()]
 
 
@@ -298,13 +319,13 @@ def create_account(payload: dict[str, Any]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
       if payload.get("isDefault"):
-        cur.execute("UPDATE backtest_account SET is_default = false WHERE owner_user_id = %s", (settings.DEFAULT_USER_ID,))
+        cur.execute("UPDATE backtest_account SET is_default = false WHERE owner_user_id = %s", (current_user_id(),))
       cur.execute("""
         INSERT INTO backtest_account (
           owner_user_id, name, initial_capital, commission_rate, slippage, position_mode,
           order_cash, order_pct, allow_short, is_default
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
-      """, (settings.DEFAULT_USER_ID, *_account_values(payload)))
+      """, (current_user_id(), *_account_values(payload)))
       account_id = int(cur.fetchone()["id"])
   return get_account(account_id)
 
@@ -313,13 +334,13 @@ def update_account(account_id: int, payload: dict[str, Any]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
       if payload.get("isDefault"):
-        cur.execute("UPDATE backtest_account SET is_default = false WHERE owner_user_id = %s AND id <> %s", (settings.DEFAULT_USER_ID, account_id))
+        cur.execute("UPDATE backtest_account SET is_default = false WHERE owner_user_id = %s AND id <> %s", (current_user_id(), account_id))
       cur.execute("""
         UPDATE backtest_account SET name=%s, initial_capital=%s, commission_rate=%s,
           slippage=%s, position_mode=%s, order_cash=%s, order_pct=%s, allow_short=%s,
           is_default=%s, updated_at=now()
         WHERE id=%s AND owner_user_id=%s
-      """, (*_account_values(payload), account_id, settings.DEFAULT_USER_ID))
+      """, (*_account_values(payload), account_id, current_user_id()))
       if cur.rowcount == 0:
         raise KeyError(account_id)
   return get_account(account_id)
@@ -328,7 +349,7 @@ def update_account(account_id: int, payload: dict[str, Any]) -> dict[str, Any]:
 def get_account(account_id: int) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("SELECT * FROM backtest_account WHERE id=%s AND owner_user_id=%s", (account_id, settings.DEFAULT_USER_ID))
+      cur.execute("SELECT * FROM backtest_account WHERE id=%s AND owner_user_id=%s", (account_id, current_user_id()))
       row = cur.fetchone()
       if not row:
         raise KeyError(account_id)
@@ -338,7 +359,7 @@ def get_account(account_id: int) -> dict[str, Any]:
 def delete_account(account_id: int) -> bool:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("DELETE FROM backtest_account WHERE id=%s AND owner_user_id=%s", (account_id, settings.DEFAULT_USER_ID))
+      cur.execute("DELETE FROM backtest_account WHERE id=%s AND owner_user_id=%s", (account_id, current_user_id()))
       return cur.rowcount > 0
 
 
@@ -355,7 +376,7 @@ def _script_query(where: str = "") -> str:
 def list_strategy_scripts() -> list[dict[str, Any]]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(_script_query("ORDER BY s.updated_at DESC, s.id DESC"), (settings.DEFAULT_USER_ID,))
+      cur.execute(_script_query("ORDER BY s.updated_at DESC, s.id DESC"), (current_user_id(),))
       return [_normalize_script(row) for row in cur.fetchall()]
 
 
@@ -367,7 +388,7 @@ def _insert_script_version(cur: Any, script_id: str, version_no: int, payload: d
     ) VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s)
   """, (script_id, version_no, source, hashlib.sha256(source.encode("utf-8")).hexdigest(),
          Jsonb({"entryType": payload.get("entryType", "on_bar"), "status": payload.get("status", "draft")}),
-         settings.DEFAULT_USER_ID))
+         current_user_id()))
 
 
 def create_strategy_script(payload: dict[str, Any]) -> dict[str, Any]:
@@ -376,7 +397,7 @@ def create_strategy_script(payload: dict[str, Any]) -> dict[str, Any]:
       cur.execute("""
         INSERT INTO user_strategy (id, owner_user_id, name, description, strategy_type, status)
         VALUES (gen_random_uuid(), %s, %s, %s, 'python', 'active') RETURNING id
-      """, (settings.DEFAULT_USER_ID, payload["name"], payload.get("description", "")))
+      """, (current_user_id(), payload["name"], payload.get("description", "")))
       script_id = _uuid(cur.fetchone()["id"])
       _insert_script_version(cur, script_id or "", 1, payload)
   return get_strategy_script(script_id or "")
@@ -385,7 +406,7 @@ def create_strategy_script(payload: dict[str, Any]) -> dict[str, Any]:
 def update_strategy_script(script_id: str, payload: dict[str, Any]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("SELECT current_version_no FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, settings.DEFAULT_USER_ID))
+      cur.execute("SELECT current_version_no FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, current_user_id()))
       row = cur.fetchone()
       if not row:
         raise KeyError(script_id)
@@ -393,7 +414,7 @@ def update_strategy_script(script_id: str, payload: dict[str, Any]) -> dict[str,
       cur.execute("""
         UPDATE user_strategy SET name=%s, description=%s, current_version_no=%s, updated_at=now()
         WHERE id=%s AND owner_user_id=%s
-      """, (payload["name"], payload.get("description", ""), next_version, script_id, settings.DEFAULT_USER_ID))
+      """, (payload["name"], payload.get("description", ""), next_version, script_id, current_user_id()))
       _insert_script_version(cur, script_id, next_version, payload)
   return get_strategy_script(script_id)
 
@@ -401,7 +422,7 @@ def update_strategy_script(script_id: str, payload: dict[str, Any]) -> dict[str,
 def get_strategy_script(script_id: str) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(_script_query("AND s.id=%s"), (settings.DEFAULT_USER_ID, script_id))
+      cur.execute(_script_query("AND s.id=%s"), (current_user_id(), script_id))
       row = cur.fetchone()
       if not row:
         raise KeyError(script_id)
@@ -411,7 +432,7 @@ def get_strategy_script(script_id: str) -> dict[str, Any]:
 def delete_strategy_script(script_id: str) -> bool:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("DELETE FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, settings.DEFAULT_USER_ID))
+      cur.execute("DELETE FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, current_user_id()))
       return cur.rowcount > 0
 
 
@@ -429,7 +450,7 @@ def _config_query(where: str = "") -> str:
 def list_strategy_configs() -> list[dict[str, Any]]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(_config_query("ORDER BY c.updated_at DESC, c.id DESC"), (settings.DEFAULT_USER_ID,))
+      cur.execute(_config_query("ORDER BY c.updated_at DESC, c.id DESC"), (current_user_id(),))
       return [_normalize_config(row) for row in cur.fetchall()]
 
 
@@ -449,7 +470,7 @@ def _script_version_id(cur: Any, script_id: str | None) -> str | None:
     SELECT v.id FROM user_strategy s JOIN user_strategy_version v
       ON v.strategy_id=s.id AND v.version_no=s.current_version_no
     WHERE s.id=%s AND s.owner_user_id=%s
-  """, (script_id, settings.DEFAULT_USER_ID))
+  """, (script_id, current_user_id()))
   row = cur.fetchone()
   if not row:
     raise KeyError(script_id)
@@ -465,18 +486,18 @@ def _write_config(cur: Any, config_id: str | None, payload: dict[str, Any]) -> s
         owner_user_id, name, strategy_id, strategy_key, mode, instrument_id, timeframe,
         benchmark_instrument_id, account_id, params, enabled, published
       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,false) RETURNING id
-    """, (settings.DEFAULT_USER_ID, payload["name"], payload.get("scriptId"), payload.get("strategy", "trend_grid"),
+    """, (current_user_id(), payload["name"], payload.get("scriptId"), payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
            payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True)))
   else:
     cur.execute("""
       UPDATE strategy_config SET name=%s, strategy_id=%s, strategy_key=%s, mode=%s,
         instrument_id=%s, timeframe=%s, benchmark_instrument_id=%s, account_id=%s, params=%s,
-        enabled=%s, updated_at=now() WHERE id=%s AND owner_user_id=%s RETURNING id
-    """, (payload["name"], payload.get("scriptId"), payload.get("strategy", "trend_grid"),
+        enabled=%s, published=false, updated_at=now() WHERE id=%s AND owner_user_id=%s RETURNING id
+    """, (payload["name"], payload.get("scriptId"), payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
            payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True),
-           config_id, settings.DEFAULT_USER_ID))
+           config_id, current_user_id()))
   row = cur.fetchone()
   if not row:
     raise KeyError(config_id)
@@ -530,7 +551,7 @@ def publish_strategy_config(config_id: str) -> tuple[dict[str, Any], bool]:
 def get_strategy_config(config_id: str) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(_config_query("AND c.id=%s"), (settings.DEFAULT_USER_ID, config_id))
+      cur.execute(_config_query("AND c.id=%s"), (current_user_id(), config_id))
       row = cur.fetchone()
       if not row:
         raise KeyError(config_id)
@@ -544,7 +565,7 @@ def get_strategy_config_version(version_id: str) -> dict[str, Any]:
         SELECT v.* FROM strategy_config_version v
         JOIN strategy_config c ON c.id=v.config_id
         WHERE v.id=%s AND c.owner_user_id=%s
-      """, (version_id, settings.DEFAULT_USER_ID))
+      """, (version_id, current_user_id()))
       row = cur.fetchone()
       if not row:
         raise KeyError(version_id)
@@ -559,7 +580,7 @@ def get_latest_strategy_config_version(config_id: str) -> dict[str, Any] | None:
         JOIN strategy_config c ON c.id=v.config_id
         WHERE v.config_id=%s AND c.owner_user_id=%s
         ORDER BY v.version_no DESC LIMIT 1
-      """, (config_id, settings.DEFAULT_USER_ID))
+      """, (config_id, current_user_id()))
       row = cur.fetchone()
       return _normalize_version(row) if row else None
 
@@ -571,14 +592,14 @@ def list_strategy_config_versions(config_id: str) -> list[dict[str, Any]]:
         SELECT v.* FROM strategy_config_version v
         JOIN strategy_config c ON c.id=v.config_id
         WHERE v.config_id=%s AND c.owner_user_id=%s ORDER BY v.version_no DESC
-      """, (config_id, settings.DEFAULT_USER_ID))
+      """, (config_id, current_user_id()))
       return [_normalize_version(row) for row in cur.fetchall()]
 
 
 def delete_strategy_config(config_id: str) -> bool:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("DELETE FROM strategy_config WHERE id=%s AND owner_user_id=%s", (config_id, settings.DEFAULT_USER_ID))
+      cur.execute("DELETE FROM strategy_config WHERE id=%s AND owner_user_id=%s", (config_id, current_user_id()))
       return cur.rowcount > 0
 
 
@@ -607,22 +628,22 @@ def create_backtest_run(payload: dict[str, Any], status: str = "running") -> str
       instrument_id = _instrument_id(cur, payload["symbol"])
       benchmark_id = _instrument_id(cur, payload["benchmarkSymbol"]) if payload.get("benchmarkSymbol") else None
       strategy_version_id = version and version["paramsJson"].get("strategyVersionId")
-      script_snapshot = version and version["paramsJson"].get("scriptSnapshot")
+      script_snapshot = (version and version["paramsJson"].get("scriptSnapshot")) or payload.get("draftScriptSnapshot")
       params_snapshot = version and version["paramsJson"]
       db_status = "running" if status == "running" else "queued"
       cur.execute("""
         INSERT INTO backtest_run (
           id, owner_user_id, strategy_version_id, status, requested_params, market_data_snapshot,
           started_at, config_id, config_version_id, account_id, instrument_id,
-          benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot
+          benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot, execution_kind
         ) VALUES (
           gen_random_uuid(), %s, %s, %s, %s, '{}'::jsonb,
-          CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s
+          CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         ) RETURNING id
-      """, (settings.DEFAULT_USER_ID, strategy_version_id, db_status, Jsonb(payload), db_status,
+      """, (current_user_id(), strategy_version_id, db_status, Jsonb(payload), db_status,
              config_id, version_id, payload.get("accountId"), instrument_id, benchmark_id,
              payload.get("timeframe", "5m"), "bar_close_signal_fill", Jsonb(script_snapshot) if script_snapshot else None,
-             Jsonb(params_snapshot) if params_snapshot else Jsonb({})))
+             Jsonb(params_snapshot) if params_snapshot else Jsonb({}), payload.get("executionKind", "published")))
       return _uuid(cur.fetchone()["id"]) or ""
 
 
@@ -644,7 +665,7 @@ def list_backtest_runs(limit: int = 30, config_id: str | None = None) -> list[di
   with _db() as conn:
     with conn.cursor() as cur:
       query = _run_query("AND r.config_id=%s ORDER BY r.created_at DESC LIMIT %s") if config_id else _run_query("ORDER BY r.created_at DESC LIMIT %s")
-      params = (settings.DEFAULT_USER_ID, config_id, limit) if config_id else (settings.DEFAULT_USER_ID, limit)
+      params = (current_user_id(), config_id, limit) if config_id else (current_user_id(), limit)
       cur.execute(query, params)
       return [_normalize_run(row) for row in cur.fetchall()]
 
@@ -652,7 +673,7 @@ def list_backtest_runs(limit: int = 30, config_id: str | None = None) -> list[di
 def get_backtest_run(run_id: str) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(_run_query("AND r.id=%s"), (settings.DEFAULT_USER_ID, run_id))
+      cur.execute(_run_query("AND r.id=%s"), (current_user_id(), run_id))
       row = cur.fetchone()
       if not row:
         raise KeyError(run_id)
@@ -662,7 +683,7 @@ def get_backtest_run(run_id: str) -> dict[str, Any]:
 def update_backtest_run_meta(run_id: str, note: str, tags: list[str]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("UPDATE backtest_run SET note=%s, tags=%s WHERE id=%s AND owner_user_id=%s", (note, Jsonb(tags), run_id, settings.DEFAULT_USER_ID))
+      cur.execute("UPDATE backtest_run SET note=%s, tags=%s WHERE id=%s AND owner_user_id=%s", (note, Jsonb(tags), run_id, current_user_id()))
       if cur.rowcount == 0:
         raise KeyError(run_id)
   return get_backtest_run(run_id)
@@ -677,7 +698,7 @@ def finish_backtest_run(run_id: str, status: str, summary: dict[str, Any], outpu
           output_dir=%s, error_message=%s, finished_at=now()
         WHERE id=%s AND owner_user_id=%s
       """, (db_status, Jsonb(summary), Jsonb(result) if result else None, output_dir,
-             summary.get("error") if status != "ok" else None, run_id, settings.DEFAULT_USER_ID))
+             summary.get("error") if status != "ok" else None, run_id, current_user_id()))
       if cur.rowcount == 0:
         raise KeyError(run_id)
 
@@ -690,18 +711,20 @@ def log_data_sync_run(payload: dict[str, Any], result: dict[str, Any]) -> int:
   with _db() as conn:
     with conn.cursor() as cur:
       instrument_id = _instrument_id(cur, payload["symbol"])
-      outcome = "fetched" if result.get("status") in {"ok", "partial_error"} else "failed"
-      details = {"timeframe": payload.get("timeframe", "5m"), "sourceTimeframe": result.get("source_timeframe", ""),
+      outcome = result.get("cacheStatus") if result.get("status") == "ok" else "failed"
+      if outcome not in {"cache_hit", "fetched", "failed"}:
+        outcome = "fetched" if result.get("status") == "ok" else "failed"
+      details = {"timeframe": payload.get("timeframe", "5m"), "sourceTimeframe": payload.get("timeframe", "5m"),
                  "mode": payload.get("mode", "incremental"), "newDates": result.get("new_dates", []),
-                 "outputPath": result.get("output_path", ""), "elapsedMs": result.get("elapsed_ms", 0),
+                 "outputPath": "postgresql://market_minute_bar", "elapsedMs": result.get("elapsed_ms", 0),
                  "message": result.get("message", "")}
       cur.execute("""
         INSERT INTO market_fetch_log (
           instrument_id, requested_by_user_id, period, adjustment, source, requested_from,
           requested_to, outcome, row_count, error_message, finished_at, details
-        ) VALUES (%s,%s,'1d','none','local',%s,%s,%s,%s,%s,now(),%s) RETURNING id
-      """, (instrument_id, settings.DEFAULT_USER_ID, _date_value(payload.get("startDate")),
-             _date_value(payload.get("endDate")), outcome, int(result.get("new_rows", 0)),
+        ) VALUES (%s,%s,%s,'none','eastmoney',%s,%s,%s,%s,%s,now(),%s) RETURNING id
+      """, (instrument_id, current_user_id(), payload.get("timeframe", "5m"),
+             _date_value(payload.get("startDate")), _date_value(payload.get("endDate")), outcome, int(result.get("new_rows", 0)),
              result.get("message") if outcome == "failed" else None, Jsonb(details)))
       return int(cur.fetchone()["id"])
 
@@ -713,7 +736,7 @@ def list_data_sync_runs(limit: int = 20) -> list[dict[str, Any]]:
         SELECT f.*, i.symbol, i.exchange FROM market_fetch_log f
         LEFT JOIN market_instrument i ON i.id=f.instrument_id
         WHERE f.requested_by_user_id=%s ORDER BY f.started_at DESC LIMIT %s
-      """, (settings.DEFAULT_USER_ID, limit))
+      """, (current_user_id(), limit))
       rows = []
       for row in cur.fetchall():
         details = _json(row["details"], {})
@@ -721,7 +744,7 @@ def list_data_sync_runs(limit: int = 20) -> list[dict[str, Any]]:
           "id": int(row["id"]), "symbol": f"{row['symbol']}.{row['exchange']}",
           "timeframe": details.get("timeframe", "5m"), "sourceTimeframe": details.get("sourceTimeframe", ""),
           "startDate": row["requested_from"].strftime("%Y%m%d"), "endDate": row["requested_to"].strftime("%Y%m%d"),
-          "mode": details.get("mode", "incremental"), "status": "ok" if row["outcome"] == "fetched" else "error",
+          "mode": details.get("mode", "incremental"), "status": "ok" if row["outcome"] in {"fetched", "cache_hit"} else "error",
           "newRows": int(row["row_count"]), "newDates": details.get("newDates", []),
           "outputPath": details.get("outputPath", ""), "elapsedMs": int(details.get("elapsedMs", 0)),
           "message": details.get("message", row.get("error_message") or ""), "createdAt": _format_time(row["started_at"]),

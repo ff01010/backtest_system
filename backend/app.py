@@ -8,6 +8,7 @@
 import sys
 import os
 import ast
+from datetime import datetime, timedelta
 import hashlib
 import re
 
@@ -15,8 +16,9 @@ _viewer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _viewer_dir not in sys.path:
   sys.path.insert(0, _viewer_dir)
 
-from fastapi import Body, FastAPI, Query, HTTPException
+from fastapi import Body, FastAPI, Query, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from backend import settings
 from backend import schemas
@@ -25,11 +27,14 @@ from backend.strategies.scripted import validate_script_code
 from backend.services import (
   backtest_runner,
   data_manager,
+  market_data,
   data_repository,
   data_sync_tasks,
   state_store,
   strategy_adapters,
 )
+from backend.services import auth
+from backend.services.user_context import get_current_user, reset_current_user, set_current_user
 
 app = FastAPI(title="Trend Grid Viewer", version="0.1.0")
 
@@ -41,9 +46,30 @@ app.add_middleware(
     "http://localhost:5176", "http://127.0.0.1:5176",
     "http://localhost:5177", "http://127.0.0.1:5177",
   ],
+  allow_credentials=True,
   allow_methods=["GET", "POST", "PUT", "DELETE"],
   allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def authenticate_api_request(request: Request, call_next):
+  """所有业务 API 必须携带有效会话，用户身份由上下文供仓储层使用。"""
+  path = request.url.path
+  if request.method == "OPTIONS" or not path.startswith("/api/") or path in {
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/logout",
+  }:
+    return await call_next(request)
+  user = auth.get_user_by_token(request.cookies.get(auth.SESSION_COOKIE))
+  if not user:
+    return JSONResponse(status_code=401, content={"detail": "登录已失效，请重新登录"})
+  token = set_current_user(user)
+  try:
+    return await call_next(request)
+  finally:
+    reset_current_user(token)
 
 
 def _model_dump(model):
@@ -72,62 +98,28 @@ def _merge_instruments(
 
 
 def _run_sync_script(request: dict) -> dict:
-  import json
-  import subprocess
-  import time
-
-  sync_script = os.path.join(
-    os.path.dirname(_viewer_dir), "scripts", "sync_kline.py",
-  )
-  cmd = [
-    sys.executable,
-    sync_script,
-    request["symbol"],
-    "--timeframe",
-    request.get("timeframe", "5m"),
-    "--mode",
-    request.get("mode", "incremental"),
-    "--json",
-  ]
-  if request.get("startDate"):
-    cmd.extend(["--start-date", request["startDate"]])
-  if request.get("endDate"):
-    cmd.extend(["--end-date", request["endDate"]])
-
-  started = time.perf_counter()
+  """通过东财补齐分钟缓存，兼容旧数据同步 API。"""
+  end_date = request.get("endDate") or datetime.now().strftime("%Y%m%d")
+  start_date = request.get("startDate") or (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
   try:
-    proc = subprocess.run(
-      cmd,
-      capture_output=True, text=True, timeout=180,
+    result = market_data.ensure_cached(
+      request["symbol"], request.get("timeframe", "5m"), start_date, end_date,
     )
-  except subprocess.TimeoutExpired:
+  except market_data.MarketDataError as error:
     return {
       "status": "error",
       "symbol": request["symbol"],
       "timeframe": request.get("timeframe", "5m"),
-      "message": "同步超时，请检查 QMT 是否运行",
+      "message": str(error),
       "new_rows": 0,
       "new_dates": [],
     }
-  output_lines = proc.stdout.strip().splitlines()
-  if not output_lines:
-    return {
-      "status": "error",
-      "symbol": request["symbol"],
-      "timeframe": request.get("timeframe", "5m"),
-      "message": proc.stderr or "同步脚本无输出",
-    }
-  try:
-    result = json.loads(output_lines[-1])
-    result["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
-    return result
-  except json.JSONDecodeError:
-    return {
-      "status": "error",
-      "symbol": request["symbol"],
-      "timeframe": request.get("timeframe", "5m"),
-      "message": f"同步脚本输出异常: {proc.stderr or proc.stdout[-500:]}",
-    }
+  return {
+    "status": "ok", "symbol": request["symbol"], "timeframe": request.get("timeframe", "5m"),
+    "from": start_date, "to": end_date, "new_rows": result["rowCount"],
+    "new_dates": result["fetchedDates"], "cacheStatus": result["status"],
+    "message": "数据库缓存命中" if result["status"] == "cache_hit" else "东财分钟行情已缓存",
+  }
 
 
 def _validate_sync_request(request: dict) -> None:
@@ -213,7 +205,7 @@ def _validate_strategy_script(payload: dict) -> None:
     raise HTTPException(422, str(error)) from error
   except SyntaxError as error:
     raise HTTPException(422, f"Python 语法错误: 第 {error.lineno} 行 {error.msg}")
-  if payload.get("status") not in {"draft", "enabled", "disabled"}:
+  if payload.get("status") not in {"draft", "published", "disabled"}:
     raise HTTPException(422, f"非法脚本状态: {payload.get('status')}")
 
 
@@ -279,9 +271,14 @@ def _validate_backtest_request(request: dict) -> None:
   if not strategy_adapters.has_strategy(request["strategy"]):
     raise HTTPException(422, f"不支持的策略: {request['strategy']}")
 
+  if not request.get("configId"):
+    raise HTTPException(422, "回测必须选择已保存的策略方案")
+  if request.get("runDraft") and not get_current_user().is_admin:
+    raise HTTPException(403, "只有管理员可以试跑未发布草稿")
   if request.get("configId") and not request.get("configVersionId"):
     latest_version = state_store.get_latest_strategy_config_version(str(request["configId"]))
-    request["configVersionId"] = latest_version["id"] if latest_version else None
+    if latest_version and not request.get("runDraft"):
+      request["configVersionId"] = latest_version["id"]
   if request.get("configVersionId"):
     try:
       version = state_store.get_strategy_config_version(str(request["configVersionId"]))
@@ -298,8 +295,38 @@ def _validate_backtest_request(request: dict) -> None:
     script_snapshot = version.get("paramsJson", {}).get("scriptSnapshot")
     if isinstance(script_snapshot, dict) and isinstance(script_snapshot.get("code"), str):
       request["versionScriptSnapshot"] = script_snapshot
+  else:
+    if not get_current_user().is_admin:
+      raise HTTPException(422, "策略方案尚未发布，普通用户不能回测")
+    try:
+      draft_config = state_store.get_strategy_config(str(request["configId"]))
+    except KeyError as error:
+      raise HTTPException(404, "策略方案不存在") from error
+    script_id = draft_config.get("scriptId")
+    if not script_id:
+      raise HTTPException(422, "草稿方案必须绑定策略脚本")
+    script = state_store.get_strategy_script(str(script_id))
+    request["strategy"] = draft_config["strategy"]
+    request["scriptId"] = script_id
+    request["draftScriptSnapshot"] = {
+      "id": script["id"], "name": script["name"], "code": script["code"], "entryType": script["entryType"],
+    }
+    request["versionScriptSnapshot"] = request["draftScriptSnapshot"]
+    request["executionKind"] = "draft_test"
+
+  if request["strategy"] != "user_script":
+    raise HTTPException(422, "当前仅支持数据库中的用户脚本策略")
 
   try:
+    for symbol in {request["symbol"], request.get("benchmarkSymbol") or request["symbol"]}:
+      cache_result = market_data.ensure_cached(
+        symbol, request["timeframe"], request["startDate"], request["endDate"],
+      )
+      state_store.log_data_sync_run({
+        "symbol": symbol, "timeframe": request["timeframe"],
+        "startDate": request["startDate"], "endDate": request["endDate"], "mode": "backtest_auto",
+      }, {"status": "ok", "cacheStatus": cache_result["status"], "new_rows": cache_result["rowCount"],
+          "new_dates": cache_result["fetchedDates"], "message": "回测自动补齐分钟行情"})
     data_repository.validate_backtest_coverage(
       request["symbol"], request["timeframe"], request["startDate"], request["endDate"],
     )
@@ -319,6 +346,98 @@ def startup():
 @app.get("/api/health")
 def health():
   return {"status": "ok"}
+
+
+@app.post("/api/auth/login")
+def login(payload: schemas.LoginRequest, request: Request, response: Response):
+  """校验用户名密码并签发仅浏览器可见的 HttpOnly 会话 Cookie。"""
+  try:
+    token, user = auth.authenticate(
+      payload.username,
+      payload.password,
+      request.client.host if request.client else None,
+      request.headers.get("user-agent"),
+    )
+  except auth.AuthenticationError as error:
+    raise HTTPException(401, str(error)) from error
+  response.set_cookie(
+    auth.SESSION_COOKIE,
+    token,
+    max_age=int(auth.SESSION_LIFETIME.total_seconds()),
+    httponly=True,
+    samesite="lax",
+    secure=settings.AUTH_COOKIE_SECURE,
+    path="/",
+  )
+  return {"user": {
+    "id": user.id,
+    "username": user.username,
+    "displayName": user.display_name,
+    "role": user.role,
+  }}
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response):
+  """撤销服务端会话并清除浏览器 Cookie。"""
+  auth.revoke_session(request.cookies.get(auth.SESSION_COOKIE))
+  response.delete_cookie(auth.SESSION_COOKIE, path="/")
+  return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def current_user(request: Request):
+  user = auth.get_user_by_token(request.cookies.get(auth.SESSION_COOKIE))
+  if not user:
+    raise HTTPException(401, "登录已失效，请重新登录")
+  return {"user": {
+    "id": user.id,
+    "username": user.username,
+    "displayName": user.display_name,
+    "role": user.role,
+  }}
+
+
+def _require_admin(request: Request) -> None:
+  user = auth.get_user_by_token(request.cookies.get(auth.SESSION_COOKIE))
+  if not user or not user.is_admin:
+    raise HTTPException(403, "仅管理员可执行此操作")
+
+
+@app.get("/api/admin/users")
+def admin_users(request: Request):
+  _require_admin(request)
+  return {"users": auth.list_users()}
+
+
+@app.post("/api/admin/users")
+def create_user(payload: schemas.UserCreate, request: Request):
+  _require_admin(request)
+  try:
+    return {"user": auth.create_user(payload.username, payload.displayName, payload.password, payload.role)}
+  except auth.UserManagementError as error:
+    raise HTTPException(409, str(error)) from error
+
+
+@app.put("/api/admin/users/{user_id}")
+def update_user(user_id: str, payload: schemas.UserUpdate, request: Request):
+  _require_admin(request)
+  try:
+    return {"user": auth.update_user(user_id, payload.displayName, payload.role, payload.status)}
+  except KeyError as error:
+    raise HTTPException(404, "用户不存在") from error
+  except auth.UserManagementError as error:
+    raise HTTPException(422, str(error)) from error
+
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+def reset_user_password(user_id: str, payload: schemas.PasswordReset, request: Request):
+  _require_admin(request)
+  try:
+    auth.reset_password(user_id, payload.password)
+  except KeyError as error:
+    raise HTTPException(404, "用户不存在") from error
+  return {"ok": True}
 
 
 @app.get("/api/strategies")

@@ -19,7 +19,7 @@ import type {
 const BASE = '/api';
 
 async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetch(url, { credentials: 'include' });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`API ${res.status}: ${text}`);
@@ -32,6 +32,7 @@ async function sendJson<T>(url: string, method: string, payload: unknown): Promi
     method,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    credentials: 'include',
   });
   if (!res.ok) {
     const text = await res.text();
@@ -42,6 +43,52 @@ async function sendJson<T>(url: string, method: string, payload: unknown): Promi
 
 export async function fetchHealth(): Promise<{ status: string }> {
   return fetchJson(`${BASE}/health`);
+}
+
+export interface SessionUser {
+  id: string;
+  username: string;
+  displayName: string;
+  role: 'admin' | 'user';
+}
+
+export interface ManagedUser extends SessionUser {
+  status: 'active' | 'disabled';
+  createdAt: string;
+  lastLoginAt: string | null;
+}
+
+export async function login(username: string, password: string): Promise<SessionUser> {
+  const data = await sendJson<{ user: SessionUser }>(`${BASE}/auth/login`, 'POST', { username, password });
+  return data.user;
+}
+
+export async function fetchCurrentUser(): Promise<SessionUser> {
+  const data = await fetchJson<{ user: SessionUser }>(`${BASE}/auth/me`);
+  return data.user;
+}
+
+export async function logout(): Promise<void> {
+  await sendJson<{ ok: boolean }>(`${BASE}/auth/logout`, 'POST', {});
+}
+
+export async function fetchUsers(): Promise<ManagedUser[]> {
+  const data = await fetchJson<{ users: ManagedUser[] }>(`${BASE}/admin/users`);
+  return data.users;
+}
+
+export async function createUser(payload: { username: string; displayName: string; password: string; role: string }): Promise<ManagedUser> {
+  const data = await sendJson<{ user: ManagedUser }>(`${BASE}/admin/users`, 'POST', payload);
+  return data.user;
+}
+
+export async function updateUser(userId: string, payload: { displayName: string; role: string; status: string }): Promise<ManagedUser> {
+  const data = await sendJson<{ user: ManagedUser }>(`${BASE}/admin/users/${userId}`, 'PUT', payload);
+  return data.user;
+}
+
+export async function resetUserPassword(userId: string, password: string): Promise<void> {
+  await sendJson<{ ok: boolean }>(`${BASE}/admin/users/${userId}/reset-password`, 'POST', { password });
 }
 
 export async function fetchInstruments(): Promise<InstrumentItem[]> {
@@ -112,6 +159,7 @@ export interface BacktestRunPayload {
   holdingPolicy: 'intraday' | 'overnight';
   isDefault: boolean;
   strategyParams?: Record<string, string | boolean>;
+  runDraft?: boolean;
 }
 
 export async function runBacktest(payload: BacktestRunPayload): Promise<BacktestRunResponse> {
@@ -234,7 +282,7 @@ export async function updateStrategyScript(
 }
 
 export async function deleteStrategyScript(scriptId: string): Promise<boolean> {
-  const data = await fetch(`${BASE}/strategy-scripts/${scriptId}`, { method: 'DELETE' });
+  const data = await fetch(`${BASE}/strategy-scripts/${scriptId}`, { method: 'DELETE', credentials: 'include' });
   if (!data.ok) throw new Error(`API ${data.status}: ${await data.text()}`);
   return (await data.json()).deleted;
 }
@@ -297,7 +345,7 @@ export async function publishStrategyConfig(
 }
 
 export async function deleteStrategyConfig(configId: string): Promise<boolean> {
-  const data = await fetch(`${BASE}/strategy-configs/${configId}`, { method: 'DELETE' });
+  const data = await fetch(`${BASE}/strategy-configs/${configId}`, { method: 'DELETE', credentials: 'include' });
   if (!data.ok) throw new Error(`API ${data.status}: ${await data.text()}`);
   return (await data.json()).deleted;
 }
@@ -413,7 +461,7 @@ export interface SyncResult {
 }
 
 export async function syncKline(symbol: string): Promise<SyncResult> {
-  const res = await fetch(`${BASE}/data/sync?symbol=${symbol}`, { method: 'POST' });
+  const res = await fetch(`${BASE}/data/sync?symbol=${symbol}`, { method: 'POST', credentials: 'include' });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text);

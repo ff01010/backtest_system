@@ -123,22 +123,9 @@ class UserScriptAdapter:
     return backtest_runner.run_user_script_backtest(payload)
 
 
-_ADAPTERS: dict[str, StrategyAdapter] = {
-  "trend_follow": TrendGridAdapter("trend_follow", "趋势跟踪"),
-  "grid_mean_reversion": TrendGridAdapter("grid_mean_reversion", "网格均值回归"),
-  "trend_grid": TrendGridAdapter("trend_grid", "趋势网格组合"),
-  "trend_grid_both": TrendGridAdapter("trend_grid_both", "趋势网格组合"),
-  "midcap_earnings": MidcapEarningsAdapter("midcap_earnings", "中盘盈利增长"),
-  "user_script": UserScriptAdapter(),
-}
+_ADAPTERS: dict[str, StrategyAdapter] = {"user_script": UserScriptAdapter()}
 
-_VISIBLE_STRATEGY_IDS = (
-  "trend_follow",
-  "grid_mean_reversion",
-  "trend_grid",
-  "user_script",
-  "midcap_earnings",
-)
+_VISIBLE_STRATEGY_IDS = ("user_script",)
 
 
 def list_strategy_ids() -> list[str]:
