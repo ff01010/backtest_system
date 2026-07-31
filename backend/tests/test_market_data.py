@@ -1,56 +1,72 @@
 # -*- coding: utf-8 -*-
-"""分钟缓存覆盖状态测试。"""
+"""QMT ClickHouse 行情读取和派生周期测试。"""
 
 from datetime import datetime, timedelta
-from typing import Any
+from zoneinfo import ZoneInfo
 
-from backend.services import eastmoney_client, market_data
+import pandas as pd
+import pytest
 
-
-class _Cursor:
-  def __init__(self) -> None:
-    self.rows: list[tuple[Any, ...]] = []
-
-  def executemany(self, _query: str, rows: list[tuple[Any, ...]]) -> None:
-    self.rows = rows
+from backend.services import market_data
 
 
-def _bars(count: int) -> list[eastmoney_client.MinuteBar]:
-  start = datetime(2026, 7, 27, 9, 30)
-  return [
-    eastmoney_client.MinuteBar(
-      time=start + timedelta(minutes=index), open=10, high=10, low=10, close=10,
-      volume=100, amount=1000,
-    )
-    for index in range(count)
-  ]
+_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
-def test_coverage_marks_complete_and_incomplete_days() -> None:
-  cursor = _Cursor()
-  bars = _bars(240) + [
-    eastmoney_client.MinuteBar(
-      time=datetime(2026, 7, 28, 9, 30), open=10, high=10, low=10, close=10,
-      volume=100, amount=1000,
-    ),
-  ]
+def test_load_bars_reads_qmt_raw_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+  epoch = int(datetime(2026, 7, 30, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
 
-  market_data._update_coverage(
-    cursor, 1, "1m", market_data._date_range("20260727", "20260728"), bars,
-  )
+  def query_rows(query: str) -> list[dict[str, object]]:
+    if "qmt_kline_coverage" in query:
+      return [{"trade_date": "2026-07-30", "status": "complete"}]
+    return [{
+      "qmt_index": "20260730093000", "time": epoch, "open": 10.0, "high": 11.0,
+      "low": 9.0, "close": 10.5, "volume": 100,
+    }]
 
-  assert cursor.rows[0][5:7] == ("complete", 240)
-  assert cursor.rows[1][5:7] == ("incomplete", 1)
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+
+  frame = market_data.load_bars("688981.SH", "1m", "20260730", "20260730")
+
+  assert frame.to_dict("records") == [{
+    "time": "202607300930", "open": 10.0, "high": 11.0,
+    "low": 9.0, "close": 10.5, "volume": 100,
+  }]
 
 
-def test_missing_dates_include_failed_and_incomplete_cache() -> None:
-  dates = market_data._date_range("20260727", "20260730")
-  coverage = {
-    dates[0]: "complete",
-    dates[1]: "empty",
-    dates[2]: "incomplete",
-  }
+def test_incomplete_qmt_coverage_rejects_backtest(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", lambda _: [
+    {"trade_date": "2026-07-30", "status": "partial"},
+  ])
 
-  missing = [item for item in dates if coverage.get(item) not in {"complete", "empty"}]
+  with pytest.raises(market_data.MarketDataError, match="QMT 行情不完整"):
+    market_data.ensure_cached("688981.SH", "1m", "20260730", "20260730")
 
-  assert missing == [dates[2], dates[3]]
+
+def test_15m_aggregation_uses_qmt_right_closed_opening_window() -> None:
+  start = datetime(2026, 7, 30, 9, 30, tzinfo=_TIMEZONE)
+  rows = []
+  for offset in range(16):
+    value = float(offset + 1)
+    timestamp = start + timedelta(minutes=offset)
+    rows.append({
+      "qmt_index": timestamp.strftime("%Y%m%d%H%M00"),
+      "time": int(timestamp.timestamp() * 1000), "open": value, "high": value + 0.1,
+      "low": value - 0.1, "close": value, "volume": 10,
+    })
+
+  frame = market_data._rows_to_frame(rows)
+  result = market_data._aggregate_minutes(frame, 15)
+
+  assert result.to_dict("records") == [{
+    "_bucket": pd.Timestamp("2026-07-30 09:45:00", tz="Asia/Shanghai"),
+    "open": 1.0, "high": 16.1, "low": 0.9, "close": 16.0, "volume": 160,
+    "time": "202607300945",
+  }]
+
+
+def test_invalid_symbol_does_not_reach_clickhouse(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", lambda _: pytest.fail("不应查询 ClickHouse"))
+
+  with pytest.raises(market_data.MarketDataError, match="标的格式无效"):
+    market_data.list_dates("688981.SH' OR 1=1 --", "1m")

@@ -57,3 +57,21 @@ def test_parse_market_instrument_keeps_valid_shenzhen_and_shanghai_stocks() -> N
 
 def test_parse_market_instrument_skips_incomplete_rows() -> None:
   assert eastmoney_client._parse_market_instrument({"f12": "600519", "f13": 1, "f14": ""}) is None
+
+
+def test_fetch_a_share_instruments_reads_all_pages(monkeypatch) -> None:
+  pages = {
+    1: {"data": {"total": 3, "diff": [
+      {"f12": "600519", "f13": 1, "f14": "贵州茅台"},
+      {"f12": "300750", "f13": 0, "f14": "宁德时代"},
+    ]}},
+    2: {"data": {"total": 3, "diff": [
+      {"f12": "430047", "f13": 0, "f14": "诺思兰德"},
+    ]}},
+  }
+
+  monkeypatch.setattr(eastmoney_client, "_fetch_market_directory_page", lambda page, timeout: pages[page])
+
+  items = eastmoney_client.fetch_a_share_instruments()
+
+  assert [item.exchange for item in items] == ["SZ", "BJ", "SH"]

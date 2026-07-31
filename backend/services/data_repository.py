@@ -113,7 +113,7 @@ def list_dates(symbol: str, timeframe: str) -> list[dict[str, Any]]:
       except Exception:
         pass
 
-  # K 线日期从 PostgreSQL 分钟缓存读取。
+  # K 线日期从 ClickHouse 的 QMT 覆盖记录读取。
   all_kline_dates = {item["date"] for item in market_data.list_dates(symbol, timeframe)}
 
   # 合并
@@ -131,7 +131,7 @@ def get_backtest_timeframes(
   start_date: str | None = None,
   end_date: str | None = None,
 ) -> list[dict[str, Any]]:
-  """返回引擎支持周期及 PostgreSQL 缓存覆盖情况。"""
+  """返回引擎支持周期及 QMT 历史数据覆盖情况。"""
   return market_data.timeframe_status(symbol, start_date, end_date)
 
 
@@ -141,7 +141,7 @@ def validate_backtest_coverage(
   start_date: str,
   end_date: str,
 ) -> None:
-  """在回测前按需拉取缺失分钟数据，并拒绝不完整结果。"""
+  """在回测前确认 QMT 历史数据已完整覆盖请求区间。"""
   if not settings.validate_backtest_timeframe(timeframe):
     raise ValueError(f"当前回测引擎不支持 {timeframe}，仅支持 {', '.join(settings.BACKTEST_TIMEFRAMES)}")
   market_data.ensure_cached(symbol, timeframe, start_date, end_date)

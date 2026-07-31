@@ -85,7 +85,7 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
           </div>
         )}
       </div>
-      <span style={{ color: 'var(--text-subtle)', fontSize: 11 }}>无缓存时，首次运行将自动从东财拉取并缓存。</span>
+      <span style={{ color: 'var(--text-subtle)', fontSize: 11 }}>回测只使用已导入的 QMT 历史数据；数据缺失时请联系管理员导入。</span>
     </label>
   );
 }

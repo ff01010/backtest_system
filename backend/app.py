@@ -99,7 +99,7 @@ def _merge_instruments(
 
 
 def _run_sync_script(request: dict) -> dict:
-  """通过东财补齐分钟缓存，兼容旧数据同步 API。"""
+  """检查指定范围的 QMT 历史行情是否已导入。"""
   end_date = request.get("endDate") or datetime.now().strftime("%Y%m%d")
   start_date = request.get("startDate") or (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
   try:
@@ -117,9 +117,9 @@ def _run_sync_script(request: dict) -> dict:
     }
   return {
     "status": "ok", "symbol": request["symbol"], "timeframe": request.get("timeframe", "5m"),
-    "from": start_date, "to": end_date, "new_rows": result["rowCount"],
+    "from": start_date, "to": end_date, "new_rows": 0,
     "new_dates": result["fetchedDates"], "cacheStatus": result["status"],
-    "message": "数据库缓存命中" if result["status"] == "cache_hit" else "东财分钟行情已缓存",
+    "message": "QMT 历史行情已覆盖",
   }
 
 
@@ -219,30 +219,9 @@ _EXPERIMENT_PARAM_KEYS = {
 }
 
 
-def _validate_versioned_script(version: dict) -> None:
-  """优先使用版本内的脚本快照，兼容旧版本的代码指纹校验。"""
-  expected_hash = version.get("paramsJson", {}).get("scriptCodeHash")
-  script_snapshot = version.get("paramsJson", {}).get("scriptSnapshot")
-  if isinstance(script_snapshot, dict) and isinstance(script_snapshot.get("code"), str):
-    snapshot_hash = hashlib.sha256(script_snapshot["code"].encode("utf-8")).hexdigest()
-    if expected_hash and snapshot_hash != expected_hash:
-      raise HTTPException(422, "策略方案保存的代码快照已损坏")
-    return
-  script_id = version.get("scriptId")
-  if not expected_hash or script_id is None:
-    return
-  try:
-    script = state_store.get_strategy_script(str(script_id))
-  except KeyError as error:
-    raise HTTPException(422, "策略方案绑定的脚本不存在") from error
-  actual_hash = hashlib.sha256(script["code"].encode("utf-8")).hexdigest()
-  if actual_hash != expected_hash:
-    raise HTTPException(422, "策略脚本已修改，请保存策略方案生成新版本后再回测")
-
-
-def _validate_versioned_params(request: dict, version: dict) -> None:
-  """只锁定策略语义参数，日期、资金和成本属于本次实验输入。"""
-  saved_params = version.get("paramsJson", {}).get("params", {})
+def _validate_saved_params(request: dict, config: dict) -> None:
+  """策略语义参数必须来自已保存的当前策略。"""
+  saved_params = config.get("paramsJson", {}).get("params", {})
   if not isinstance(saved_params, dict):
     return
   request_params = request.get("strategyParams", {})
@@ -254,11 +233,56 @@ def _validate_versioned_params(request: dict, version: dict) -> None:
     if key not in _EXPERIMENT_PARAM_KEYS and request_params.get(key) != value
   ]
   if mismatches:
-    raise HTTPException(422, f"回测参数必须与方案版本一致：{', '.join(sorted(mismatches))}")
+    raise HTTPException(422, f"策略内容已修改，请先保存策略：{', '.join(sorted(mismatches))}")
+
+
+def _prepare_saved_strategy_snapshot(request: dict) -> None:
+  try:
+    config = state_store.get_strategy_config(str(request["configId"]))
+  except KeyError as error:
+    raise HTTPException(404, "策略不存在") from error
+  script_id = config.get("scriptId")
+  if not script_id:
+    raise HTTPException(422, "策略必须先保存代码")
+  try:
+    script = state_store.get_strategy_script(str(script_id))
+  except KeyError as error:
+    raise HTTPException(422, "策略保存的代码不存在") from error
+  mismatches = []
+  for key, saved_value, request_value in (
+    ("标的", config["symbol"], request["symbol"]),
+    ("周期", config["timeframe"], request["timeframe"]),
+    ("策略", config["strategy"], request["strategy"]),
+    ("基准标的", config.get("benchmarkSymbol") or config["symbol"], request.get("benchmarkSymbol") or request["symbol"]),
+  ):
+    if saved_value != request_value:
+      mismatches.append(key)
+  if config.get("accountId") != request.get("accountId"):
+    mismatches.append("回测账户")
+  if mismatches:
+    raise HTTPException(422, f"策略内容已修改，请先保存策略：{', '.join(mismatches)}")
+  _validate_saved_params(request, config)
+  request["strategy"] = config["strategy"]
+  request["scriptId"] = script["id"]
+  request["configVersionId"] = None
+  request["runDraft"] = False
+  request["versionScriptSnapshot"] = {
+    "id": script["id"], "name": script["name"], "description": script["description"],
+    "code": script["code"], "entryType": script["entryType"],
+    "codeHash": hashlib.sha256(script["code"].encode("utf-8")).hexdigest(),
+  }
+  request["savedScriptSnapshot"] = request["versionScriptSnapshot"]
+  request["savedConfigSnapshot"] = {
+    "name": config["name"], "strategy": config["strategy"], "mode": config["mode"],
+    "symbol": config["symbol"], "timeframe": config["timeframe"],
+    "benchmarkSymbol": config.get("benchmarkSymbol"), "accountId": config.get("accountId"),
+    "params": config.get("paramsJson", {}).get("params", {}),
+    "description": script["description"], "runParams": request.get("strategyParams", {}),
+  }
 
 
 def _validate_backtest_request(request: dict) -> None:
-  """校验回测请求并确认策略方案版本与实际执行内容一致。"""
+  """校验回测请求并确认使用已保存的当前策略。"""
   if not settings.validate_symbol(request["symbol"]):
     raise HTTPException(422, f"非法标的: {request['symbol']}")
   if request.get("benchmarkSymbol") and not settings.validate_symbol(request["benchmarkSymbol"]):
@@ -273,61 +297,22 @@ def _validate_backtest_request(request: dict) -> None:
     raise HTTPException(422, f"不支持的策略: {request['strategy']}")
 
   if not request.get("configId"):
-    raise HTTPException(422, "回测必须选择已保存的策略方案")
-  if request.get("runDraft") and not get_current_user().is_admin:
-    raise HTTPException(403, "只有管理员可以试跑未发布草稿")
-  if request.get("configId") and not request.get("configVersionId"):
-    latest_version = state_store.get_latest_strategy_config_version(str(request["configId"]))
-    if latest_version and not request.get("runDraft"):
-      request["configVersionId"] = latest_version["id"]
-  if request.get("configVersionId"):
-    try:
-      version = state_store.get_strategy_config_version(str(request["configVersionId"]))
-    except KeyError as error:
-      raise HTTPException(404, "策略方案版本不存在") from error
-    if version["timeframe"] != request["timeframe"]:
-      raise HTTPException(422, f"回测周期必须与方案版本一致：{version['timeframe']}")
-    if version["strategy"] != request["strategy"]:
-      raise HTTPException(422, f"回测策略必须与方案版本一致：{version['strategy']}")
-    if version.get("scriptId") != request.get("scriptId"):
-      raise HTTPException(422, "回测脚本必须与方案版本一致")
-    _validate_versioned_params(request, version)
-    _validate_versioned_script(version)
-    script_snapshot = version.get("paramsJson", {}).get("scriptSnapshot")
-    if isinstance(script_snapshot, dict) and isinstance(script_snapshot.get("code"), str):
-      request["versionScriptSnapshot"] = script_snapshot
-  else:
-    if not get_current_user().is_admin:
-      raise HTTPException(422, "策略方案尚未发布，普通用户不能回测")
-    try:
-      draft_config = state_store.get_strategy_config(str(request["configId"]))
-    except KeyError as error:
-      raise HTTPException(404, "策略方案不存在") from error
-    script_id = draft_config.get("scriptId")
-    if not script_id:
-      raise HTTPException(422, "草稿方案必须绑定策略脚本")
-    script = state_store.get_strategy_script(str(script_id))
-    request["strategy"] = draft_config["strategy"]
-    request["scriptId"] = script_id
-    request["draftScriptSnapshot"] = {
-      "id": script["id"], "name": script["name"], "code": script["code"], "entryType": script["entryType"],
-    }
-    request["versionScriptSnapshot"] = request["draftScriptSnapshot"]
-    request["executionKind"] = "draft_test"
+    raise HTTPException(422, "回测必须先选择并保存策略")
+  _prepare_saved_strategy_snapshot(request)
 
   if request["strategy"] != "user_script":
     raise HTTPException(422, "当前仅支持数据库中的用户脚本策略")
 
   try:
+    market_snapshots = {}
     for symbol in {request["symbol"], request.get("benchmarkSymbol") or request["symbol"]}:
-      cache_result = market_data.ensure_cached(
+      market_data.ensure_cached(
         symbol, request["timeframe"], request["startDate"], request["endDate"],
       )
-      state_store.log_data_sync_run({
-        "symbol": symbol, "timeframe": request["timeframe"],
-        "startDate": request["startDate"], "endDate": request["endDate"], "mode": "backtest_auto",
-      }, {"status": "ok", "cacheStatus": cache_result["status"], "new_rows": cache_result["rowCount"],
-          "new_dates": cache_result["fetchedDates"], "message": "回测自动补齐分钟行情"})
+      market_snapshots[symbol] = market_data.snapshot(
+        symbol, request["timeframe"], request["startDate"], request["endDate"],
+      )
+    request["marketDataSnapshot"] = market_snapshots
     data_repository.validate_backtest_coverage(
       request["symbol"], request["timeframe"], request["startDate"], request["endDate"],
     )
