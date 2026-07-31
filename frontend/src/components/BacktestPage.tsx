@@ -570,8 +570,8 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
           entries={[
             { label: '信号规则', value: manifest?.signalModel },
             { label: 'K 线数量', value: manifest?.barCount },
-            { label: '数据范围', value: manifest ? `${manifest.barRange.start} - ${manifest.barRange.end}` : null },
-            { label: '数据周期', value: manifest?.barRange.timeframe },
+            { label: '数据范围', value: manifest?.barRange ? `${manifest.barRange.start} - ${manifest.barRange.end}` : null },
+            { label: '数据周期', value: manifest?.barRange?.timeframe },
             { label: '数据文件', value: dataFiles == null ? null : `${dataFiles} 个` },
             { label: '数据指纹', value: shortenHistoryHash(dataVersion.dataHash ?? manifest?.dataHash) },
           ]}
@@ -1756,6 +1756,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     : activeConfig ? `当前策略：${activeConfig.name}` : '请先新建并保存策略');
   const statusColor = error ? '#b91c1c' : status ? '#0f766e' : '#94a3b8';
   const statusBackground = error ? '#fef2f2' : status ? '#ecfdf5' : '#f8fafc';
+  const resultManifest = result?.experimentManifest;
+  const resultCostModel = resultManifest?.costModel;
   const handleExportTrades = () => {
     downloadCsv(
       `trades_${selectedSymbol}_${params.startDate}_${params.endDate}.csv`,
@@ -2867,13 +2869,13 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     })}
                   </div>
                 )}
-                {result?.experimentManifest && (
+                {resultManifest && (
                   <div style={{ marginTop: 10, padding: '9px 10px', borderRadius: 5, background: '#f1f5f9', color: '#475569', fontSize: 12, lineHeight: 1.65 }}>
                     <div>
-                      回测口径：Bar 收盘信号虚拟成交 · {result.experimentManifest.holdingPolicy === 'overnight' ? '允许跨日' : result.experimentManifest.holdingPolicy === 'intraday' ? '日内平仓' : '期末规则未记录'} · 手续费 {(result.experimentManifest.costModel.commissionRate * 10_000).toFixed(2)} bp · 滑点 {(result.experimentManifest.costModel.slippage * 10_000).toFixed(2)} bp
+                      回测口径：Bar 收盘信号虚拟成交 · {resultManifest.holdingPolicy === 'overnight' ? '允许跨日' : resultManifest.holdingPolicy === 'intraday' ? '日内平仓' : '期末规则未记录'} · {resultCostModel ? `手续费 ${(resultCostModel.commissionRate * 10_000).toFixed(2)} bp · 滑点 ${(resultCostModel.slippage * 10_000).toFixed(2)} bp` : '成本模型未记录'}
                     </div>
                     <div>
-                      实验指纹：{result.experimentManifest.experimentHash.slice(0, 12)} · {result.experimentManifest.barCount} 根 {result.experimentManifest.barRange.timeframe} K 线
+                      实验指纹：{resultManifest.experimentHash?.slice(0, 12) || '未记录'} · {resultManifest.barCount} 根 {resultManifest.barRange?.timeframe || selectedTimeframe} K 线
                     </div>
                   </div>
                 )}
@@ -3171,12 +3173,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                               <div>区间：{selectedHistoryRun.startDate}-{selectedHistoryRun.endDate}</div>
                               <div>状态：{selectedHistoryRun.status}</div>
                             </div>
-                            {selectedHistoryRun.resultJson?.experimentManifest ? (
+                            {selectedHistoryRun.resultJson?.experimentManifest?.experimentHash ? (
                               <div style={{ padding: '8px 10px', borderRadius: 4, background: '#f1f5f9', color: '#475569' }}>
                                 实验指纹：{selectedHistoryRun.resultJson.experimentManifest.experimentHash.slice(0, 12)} · {selectedHistoryRun.resultJson.experimentManifest.barCount} 根 {selectedHistoryRun.resultJson.experimentManifest.barRange.timeframe} K 线
                               </div>
                             ) : (
-                              <div style={{ color: '#b45309' }}>旧记录未保存实验清单，无法完整复现。</div>
+                              <div style={{ color: '#b45309' }}>该记录的实验清单不完整，无法完整复现。</div>
                             )}
                             <HistoryRunSnapshot run={selectedHistoryRun} />
                             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8, marginTop: 4 }}>
