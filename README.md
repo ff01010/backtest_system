@@ -12,7 +12,7 @@
 
 - 回测当前支持 `1m`、`5m`；QMT 还保存 `60m`、`1d` 原始 K 线，`15m`、`30m` 由 `1m` 聚合。
 - 数据按“标的、周期、交易日”记录覆盖状态。未导入或不完整的数据不会用于回测，也不会在回测时联网下载。
-- 策略源码、方案、版本和回测记录按登录用户隔离；普通用户无法读取其他人的数据。
+- 策略源码、方案、版本和回测记录按登录用户隔离；回测展示编号也从每位用户自己的 `#01` 开始递增。
 - 策略代码在无数据库凭据、无宿主机目录挂载的 `strategy-worker` 容器执行；该容器只接收本次脚本快照与 K 线数据。
 - 初始化仅创建管理员 `admin`（初始密码 `123456`）、管理员默认账户，以及管理员策略库中的一条均线示例策略。请首次登录后重置管理员密码。
 
@@ -34,6 +34,8 @@ deploy/        Docker Compose、镜像与 Nginx 配置
 - `003_market_minute_cache.sql`：分钟 K 线缓存与按日覆盖状态。
 - `004_authentication_and_users.sql`：默认管理员与账户查询索引。
 - `005_strategy_runtime.sql`：隔离策略运行标记与管理员示例策略。
+- `006_global_market_instrument_directory.sql`：全市场证券目录与搜索索引。
+- `007_backtest_run_display_number.sql`：按用户递增的回测展示编号与原子计数器。
 
 QMT 原始历史行情位于 ClickHouse 数据库 `raw_historical_data`：
 

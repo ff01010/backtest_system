@@ -497,6 +497,10 @@ function getHistoryRunParam(run: BacktestRunHistory, key: string): unknown {
   return snapshot[key] ?? requestStrategyParams[key] ?? run.paramsJson[key];
 }
 
+function formatRunReference(displayNo: number | null | undefined): string {
+  return `#${String(displayNo ?? 0).padStart(2, '0')}`;
+}
+
 function getHistoryDirectionLabel(run: BacktestRunHistory): string {
   const allowLong = getHistoryRunParam(run, 'allowLong') !== false;
   const allowShort = getHistoryRunParam(run, 'allowShort') !== false;
@@ -1452,14 +1456,14 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         const data = await runLiveStrategy(payload);
         setResult(null);
         refreshBacktestRuns();
-        setStatus(`运行模式已记录 #${data.runId ?? '-'}，${data.message}`);
+        setStatus(`运行模式已记录 ${formatRunReference(data.displayNo)}，${data.message}`);
         return;
       }
       const data = await runBacktest(payload);
       setResult(data);
       refreshDataStatus(selectedSymbol, selectedTimeframe);
       refreshBacktestRuns();
-      setStatus(`回测完成 #${data.runId ?? '-'}，交易 ${data.summary.tradeCount} 笔`);
+      setStatus(`回测完成 ${formatRunReference(data.displayNo)}，交易 ${data.summary.tradeCount} 笔`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '回测失败');
     } finally {
@@ -1738,7 +1742,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     const query = historyQuery.trim().toLowerCase();
     return backtestRuns.filter((run) => {
       const configName = run.configId ? configNameById.get(run.configId) || '' : '';
-      const searchable = [run.id, run.symbol, run.strategy, configName, ...run.tags].join(' ').toLowerCase();
+      const searchable = [run.id, run.displayNo, run.symbol, run.strategy, configName, ...run.tags].join(' ').toLowerCase();
       return (!historySymbolFilter || run.symbol === historySymbolFilter) && (!query || searchable.includes(query));
     });
   }, [backtestRuns, configNameById, historyQuery, historySymbolFilter]);
@@ -1809,7 +1813,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       allowShort: boolValue('allowShort', DEFAULT_PARAMS.allowShort),
       holdingPolicy: textValue('holdingPolicy', DEFAULT_PARAMS.holdingPolicy),
     });
-    setStatus(`已恢复历史回测 #${run.id} 的参数`);
+    setStatus(`已恢复历史回测 ${formatRunReference(run.displayNo)} 的参数`);
   };
 
   const handleViewHistoryResult = (run: BacktestRunHistory) => {
@@ -1820,12 +1824,13 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     setResult({
       ...run.resultJson,
       runId: run.id,
+      displayNo: run.displayNo,
       configId: run.configId,
       configVersionId: run.configVersionId,
       scriptId: run.scriptId,
     });
     setActivePanel('overview');
-    setStatus(`正在查看历史回测 #${run.id} 的结果`);
+    setStatus(`正在查看历史回测 ${formatRunReference(run.displayNo)} 的结果`);
   };
 
   const handleRerunHistory = async (run: BacktestRunHistory) => {
@@ -1860,7 +1865,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       setResult(data);
       await refreshBacktestRuns();
       setActivePanel('overview');
-      setStatus(`已重新运行回测 #${run.id}，新记录为 #${data.runId ?? '-'}`);
+      setStatus(`已重新运行回测 ${formatRunReference(run.displayNo)}，新记录为 ${formatRunReference(data.displayNo)}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '重新运行回测失败');
     } finally {
@@ -1882,7 +1887,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         tags,
       });
       setBacktestRuns((prev) => prev.map((item) => (item.id === run.id ? run : item)));
-      setStatus(`已保存历史记录 #${run.id} 的备注和标签`);
+      setStatus(`已保存历史记录 ${formatRunReference(run.displayNo)} 的备注和标签`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '保存历史备注失败');
     }
@@ -2309,7 +2314,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
                 <div>已保存策略：{strategyConfigs.length}</div>
                 <div>关联脚本：{strategyScripts.length}</div>
-                <div>当前回测：{result ? `#${result.runId ?? '-'}` : '暂无'}</div>
+                <div>当前回测：{result ? formatRunReference(result.displayNo) : '暂无'}</div>
               </div>
               <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
                 日志输出后续会接入回测和运行过程日志；当前先显示策略方案和脚本统计。
@@ -3072,7 +3077,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                           return (
                             <div key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
                               <button onClick={() => setSelectedHistoryRunId(run.id)} style={{ textAlign: 'left', border: 'none', background: 'transparent', padding: 0, color: '#0f172a', cursor: 'pointer', fontWeight: isSelected ? 700 : 500 }}>
-                                #{run.id}
+                                {formatRunReference(run.displayNo)}
                               </button>
                               <span style={{ minWidth: 0 }}>
                                 <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -3406,7 +3411,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     lineHeight: 1.7,
                   }}>
                     <div>输出目录：{result?.outputDir || '--'}</div>
-                    <div>回测记录：{result?.runId ? `#${result.runId}` : '--'}</div>
+                    <div>回测记录：{result?.runId ? formatRunReference(result.displayNo) : '--'}</div>
                     <div>告警数量：{result?.warnings.length || 0}</div>
                     {result && result.warnings.length > 0 ? (
                       result.warnings.map((item) => (

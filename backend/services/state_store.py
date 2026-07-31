@@ -234,6 +234,7 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
   request = _json(row["requested_params"], {})
   return {
     "id": _uuid(row["id"]),
+    "displayNo": int(row["display_no"]),
     "configId": _uuid(row.get("config_id")),
     "configVersionId": _uuid(row.get("config_version_id")),
     "scriptId": _uuid(row.get("strategy_id")) or request.get("scriptId"),
@@ -602,10 +603,24 @@ def _with_script_code_hash(payload: dict[str, Any]) -> dict[str, Any]:
   return normalized
 
 
-def create_backtest_run(payload: dict[str, Any], status: str = "running") -> str:
+def _next_backtest_display_no(cur: Any, owner_user_id: str) -> int:
+  cur.execute("""
+    INSERT INTO user_backtest_counter (owner_user_id, next_display_no)
+    VALUES (%s, 2)
+    ON CONFLICT (owner_user_id) DO UPDATE
+    SET next_display_no = user_backtest_counter.next_display_no + 1
+    RETURNING next_display_no - 1 AS display_no
+  """, (owner_user_id,))
+  row = cur.fetchone()
+  return int(row["display_no"])
+
+
+def create_backtest_run(payload: dict[str, Any], status: str = "running") -> tuple[str, int]:
   config_id = payload.get("configId")
+  owner_user_id = current_user_id()
   with _db() as conn:
     with conn.cursor() as cur:
+      display_no = _next_backtest_display_no(cur, owner_user_id)
       instrument_id = _instrument_id(cur, payload["symbol"])
       benchmark_id = _instrument_id(cur, payload["benchmarkSymbol"]) if payload.get("benchmarkSymbol") else None
       script_snapshot = payload.get("savedScriptSnapshot")
@@ -613,18 +628,19 @@ def create_backtest_run(payload: dict[str, Any], status: str = "running") -> str
       db_status = "running" if status == "running" else "queued"
       cur.execute("""
         INSERT INTO backtest_run (
-          id, owner_user_id, strategy_version_id, status, requested_params, market_data_snapshot,
+          id, owner_user_id, display_no, strategy_version_id, status, requested_params, market_data_snapshot,
           started_at, config_id, config_version_id, account_id, instrument_id,
           benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot, execution_kind
         ) VALUES (
-          gen_random_uuid(), %s, %s, %s, %s, %s,
+          gen_random_uuid(), %s, %s, %s, %s, %s, %s,
           CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-        ) RETURNING id
-      """, (current_user_id(), None, db_status, Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
+        ) RETURNING id, display_no
+      """, (owner_user_id, display_no, None, db_status, Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
              config_id, None, payload.get("accountId"), instrument_id, benchmark_id,
              payload.get("timeframe", "5m"), "bar_close_signal_fill", Jsonb(script_snapshot) if script_snapshot else None,
              Jsonb(params_snapshot), payload.get("executionKind", "published")))
-      return _uuid(cur.fetchone()["id"]) or ""
+      row = cur.fetchone()
+      return _uuid(row["id"]) or "", int(row["display_no"])
 
 
 def _run_query(where: str = "") -> str:
