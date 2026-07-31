@@ -24,8 +24,6 @@ import {
   fetchDataStatus,
   fetchStrategyParameterSchema,
   fetchStrategySource,
-  publishStrategyConfig,
-  fetchStrategyConfigVersions,
   fetchStrategyConfigs,
   fetchStrategyScripts,
   runBacktest,
@@ -235,6 +233,10 @@ export function buildTimeframeAvailabilityCacheKey(
 
 export function isCustomScriptStrategy(strategyId: string): boolean {
   return strategyId === 'user_script';
+}
+
+export function hasSavedStrategyId(strategyId: string): boolean {
+  return strategyId.length > 0;
 }
 
 export function hasEnabledTradeDirection(allowLong: boolean, allowShort: boolean): boolean {
@@ -678,7 +680,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const [selectedTimeframe, setSelectedTimeframe] = useState('5m');
   const [backtestTimeframes, setBacktestTimeframes] = useState<BacktestTimeframeAvailability[]>([]);
   const [selectedBenchmarkSymbol, setSelectedBenchmarkSymbol] = useState(symbol);
-  const [selectedStrategy, setSelectedStrategy] = useState(strategy);
+  const [selectedStrategy, setSelectedStrategy] = useState('user_script');
   const [selectedAccountId, setSelectedAccountId] = useState<number | ''>('');
   const [newAccountName, setNewAccountName] = useState('');
   const [status, setStatus] = useState('');
@@ -710,12 +712,14 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const [historyPageSize, setHistoryPageSize] = useState(10);
   const [historyNoteDraft, setHistoryNoteDraft] = useState('');
   const [historyTagsDraft, setHistoryTagsDraft] = useState('');
-  const [selectedScriptId, setSelectedScriptId] = useState<string | ''>('');
-  const [selectedConfigId, setSelectedConfigId] = useState<string | ''>('');
+  const [selectedScriptId, setSelectedScriptId] = useState<string>('');
+  const [selectedConfigId, setSelectedConfigId] = useState<string>('');
   const [versionDirty, setVersionDirty] = useState(false);
   const [publishedFingerprint, setPublishedFingerprint] = useState('');
   const [configName, setConfigName] = useState('');
   const [scriptForm, setScriptForm] = useState(createEmptyScriptForm());
+  const hasSelectedScript = hasSavedStrategyId(selectedScriptId);
+  const hasSelectedConfig = hasSavedStrategyId(selectedConfigId);
   const [activePanel, setActivePanel] = useState<WorkbenchPanel>('overview');
   const [chartRange, setChartRange] = useState<ChartRange>('all');
   const [showStrategyCurve, setShowStrategyCurve] = useState(true);
@@ -781,33 +785,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   }, []);
 
   useEffect(() => {
-    if (typeof selectedConfigId !== 'string' || !publishedFingerprint) return;
+    if (!hasSelectedConfig || !publishedFingerprint) return;
     setVersionDirty(draftFingerprint !== publishedFingerprint);
   }, [draftFingerprint, publishedFingerprint, selectedConfigId]);
-
-  useEffect(() => {
-    if (typeof selectedConfigId !== 'string' || configVersions.length === 0) return;
-    const latestVersion = configVersions[0];
-    const versionParams = asHistoryRecord(latestVersion.paramsJson.params);
-    const scriptSnapshot = asHistoryRecord(latestVersion.paramsJson.scriptSnapshot);
-    const scriptCode = typeof scriptSnapshot.code === 'string'
-      ? scriptSnapshot.code
-      : strategyScripts.find((item) => item.id === latestVersion.scriptId)?.code;
-    if (typeof scriptCode !== 'string') return;
-    setPublishedFingerprint(buildStrategyDraftFingerprint({
-      strategy: latestVersion.strategy,
-      mode: latestVersion.mode,
-      symbol: latestVersion.symbol,
-      timeframe: latestVersion.timeframe,
-      benchmarkSymbol: latestVersion.benchmarkSymbol || latestVersion.symbol,
-      accountId: latestVersion.accountId || '',
-      params: versionParams,
-      script: {
-        code: scriptCode,
-        entryType: typeof scriptSnapshot.entryType === 'string' ? scriptSnapshot.entryType : 'on_bar',
-      },
-    }));
-  }, [configVersions, selectedConfigId, strategyScripts]);
 
   useEffect(() => {
     refreshDataStatus(selectedSymbol, selectedTimeframe);
@@ -879,11 +859,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   }, [tradeSideFilter, tradePnlFilter, tradePageSize, result]);
 
   useEffect(() => {
-    if (typeof selectedConfigId === 'string') {
-      refreshConfigVersions(selectedConfigId);
-    } else {
-      setConfigVersions([]);
-    }
+    setConfigVersions([]);
   }, [selectedConfigId]);
 
   useEffect(() => {
@@ -962,11 +938,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     setStrategyConfigs(configs);
   };
 
-  const refreshConfigVersions = async (configId: string) => {
-    const versions = await fetchStrategyConfigVersions(configId);
-    setConfigVersions(versions);
-  };
-
   const refreshBacktestRuns = async () => {
     const runs = await fetchBacktestRuns(30);
     setBacktestRuns(runs);
@@ -1037,6 +1008,16 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         code: script.code,
         entryType: script.entryType,
       });
+      setPublishedFingerprint(buildStrategyDraftFingerprint({
+        strategy: config.strategy,
+        mode: config.mode,
+        symbol: config.symbol,
+        timeframe: config.timeframe,
+        benchmarkSymbol: config.benchmarkSymbol || config.symbol,
+        accountId: config.accountId || '',
+        params: savedParams || {},
+        script: { code: script.code, entryType: script.entryType },
+      }));
     }
     setStatus(`已加载策略 ${config.name}`);
     setError('');
@@ -1263,7 +1244,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         code: scriptForm.code,
         entryType: scriptForm.entryType,
       };
-      const script = typeof selectedScriptId === 'string'
+      const script = hasSelectedScript
         ? await updateStrategyScript(selectedScriptId, payload)
         : await createStrategyScript(payload);
       await refreshStrategyAssets();
@@ -1274,8 +1255,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         code: script.code,
         entryType: script.entryType,
       });
-      if (typeof selectedConfigId === 'string') {
-        setStatus(`已保存策略脚本 ${script.name}，请保存策略草稿后发布新版本`);
+      if (hasSelectedConfig) {
+        setStatus(`已保存策略代码 ${script.name}，请继续保存策略配置`);
       } else {
         setStatus(`已保存策略脚本 ${script.name}`);
       }
@@ -1285,7 +1266,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   };
 
   const handleDeleteScript = async () => {
-    if (typeof selectedScriptId !== 'string') return;
+    if (!hasSelectedScript) return;
     setError('');
     setStatus('');
     try {
@@ -1329,7 +1310,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
           ? 'on_bar'
           : (strategySource ? `catalog:${strategySource.id}` : scriptForm.entryType),
       };
-      const savedScript = typeof selectedScriptId === 'string'
+      const savedScript = hasSelectedScript
         ? await updateStrategyScript(selectedScriptId, scriptPayload)
         : await createStrategyScript(scriptPayload);
       const strategyId = isCustomScript ? 'user_script' : selectedStrategy;
@@ -1342,10 +1323,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         publish: false,
       };
       const existingConfig = strategyConfigs.find((item) => item.name === strategyName);
-      const targetConfigId = typeof selectedConfigId === 'string'
+      const targetConfigId = hasSelectedConfig
         ? selectedConfigId
         : existingConfig?.id;
-      const config = typeof targetConfigId === 'string'
+      const config = targetConfigId
         ? await updateStrategyConfig(targetConfigId, payload)
         : await createStrategyConfig(payload);
       await refreshStrategyAssets();
@@ -1359,8 +1340,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         code: savedScript.code,
         entryType: savedScript.entryType,
       });
-      await refreshConfigVersions(config.id);
-      setStatus(`已保存策略草稿 ${config.name}`);
+      setPublishedFingerprint(draftFingerprint);
+      setVersionDirty(false);
+      setStatus(`已保存策略 ${config.name}`);
       return config.id;
     } catch (e) {
       setError(e instanceof Error ? e.message : '保存策略失败');
@@ -1368,25 +1350,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     }
   };
 
-  const handlePublishConfig = async () => {
-    const configId = await handleSaveConfig();
-    if (configId == null) return;
-    setError('');
-    try {
-      const result = await publishStrategyConfig(configId);
-      await Promise.all([refreshStrategyAssets(), refreshConfigVersions(configId)]);
-      setPublishedFingerprint(draftFingerprint);
-      setVersionDirty(false);
-      setStatus(result.created
-        ? `已发布策略版本 v${result.version.versionNo}`
-        : `草稿与 v${result.version.versionNo} 执行内容一致，无需新建版本`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '发布策略版本失败');
-    }
-  };
-
   const handleDeleteConfig = async () => {
-    if (typeof selectedConfigId !== 'string') return;
+    if (!hasSelectedConfig) return;
     setError('');
     setStatus('');
     try {
@@ -1444,17 +1409,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const handleRunBacktest = async () => {
     setError('');
     setStatus('');
-    if (typeof selectedConfigId !== 'string') {
+    if (!hasSelectedConfig) {
       setError('请先选择策略方案，再运行回测');
       return;
     }
-    const runDraft = isAdmin && (versionDirty || configVersions.length === 0);
-    if (versionDirty && !isAdmin) {
-      setError('策略草稿与已发布版本不同，请先发布新版本');
-      return;
-    }
-    if (configVersions.length === 0 && !isAdmin) {
-      setError('策略草稿尚未发布，请先发布首个版本');
+    if (versionDirty) {
+      setError('策略内容已修改，请先保存策略');
       return;
     }
     const validationErrors = validateParams(params);
@@ -1466,9 +1426,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     try {
       const account = accounts.find((item) => item.id === selectedAccountId);
       const payload: BacktestRunPayload = {
-        configId: typeof selectedConfigId === 'string' ? selectedConfigId : null,
+        configId: selectedConfigId || null,
         configVersionId: null,
-        scriptId: typeof selectedScriptId === 'string' ? selectedScriptId : null,
+        scriptId: selectedScriptId || null,
         accountId: typeof selectedAccountId === 'number' ? selectedAccountId : null,
         account: account?.name || 'default',
         mode,
@@ -1486,7 +1446,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         holdingPolicy: params.holdingPolicy === 'overnight' ? 'overnight' : 'intraday',
         isDefault: false,
         strategyParams: params,
-        runDraft,
+        runDraft: false,
       };
       if (mode === 'live') {
         const data = await runLiveStrategy(payload);
@@ -1528,7 +1488,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     if (loading) return { tone: 'info', text: `正在检查${label} ${selectedTimeframe} K 线覆盖...` };
     if (statusError) return { tone: 'warn', text: `${label}数据状态读取失败：${statusError}` };
     if (!statusData || !statusData.exists) {
-      return { tone: 'ok', text: `${label} ${selectedTimeframe} 尚未缓存，首次回测将自动从东财拉取` };
+      return { tone: 'warn', text: `${label} ${selectedTimeframe} 尚未导入 QMT 历史数据` };
     }
     if (!isValidDate(params.startDate) || !isValidDate(params.endDate)) {
       return { tone: 'warn', text: '日期格式正确后再检查数据覆盖' };
@@ -1790,14 +1750,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const historyRangeEnd = Math.min(historyPageStart + historyPageSize, filteredHistoryRuns.length);
   const historyGridColumns = 'minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 74px';
   const activePanelLabel = resultTabs.find((item) => item.id === activePanel)?.label || '概览';
-  const hasPublishedVersion = configVersions.length > 0;
-  const draftRunAllowed = isAdmin && (versionDirty || !hasPublishedVersion);
-  const runDisabled = running || typeof selectedConfigId !== 'string' || (!hasPublishedVersion && !isAdmin) || (versionDirty && !isAdmin);
+  const runDisabled = running || !hasSelectedConfig || versionDirty;
   const statusMessage = error || status || (versionDirty
-    ? (isAdmin ? '管理员将以草稿快照试跑；结果会标注 draft_test。' : '策略草稿与已发布版本不同，请发布新版本后运行')
-    : !hasPublishedVersion
-      ? (isAdmin ? '管理员可试跑未发布草稿；结果会标注 draft_test。' : '策略草稿尚未发布，不能运行回测')
-    : activeConfig ? `策略方案：${activeConfig.name}` : '当前策略方案未保存');
+    ? '策略内容已修改，请先保存策略后运行回测。'
+    : activeConfig ? `当前策略：${activeConfig.name}` : '请先新建并保存策略');
   const statusColor = error ? '#b91c1c' : status ? '#0f766e' : '#94a3b8';
   const statusBackground = error ? '#fef2f2' : status ? '#ecfdf5' : '#f8fafc';
   const handleExportTrades = () => {
@@ -1937,10 +1893,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       background: '#eef3f8',
       color: '#0f172a',
       display: 'grid',
-      gridTemplateRows: '52px minmax(0, 1fr)',
+      gridTemplateRows: activePanel === 'overview' ? '52px minmax(0, 1fr)' : 'minmax(0, 1fr)',
       overflow: 'hidden',
     }}>
-      <header style={{
+      {activePanel === 'overview' && <header style={{
         display: 'grid',
         gridTemplateColumns: 'minmax(260px, 1fr) auto auto',
         alignItems: 'center',
@@ -2017,12 +1973,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         <button
           onClick={handleRunBacktest}
           disabled={runDisabled}
-          title={typeof selectedConfigId !== 'string'
+          title={!hasSelectedConfig
             ? '请先选择策略方案'
             : versionDirty
-              ? '请先发布新版本'
-              : !hasPublishedVersion
-                ? '请先发布首个版本'
+              ? '请先保存策略'
               : !runPreflightReady
                 ? '请等待运行前检查通过'
                 : undefined}
@@ -2044,9 +1998,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
           }}
         >
           <Play size={15} />
-          {running ? '处理中...' : typeof selectedConfigId !== 'string' ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
+          {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
         </button>
-      </header>
+      </header>}
 
       <div style={{
         minHeight: 0,
@@ -2123,7 +2077,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                   <input value={params.slippage} onChange={(e) => setParam('slippage', e.target.value)} style={fieldStyle} />
                 </label>
                 <div style={{ borderTop: '1px solid #e2e8f0', paddingTop: 10, color: '#64748b', fontSize: 12, lineHeight: 1.55 }}>
-                  策略方向：{params.allowLong ? '允许做多' : '不做多'} · {params.allowShort ? '允许做空' : '不做空'}；请在“策略代码”页面修改并保存新版本。
+                  策略方向：{params.allowLong ? '允许做多' : '不做多'} · {params.allowShort ? '允许做空' : '不做空'}；请在“策略管理”中修改并保存策略。
                 </div>
                 {['trend_follow', 'grid_mean_reversion', 'trend_grid', 'trend_grid_both'].includes(selectedStrategy) && (
                   <div style={{ borderTop: '1px solid #e2e8f0', paddingTop: 10 }}>
@@ -2158,11 +2112,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                 <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.65, marginTop: 8 }}>
                   {activeConfig
                     ? versionDirty
-                      ? '策略草稿与已发布版本不同；发布新版本后才能运行。'
-                      : !hasPublishedVersion
-                        ? '策略草稿尚未发布；发布首个版本后才能运行。'
-                      : `将使用策略方案「${activeConfig.name}」及其当前版本。`
-                    : '当前为临时实验；运行后可从历史记录恢复参数。'}
+                      ? '策略内容已修改；请先保存策略后运行。'
+                      : `将使用已保存策略「${activeConfig.name}」。`
+                    : '请先在策略管理中创建并保存策略。'}
                 </div>
                 {mode === 'live' && (
                   <div style={{ color: '#b45309', fontSize: 12, lineHeight: 1.65, marginTop: 8 }}>
@@ -2442,10 +2394,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     lineHeight: 1.55,
                   }}>
                     {versionDirty
-                      ? '当前草稿与已发布版本不同；发布新版本后才能运行。'
-                      : configVersions[0]
-                        ? `当前已保存版本：v${configVersions[0].versionNo}`
-                        : '当前为草稿；发布后会生成首个策略版本。'}
+                      ? '策略内容已修改，请先保存后再运行回测。'
+                      : hasSelectedConfig
+                        ? '当前策略内容已保存，可直接运行回测。'
+                        : '新建策略保存后即可运行回测。'}
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}>
                     <button
@@ -2477,44 +2429,26 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       }}
                     >
                       <Save size={14} />
-                      保存草稿
-                    </button>
-                    <button
-                      onClick={handlePublishConfig}
-                      style={{
-                        height: 34,
-                        borderRadius: 4,
-                        border: '1px solid #1d4ed8',
-                        background: '#dbeafe',
-                        color: '#1d4ed8',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        gap: 6,
-                        cursor: 'pointer',
-                      }}
-                    >
-                      <Save size={14} />
-                      发布新版本
+                      保存策略
                     </button>
                     <button
                       onClick={handleDeleteConfig}
-                      disabled={typeof selectedConfigId !== 'string'}
+                      disabled={!hasSelectedConfig}
                       style={{
                         height: 34,
                         borderRadius: 4,
                         border: '1px solid #cbd5e1',
                         background: '#ffffff',
                         color: '#64748b',
-                        cursor: typeof selectedConfigId === 'string' ? 'pointer' : 'not-allowed',
-                        opacity: typeof selectedConfigId === 'string' ? 1 : 0.55,
+                        cursor: hasSelectedConfig ? 'pointer' : 'not-allowed',
+                        opacity: hasSelectedConfig ? 1 : 0.55,
                       }}
                     >
                       删除策略
                     </button>
                   </div>
                   <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
-                    保存会同时更新代码和参数。历史版本仍会保留，可在回测历史里回溯。
+                    保存会同时更新代码和参数。每次回测会保存当时快照，可在历史回测中回溯。
                   </div>
                 </section>
 
@@ -2534,7 +2468,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       </div>
                       <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
                         {selectedStrategy === 'user_script'
-                          ? '保存代码后，需保存策略方案生成版本才可回测'
+                          ? '编辑完成后点击左侧“保存策略”，保存后即可回测'
                           : (strategySource ? `代码指纹：${strategySource.codeHash.slice(0, 12)}` : '正在读取代码快照')}
                       </div>
                     </div>
@@ -2567,15 +2501,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                         <span style={{ color: '#64748b', fontSize: 12 }}>
                           接口：on_bar(bar, state)；每根已完成的 {selectedTimeframe} K 线触发，按收盘价成交；支持导入后端已安装模块。
                         </span>
-                        <button
-                          onClick={handleSaveScript}
-                          style={{
-                            height: 34, padding: '0 14px', borderRadius: 4, border: '1px solid #0f766e',
-                            background: '#ccfbf1', color: '#0f766e', cursor: 'pointer', fontWeight: 700,
-                          }}
-                        >
-                          保存代码
-                        </button>
+                        <span style={{ color: '#64748b', fontSize: 12 }}>代码将随“保存策略”一并保存。</span>
                       </div>
                     </div>
                   ) : (
@@ -2613,7 +2539,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     >
                       {backtestTimeframes.map((item) => (
                         <option key={item.timeframe} value={item.timeframe}>
-                          {item.timeframe}{item.available ? '（已缓存）' : '（首次运行自动拉取）'}
+                          {item.timeframe}{item.available ? '（QMT 数据已导入）' : '（QMT 数据未覆盖）'}
                         </option>
                       ))}
                     </select>
@@ -2709,9 +2635,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       gap: 6,
                       cursor: runDisabled ? 'not-allowed' : 'pointer',
                       opacity: runDisabled ? 0.7 : 1,
-                    }} onClick={handleRunBacktest} disabled={runDisabled} title={versionDirty ? '请先发布新版本' : !hasPublishedVersion ? '请先发布首个版本' : !runPreflightReady ? '请等待运行前检查通过' : undefined}>
+                    }} onClick={handleRunBacktest} disabled={runDisabled} title={versionDirty ? '请先保存策略' : !hasSelectedConfig ? '请先保存策略' : !runPreflightReady ? '请等待运行前检查通过' : undefined}>
                       <Play size={14} />
-                      {running ? '处理中...' : typeof selectedConfigId !== 'string' ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
+                      {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
                     </button>
                     <button style={{
                       width: 38,
@@ -2743,7 +2669,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     {activePanel === 'params' && '当前参数位于左侧，可随策略一起保存'}
                     {activePanel === 'trades' && '单笔信号记录与后续字段筛选'}
                     {activePanel === 'positions' && '每日持仓与收益快照待接入'}
-                    {activePanel === 'history' && '回测记录、版本和结果追溯'}
+                    {activePanel === 'history' && '回测记录与结果快照追溯'}
                     {activePanel === 'logs' && '回测与运行日志待接入'}
                   </div>
                 </div>
@@ -3085,7 +3011,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                         历史回测
                       </div>
                       <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
-                        每次回测会保存参数快照，并关联当时的策略版本。
+                        每次回测会保存代码、参数与行情数据快照。
                       </div>
                     </div>
                     <button
@@ -3129,7 +3055,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     <div style={{ minWidth: 0 }}>
                       <div style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', padding: '0 10px 8px' }}>
                         <span>ID</span>
-                        <span>方案/版本</span>
+                        <span>策略</span>
                         <span>标的/基准</span>
                         <span>区间</span>
                         <span>收益</span>
@@ -3151,7 +3077,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                                   {run.configId ? (configNameById.get(run.configId) || `方案 ${run.configId}`) : '未绑定方案'}
                                 </div>
                                 <div style={{ color: '#64748b', marginTop: 2 }}>
-                                  {run.configVersionId ? `version #${run.configVersionId}` : '无版本'}
+                                  {run.configId ? '已保存策略快照' : '未关联策略'}
                                 </div>
                               </span>
                               <span>
@@ -3237,7 +3163,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, color: '#334155', fontSize: 12, lineHeight: 1.6 }}>
                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                               <div>方案：{selectedHistoryRun.configId ? (configNameById.get(selectedHistoryRun.configId) || `方案 ${selectedHistoryRun.configId}`) : '未绑定'}</div>
-                              <div>版本：{selectedHistoryRun.configVersionId ? `#${selectedHistoryRun.configVersionId}` : '--'}</div>
+                              <div>策略快照：{selectedHistoryRun.scriptSnapshot ? '已保存' : '--'}</div>
                               <div>脚本：{selectedHistoryRun.scriptId ?? '--'}</div>
                               <div>标的：{selectedHistoryRun.symbol}</div>
                               <div>运行周期：{selectedHistoryRun.timeframe || '5m'} K 线</div>
@@ -3688,7 +3614,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                 ))}
               </select>
               <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.45, marginTop: 5 }}>
-                决定本方案实际执行的策略；保存后将写入方案版本。
+                决定本策略实际执行的代码；保存后可直接运行回测。
               </div>
             </label>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -3703,12 +3629,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               </button>
               <button
                 onClick={handleDeleteConfig}
-                disabled={typeof selectedConfigId !== 'string'}
+                disabled={!hasSelectedConfig}
                 style={{
                   height: 32, borderRadius: 4, border: '1px solid #cbd5e1',
                   background: '#f8fafc', color: '#64748b',
-                  cursor: typeof selectedConfigId === 'string' ? 'pointer' : 'not-allowed',
-                  opacity: typeof selectedConfigId === 'string' ? 1 : 0.55,
+                  cursor: hasSelectedConfig ? 'pointer' : 'not-allowed',
+                  opacity: hasSelectedConfig ? 1 : 0.55,
                 }}
               >
                 删除策略
@@ -3733,7 +3659,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                 style={fieldStyle}
               >
                 {selectedScriptId === '' && (
-                  <option value="" disabled>新建策略草稿（未保存）</option>
+                  <option value="" disabled>新建策略（未保存）</option>
                 )}
                 {strategyScripts.map((item) => (
                   <option key={item.id} value={item.id}>
@@ -3763,12 +3689,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               </button>
               <button
                 onClick={handleDeleteConfig}
-                disabled={typeof selectedConfigId !== 'string'}
+                disabled={!hasSelectedConfig}
                 style={{
                   height: 32, borderRadius: 4, border: '1px solid #cbd5e1',
                   background: '#f8fafc', color: '#64748b',
-                  cursor: typeof selectedConfigId === 'string' ? 'pointer' : 'not-allowed',
-                  opacity: typeof selectedConfigId === 'string' ? 1 : 0.55,
+                  cursor: hasSelectedConfig ? 'pointer' : 'not-allowed',
+                  opacity: hasSelectedConfig ? 1 : 0.55,
                 }}
               >
                 删除

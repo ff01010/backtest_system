@@ -236,7 +236,7 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
     "id": _uuid(row["id"]),
     "configId": _uuid(row.get("config_id")),
     "configVersionId": _uuid(row.get("config_version_id")),
-    "scriptId": _uuid(row.get("strategy_id")),
+    "scriptId": _uuid(row.get("strategy_id")) or request.get("scriptId"),
     "accountId": int(row["account_id"]) if row.get("account_id") is not None else None,
     "symbol": row.get("symbol") or request.get("symbol", ""),
     "timeframe": row.get("timeframe") or request.get("timeframe", "5m"),
@@ -388,12 +388,20 @@ def update_strategy_script(script_id: str, payload: dict[str, Any]) -> dict[str,
       row = cur.fetchone()
       if not row:
         raise KeyError(script_id)
-      next_version = int(row["current_version_no"]) + 1
       cur.execute("""
-        UPDATE user_strategy SET name=%s, description=%s, current_version_no=%s, updated_at=now()
+        UPDATE user_strategy SET name=%s, description=%s, updated_at=now()
         WHERE id=%s AND owner_user_id=%s
-      """, (payload["name"], payload.get("description", ""), next_version, script_id, current_user_id()))
-      _insert_script_version(cur, script_id, next_version, payload)
+      """, (payload["name"], payload.get("description", ""), script_id, current_user_id()))
+      cur.execute("""
+        UPDATE user_strategy_version SET source_code=%s, source_checksum=%s, runtime_config=%s
+        WHERE strategy_id=%s AND version_no=%s
+      """, (
+        payload["code"], hashlib.sha256(payload["code"].encode("utf-8")).hexdigest(),
+        Jsonb({"entryType": payload.get("entryType", "on_bar"), "status": "active"}),
+        script_id, int(row["current_version_no"]),
+      ))
+      if cur.rowcount == 0:
+        _insert_script_version(cur, script_id, int(row["current_version_no"]), payload)
   return get_strategy_script(script_id)
 
 
@@ -463,7 +471,7 @@ def _write_config(cur: Any, config_id: str | None, payload: dict[str, Any]) -> s
       INSERT INTO strategy_config (
         owner_user_id, name, strategy_id, strategy_key, mode, instrument_id, timeframe,
         benchmark_instrument_id, account_id, params, enabled, published
-      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,false) RETURNING id
+      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true) RETURNING id
     """, (current_user_id(), payload["name"], payload.get("scriptId"), payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
            payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True)))
@@ -471,7 +479,7 @@ def _write_config(cur: Any, config_id: str | None, payload: dict[str, Any]) -> s
     cur.execute("""
       UPDATE strategy_config SET name=%s, strategy_id=%s, strategy_key=%s, mode=%s,
         instrument_id=%s, timeframe=%s, benchmark_instrument_id=%s, account_id=%s, params=%s,
-        enabled=%s, published=false, updated_at=now() WHERE id=%s AND owner_user_id=%s RETURNING id
+        enabled=%s, published=true, updated_at=now() WHERE id=%s AND owner_user_id=%s RETURNING id
     """, (payload["name"], payload.get("scriptId"), payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
            payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True),
@@ -596,18 +604,12 @@ def _with_script_code_hash(payload: dict[str, Any]) -> dict[str, Any]:
 
 def create_backtest_run(payload: dict[str, Any], status: str = "running") -> str:
   config_id = payload.get("configId")
-  version_id = payload.get("configVersionId")
-  if config_id and not version_id:
-    latest = get_latest_strategy_config_version(str(config_id))
-    version_id = latest["id"] if latest else None
-  version = get_strategy_config_version(str(version_id)) if version_id else None
   with _db() as conn:
     with conn.cursor() as cur:
       instrument_id = _instrument_id(cur, payload["symbol"])
       benchmark_id = _instrument_id(cur, payload["benchmarkSymbol"]) if payload.get("benchmarkSymbol") else None
-      strategy_version_id = version and version["paramsJson"].get("strategyVersionId")
-      script_snapshot = (version and version["paramsJson"].get("scriptSnapshot")) or payload.get("draftScriptSnapshot")
-      params_snapshot = version and version["paramsJson"]
+      script_snapshot = payload.get("savedScriptSnapshot")
+      params_snapshot = payload.get("savedConfigSnapshot", {})
       db_status = "running" if status == "running" else "queued"
       cur.execute("""
         INSERT INTO backtest_run (
@@ -615,13 +617,13 @@ def create_backtest_run(payload: dict[str, Any], status: str = "running") -> str
           started_at, config_id, config_version_id, account_id, instrument_id,
           benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot, execution_kind
         ) VALUES (
-          gen_random_uuid(), %s, %s, %s, %s, '{}'::jsonb,
+          gen_random_uuid(), %s, %s, %s, %s, %s,
           CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         ) RETURNING id
-      """, (current_user_id(), strategy_version_id, db_status, Jsonb(payload), db_status,
-             config_id, version_id, payload.get("accountId"), instrument_id, benchmark_id,
+      """, (current_user_id(), None, db_status, Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
+             config_id, None, payload.get("accountId"), instrument_id, benchmark_id,
              payload.get("timeframe", "5m"), "bar_close_signal_fill", Jsonb(script_snapshot) if script_snapshot else None,
-             Jsonb(params_snapshot) if params_snapshot else Jsonb({}), payload.get("executionKind", "published")))
+             Jsonb(params_snapshot), payload.get("executionKind", "published")))
       return _uuid(cur.fetchone()["id"]) or ""
 
 

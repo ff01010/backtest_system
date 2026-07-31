@@ -127,11 +127,11 @@ export default function Toolbar({
         5m
       </span>
 
-      {/* Sync K-line data */}
+      {/* Check K-line coverage */}
       <button
         onClick={onSync}
         disabled={syncing}
-        title="同步 K 线数据"
+        title="检查 QMT K 线覆盖"
         style={{
           background: 'var(--surface-muted)', color: syncing ? 'var(--warning)' : 'var(--text-muted)',
           border: '1px solid var(--border-strong)', borderRadius: '4px',
@@ -140,7 +140,7 @@ export default function Toolbar({
         }}
       >
         <DownloadCloud size={14} style={syncing ? { animation: 'pulse 0.6s ease-in-out infinite' } : undefined} />
-        {syncing ? '同步中...' : '同步'}
+        {syncing ? '检查中...' : '检查覆盖'}
       </button>
 
       {/* Refresh */}

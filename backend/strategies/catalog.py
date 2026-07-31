@@ -51,10 +51,7 @@ def _create_trend_strategy(
 
 
 def _trend_grid_sources() -> tuple[str, ...]:
-  return (
-    str(Path(__file__).with_name("trend_grid.py")),
-    str(_trend_grid_root() / "engine.py"),
-  )
+  return (str(Path(__file__).with_name("trend_grid.py")),)
 
 
 _TREND_FOLLOW = StrategyDefinition(
