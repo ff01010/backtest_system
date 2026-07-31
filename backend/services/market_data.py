@@ -1,272 +1,265 @@
-# -*- coding: utf-8 -*-
-"""分钟行情缓存、覆盖检查和 PostgreSQL 读取服务。"""
+"""QMT 原始历史行情的 ClickHouse 读取、覆盖检查和周期聚合服务。"""
 
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import date, datetime, timedelta
 import hashlib
+import math
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-from psycopg.types.json import Jsonb
 
 from backend import settings
-from backend.services import eastmoney_client, state_store
+from backend.services import clickhouse_client
 
-_EXPECTED_BARS = {"1m": 240, "5m": 48}
-_ADJUSTMENT = "none"
-_SOURCE = "eastmoney"
+
+_DATABASE = "raw_historical_data"
+_DIRECT_PERIODS = {"1m", "5m", "60m", "1d"}
+_DERIVED_PERIODS = {"15m": 15, "30m": 30}
+_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class MarketDataError(ValueError):
-  """行情缓存未就绪或上游数据不可用。"""
+  """QMT 行情未导入、未覆盖或数据结构无效。"""
 
 
 def ensure_cached(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:
-  """确保所需日期已缓存，只有缺失日期会访问东财。"""
-  _validate_request(timeframe, start_date, end_date)
-  with state_store._db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{symbol}:{timeframe}",))
-      instrument_id = state_store._instrument_id(cur, symbol)
-      dates = _date_range(start_date, end_date)
-      covered = _coverage_status(cur, instrument_id, timeframe, dates)
-      missing = [
-        item for item in dates
-        if covered.get(item) not in {"complete", "empty"}
-      ]
-      if not missing:
-        _log_fetch(cur, instrument_id, timeframe, start_date, end_date, "cache_hit", 0, None)
-        return {"status": "cache_hit", "fetchedDates": [], "rowCount": 0}
-      try:
-        bars = eastmoney_client.fetch_minute_bars(symbol, timeframe, start_date, end_date)
-      except eastmoney_client.EastmoneyError as error:
-        _mark_failed(cur, instrument_id, timeframe, missing, str(error))
-        _log_fetch(cur, instrument_id, timeframe, start_date, end_date, "failed", 0, str(error))
-        raise MarketDataError(str(error)) from error
-      inserted = _upsert_bars(cur, instrument_id, timeframe, bars)
-      _update_coverage(cur, instrument_id, timeframe, missing, bars)
-      _log_fetch(cur, instrument_id, timeframe, start_date, end_date, "fetched", inserted, None)
+  """兼容旧调用方：QMT 数据只检查覆盖，不在回测时联网抓取。"""
   _require_complete(symbol, timeframe, start_date, end_date)
-  return {"status": "fetched", "fetchedDates": [item.strftime("%Y%m%d") for item in missing], "rowCount": inserted}
+  return {"status": "qmt_available", "fetchedDates": [], "rowCount": 0}
 
 
 def load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
-  """从 PostgreSQL 读取已验证的分钟 K 线。"""
+  """从 ClickHouse 读取 QMT 原始 K 线，必要时由 1 分钟线派生周期。"""
   _require_complete(symbol, timeframe, start_date, end_date)
-  with state_store._db() as conn:
-    with conn.cursor() as cur:
-      instrument_id = state_store._instrument_id(cur, symbol)
-      cur.execute("""
-        SELECT bar_time, open, high, low, close, volume
-        FROM market_minute_bar
-        WHERE instrument_id=%s AND period=%s AND adjustment=%s
-          AND trade_date BETWEEN %s AND %s
-        ORDER BY bar_time
-      """, (instrument_id, timeframe, _ADJUSTMENT, _date(start_date), _date(end_date)))
-      rows = cur.fetchall()
-  if not rows:
-    raise MarketDataError(f"{symbol} {timeframe} 区间内无可用分钟行情")
-  return pd.DataFrame([{
-    "time": row["bar_time"].strftime("%Y%m%d%H%M"),
-    "open": float(row["open"]), "high": float(row["high"]),
-    "low": float(row["low"]), "close": float(row["close"]),
-    "volume": float(row["volume"] or 0),
-  } for row in rows])
+  source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
+  rows = _query_kline_rows(symbol, source_period, start_date, end_date)
+  frame = _rows_to_frame(rows)
+  if timeframe in _DERIVED_PERIODS:
+    frame = _aggregate_minutes(frame, _DERIVED_PERIODS[timeframe])
+  if frame.empty:
+    raise MarketDataError(f"{symbol} {timeframe} 区间内无可用 QMT 行情")
+  return frame[["time", "open", "high", "low", "close", "volume"]]
 
 
 def timeframe_status(symbol: str, start_date: str | None, end_date: str | None) -> list[dict[str, Any]]:
-  """返回回测周期的缓存状态，不触发上游行情请求。"""
+  """返回回测可用周期与 QMT 覆盖情况，不触发任何上游请求。"""
   items: list[dict[str, Any]] = []
   for timeframe in settings.BACKTEST_TIMEFRAMES:
     if not start_date or not end_date:
-      items.append({"timeframe": timeframe, "available": False, "reason": "请选择回测日期", "dataStart": None, "dataEnd": None})
+      items.append(_unavailable_timeframe(timeframe, "请选择回测日期"))
       continue
     items.append(_cached_timeframe_status(symbol, timeframe, start_date, end_date))
   return items
 
 
 def list_dates(symbol: str, timeframe: str) -> list[dict[str, Any]]:
-  with state_store._db() as conn:
-    with conn.cursor() as cur:
-      instrument_id = state_store._instrument_id(cur, symbol)
-      cur.execute("""
-        SELECT DISTINCT trade_date FROM market_minute_bar
-        WHERE instrument_id=%s AND period=%s AND adjustment=%s ORDER BY trade_date DESC
-      """, (instrument_id, timeframe, _ADJUSTMENT))
-      return [{"date": row["trade_date"].strftime("%Y%m%d"), "hasKline": True, "hasSignal": False} for row in cur.fetchall()]
+  """返回已经导入且覆盖完整的 QMT 交易日。"""
+  _validate_symbol(symbol)
+  source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
+  query = f"""
+    SELECT trade_date
+    FROM {_DATABASE}.qmt_kline_coverage FINAL
+    WHERE symbol = '{symbol}' AND period = '{source_period}' AND status = 'complete'
+    ORDER BY trade_date DESC
+  """
+  try:
+    rows = clickhouse_client.query_rows(query)
+  except clickhouse_client.ClickHouseError as error:
+    raise MarketDataError(str(error)) from error
+  return [{"date": str(row["trade_date"]).replace("-", ""), "hasKline": True, "hasSignal": False} for row in rows]
 
 
 def status(symbol: str, timeframe: str, preview_limit: int = 20) -> dict[str, Any]:
-  """返回数据管理页所需的数据库缓存状态。"""
-  if timeframe not in _EXPECTED_BARS:
-    raise MarketDataError(f"不支持分钟周期: {timeframe}")
-  with state_store._db() as conn:
-    with conn.cursor() as cur:
-      instrument_id = state_store._instrument_id(cur, symbol)
-      cur.execute("""
-        SELECT min(trade_date) AS first_date, max(trade_date) AS last_date, count(*) AS bar_count,
-               max(cached_at) AS cached_at
-        FROM market_minute_bar
-        WHERE instrument_id=%s AND period=%s AND adjustment=%s
-      """, (instrument_id, timeframe, _ADJUSTMENT))
-      summary = cur.fetchone()
-      cur.execute("""
-        SELECT bar_time, open, high, low, close, volume FROM market_minute_bar
-        WHERE instrument_id=%s AND period=%s AND adjustment=%s
-        ORDER BY bar_time DESC LIMIT %s
-      """, (instrument_id, timeframe, _ADJUSTMENT, preview_limit))
-      preview = [{
-        "time": row["bar_time"].strftime("%Y%m%d%H%M"), "open": float(row["open"]),
-        "high": float(row["high"]), "low": float(row["low"]), "close": float(row["close"]),
-        "volume": float(row["volume"] or 0),
-      } for row in cur.fetchall()]
-      cur.execute("""
-        SELECT trade_date, bar_count, message FROM market_minute_coverage
-        WHERE instrument_id=%s AND period=%s AND adjustment=%s AND status IN ('incomplete', 'failed')
-        ORDER BY trade_date DESC
-      """, (instrument_id, timeframe, _ADJUSTMENT))
-      gaps = [{"date": row["trade_date"].strftime("%Y%m%d"), "barCount": int(row["bar_count"]), "expected": _EXPECTED_BARS[timeframe], "missing": max(_EXPECTED_BARS[timeframe] - int(row["bar_count"]), 0), "message": row["message"]} for row in cur.fetchall()]
+  """返回数据管理页所需的 QMT 数据概览。"""
+  _validate_request(timeframe, "20000101", "20991231")
+  _validate_symbol(symbol)
+  source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
+  query = f"""
+    SELECT min(trade_date) AS first_date, max(trade_date) AS last_date,
+           sum(valid_row_count) AS bar_count, max(updated_at) AS updated_at
+    FROM {_DATABASE}.qmt_kline_coverage FINAL
+    WHERE symbol = '{symbol}' AND period = '{source_period}' AND status = 'complete'
+  """
+  try:
+    summary = clickhouse_client.query_rows(query)[0]
+    preview = _query_preview(symbol, source_period, preview_limit)
+  except (IndexError, clickhouse_client.ClickHouseError) as error:
+    raise MarketDataError(f"读取 QMT 数据状态失败: {error}") from error
   return {
-    "symbol": symbol, "timeframe": timeframe, "path": "postgresql://market_minute_bar",
-    "exists": bool(summary["bar_count"]), "firstDate": summary["first_date"].strftime("%Y%m%d") if summary["first_date"] else None,
-    "lastDate": summary["last_date"].strftime("%Y%m%d") if summary["last_date"] else None,
-    "barCount": int(summary["bar_count"]), "fileSize": 0,
-    "mtime": str(summary["cached_at"] or "") or None, "duplicateCount": 0,
-    "nonTradingCount": 0, "expectedBarsPerDay": _EXPECTED_BARS[timeframe],
-    "gapDates": gaps, "preview": preview,
+    "symbol": symbol, "timeframe": timeframe, "path": f"clickhouse://{_DATABASE}.qmt_kline",
+    "exists": int(summary.get("bar_count") or 0) > 0, "firstDate": _compact_date(summary.get("first_date")),
+    "lastDate": _compact_date(summary.get("last_date")), "barCount": int(summary.get("bar_count") or 0),
+    "fileSize": 0, "mtime": str(summary.get("updated_at") or "") or None, "duplicateCount": 0,
+    "nonTradingCount": 0, "expectedBarsPerDay": None, "gapDates": [], "preview": preview,
   }
 
 
 def snapshot(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:
-  with state_store._db() as conn:
-    with conn.cursor() as cur:
-      instrument_id = state_store._instrument_id(cur, symbol)
-      cur.execute("""
-        SELECT count(*) AS count, min(bar_time) AS first_time, max(bar_time) AS last_time,
-               max(cached_at) AS cached_at
-        FROM market_minute_bar
-        WHERE instrument_id=%s AND period=%s AND adjustment=%s
-          AND trade_date BETWEEN %s AND %s
-      """, (instrument_id, timeframe, _ADJUSTMENT, _date(start_date), _date(end_date)))
-      row = cur.fetchone()
-  identity = {"symbol": symbol, "timeframe": timeframe, "startDate": start_date, "endDate": end_date, "barCount": int(row["count"]), "lastCachedAt": str(row["cached_at"] or "")}
+  """返回回测数据快照标识，记录读取的数据范围和最新导入时间。"""
+  _require_complete(symbol, timeframe, start_date, end_date)
+  source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
+  query = f"""
+    SELECT sum(valid_row_count) AS bar_count, min(first_bar_time) AS first_time,
+           max(last_bar_time) AS last_time, max(updated_at) AS updated_at
+    FROM {_DATABASE}.qmt_kline_coverage FINAL
+    WHERE symbol = '{symbol}' AND period = '{source_period}'
+      AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
+      AND status = 'complete'
+  """
+  try:
+    row = clickhouse_client.query_rows(query)[0]
+  except (IndexError, clickhouse_client.ClickHouseError) as error:
+    raise MarketDataError(f"读取 QMT 数据快照失败: {error}") from error
+  identity = {
+    "symbol": symbol, "timeframe": timeframe, "sourcePeriod": source_period,
+    "startDate": start_date, "endDate": end_date, "barCount": int(row.get("bar_count") or 0),
+    "lastImportedAt": str(row.get("updated_at") or ""),
+  }
   identity["hash"] = hashlib.sha256(repr(sorted(identity.items())).encode("utf-8")).hexdigest()
   return identity
 
 
 def _require_complete(symbol: str, timeframe: str, start_date: str, end_date: str) -> None:
   _validate_request(timeframe, start_date, end_date)
-  with state_store._db() as conn:
-    with conn.cursor() as cur:
-      instrument_id = state_store._instrument_id(cur, symbol)
-      dates = _date_range(start_date, end_date)
-      statuses = _coverage_status(cur, instrument_id, timeframe, dates)
-  invalid = [item.strftime("%Y%m%d") for item in dates if statuses.get(item) in {"incomplete", "failed"}]
+  statuses = _coverage_status(symbol, timeframe, start_date, end_date)
+  invalid = [item["date"] for item in statuses if item["status"] != "complete"]
   if invalid:
-    raise MarketDataError(f"{symbol} {timeframe} 行情不完整: {', '.join(invalid)}")
+    raise MarketDataError(f"{symbol} {timeframe} QMT 行情不完整: {', '.join(invalid)}")
+  if not statuses:
+    raise MarketDataError(f"{symbol} {timeframe} 区间内未导入 QMT 行情")
+  if start_date < statuses[0]["date"] or end_date > statuses[-1]["date"]:
+    raise MarketDataError(
+      f"{symbol} {timeframe} QMT 覆盖仅到 {statuses[0]['date']}-{statuses[-1]['date']}"
+    )
 
 
 def _cached_timeframe_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:
-  """检查缓存状态，缺失数据保持可运行以便回测时按需拉取。"""
-  with state_store._db() as conn:
-    with conn.cursor() as cur:
-      instrument_id = state_store._instrument_id(cur, symbol)
-      dates = _date_range(start_date, end_date)
-      statuses = _coverage_status(cur, instrument_id, timeframe, dates)
-      cur.execute("""
-        SELECT min(trade_date) AS first_date, max(trade_date) AS last_date
-        FROM market_minute_bar
-        WHERE instrument_id=%s AND period=%s AND adjustment=%s
-          AND trade_date BETWEEN %s AND %s
-      """, (instrument_id, timeframe, _ADJUSTMENT, dates[0], dates[-1]))
-      row = cur.fetchone()
-  invalid = [item.strftime("%Y%m%d") for item, status in statuses.items() if status in {"incomplete", "failed"}]
+  try:
+    statuses = _coverage_status(symbol, timeframe, start_date, end_date)
+  except MarketDataError as error:
+    return _unavailable_timeframe(timeframe, str(error))
+  invalid = [item["date"] for item in statuses if item["status"] != "complete"]
   if invalid:
-    return {"timeframe": timeframe, "available": True, "reason": f"将重试补齐: {', '.join(invalid)}", "dataStart": None, "dataEnd": None}
-  if len(statuses) == len(dates):
-    return {
-      "timeframe": timeframe, "available": True, "reason": "数据库缓存可用",
-      "dataStart": row["first_date"].strftime("%Y%m%d") if row["first_date"] else None,
-      "dataEnd": row["last_date"].strftime("%Y%m%d") if row["last_date"] else None,
-    }
-  return {"timeframe": timeframe, "available": True, "reason": "首次回测时将自动拉取东财分钟行情", "dataStart": None, "dataEnd": None}
+    return _unavailable_timeframe(timeframe, f"QMT 数据不完整: {', '.join(invalid)}")
+  if not statuses:
+    return _unavailable_timeframe(timeframe, "未导入该标的的 QMT 行情")
+  reason = "由 QMT 1 分钟数据聚合" if timeframe in _DERIVED_PERIODS else "QMT 原始数据可用"
+  return {"timeframe": timeframe, "available": True, "reason": reason, "dataStart": statuses[0]["date"], "dataEnd": statuses[-1]["date"]}
 
 
-def _coverage_status(cur: Any, instrument_id: int, timeframe: str, dates: list[date]) -> dict[date, str]:
-  cur.execute("""
-    SELECT trade_date, status FROM market_minute_coverage
-    WHERE instrument_id=%s AND period=%s AND adjustment=%s AND source=%s
-      AND trade_date BETWEEN %s AND %s
-  """, (instrument_id, timeframe, _ADJUSTMENT, _SOURCE, dates[0], dates[-1]))
-  return {row["trade_date"]: row["status"] for row in cur.fetchall()}
+def _coverage_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> list[dict[str, str]]:
+  _validate_symbol(symbol)
+  source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
+  query = f"""
+    SELECT trade_date, status
+    FROM {_DATABASE}.qmt_kline_coverage FINAL
+    WHERE symbol = '{symbol}' AND period = '{source_period}'
+      AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
+    ORDER BY trade_date
+  """
+  try:
+    rows = clickhouse_client.query_rows(query)
+  except clickhouse_client.ClickHouseError as error:
+    raise MarketDataError(str(error)) from error
+  return [{"date": _compact_date(row["trade_date"]) or "", "status": str(row["status"])} for row in rows]
 
 
-def _upsert_bars(cur: Any, instrument_id: int, timeframe: str, bars: list[eastmoney_client.MinuteBar]) -> int:
-  if not bars:
-    return 0
-  rows = [(instrument_id, timeframe, _ADJUSTMENT, item.time, item.time.date(), item.open, item.high, item.low, item.close, item.volume, item.amount, _SOURCE) for item in bars]
-  cur.executemany("""
-    INSERT INTO market_minute_bar (
-      instrument_id, period, adjustment, bar_time, trade_date, open, high, low, close, volume, amount, source
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    ON CONFLICT (instrument_id, period, adjustment, bar_time) DO UPDATE SET
-      open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close,
-      volume=EXCLUDED.volume, amount=EXCLUDED.amount, source=EXCLUDED.source, cached_at=now()
-  """, rows)
-  return len(rows)
+def _query_kline_rows(symbol: str, period: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
+  _validate_symbol(symbol)
+  start_time, end_time = _epoch_range(start_date, end_date)
+  query = f"""
+    SELECT qmt_index, time, open, high, low, close, volume
+    FROM {_DATABASE}.qmt_kline FINAL
+    WHERE symbol = '{symbol}' AND period = '{period}' AND time BETWEEN {start_time} AND {end_time}
+    ORDER BY time
+  """
+  try:
+    return clickhouse_client.query_rows(query)
+  except clickhouse_client.ClickHouseError as error:
+    raise MarketDataError(str(error)) from error
 
 
-def _update_coverage(cur: Any, instrument_id: int, timeframe: str, dates: list[date], bars: list[eastmoney_client.MinuteBar]) -> None:
-  grouped: dict[date, list[eastmoney_client.MinuteBar]] = defaultdict(list)
-  for bar in bars:
-    grouped[bar.time.date()].append(bar)
-  expected = _EXPECTED_BARS[timeframe]
-  rows = []
-  for item in dates:
-    count = len(grouped[item])
-    status = "complete" if count == expected else "empty" if count == 0 else "incomplete"
-    rows.append((instrument_id, timeframe, _ADJUSTMENT, item, _SOURCE, status, count, None if status == "complete" else f"预期 {expected} 根，实际 {count} 根"))
-  cur.executemany("""
-    INSERT INTO market_minute_coverage (
-      instrument_id, period, adjustment, trade_date, source, status, bar_count, message
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-    ON CONFLICT (instrument_id, period, adjustment, trade_date, source) DO UPDATE SET
-      status=EXCLUDED.status, bar_count=EXCLUDED.bar_count, message=EXCLUDED.message,
-      last_verified_at=now(), updated_at=now()
-  """, rows)
+def _query_preview(symbol: str, period: str, limit: int) -> list[dict[str, Any]]:
+  _validate_symbol(symbol)
+  query = f"""
+    SELECT qmt_index, time, open, high, low, close, volume
+    FROM {_DATABASE}.qmt_kline FINAL
+    WHERE symbol = '{symbol}' AND period = '{period}' ORDER BY time DESC LIMIT {max(1, min(limit, 200))}
+  """
+  rows = clickhouse_client.query_rows(query)
+  return [_row_preview(row) for row in rows]
 
 
-def _mark_failed(cur: Any, instrument_id: int, timeframe: str, dates: list[date], message: str) -> None:
-  cur.executemany("""
-    INSERT INTO market_minute_coverage (instrument_id, period, adjustment, trade_date, source, status, message)
-    VALUES (%s,%s,%s,%s,%s,'failed',%s)
-    ON CONFLICT (instrument_id, period, adjustment, trade_date, source) DO UPDATE SET
-      status='failed', message=EXCLUDED.message, last_verified_at=now(), updated_at=now()
-  """, [(instrument_id, timeframe, _ADJUSTMENT, item, _SOURCE, message) for item in dates])
+def _rows_to_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
+  frame = pd.DataFrame(rows)
+  if frame.empty:
+    return frame
+  frame["_timestamp"] = pd.to_datetime(frame["time"].astype("int64"), unit="ms", utc=True).dt.tz_convert(_TIMEZONE)
+  for column in ("open", "high", "low", "close", "volume"):
+    frame[column] = pd.to_numeric(frame[column])
+  frame["time"] = frame["_timestamp"].dt.strftime("%Y%m%d%H%M")
+  return frame
 
 
-def _log_fetch(cur: Any, instrument_id: int, timeframe: str, start_date: str, end_date: str, outcome: str, row_count: int, error: str | None) -> None:
-  cur.execute("""
-    INSERT INTO market_fetch_log (
-      instrument_id, requested_by_user_id, period, adjustment, source, requested_from,
-      requested_to, outcome, row_count, error_message, finished_at, details
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s)
-  """, (instrument_id, settings.DEFAULT_USER_ID, timeframe, _ADJUSTMENT, _SOURCE, _date(start_date), _date(end_date), outcome, row_count, error, Jsonb({"provider": _SOURCE})))
+def _aggregate_minutes(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
+  if frame.empty:
+    return frame
+  frame = frame.copy()
+  frame["_bucket"] = frame["_timestamp"].map(lambda item: _period_end(item.to_pydatetime(), minutes))
+  grouped = frame.groupby("_bucket", sort=True)
+  result = grouped.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).reset_index()
+  result["time"] = result["_bucket"].dt.strftime("%Y%m%d%H%M")
+  return result
+
+
+def _period_end(value: datetime, minutes: int) -> datetime:
+  morning = value.replace(hour=9, minute=30, second=0, microsecond=0)
+  afternoon = value.replace(hour=13, minute=0, second=0, microsecond=0)
+  session_start = morning if morning <= value <= value.replace(hour=11, minute=30, second=0, microsecond=0) else afternoon
+  offset = int((value - session_start).total_seconds() // 60)
+  bucket_count = max(1, math.ceil(offset / minutes))
+  return session_start + timedelta(minutes=bucket_count * minutes)
+
+
+def _row_preview(row: dict[str, Any]) -> dict[str, Any]:
+  timestamp = datetime.fromtimestamp(int(row["time"]) / 1000, tz=_TIMEZONE)
+  return {
+    "time": timestamp.strftime("%Y%m%d%H%M"), "open": float(row["open"]),
+    "high": float(row["high"]), "low": float(row["low"]), "close": float(row["close"]),
+    "volume": float(row["volume"]),
+  }
 
 
 def _validate_request(timeframe: str, start_date: str, end_date: str) -> None:
-  if timeframe not in _EXPECTED_BARS:
-    raise MarketDataError(f"当前回测仅支持分钟周期: {', '.join(_EXPECTED_BARS)}")
+  supported = _DIRECT_PERIODS | set(_DERIVED_PERIODS)
+  if timeframe not in supported:
+    raise MarketDataError(f"QMT 数据暂不支持周期: {timeframe}")
   if not settings.validate_date(start_date) or not settings.validate_date(end_date) or start_date > end_date:
-    raise MarketDataError("分钟行情日期范围无效")
+    raise MarketDataError("行情日期范围无效")
 
 
-def _date(value: str) -> date:
-  return datetime.strptime(value, "%Y%m%d").date()
+def _validate_symbol(symbol: str) -> None:
+  if not settings.validate_symbol(symbol):
+    raise MarketDataError(f"标的格式无效: {symbol}")
 
 
-def _date_range(start_date: str, end_date: str) -> list[date]:
-  start, end = _date(start_date), _date(end_date)
-  return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
+def _epoch_range(start_date: str, end_date: str) -> tuple[int, int]:
+  start = datetime.strptime(start_date, "%Y%m%d").replace(tzinfo=_TIMEZONE)
+  end = datetime.strptime(end_date, "%Y%m%d").replace(hour=23, minute=59, second=59, microsecond=999000, tzinfo=_TIMEZONE)
+  return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
+def _date_sql(value: str) -> str:
+  return datetime.strptime(value, "%Y%m%d").strftime("%Y-%m-%d")
+
+
+def _compact_date(value: Any) -> str | None:
+  if value is None:
+    return None
+  return str(value).replace("-", "")
+
+
+def _unavailable_timeframe(timeframe: str, reason: str) -> dict[str, Any]:
+  return {"timeframe": timeframe, "available": False, "reason": reason, "dataStart": None, "dataEnd": None}

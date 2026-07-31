@@ -147,14 +147,18 @@ def test_strategy_config_uses_backend_generated_code_hash(monkeypatch: pytest.Mo
   ).hexdigest()
 
 
-def test_backtest_version_rejects_changed_locked_params(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backtest_requires_saved_strategy_params(monkeypatch: pytest.MonkeyPatch) -> None:
   code = "def on_bar(bar, state):\n  return []\n"
-  code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
-  version = {
+  config = {
     "id": "00000000-0000-0000-0000-000000000007",
+    "name": "测试策略",
     "timeframe": "5m",
     "strategy": "user_script",
     "scriptId": "00000000-0000-0000-0000-000000000011",
+    "mode": "backtest",
+    "symbol": "000001.SZ",
+    "benchmarkSymbol": "000001.SZ",
+    "accountId": None,
     "paramsJson": {
       "params": {
         "allowLong": False,
@@ -162,13 +166,15 @@ def test_backtest_version_rejects_changed_locked_params(monkeypatch: pytest.Monk
         "holdingPolicy": "intraday",
         "window": "20",
       },
-      "scriptCodeHash": code_hash,
     },
   }
-  monkeypatch.setattr(api_app.state_store, "get_latest_strategy_config_version", lambda _: version)
-  monkeypatch.setattr(api_app.state_store, "get_strategy_config_version", lambda _: version)
-  monkeypatch.setattr(api_app.state_store, "get_strategy_script", lambda _: {"code": code})
+  monkeypatch.setattr(api_app.state_store, "get_strategy_config", lambda _: config)
+  monkeypatch.setattr(api_app.state_store, "get_strategy_script", lambda _: {
+    "id": config["scriptId"], "name": "测试策略", "description": "测试说明",
+    "code": code, "entryType": "on_bar",
+  })
   monkeypatch.setattr(api_app.market_data, "ensure_cached", lambda *_: {"status": "cache_hit", "rowCount": 0, "fetchedDates": []})
+  monkeypatch.setattr(api_app.market_data, "snapshot", lambda *args: {"hash": args[0]})
   monkeypatch.setattr(api_app.state_store, "log_data_sync_run", lambda *_: 1)
   monkeypatch.setattr(api_app.data_repository, "validate_backtest_coverage", lambda *args: None)
   request = {
@@ -193,7 +199,9 @@ def test_backtest_version_rejects_changed_locked_params(monkeypatch: pytest.Monk
   }
 
   api_app._validate_backtest_request(request)
-  assert request["configVersionId"] == "00000000-0000-0000-0000-000000000007"
+  assert request["configVersionId"] is None
+  assert request["savedScriptSnapshot"]["code"] == code
+  assert request["savedConfigSnapshot"]["name"] == "测试策略"
 
   request["strategyParams"]["window"] = "10"
   with pytest.raises(HTTPException, match="window"):

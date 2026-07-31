@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -62,15 +63,27 @@ def fetch_minute_bars(
   }
   url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{urlencode(params)}"
   request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-  try:
-    with urlopen(request, timeout=timeout_seconds) as response:
-      payload = json.loads(response.read().decode("utf-8"))
-  except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
-    raise EastmoneyError(f"东财分钟行情请求失败: {error}") from error
+  payload = _fetch_minute_payload(request, timeout_seconds)
   rows = payload.get("data", {}).get("klines")
   if rows is None:
     raise EastmoneyError("东财分钟行情响应缺少 kline 数据")
   return _parse_rows(rows, start_date, end_date)
+
+
+def _fetch_minute_payload(request: Request, timeout_seconds: int) -> dict[str, Any]:
+  last_error: Exception | None = None
+  for attempt in range(3):
+    try:
+      with urlopen(request, timeout=timeout_seconds) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+      if not isinstance(payload, dict):
+        raise EastmoneyError("东财分钟行情响应格式无效")
+      return payload
+    except (HTTPError, URLError, OSError, TimeoutError, json.JSONDecodeError) as error:
+      last_error = error
+      if attempt < 2:
+        time.sleep(attempt + 1)
+  raise EastmoneyError(f"东财分钟行情请求失败: {last_error}") from last_error
 
 
 def fetch_a_share_instruments(timeout_seconds: int = 20) -> list[MarketInstrument]:

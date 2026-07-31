@@ -34,7 +34,7 @@ def get_kline_path(symbol: str, timeframe: str) -> str:
 
 
 def get_status(symbol: str, timeframe: str = "5m", preview_limit: int = 20) -> dict[str, Any]:
-  """返回 PostgreSQL 分钟缓存状态。"""
+  """返回 ClickHouse 中 QMT 历史数据状态。"""
   return market_data.status(symbol, timeframe, preview_limit)
 
 

@@ -117,11 +117,11 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
     setStatus('');
     try {
       const result = await runDataSync(syncPayload(selectedSymbol));
-      setStatus(`${result.symbol} ${result.status}，新增 ${result.new_rows} 行`);
+      setStatus(`${result.symbol} QMT 数据覆盖检查${result.status === 'ok' ? '通过' : '失败'}`);
       await refreshStatuses([selectedSymbol]);
       await refreshRuns();
     } catch (e) {
-      setError(e instanceof Error ? e.message : '同步失败');
+      setError(e instanceof Error ? e.message : '覆盖检查失败');
     } finally {
       setSyncing(false);
     }
@@ -151,15 +151,15 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
         mode,
       });
       setActiveTask(task);
-      setStatus(`后台同步任务已启动：${task.id.slice(0, 8)}`);
+      setStatus(`后台覆盖检查任务已启动：${task.id.slice(0, 8)}`);
       const done = await waitTask(task.id);
       const results = done.results;
       const ok = results.filter((item) => item.status !== 'error').length;
-      setStatus(`批量同步完成：${ok}/${results.length} 成功`);
+      setStatus(`批量覆盖检查完成：${ok}/${results.length} 通过`);
       await refreshStatuses(selectedSymbols);
       await refreshRuns();
     } catch (e) {
-      setError(e instanceof Error ? e.message : '批量同步失败');
+      setError(e instanceof Error ? e.message : '批量覆盖检查失败');
     } finally {
       setSyncing(false);
     }
@@ -177,13 +177,13 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
         dates: selectedStatus.gapDates.map((item) => item.date),
       });
       setActiveTask(task);
-      setStatus(`缺口补齐任务已启动：${task.id.slice(0, 8)}`);
+      setStatus(`缺口覆盖检查任务已启动：${task.id.slice(0, 8)}`);
       await waitTask(task.id);
       await refreshStatuses([selectedSymbol]);
       await refreshRuns();
-      setStatus('缺口补齐完成');
+      setStatus('缺口覆盖检查完成');
     } catch (e) {
-      setError(e instanceof Error ? e.message : '缺口补齐失败');
+      setError(e instanceof Error ? e.message : '缺口覆盖检查失败');
     } finally {
       setSyncing(false);
     }
@@ -230,7 +230,7 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
               </select>
             </label>
             <label>
-              <div style={labelStyle}>同步模式</div>
+              <div style={labelStyle}>检查模式</div>
               <select value={mode} onChange={(e) => setMode(e.target.value as 'incremental' | 'range')} style={fieldStyle}>
                 <option value="incremental">增量</option>
                 <option value="range">覆盖区间</option>
@@ -252,7 +252,7 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={handleSyncOne} disabled={syncing} style={primaryButtonStyle}>
               <DownloadCloud size={14} />
-              {syncing ? '同步中...' : '同步当前'}
+              {syncing ? '检查中...' : '检查当前覆盖'}
             </button>
             <button
               onClick={() => refreshStatuses(enabledInstruments.map((item) => item.symbol))}
@@ -265,7 +265,7 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
           </div>
 
           <button onClick={handleSyncBatch} disabled={syncing || selectedSymbols.length === 0} style={secondaryButtonStyle}>
-            批量同步已选 {selectedSymbols.length}
+            批量检查已选 {selectedSymbols.length}
           </button>
 
           <button
@@ -273,7 +273,7 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
             disabled={syncing || !selectedStatus || selectedStatus.gapDates.length === 0}
             style={secondaryButtonStyle}
           >
-            补齐当前缺口 {selectedStatus?.gapDates.length || 0}
+            检查当前缺口 {selectedStatus?.gapDates.length || 0}
           </button>
 
           {activeTask && (
@@ -407,7 +407,7 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
 
           <div style={{ ...panelStyle, padding: 14 }}>
             <div style={{ color: 'var(--text)', fontSize: typography.lg, fontWeight: 700, marginBottom: 12 }}>
-              最近同步
+              最近覆盖检查
             </div>
             {runs.length > 0 ? runs.map((run) => (
               <div key={run.id} style={{
@@ -431,7 +431,7 @@ export default function DataPage({ symbol, instruments, onInstrumentsChange }: P
               </div>
             )) : (
               <div style={{ color: 'var(--text-muted)', fontSize: 13, padding: '12px 0' }}>
-                暂无同步记录
+                暂无覆盖检查记录
               </div>
             )}
           </div>

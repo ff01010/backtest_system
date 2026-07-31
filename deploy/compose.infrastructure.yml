@@ -72,6 +72,9 @@ services:
       TREND_GRID_SIGNAL_ROOT: /data/signals
       TREND_GRID_OUTPUT_ROOT: /runtime/artifacts
       TREND_GRID_STRATEGY_WORKER_URL: http://strategy-worker:8001
+      TREND_GRID_CLICKHOUSE_HTTP_URL: ${TREND_GRID_CLICKHOUSE_HTTP_URL:-}
+      TREND_GRID_CLICKHOUSE_USER: ${TREND_GRID_CLICKHOUSE_USER:-default}
+      TREND_GRID_CLICKHOUSE_PASSWORD: ${TREND_GRID_CLICKHOUSE_PASSWORD:-}
     depends_on:
       postgres:
         condition: service_healthy

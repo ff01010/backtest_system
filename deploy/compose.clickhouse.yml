@@ -1,0 +1,11 @@
+services:
+  backend:
+    networks:
+      - quant-backtest-net
+      - quant-backtest-worker-net
+      - quant-platform-net
+
+networks:
+  quant-platform-net:
+    external: true
+    name: quant-net
