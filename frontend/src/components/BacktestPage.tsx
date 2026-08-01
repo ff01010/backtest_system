@@ -2244,6 +2244,38 @@ export default function BacktestPage({
             </div>
           )}
 
+          {activePanel === 'code' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
+                <div style={{ color: '#0f172a', fontWeight: 700, marginBottom: 6 }}>
+                  {isCustomScriptStrategy(selectedStrategy) ? '当前自定义脚本' : '实际运行代码'}
+                </div>
+                {isCustomScriptStrategy(selectedStrategy) ? (
+                  <>
+                    <div>{scriptForm.name || '尚未命名的策略脚本'}</div>
+                    <div style={{ marginTop: 8 }}>策略方案版本会保存这份代码快照与参数；请在“策略管理”中编辑代码并保存生成版本。</div>
+                    <textarea
+                      value={scriptForm.code}
+                      readOnly
+                      spellCheck={false}
+                      style={{
+                        width: '100%', minHeight: 420, resize: 'vertical', marginTop: 10, background: '#f8fafc',
+                        color: '#334155', border: '1px solid #d7dde8', borderRadius: 6, padding: 14,
+                        fontSize: 13, lineHeight: 1.55, fontFamily: 'Consolas, monospace', outline: 'none',
+                      }}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <div>{strategySource?.name || '当前策略未提供代码快照'}</div>
+                    {strategySource && <div style={{ marginTop: 5 }}>版本指纹：{strategySource.codeHash.slice(0, 12)}</div>}
+                    <div style={{ marginTop: 8 }}>策略方案会保存这份代码的快照与参数；代码修改需在实际策略文件中完成。</div>
+                    {strategySourceError && <div style={{ color: '#b91c1c', marginTop: 8 }}>{strategySourceError}</div>}
+                  </>
+                )}
+              </div>
+            </div>
+          )}
           {false && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>

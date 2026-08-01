@@ -19,7 +19,7 @@ describe('BacktestTabs', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '交易详情' }));
 
-    expect(screen.getByRole('navigation', { name: '回测结果导航' })).toBeTruthy();
+    expect(screen.getByRole('navigation', { name: '回测工作台导航' })).toBeTruthy();
     expect(onChange).toHaveBeenCalledWith('trades');
   });
 });
