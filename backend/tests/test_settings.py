@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from backend import settings
-from backend.services import data_manager, data_repository
+from backend.services import data_repository
 from backend.services import state_store
 
 
@@ -54,14 +54,6 @@ def test_backtest_timeframe_availability_uses_database_cache(monkeypatch: pytest
   assert items[1]["timeframe"] == "5m"
   assert items[1]["available"] is False
   data_repository.validate_backtest_coverage("688981.SH", "1m", "20260727", "20260727")
-
-
-def test_data_manager_uses_same_timeframe_path_layout(tmp_path: Path, monkeypatch) -> None:
-  monkeypatch.setattr(settings, "KLINE_ROOT", str(tmp_path))
-
-  path = data_manager.get_kline_path("688981.SH", "1m")
-
-  assert path == str(tmp_path / "1m" / "688981_SH" / "688981_SH_1m.csv")
 
 
 def test_backtest_run_insert_has_matching_placeholder_count() -> None:

@@ -69,6 +69,27 @@ export interface ChartResponse {
   dataFreshness: DataFreshness;
 }
 
+export interface BacktestChartTrade {
+  id: string;
+  executionTime: string;
+  signalTime: string;
+  action: 'buy_open' | 'sell_close' | 'sell_open' | 'buy_close' | 'buy' | 'sell';
+  side: 'BUY' | 'SELL';
+  price: number;
+  quantity: number;
+  note: string;
+}
+
+export interface BacktestChartResponse {
+  runId: string;
+  displayNo: number;
+  symbol: string;
+  timeframe: string;
+  date: string;
+  bars: BarData[];
+  trades: BacktestChartTrade[];
+}
+
 export interface InstrumentItem {
   symbol: string;
   name?: string | null;
@@ -346,43 +367,4 @@ export interface DataStatus {
   gapDates: DataGapDate[];
   preview: KlinePreviewRow[];
   error?: string;
-}
-
-export interface DataSyncResult {
-  status: string;
-  symbol: string;
-  timeframe: string;
-  from: string;
-  to: string;
-  new_rows: number;
-  new_dates: string[];
-  message?: string;
-}
-
-export interface DataSyncRun {
-  id: number;
-  symbol: string;
-  timeframe: string;
-  sourceTimeframe: string;
-  startDate: string;
-  endDate: string;
-  mode: string;
-  status: string;
-  newRows: number;
-  newDates: string[];
-  outputPath: string;
-  elapsedMs: number;
-  message: string;
-  createdAt: string;
-}
-
-export interface DataSyncTask {
-  id: string;
-  status: 'queued' | 'running' | 'ok' | 'partial_error' | 'error' | string;
-  request: Record<string, unknown>;
-  results: DataSyncResult[];
-  error: string;
-  createdAt: string;
-  startedAt: string | null;
-  finishedAt: string | null;
 }

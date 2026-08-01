@@ -175,7 +175,6 @@ def test_backtest_requires_saved_strategy_params(monkeypatch: pytest.MonkeyPatch
   })
   monkeypatch.setattr(api_app.market_data, "ensure_cached", lambda *_: {"status": "cache_hit", "rowCount": 0, "fetchedDates": []})
   monkeypatch.setattr(api_app.market_data, "snapshot", lambda *args: {"hash": args[0]})
-  monkeypatch.setattr(api_app.state_store, "log_data_sync_run", lambda *_: 1)
   monkeypatch.setattr(api_app.data_repository, "validate_backtest_coverage", lambda *args: None)
   request = {
     "configId": "00000000-0000-0000-0000-000000000003",

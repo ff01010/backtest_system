@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """东财分钟数据适配器测试。"""
 
+from http.client import RemoteDisconnected
+
 from backend.services import eastmoney_client
 
 
@@ -75,3 +77,32 @@ def test_fetch_a_share_instruments_reads_all_pages(monkeypatch) -> None:
   items = eastmoney_client.fetch_a_share_instruments()
 
   assert [item.exchange for item in items] == ["SZ", "BJ", "SH"]
+
+
+def test_market_directory_request_retries_after_connection_drop(monkeypatch) -> None:
+  attempts = 0
+
+  class Response:
+    def __enter__(self) -> "Response":
+      return self
+
+    def __exit__(self, *_args: object) -> None:
+      return None
+
+    def read(self) -> bytes:
+      return b'{"data": {"total": 0, "diff": []}}'
+
+  def fake_urlopen(*_args: object, **_kwargs: object) -> Response:
+    nonlocal attempts
+    attempts += 1
+    if attempts < 3:
+      raise RemoteDisconnected("temporary disconnect")
+    return Response()
+
+  monkeypatch.setattr(eastmoney_client, "urlopen", fake_urlopen)
+  monkeypatch.setattr(eastmoney_client.time, "sleep", lambda _seconds: None)
+
+  payload = eastmoney_client._fetch_json("https://example.test", 1)
+
+  assert payload["data"]["total"] == 0
+  assert attempts == 3

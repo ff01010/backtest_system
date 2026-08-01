@@ -7,23 +7,29 @@
 }
 
 :root {
-  --canvas: #f4f7f9;
+  --canvas: #f7f8fa;
   --surface: #ffffff;
-  --surface-muted: #f7f9fb;
-  --surface-accent: #e8f5f2;
-  --text: #14263a;
-  --text-muted: #64748b;
-  --text-subtle: #8796a8;
-  --border: #d7e0e8;
-  --border-strong: #bdcbd7;
-  --accent: #0f766e;
-  --accent-strong: #0b5e58;
-  --accent-soft: #d9f0eb;
-  --danger: #b42318;
-  --danger-soft: #fff1f0;
-  --warning: #a16207;
-  --warning-soft: #fff8df;
-  --success: #087f5b;
+  --surface-muted: #f0f3f7;
+  --surface-hover: #e9edf3;
+  --surface-accent: #e8f0fe;
+  --chrome: #131722;
+  --chrome-raised: #1e222d;
+  --chrome-text: #d1d4dc;
+  --text: #131722;
+  --text-muted: #5d606b;
+  --text-subtle: #8a8f98;
+  --border: #e0e3eb;
+  --border-strong: #c9cdd4;
+  --accent: #2962ff;
+  --accent-strong: #1f4fd1;
+  --accent-soft: #e8f0fe;
+  --profit: #f23645;
+  --loss: #089981;
+  --danger: #d64c4c;
+  --danger-soft: #fff0f1;
+  --warning: #b7791f;
+  --warning-soft: #fff7e6;
+  --success: #0b8f78;
   --font-xs: 11px;
   --font-sm: 12px;
   --font-base: 14px;
@@ -37,7 +43,7 @@ html, body, #root {
   height: 100%;
   background: var(--canvas);
   color: var(--text);
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
   font-size: 14px;
   line-height: 1.5;
   overflow: hidden;
@@ -67,7 +73,7 @@ select {
   cursor: pointer;
 }
 select:focus {
-  outline: 2px solid #8ed2c8;
+  outline: 2px solid #8facff;
   outline-offset: 1px;
 }
 
@@ -81,6 +87,10 @@ button, input, select, textarea {
 }
 
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
-  outline: 2px solid #7ccdc0;
+  outline: 2px solid #8facff;
   outline-offset: 2px;
+}
+
+button, input, select, textarea {
+  font-variant-numeric: tabular-nums;
 }

@@ -1,12 +1,10 @@
 import type {
   BacktestAccount,
+  BacktestChartResponse,
   BacktestRunHistory,
   BacktestRunResponse,
   ChartResponse,
   DataStatus,
-  DataSyncResult,
-  DataSyncRun,
-  DataSyncTask,
   InstrumentItem,
   MarketInstrument,
   DateItem,
@@ -105,11 +103,6 @@ export async function searchMarketInstruments(query: string): Promise<MarketInst
   return data.instruments;
 }
 
-export async function refreshMarketInstruments(): Promise<number> {
-  const data = await sendJson<{ count: number }>(`${BASE}/admin/market-instruments/refresh`, 'POST', {});
-  return data.count;
-}
-
 export interface BacktestAccountPayload {
   name: string;
   initialCapital: number;
@@ -193,6 +186,17 @@ export async function fetchBacktestRuns(
 export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistory> {
   const data = await fetchJson<{ run: BacktestRunHistory }>(`${BASE}/backtest/runs/${runId}`);
   return data.run;
+}
+
+export async function fetchBacktestRunChart(
+  runId: string,
+  date: string,
+  timeframe: string
+): Promise<BacktestChartResponse> {
+  const search = new URLSearchParams({ date, timeframe });
+  return fetchJson<BacktestChartResponse>(
+    `${BASE}/backtest/runs/${runId}/chart?${search.toString()}`
+  );
 }
 
 export async function updateBacktestRunMeta(
@@ -349,62 +353,11 @@ export async function deleteStrategyConfig(configId: string): Promise<boolean> {
   return (await data.json()).deleted;
 }
 
-export interface DataSyncPayload {
-  symbol: string;
-  timeframe: string;
-  startDate: string | null;
-  endDate: string | null;
-  mode: 'incremental' | 'range' | string;
-}
-
 export async function fetchDataStatus(symbol: string, timeframe = '5m'): Promise<DataStatus> {
   const data = await fetchJson<{ status: DataStatus }>(
     `${BASE}/data/status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`
   );
   return data.status;
-}
-
-export async function fetchDataSyncRuns(limit = 20): Promise<DataSyncRun[]> {
-  const data = await fetchJson<{ runs: DataSyncRun[] }>(`${BASE}/data/sync-runs?limit=${limit}`);
-  return data.runs;
-}
-
-export async function runDataSync(payload: DataSyncPayload): Promise<DataSyncResult> {
-  return sendJson<DataSyncResult>(`${BASE}/data/sync`, 'POST', payload);
-}
-
-export async function runDataSyncBatch(
-  payload: Omit<DataSyncPayload, 'symbol'> & { symbols: string[] }
-): Promise<DataSyncResult[]> {
-  const data = await sendJson<{ results: DataSyncResult[] }>(
-    `${BASE}/data/sync/batch`,
-    'POST',
-    payload
-  );
-  return data.results;
-}
-
-export async function startDataSyncTask(
-  payload: Omit<DataSyncPayload, 'symbol'> & { symbols: string[] }
-): Promise<DataSyncTask> {
-  const data = await sendJson<{ task: DataSyncTask }>(
-    `${BASE}/data/sync/start`,
-    'POST',
-    payload
-  );
-  return data.task;
-}
-
-export async function fetchDataSyncTask(taskId: string): Promise<DataSyncTask> {
-  const data = await fetchJson<{ task: DataSyncTask }>(`${BASE}/data/sync/tasks/${taskId}`);
-  return data.task;
-}
-
-export async function refillDataGaps(
-  payload: { symbol: string; timeframe: string; dates: string[] }
-): Promise<DataSyncTask> {
-  const data = await sendJson<{ task: DataSyncTask }>(`${BASE}/data/refill`, 'POST', payload);
-  return data.task;
 }
 
 export async function fetchDates(symbol: string, timeframe = '5m'): Promise<DateItem[]> {
@@ -447,23 +400,4 @@ export interface SignalFileItem {
 export async function fetchSignalFiles(): Promise<SignalFileItem[]> {
   const data = await fetchJson<{ files: SignalFileItem[] }>(`${BASE}/signal-files`);
   return data.files;
-}
-
-export interface SyncResult {
-  status: string;
-  symbol: string;
-  from: string;
-  to: string;
-  new_rows: number;
-  new_dates: string[];
-  message?: string;
-}
-
-export async function syncKline(symbol: string): Promise<SyncResult> {
-  const res = await fetch(`${BASE}/data/sync?symbol=${symbol}`, { method: 'POST', credentials: 'include' });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text);
-  }
-  return res.json();
 }

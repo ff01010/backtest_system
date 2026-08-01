@@ -2,21 +2,22 @@
 """
 趋势网格信号可视化工作台 — FastAPI 后端
 只读 API：instruments / dates / chart / strategies / health
-写 API：data/sync（通过 subprocess 调同步脚本，避免直接 import xtquant）
+写 API：策略、账号和回测记录管理
 """
 
 import sys
 import os
 import ast
-from datetime import datetime, timedelta
 import hashlib
+import logging
 import re
+from typing import Any
 
 _viewer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _viewer_dir not in sys.path:
   sys.path.insert(0, _viewer_dir)
 
-from fastapi import Body, FastAPI, Query, HTTPException, Request, Response
+from fastapi import FastAPI, Query, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -26,11 +27,9 @@ from backend.strategies.catalog import get_strategy_source_snapshot
 from backend.strategies.scripted import validate_script_code
 from backend.services import (
   backtest_runner,
-  data_manager,
-  eastmoney_client,
   market_data,
+  qmt_instrument_directory,
   data_repository,
-  data_sync_tasks,
   state_store,
   strategy_adapters,
 )
@@ -38,6 +37,18 @@ from backend.services import auth
 from backend.services.user_context import get_current_user, reset_current_user, set_current_user
 
 app = FastAPI(title="Trend Grid Viewer", version="0.1.0")
+logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+def sync_qmt_instrument_directory() -> None:
+  """用已预置的 QMT 快照刷新 PostgreSQL 搜索目录。"""
+  try:
+    count = qmt_instrument_directory.sync_market_instruments()
+  except Exception as error:
+    logger.warning("QMT 证券目录同步跳过: %s", error)
+  else:
+    logger.info("QMT 证券目录已同步 %s 条", count)
 
 app.add_middleware(
   CORSMiddleware,
@@ -79,6 +90,53 @@ def _model_dump(model):
   return model.dict()
 
 
+def _compact_trade_time(value: object) -> str:
+  """统一回测成交时间，兼容历史记录中的 ISO 与紧凑格式。"""
+  digits = re.sub(r"\D", "", str(value or ""))
+  return digits[:12] if len(digits) >= 12 else ""
+
+
+def _backtest_chart_trades(
+  run: dict[str, Any],
+  date: str,
+) -> tuple[list[dict[str, Any]], int]:
+  """筛选指定交易日的成交记录，不猜测缺失的历史字段。"""
+  result = run.get("resultJson") or {}
+  trades: list[dict[str, Any]] = []
+  unsupported_count = 0
+  for index, trade in enumerate(result.get("trades") or []):
+    execution_time = _compact_trade_time(trade.get("executionTime") or trade.get("time"))
+    signal_time = _compact_trade_time(trade.get("signalTime") or trade.get("time"))
+    action = str(trade.get("action") or "").lower()
+    side = str(trade.get("side") or "").upper()
+    price = trade.get("price")
+    quantity = trade.get("quantity")
+    if action not in {"buy_open", "sell_close", "sell_open", "buy_close"} and side in {"BUY", "SELL"}:
+      action = side.lower()
+    if (
+      not execution_time
+      or execution_time[:8] != date
+      or action not in {"buy_open", "sell_close", "sell_open", "buy_close", "buy", "sell"}
+      or side not in {"BUY", "SELL"}
+      or not isinstance(price, (int, float))
+      or not isinstance(quantity, int)
+    ):
+      if execution_time[:8] == date:
+        unsupported_count += 1
+      continue
+    trades.append({
+      "id": f"{run['id']}-{index}",
+      "executionTime": execution_time,
+      "signalTime": signal_time or execution_time,
+      "action": action,
+      "side": side,
+      "price": float(price),
+      "quantity": quantity,
+      "note": str(trade.get("note") or ""),
+    })
+  return trades, unsupported_count
+
+
 def _merge_instruments(
   scanned: list[dict],
   stored: list[dict],
@@ -96,104 +154,6 @@ def _merge_instruments(
       "note": previous.get("note"),
     }
   return sorted(merged.values(), key=lambda item: item["symbol"])
-
-
-def _run_sync_script(request: dict) -> dict:
-  """检查指定范围的 QMT 历史行情是否已导入。"""
-  end_date = request.get("endDate") or datetime.now().strftime("%Y%m%d")
-  start_date = request.get("startDate") or (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
-  try:
-    result = market_data.ensure_cached(
-      request["symbol"], request.get("timeframe", "5m"), start_date, end_date,
-    )
-  except market_data.MarketDataError as error:
-    return {
-      "status": "error",
-      "symbol": request["symbol"],
-      "timeframe": request.get("timeframe", "5m"),
-      "message": str(error),
-      "new_rows": 0,
-      "new_dates": [],
-    }
-  return {
-    "status": "ok", "symbol": request["symbol"], "timeframe": request.get("timeframe", "5m"),
-    "from": start_date, "to": end_date, "new_rows": 0,
-    "new_dates": result["fetchedDates"], "cacheStatus": result["status"],
-    "message": "QMT 历史行情已覆盖",
-  }
-
-
-def _validate_sync_request(request: dict) -> None:
-  if not settings.validate_symbol(request["symbol"]):
-    raise HTTPException(422, f"非法标的: {request['symbol']}")
-  if not settings.validate_timeframe(request.get("timeframe", "5m")):
-    raise HTTPException(422, f"不支持的周期: {request.get('timeframe')}")
-  start_date = request.get("startDate")
-  end_date = request.get("endDate")
-  if start_date and not settings.validate_date(start_date):
-    raise HTTPException(422, f"非法开始日期: {start_date}")
-  if end_date and not settings.validate_date(end_date):
-    raise HTTPException(422, f"非法结束日期: {end_date}")
-  if start_date and end_date and start_date > end_date:
-    raise HTTPException(422, "开始日期不能晚于结束日期")
-
-
-def _sync_many(request: dict) -> list[dict]:
-  results = []
-  for symbol in request["symbols"]:
-    item = {
-      "symbol": symbol,
-      "timeframe": request.get("timeframe", "5m"),
-      "startDate": request.get("startDate"),
-      "endDate": request.get("endDate"),
-      "mode": request.get("mode", "incremental"),
-    }
-    try:
-      _validate_sync_request(item)
-      result = _run_sync_script(item)
-      state_store.log_data_sync_run(item, result)
-    except Exception as e:
-      result = {
-        "status": "error",
-        "symbol": symbol,
-        "timeframe": item["timeframe"],
-        "message": str(e),
-        "new_rows": 0,
-        "new_dates": [],
-      }
-      state_store.log_data_sync_run(item, result)
-    results.append(result)
-  return results
-
-
-def _sync_gap_dates(request: dict) -> list[dict]:
-  results = []
-  for date in request["dates"]:
-    item = {
-      "symbol": request["symbol"],
-      "timeframe": request.get("timeframe", "5m"),
-      "startDate": date,
-      "endDate": date,
-      "mode": "range",
-    }
-    try:
-      _validate_sync_request(item)
-      result = _run_sync_script(item)
-      state_store.log_data_sync_run(item, result)
-    except Exception as e:
-      result = {
-        "status": "error",
-        "symbol": request["symbol"],
-        "timeframe": item["timeframe"],
-        "from": date,
-        "to": date,
-        "message": str(e),
-        "new_rows": 0,
-        "new_dates": [],
-      }
-      state_store.log_data_sync_run(item, result)
-    results.append(result)
-  return results
 
 
 def _validate_strategy_script(payload: dict) -> None:
@@ -482,15 +442,6 @@ def search_market_instruments(q: str = Query("", max_length=64), limit: int = Qu
   return {"instruments": state_store.search_market_instruments(q, limit)}
 
 
-@app.post("/api/admin/market-instruments/refresh")
-def refresh_market_instruments(request: Request):
-  _require_admin(request)
-  try:
-    count = state_store.upsert_market_instruments(eastmoney_client.fetch_a_share_instruments())
-  except eastmoney_client.EastmoneyError as error:
-    raise HTTPException(502, str(error)) from error
-  return {"count": count}
-
 
 @app.get("/api/accounts")
 def accounts():
@@ -651,6 +602,40 @@ def backtest_run_detail(run_id: str):
     raise HTTPException(404, f"回测记录不存在: {run_id}")
 
 
+@app.get("/api/backtest/runs/{run_id}/chart", response_model=schemas.BacktestChartResponse)
+def backtest_run_chart(
+  run_id: str,
+  date: str = Query(..., pattern=r"^\d{8}$"),
+  timeframe: str | None = Query(default=None),
+):
+  """返回当前用户指定回测的一日行情与已成交买卖点。"""
+  try:
+    run = state_store.get_backtest_run(run_id)
+  except KeyError as error:
+    raise HTTPException(404, "回测记录不存在") from error
+
+  selected_timeframe = timeframe or str(run["timeframe"])
+  if not settings.validate_timeframe(selected_timeframe):
+    raise HTTPException(422, f"不支持的周期: {selected_timeframe}")
+  try:
+    bars = data_repository.load_chart_bars(run["symbol"], date, selected_timeframe)
+  except ValueError as error:
+    raise HTTPException(404, str(error)) from error
+
+  trades, unsupported_count = _backtest_chart_trades(run, date)
+  if unsupported_count:
+    raise HTTPException(422, "该历史回测缺少可用于交易点复盘的成交字段")
+  return {
+    "runId": run["id"],
+    "displayNo": run["displayNo"],
+    "symbol": run["symbol"],
+    "timeframe": selected_timeframe,
+    "date": date,
+    "bars": bars,
+    "trades": trades,
+  }
+
+
 @app.put("/api/backtest/runs/{run_id}")
 def update_backtest_run_meta(run_id: str, payload: schemas.BacktestRunMetaUpdate):
   try:
@@ -793,80 +778,7 @@ def data_status(
 ):
   if not settings.validate_timeframe(timeframe):
     raise HTTPException(422, f"不支持的周期: {timeframe}")
-  return {"status": data_manager.get_status(symbol, timeframe)}
-
-
-@app.get("/api/data/sync-runs")
-def data_sync_runs(limit: int = Query(20, ge=1, le=100)):
-  return {"runs": state_store.list_data_sync_runs(limit)}
-
-
-@app.post("/api/data/sync")
-def sync_kline(
-  payload: schemas.DataSyncRequest | None = Body(None),
-  symbol: str | None = Query(None),
-):
-  """同步指定标的 K 线；兼容旧 query 参数和新 JSON 请求体。"""
-  request = _model_dump(payload) if payload else {
-    "symbol": symbol,
-    "timeframe": "5m",
-    "startDate": None,
-    "endDate": None,
-    "mode": "incremental",
-  }
-  if not request.get("symbol"):
-    raise HTTPException(422, "缺少标的")
-  _validate_sync_request(request)
-  result = _run_sync_script(request)
-  state_store.log_data_sync_run(request, result)
-  if result["status"] == "error":
-    raise HTTPException(500, result.get("message", "同步失败"))
-  return result
-
-
-@app.post("/api/data/sync/batch")
-def sync_kline_batch(payload: schemas.DataSyncBatchRequest):
-  request = _model_dump(payload)
-  return {"results": _sync_many(request)}
-
-
-@app.post("/api/data/sync/start")
-def start_sync_task(payload: schemas.DataSyncBatchRequest):
-  request = _model_dump(payload)
-  if not request["symbols"]:
-    raise HTTPException(422, "缺少标的")
-  for symbol in request["symbols"]:
-    _validate_sync_request({
-      "symbol": symbol,
-      "timeframe": request.get("timeframe", "5m"),
-      "startDate": request.get("startDate"),
-      "endDate": request.get("endDate"),
-      "mode": request.get("mode", "incremental"),
-    })
-  return {"task": data_sync_tasks.start_task(request, _sync_many)}
-
-
-@app.get("/api/data/sync/tasks/{task_id}")
-def get_sync_task(task_id: str):
-  task = data_sync_tasks.get_task(task_id)
-  if task is None:
-    raise HTTPException(404, f"同步任务不存在: {task_id}")
-  return {"task": task}
-
-
-@app.post("/api/data/refill")
-def refill_data_gaps(payload: schemas.DataRefillRequest):
-  request = _model_dump(payload)
-  if not settings.validate_symbol(request["symbol"]):
-    raise HTTPException(422, f"非法标的: {request['symbol']}")
-  if not settings.validate_timeframe(request.get("timeframe", "5m")):
-    raise HTTPException(422, f"不支持的周期: {request.get('timeframe')}")
-  if not request["dates"]:
-    raise HTTPException(422, "缺少补齐日期")
-  for date in request["dates"]:
-    if not settings.validate_date(date):
-      raise HTTPException(422, f"非法日期: {date}")
-  return {"task": data_sync_tasks.start_task(request, _sync_gap_dates)}
+  return {"status": market_data.status(symbol, timeframe)}
 
 
 if __name__ == "__main__":

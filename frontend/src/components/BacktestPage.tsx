@@ -57,16 +57,22 @@ interface Props {
   strategies: string[];
   instruments: InstrumentItem[];
   isAdmin: boolean;
+  onViewTradeChart: (selection: {
+    runId: string;
+    symbol: string;
+    timeframe: string;
+    date: string;
+  }) => void;
 }
 
 const panelStyle = {
-  background: '#ffffff',
-  border: '1px solid #d7dde8',
-  borderRadius: 6,
+  background: 'var(--surface)',
+  border: '1px solid var(--border)',
+  borderRadius: 4,
 } as const;
 
 const labelStyle = {
-  color: '#64748b',
+  color: 'var(--text-muted)',
   fontSize: typography.base,
   marginBottom: 6,
 } as const;
@@ -74,9 +80,9 @@ const labelStyle = {
 const fieldStyle = {
   width: '100%',
   height: 34,
-  background: '#f8fafc',
-  color: '#0f172a',
-  border: '1px solid #cbd5e1',
+  background: 'var(--surface-muted)',
+  color: 'var(--text)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 4,
   padding: '0 10px',
   fontSize: typography.base,
@@ -723,7 +729,14 @@ function buildStrategyDraftFingerprint(input: {
   }));
 }
 
-export default function BacktestPage({ symbol, strategy, strategies, instruments, isAdmin }: Props) {
+export default function BacktestPage({
+  symbol,
+  strategy,
+  strategies,
+  instruments,
+  isAdmin,
+  onViewTradeChart,
+}: Props) {
   const [instrumentList, setInstrumentList] = useState<InstrumentItem[]>(instruments);
   const [accounts, setAccounts] = useState<BacktestAccount[]>([]);
   const [selectedSymbol, setSelectedSymbol] = useState(symbol);
@@ -1725,10 +1738,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const visibleTradeColumns = tradeColumnDefs.filter((column) => tradeColumns[column.key]);
   const tradeGridColumns = visibleTradeColumns.map((column) => column.width).join(' ') || '1fr';
   const coreMetrics = [
-    ['策略收益', result ? formatPct(result.summary.totalReturn) : '--'],
-    ['基准收益', result ? formatPct(result.benchmarkReturn) : '--'],
+    ['总收益', result ? formatPct(result.summary.totalReturn) : '--'],
+    ['年化收益', result ? formatPct(result.summary.annualReturn) : '--'],
     ['超额收益', result ? formatPct(result.excessReturn) : '--'],
-    ['最大回撤率', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
+    ['最大回撤', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
+    ['Sharpe', result ? formatNumber(result.summary.annualSharpe) : '--'],
+    ['交易 / 胜率', result ? `${result.summary.tradeCount} / ${formatPct(result.summary.winRate)}` : '--'],
   ];
   const metricGroups = [
     {
@@ -1796,7 +1811,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     slippage: resultCostModel?.slippage ?? Number(params.slippage),
     holdingPolicy: resultManifest?.holdingPolicy || String(params.holdingPolicy),
   };
-  const hasWorkbenchSidebar = !['history', 'trades', 'positions'].includes(activePanel);
+  const hasWorkbenchSidebar = !['history', 'trades', 'positions', 'code'].includes(activePanel);
   const historyParamDiffs = compareHistoryRuns(selectedHistoryRun, compareHistoryRun);
   const historySymbols = useMemo(
     () => Array.from(new Set(backtestRuns.map((run) => run.symbol))).sort(),
@@ -1841,6 +1856,21 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         note: trade.note,
       }))
     );
+  };
+
+  const handleViewTradeChart = (trade: BacktestRunResponse['trades'][number]) => {
+    if (!result?.runId || trade.status === 'skipped') return;
+    const executionTime = (trade.executionTime || trade.time).replace(/\D/g, '');
+    if (executionTime.length < 8) {
+      setError('该成交记录缺少可定位的实际成交时间');
+      return;
+    }
+    onViewTradeChart({
+      runId: result.runId,
+      symbol: resultContext.symbol,
+      timeframe: resultContext.timeframe || selectedTimeframe,
+      date: executionTime.slice(0, 8),
+    });
   };
 
   const handleApplyBacktestRun = (run: BacktestRunHistory) => {
@@ -2074,14 +2104,34 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       <div style={{
         minHeight: 0,
         display: 'grid',
-        gridTemplateColumns: hasWorkbenchSidebar ? '340px minmax(0, 1fr)' : 'minmax(0, 1fr)',
+        gridTemplateColumns: hasWorkbenchSidebar
+          ? '64px 340px minmax(0, 1fr)'
+          : '64px minmax(0, 1fr)',
+        gap: 12,
+        padding: 12,
+        background: '#eef3f8',
         overflow: 'hidden',
       }}>
+        <aside style={{
+          minHeight: 0,
+          overflow: 'auto',
+          border: '1px solid #dbe1ea',
+          borderRadius: 8,
+          background: '#f8fafc',
+        }}>
+          <BacktestTabs
+            activeTab={activePanel}
+            tabs={resultTabs}
+            onChange={(tabId) => setActivePanel(tabId as WorkbenchPanel)}
+          />
+        </aside>
+
         {hasWorkbenchSidebar && (
         <aside style={{
           minHeight: 0,
           overflow: 'auto',
-          borderRight: '1px solid #e2e8f0',
+          border: '1px solid #dbe1ea',
+          borderRadius: 8,
           background: '#f8fafc',
           padding: 14,
         }}>
@@ -2194,39 +2244,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
             </div>
           )}
 
-          {activePanel === 'code' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
-                <div style={{ color: '#0f172a', fontWeight: 700, marginBottom: 6 }}>
-                  {isCustomScriptStrategy(selectedStrategy) ? '当前自定义脚本' : '实际运行代码'}
-                </div>
-                {isCustomScriptStrategy(selectedStrategy) ? (
-                  <>
-                    <div>{scriptForm.name || '尚未命名的策略脚本'}</div>
-                    <div style={{ marginTop: 8 }}>策略方案版本会保存这份代码快照与参数；请在“策略管理”中编辑代码并保存生成版本。</div>
-                    <textarea
-                      value={scriptForm.code}
-                      readOnly
-                      spellCheck={false}
-                      style={{
-                        width: '100%', minHeight: 420, resize: 'vertical', marginTop: 10, background: '#f8fafc',
-                        color: '#334155', border: '1px solid #d7dde8', borderRadius: 6, padding: 14,
-                        fontSize: 13, lineHeight: 1.55, fontFamily: 'Consolas, monospace', outline: 'none',
-                      }}
-                    />
-                  </>
-                ) : (
-                  <>
-                    <div>{strategySource?.name || '当前策略未提供代码快照'}</div>
-                    {strategySource && <div style={{ marginTop: 5 }}>版本指纹：{strategySource.codeHash.slice(0, 12)}</div>}
-                    <div style={{ marginTop: 8 }}>策略方案会保存这份代码的快照与参数；代码修改需在实际策略文件中完成。</div>
-                    {strategySourceError && <div style={{ color: '#b91c1c', marginTop: 8 }}>{strategySourceError}</div>}
-                  </>
-                )}
-              </div>
-            </div>
-          )}
-
           {false && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
@@ -2295,18 +2312,22 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
           minWidth: 0,
           minHeight: 0,
           overflow: 'auto',
-          padding: 16,
-          background: '#eef3f8',
+          padding: activePanel === 'overview' ? 4 : '16px 20px 24px',
+          background: 'transparent',
         }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16, minHeight: '100%' }}>
-            <BacktestTabs
-              activeTab={activePanel}
-              tabs={resultTabs}
-              onChange={(tabId) => setActivePanel(tabId as WorkbenchPanel)}
-            />
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 16,
+            minHeight: '100%',
+            width: activePanel === 'overview' ? '100%' : 'min(1440px, 100%)',
+            margin: activePanel === 'overview' ? 0 : '0 auto',
+          }}>
             {activePanel === 'code' ? (
             <section style={{
               ...panelStyle,
+              width: 'min(1440px, 100%)',
+              margin: '0 auto',
               minHeight: 'calc(100vh - 164px)',
               padding: 16,
               background: '#ffffff',
@@ -2714,11 +2735,11 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
 
               {activePanel === 'overview' && (
               <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(140px, 1fr))', gap: 12 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(128px, 1fr))', gap: 8, overflowX: 'auto', paddingBottom: 2 }}>
                   {coreMetrics.map(([name, value]) => (
-                    <div key={name} style={{ ...panelStyle, padding: 14, background: '#ffffff' }}>
-                      <div style={{ color: '#64748b', fontSize: 12 }}>{name}</div>
-                      <div style={{ color: '#0f172a', fontSize: 24, fontWeight: 700, marginTop: 8 }}>
+                    <div key={name} style={{ ...panelStyle, minWidth: 128, padding: '12px 14px', background: 'var(--surface)' }}>
+                      <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>{name}</div>
+                      <div style={{ color: 'var(--text)', fontSize: 21, fontWeight: 700, marginTop: 8, fontVariantNumeric: 'tabular-nums' }}>
                         {value}
                       </div>
                     </div>
@@ -2985,12 +3006,13 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     </button>
                   </div>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: tradeGridColumns, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', paddingBottom: 8 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: `${tradeGridColumns} 68px`, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', paddingBottom: 8 }}>
                   {visibleTradeColumns.map((column) => (
                     <span key={column.key} style={{ textAlign: column.align || 'left' }}>
                       {column.label}
                     </span>
                   ))}
+                  <span>复盘</span>
                 </div>
                 {result && filteredTrades.length > 0 && visibleTradeColumns.length > 0 ? (
                   pagedTrades.map((trade, index) => {
@@ -3005,7 +3027,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                             {currentDate}
                           </div>
                         )}
-                        <div style={{ display: 'grid', gridTemplateColumns: tradeGridColumns, gap: 8, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '8px 0', alignItems: 'center' }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: `${tradeGridColumns} 68px`, gap: 8, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '8px 0', alignItems: 'center' }}>
                           {visibleTradeColumns.map((column) => (
                             <span key={column.key} style={{
                               textAlign: column.align || 'left',
@@ -3017,6 +3039,22 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                               {column.render(trade)}
                             </span>
                           ))}
+                          <button
+                            type="button"
+                            disabled={!result?.runId || trade.status === 'skipped'}
+                            onClick={() => handleViewTradeChart(trade)}
+                            style={{
+                              border: 'none',
+                              background: 'transparent',
+                              color: result?.runId && trade.status !== 'skipped' ? '#2962ff' : '#94a3b8',
+                              cursor: result?.runId && trade.status !== 'skipped' ? 'pointer' : 'not-allowed',
+                              padding: 0,
+                              textAlign: 'left',
+                              fontSize: 12,
+                            }}
+                          >
+                            查看 K 线
+                          </button>
                         </div>
                       </div>
                     );

@@ -147,6 +147,27 @@ def validate_backtest_coverage(
   market_data.ensure_cached(symbol, timeframe, start_date, end_date)
 
 
+def load_chart_bars(symbol: str, date: str, timeframe: str) -> list[dict[str, Any]]:
+  """读取单日行情，并转换为前端图表统一时间格式。"""
+  try:
+    frame = market_data.load_bars(symbol, timeframe, date, date)
+  except (market_data.MarketDataError, ValueError) as error:
+    raise ValueError(f"K 线读取失败: {error}") from error
+
+  bars: list[dict[str, Any]] = []
+  for _, row in frame.iterrows():
+    timestamp = str(row["time"])
+    bars.append({
+      "time": f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}T{timestamp[8:10]}:{timestamp[10:12]}:00",
+      "open": float(row["open"]),
+      "high": float(row["high"]),
+      "low": float(row["low"]),
+      "close": float(row["close"]),
+      "volume": int(row.get("volume", 0)),
+    })
+  return bars
+
+
 def load_chart_data(symbol: str, date: str, timeframe: str, strategy: str = "trend_grid",
                     signal_file: str | None = None) -> dict[str, Any]:
   """加载图表数据: bars + markers + summary
@@ -154,28 +175,14 @@ def load_chart_data(symbol: str, date: str, timeframe: str, strategy: str = "tre
   signal_file: 指定信号文件名（仅限 SIGNAL_ROOT 下的 .csv），为 None 时按策略名自动解析
   """
   warnings: list[str] = []
-  bars: list[dict[str, Any]] = []
   markers: list[dict[str, Any]] = []
 
-  # — 从 PostgreSQL 加载 K 线 —
+  # — 从 ClickHouse 加载 K 线 —
   kline_mtime = "database"
   try:
-    df = market_data.load_bars(symbol, timeframe, date, date)
-
-    for _, row in df.iterrows():
-      dt = str(row["time"])
-      # "20260622093500" → ISO 格式
-      ts = f"{dt[:4]}-{dt[4:6]}-{dt[6:8]}T{dt[8:10]}:{dt[10:12]}:00"
-      bars.append({
-        "time": ts,
-        "open": float(row["open"]),
-        "high": float(row["high"]),
-        "low": float(row["low"]),
-        "close": float(row["close"]),
-        "volume": int(row.get("volume", 0)),
-      })
-  except (market_data.MarketDataError, ValueError) as error:
-    return {"error": f"K 线读取失败: {error}"}
+    bars = load_chart_bars(symbol, date, timeframe)
+  except ValueError as error:
+    return {"error": str(error)}
 
   # 构建 bar datetime → index 映射
   bar_time_set = {b["time"] for b in bars}

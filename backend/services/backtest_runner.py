@@ -37,6 +37,8 @@ if _PROJECT_ROOT not in sys.path:
 from backend import settings
 _ENGINE_VERSION = "bar-portfolio-v1"
 _RANDOM_SEED_VERSION = "bar-signal-v1"
+_TRADING_DAYS_PER_YEAR = 242
+_ANNUAL_RISK_FREE_RATE = 0.0
 
 
 def is_trading_time(hhmm: int) -> bool:
@@ -722,14 +724,16 @@ def _compute_performance_stats(
 
   n = len(returns)
   total_return = equity / initial_capital - 1
-  annual_return = (1 + total_return) ** (242 / n) - 1 if n > 0 and equity > 0 else 0.0
+  annual_return = (1 + total_return) ** (_TRADING_DAYS_PER_YEAR / n) - 1 if n > 0 and equity > 0 else 0.0
   avg_return = sum(returns) / n if n else 0.0
-  std_return = _std(returns, avg_return)
+  daily_risk_free_rate = (1 + _ANNUAL_RISK_FREE_RATE) ** (1 / _TRADING_DAYS_PER_YEAR) - 1
+  avg_excess_return = sum(value - daily_risk_free_rate for value in returns) / n if n else 0.0
+  std_return = _sample_std(returns, avg_return)
   downside = [min(value, 0.0) for value in returns]
   downside_std = _std(downside, 0.0)
-  annual_volatility = std_return * math.sqrt(242)
-  annual_sharpe = avg_return / std_return * math.sqrt(242) if std_return > 0 else 0.0
-  sortino = avg_return / downside_std * math.sqrt(242) if downside_std > 0 else 0.0
+  annual_volatility = std_return * math.sqrt(_TRADING_DAYS_PER_YEAR)
+  annual_sharpe = avg_excess_return / std_return * math.sqrt(_TRADING_DAYS_PER_YEAR) if std_return > 0 else 0.0
+  sortino = avg_return / downside_std * math.sqrt(_TRADING_DAYS_PER_YEAR) if downside_std > 0 else 0.0
 
   return {
     "annualReturn": round(annual_return, 6),
@@ -741,9 +745,15 @@ def _compute_performance_stats(
 
 
 def _std(values: list[float], avg: float) -> float:
-  if len(values) <= 1:
+  if not values:
     return 0.0
   return (sum((value - avg) ** 2 for value in values) / len(values)) ** 0.5
+
+
+def _sample_std(values: list[float], avg: float) -> float:
+  if len(values) <= 1:
+    return 0.0
+  return (sum((value - avg) ** 2 for value in values) / (len(values) - 1)) ** 0.5
 
 
 def _build_midcap_equity(
