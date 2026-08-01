@@ -209,6 +209,7 @@ class DailyHoldingPoint(BaseModel):
 
 class BacktestRunResponse(BaseModel):
   runId: str | None
+  displayNo: int | None = None
   configId: str | None = None
   configVersionId: str | None = None
   scriptId: str | None = None
@@ -289,6 +290,7 @@ class StrategyConfigVersion(BaseModel):
 
 class BacktestRunHistory(BaseModel):
   id: str
+  displayNo: int
   configId: str | None
   configVersionId: str | None
   scriptId: str | None

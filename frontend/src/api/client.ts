@@ -166,6 +166,7 @@ export async function runBacktest(payload: BacktestRunPayload): Promise<Backtest
 
 export interface LiveStrategyResponse {
   runId: string | null;
+  displayNo?: number | null;
   configId: string | null;
   configVersionId: string | null;
   scriptId: string | null;

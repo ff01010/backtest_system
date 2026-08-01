@@ -176,6 +176,7 @@ export interface DailyHoldingPoint {
 
 export interface BacktestRunResponse {
   runId: string | null;
+  displayNo?: number | null;
   configId: string | null;
   configVersionId: string | null;
   scriptId: string | null;
@@ -288,6 +289,7 @@ export interface StrategyConfigVersion {
 
 export interface BacktestRunHistory {
   id: string;
+  displayNo: number;
   configId: string | null;
   configVersionId: string | null;
   scriptId: string | null;

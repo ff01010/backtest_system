@@ -388,6 +388,37 @@ def test_experiment_manifest_is_deterministic(
   assert first["barRange"]["timeframe"] == "1m"
 
 
+def test_script_experiment_manifest_includes_display_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(
+    backtest_runner.market_data,
+    "snapshot",
+    lambda *_args: {"hash": "qmt-history-hash", "barCount": 2},
+  )
+  payload = {
+    "strategyParams": {"window": 20},
+    "symbol": "688981.SH",
+    "timeframe": "1m",
+    "startDate": "20260601",
+    "endDate": "20260601",
+    "initialCapital": 1_000_000,
+    "commissionRate": 0.0003,
+    "slippage": 0.0001,
+    "allowLong": True,
+    "allowShort": False,
+    "holdingPolicy": "intraday",
+  }
+  bars = pd.DataFrame({"time": ["202606010930", "202606011500"]})
+
+  manifest = backtest_runner._build_script_experiment_manifest(
+    payload, bars, "script-1", "测试策略", "script-code-hash",
+  )
+
+  assert manifest["experimentHash"]
+  assert manifest["barRange"]["timeframe"] == "1m"
+  assert manifest["costModel"] == {"commissionRate": 0.0003, "slippage": 0.0001}
+  assert manifest["holdingPolicy"] == "intraday"
+
+
 def test_strategy_parameters_endpoint_rejects_unknown_strategy() -> None:
   with pytest.raises(HTTPException) as exc_info:
     api_app.strategy_parameters("missing")
