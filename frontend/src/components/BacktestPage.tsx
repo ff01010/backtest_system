@@ -501,6 +501,52 @@ function formatRunReference(displayNo: number | null | undefined): string {
   return `#${String(displayNo ?? 0).padStart(2, '0')}`;
 }
 
+interface ResultContextBarProps {
+  runReference: string;
+  configName: string;
+  symbol: string;
+  benchmarkSymbol: string | null;
+  timeframe: string;
+  startDate: string;
+  endDate: string;
+  commissionRate: number | null;
+  slippage: number | null;
+  holdingPolicy: string | undefined;
+}
+
+function ResultContextBar({
+  runReference,
+  configName,
+  symbol,
+  benchmarkSymbol,
+  timeframe,
+  startDate,
+  endDate,
+  commissionRate,
+  slippage,
+  holdingPolicy,
+}: ResultContextBarProps): ReactNode {
+  return (
+    <section style={{ ...panelStyle, padding: '10px 12px', background: '#ffffff' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', color: '#475569', fontSize: 12, lineHeight: 1.6 }}>
+        <strong style={{ color: '#0f766e' }}>{runReference}</strong>
+        <span>{configName}</span>
+        <span>{symbol} · {timeframe}</span>
+        <span>{startDate} - {endDate}</span>
+      </div>
+      <details style={{ marginTop: 8, color: '#475569', fontSize: 12 }}>
+        <summary style={{ color: '#0f766e', cursor: 'pointer', width: 'fit-content' }}>查看本次回测设置</summary>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 8, lineHeight: 1.6 }}>
+          <span>基准：{benchmarkSymbol || symbol}</span>
+          <span>手续费：{commissionRate == null ? '--' : `${(commissionRate * 10_000).toFixed(2)} bp`}</span>
+          <span>滑点：{slippage == null ? '--' : `${(slippage * 10_000).toFixed(2)} bp`}</span>
+          <span>持仓规则：{holdingPolicy === 'overnight' ? '允许跨日' : holdingPolicy === 'intraday' ? '日内平仓' : '未记录'}</span>
+        </div>
+      </details>
+    </section>
+  );
+}
+
 function getHistoryDirectionLabel(run: BacktestRunHistory): string {
   const allowLong = getHistoryRunParam(run, 'allowLong') !== false;
   const allowShort = getHistoryRunParam(run, 'allowShort') !== false;
@@ -1732,7 +1778,25 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const activeScript = strategyScripts.find((item) => item.id === selectedScriptId);
   const configNameById = new Map(strategyConfigs.map((item) => [item.id, item.name]));
   const selectedHistoryRun = backtestRuns.find((item) => item.id === selectedHistoryRunId) || null;
+  const resultHistoryRun = result?.runId ? backtestRuns.find((item) => item.id === result.runId) || null : null;
   const compareHistoryRun = backtestRuns.find((item) => item.id === compareHistoryRunId) || null;
+  const resultManifest = result?.experimentManifest;
+  const resultCostModel = resultManifest?.costModel;
+  const resultContext = {
+    runReference: result?.runId ? formatRunReference(result.displayNo) : '当前设置',
+    configName: resultHistoryRun?.configId
+      ? configNameById.get(resultHistoryRun.configId) || '已保存策略方案'
+      : activeConfig?.name || configName || '未选择策略方案',
+    symbol: resultHistoryRun?.symbol || selectedSymbol,
+    benchmarkSymbol: resultHistoryRun?.benchmarkSymbol || result?.benchmarkSymbol || selectedBenchmarkSymbol,
+    timeframe: resultHistoryRun?.timeframe || resultManifest?.barRange?.timeframe || selectedTimeframe,
+    startDate: resultHistoryRun?.startDate || params.startDate,
+    endDate: resultHistoryRun?.endDate || params.endDate,
+    commissionRate: resultCostModel?.commissionRate ?? Number(params.commissionRate),
+    slippage: resultCostModel?.slippage ?? Number(params.slippage),
+    holdingPolicy: resultManifest?.holdingPolicy || String(params.holdingPolicy),
+  };
+  const hasWorkbenchSidebar = !['history', 'trades', 'positions'].includes(activePanel);
   const historyParamDiffs = compareHistoryRuns(selectedHistoryRun, compareHistoryRun);
   const historySymbols = useMemo(
     () => Array.from(new Set(backtestRuns.map((run) => run.symbol))).sort(),
@@ -1760,8 +1824,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     : activeConfig ? `当前策略：${activeConfig.name}` : '请先新建并保存策略');
   const statusColor = error ? '#b91c1c' : status ? '#0f766e' : '#94a3b8';
   const statusBackground = error ? '#fef2f2' : status ? '#ecfdf5' : '#f8fafc';
-  const resultManifest = result?.experimentManifest;
-  const resultCostModel = resultManifest?.costModel;
   const handleExportTrades = () => {
     downloadCsv(
       `trades_${selectedSymbol}_${params.startDate}_${params.endDate}.csv`,
@@ -2012,10 +2074,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       <div style={{
         minHeight: 0,
         display: 'grid',
-        gridTemplateColumns: activePanel === 'history' ? 'minmax(0, 1fr)' : '340px minmax(0, 1fr)',
+        gridTemplateColumns: hasWorkbenchSidebar ? '340px minmax(0, 1fr)' : 'minmax(0, 1fr)',
         overflow: 'hidden',
       }}>
-        {activePanel !== 'history' && (
+        {hasWorkbenchSidebar && (
         <aside style={{
           minHeight: 0,
           overflow: 'auto',
@@ -2161,102 +2223,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     {strategySourceError && <div style={{ color: '#b91c1c', marginTop: 8 }}>{strategySourceError}</div>}
                   </>
                 )}
-              </div>
-            </div>
-          )}
-
-          {activePanel === 'positions' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <div style={{
-                color: dataCoverageColor,
-                background: dataCoverage.tone === 'ok' ? '#ecfdf5' : '#fffbeb',
-                border: `1px solid ${dataCoverage.tone === 'ok' ? '#99f6e4' : '#f59e0b'}`,
-                borderRadius: 4,
-                padding: '10px 12px',
-                fontSize: 12,
-                lineHeight: 1.6,
-              }}>
-                {dataCoverage.text}
-              </div>
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
-                <div>标的：{selectedSymbol}</div>
-                <div>周期：{selectedTimeframe}</div>
-                <div>首日：{dataStatus?.firstDate || '-'}</div>
-                <div>末日：{dataStatus?.lastDate || '-'}</div>
-                <div>缺口：{dataStatus?.gapDates.length ?? 0}</div>
-                <div>重复：{dataStatus?.duplicateCount ?? 0}</div>
-              </div>
-            </div>
-          )}
-
-          {activePanel === 'trades' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
-                <div>交易次数：{result?.summary.tradeCount ?? 0}</div>
-                <div>盈利次数：{result?.summary.winningTrades ?? 0}</div>
-                <div>亏损次数：{result?.summary.losingTrades ?? 0}</div>
-                <div>胜率：{result ? formatPct(result.summary.winRate) : '--'}</div>
-                <div>当前筛选：{filteredTrades.length}</div>
-              </div>
-
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
-                <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 10 }}>筛选</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                  <label>
-                    <div style={labelStyle}>买卖方向</div>
-                    <select value={tradeSideFilter} onChange={(e) => setTradeSideFilter(e.target.value as TradeSideFilter)} style={fieldStyle}>
-                      <option value="all">全部</option>
-                      <option value="BUY">买入</option>
-                      <option value="SELL">卖出</option>
-                    </select>
-                  </label>
-                  <label>
-                    <div style={labelStyle}>盈亏状态</div>
-                    <select value={tradePnlFilter} onChange={(e) => setTradePnlFilter(e.target.value as TradePnlFilter)} style={fieldStyle}>
-                      <option value="all">全部</option>
-                      <option value="win">盈利</option>
-                      <option value="loss">亏损</option>
-                    </select>
-                  </label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#64748b', fontSize: 13 }}>
-                    <input type="checkbox" checked={groupTradesByDay} onChange={(e) => setGroupTradesByDay(e.target.checked)} />
-                    按日期分组
-                  </label>
-                </div>
-              </div>
-
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
-                <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 10 }}>显示字段</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                  {tradeColumnDefs.map((column) => (
-                    <label key={column.key} style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#64748b', fontSize: 12 }}>
-                      <input
-                        type="checkbox"
-                        checked={tradeColumns[column.key]}
-                        onChange={(e) => setTradeColumns((prev) => ({ ...prev, [column.key]: e.target.checked }))}
-                      />
-                      {column.label}
-                    </label>
-                  ))}
-                </div>
-              </div>
-
-              <button
-                onClick={handleExportTrades}
-                disabled={filteredTrades.length === 0}
-                style={{
-                  height: 36,
-                  borderRadius: 4,
-                  border: '1px solid #0f766e',
-                  background: filteredTrades.length > 0 ? '#ccfbf1' : '#f1f5f9',
-                  color: filteredTrades.length > 0 ? '#0f766e' : '#94a3b8',
-                  cursor: filteredTrades.length > 0 ? 'pointer' : 'not-allowed',
-                }}
-              >
-                导出当前交易 CSV
-              </button>
-              <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
-                字段筛选只影响当前页面展示和导出，不会改动回测结果。
               </div>
             </div>
           )}
@@ -2681,6 +2647,70 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                   </div>
                 </div>
               </div>
+
+              {(activePanel === 'trades' || activePanel === 'positions') && (
+                <ResultContextBar {...resultContext} />
+              )}
+
+              {activePanel === 'trades' && (
+                <section style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'end', gap: 10 }}>
+                    <div style={{ color: '#475569', fontSize: 12, lineHeight: 1.6, marginRight: 8 }}>
+                      交易 {result?.summary.tradeCount ?? 0} 笔 · 盈利 {result?.summary.winningTrades ?? 0} 笔 · 亏损 {result?.summary.losingTrades ?? 0} 笔 · 胜率 {result ? formatPct(result.summary.winRate) : '--'}
+                    </div>
+                    <label style={{ minWidth: 110 }}>
+                      <div style={labelStyle}>买卖方向</div>
+                      <select value={tradeSideFilter} onChange={(e) => setTradeSideFilter(e.target.value as TradeSideFilter)} style={fieldStyle}>
+                        <option value="all">全部</option>
+                        <option value="BUY">买入</option>
+                        <option value="SELL">卖出</option>
+                      </select>
+                    </label>
+                    <label style={{ minWidth: 110 }}>
+                      <div style={labelStyle}>盈亏状态</div>
+                      <select value={tradePnlFilter} onChange={(e) => setTradePnlFilter(e.target.value as TradePnlFilter)} style={fieldStyle}>
+                        <option value="all">全部</option>
+                        <option value="win">盈利</option>
+                        <option value="loss">亏损</option>
+                      </select>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, height: 34, color: '#475569', fontSize: 12 }}>
+                      <input type="checkbox" checked={groupTradesByDay} onChange={(e) => setGroupTradesByDay(e.target.checked)} />
+                      按日期分组
+                    </label>
+                    <button
+                      onClick={handleExportTrades}
+                      disabled={filteredTrades.length === 0}
+                      style={{
+                        height: 34,
+                        borderRadius: 4,
+                        border: '1px solid #0f766e',
+                        background: filteredTrades.length > 0 ? '#ccfbf1' : '#f1f5f9',
+                        color: filteredTrades.length > 0 ? '#0f766e' : '#94a3b8',
+                        cursor: filteredTrades.length > 0 ? 'pointer' : 'not-allowed',
+                        padding: '0 10px',
+                      }}
+                    >
+                      导出 CSV
+                    </button>
+                  </div>
+                  <details style={{ marginTop: 10, color: '#475569', fontSize: 12 }}>
+                    <summary style={{ color: '#0f766e', cursor: 'pointer', width: 'fit-content' }}>选择显示字段（当前 {visibleTradeColumns.length} 项）</summary>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 14px', marginTop: 9 }}>
+                      {tradeColumnDefs.map((column) => (
+                        <label key={column.key} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                          <input
+                            type="checkbox"
+                            checked={tradeColumns[column.key]}
+                            onChange={(e) => setTradeColumns((prev) => ({ ...prev, [column.key]: e.target.checked }))}
+                          />
+                          {column.label}
+                        </label>
+                      ))}
+                    </div>
+                  </details>
+                </section>
+              )}
 
               {activePanel === 'overview' && (
               <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
