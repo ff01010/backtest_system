@@ -91,7 +91,7 @@ TREND_GRID_HOST_SIGNAL_ROOT=/srv/quant-backtest/data/signals
 
 - `kline`：旧 CSV 兼容目录；当前回测不读取该目录中的 K 线。
 - `signals`：信号可视化可选 CSV 目录；可以为空。
-- 策略脚本、策略方案、账户和回测记录保存在 PostgreSQL；QMT 原始行情保存在 ClickHouse。
+- 策略脚本、策略方案、账户和回测记录保存在 PostgreSQL；每位用户的回测展示编号从 `#01` 独立递增；QMT 原始行情保存在 ClickHouse。
 
 ### Docker 数据卷
 

@@ -497,6 +497,56 @@ function getHistoryRunParam(run: BacktestRunHistory, key: string): unknown {
   return snapshot[key] ?? requestStrategyParams[key] ?? run.paramsJson[key];
 }
 
+function formatRunReference(displayNo: number | null | undefined): string {
+  return `#${String(displayNo ?? 0).padStart(2, '0')}`;
+}
+
+interface ResultContextBarProps {
+  runReference: string;
+  configName: string;
+  symbol: string;
+  benchmarkSymbol: string | null;
+  timeframe: string;
+  startDate: string;
+  endDate: string;
+  commissionRate: number | null;
+  slippage: number | null;
+  holdingPolicy: string | undefined;
+}
+
+function ResultContextBar({
+  runReference,
+  configName,
+  symbol,
+  benchmarkSymbol,
+  timeframe,
+  startDate,
+  endDate,
+  commissionRate,
+  slippage,
+  holdingPolicy,
+}: ResultContextBarProps): ReactNode {
+  return (
+    <section style={{ ...panelStyle, padding: '10px 12px', background: '#ffffff' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', color: '#475569', fontSize: 12, lineHeight: 1.6 }}>
+        <strong style={{ color: '#0f766e' }}>{runReference}</strong>
+        <span>{configName}</span>
+        <span>{symbol} · {timeframe}</span>
+        <span>{startDate} - {endDate}</span>
+      </div>
+      <details style={{ marginTop: 8, color: '#475569', fontSize: 12 }}>
+        <summary style={{ color: '#0f766e', cursor: 'pointer', width: 'fit-content' }}>查看本次回测设置</summary>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 8, lineHeight: 1.6 }}>
+          <span>基准：{benchmarkSymbol || symbol}</span>
+          <span>手续费：{commissionRate == null ? '--' : `${(commissionRate * 10_000).toFixed(2)} bp`}</span>
+          <span>滑点：{slippage == null ? '--' : `${(slippage * 10_000).toFixed(2)} bp`}</span>
+          <span>持仓规则：{holdingPolicy === 'overnight' ? '允许跨日' : holdingPolicy === 'intraday' ? '日内平仓' : '未记录'}</span>
+        </div>
+      </details>
+    </section>
+  );
+}
+
 function getHistoryDirectionLabel(run: BacktestRunHistory): string {
   const allowLong = getHistoryRunParam(run, 'allowLong') !== false;
   const allowShort = getHistoryRunParam(run, 'allowShort') !== false;
@@ -570,8 +620,8 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
           entries={[
             { label: '信号规则', value: manifest?.signalModel },
             { label: 'K 线数量', value: manifest?.barCount },
-            { label: '数据范围', value: manifest ? `${manifest.barRange.start} - ${manifest.barRange.end}` : null },
-            { label: '数据周期', value: manifest?.barRange.timeframe },
+            { label: '数据范围', value: manifest?.barRange ? `${manifest.barRange.start} - ${manifest.barRange.end}` : null },
+            { label: '数据周期', value: manifest?.barRange?.timeframe },
             { label: '数据文件', value: dataFiles == null ? null : `${dataFiles} 个` },
             { label: '数据指纹', value: shortenHistoryHash(dataVersion.dataHash ?? manifest?.dataHash) },
           ]}
@@ -1452,14 +1502,14 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         const data = await runLiveStrategy(payload);
         setResult(null);
         refreshBacktestRuns();
-        setStatus(`运行模式已记录 #${data.runId ?? '-'}，${data.message}`);
+        setStatus(`运行模式已记录 ${formatRunReference(data.displayNo)}，${data.message}`);
         return;
       }
       const data = await runBacktest(payload);
       setResult(data);
       refreshDataStatus(selectedSymbol, selectedTimeframe);
       refreshBacktestRuns();
-      setStatus(`回测完成 #${data.runId ?? '-'}，交易 ${data.summary.tradeCount} 笔`);
+      setStatus(`回测完成 ${formatRunReference(data.displayNo)}，交易 ${data.summary.tradeCount} 笔`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '回测失败');
     } finally {
@@ -1728,7 +1778,25 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const activeScript = strategyScripts.find((item) => item.id === selectedScriptId);
   const configNameById = new Map(strategyConfigs.map((item) => [item.id, item.name]));
   const selectedHistoryRun = backtestRuns.find((item) => item.id === selectedHistoryRunId) || null;
+  const resultHistoryRun = result?.runId ? backtestRuns.find((item) => item.id === result.runId) || null : null;
   const compareHistoryRun = backtestRuns.find((item) => item.id === compareHistoryRunId) || null;
+  const resultManifest = result?.experimentManifest;
+  const resultCostModel = resultManifest?.costModel;
+  const resultContext = {
+    runReference: result?.runId ? formatRunReference(result.displayNo) : '当前设置',
+    configName: resultHistoryRun?.configId
+      ? configNameById.get(resultHistoryRun.configId) || '已保存策略方案'
+      : activeConfig?.name || configName || '未选择策略方案',
+    symbol: resultHistoryRun?.symbol || selectedSymbol,
+    benchmarkSymbol: resultHistoryRun?.benchmarkSymbol || result?.benchmarkSymbol || selectedBenchmarkSymbol,
+    timeframe: resultHistoryRun?.timeframe || resultManifest?.barRange?.timeframe || selectedTimeframe,
+    startDate: resultHistoryRun?.startDate || params.startDate,
+    endDate: resultHistoryRun?.endDate || params.endDate,
+    commissionRate: resultCostModel?.commissionRate ?? Number(params.commissionRate),
+    slippage: resultCostModel?.slippage ?? Number(params.slippage),
+    holdingPolicy: resultManifest?.holdingPolicy || String(params.holdingPolicy),
+  };
+  const hasWorkbenchSidebar = !['history', 'trades', 'positions'].includes(activePanel);
   const historyParamDiffs = compareHistoryRuns(selectedHistoryRun, compareHistoryRun);
   const historySymbols = useMemo(
     () => Array.from(new Set(backtestRuns.map((run) => run.symbol))).sort(),
@@ -1738,7 +1806,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     const query = historyQuery.trim().toLowerCase();
     return backtestRuns.filter((run) => {
       const configName = run.configId ? configNameById.get(run.configId) || '' : '';
-      const searchable = [run.id, run.symbol, run.strategy, configName, ...run.tags].join(' ').toLowerCase();
+      const searchable = [run.id, run.displayNo, run.symbol, run.strategy, configName, ...run.tags].join(' ').toLowerCase();
       return (!historySymbolFilter || run.symbol === historySymbolFilter) && (!query || searchable.includes(query));
     });
   }, [backtestRuns, configNameById, historyQuery, historySymbolFilter]);
@@ -1807,7 +1875,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       allowShort: boolValue('allowShort', DEFAULT_PARAMS.allowShort),
       holdingPolicy: textValue('holdingPolicy', DEFAULT_PARAMS.holdingPolicy),
     });
-    setStatus(`已恢复历史回测 #${run.id} 的参数`);
+    setStatus(`已恢复历史回测 ${formatRunReference(run.displayNo)} 的参数`);
   };
 
   const handleViewHistoryResult = (run: BacktestRunHistory) => {
@@ -1818,12 +1886,13 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     setResult({
       ...run.resultJson,
       runId: run.id,
+      displayNo: run.displayNo,
       configId: run.configId,
       configVersionId: run.configVersionId,
       scriptId: run.scriptId,
     });
     setActivePanel('overview');
-    setStatus(`正在查看历史回测 #${run.id} 的结果`);
+    setStatus(`正在查看历史回测 ${formatRunReference(run.displayNo)} 的结果`);
   };
 
   const handleRerunHistory = async (run: BacktestRunHistory) => {
@@ -1858,7 +1927,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       setResult(data);
       await refreshBacktestRuns();
       setActivePanel('overview');
-      setStatus(`已重新运行回测 #${run.id}，新记录为 #${data.runId ?? '-'}`);
+      setStatus(`已重新运行回测 ${formatRunReference(run.displayNo)}，新记录为 ${formatRunReference(data.displayNo)}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '重新运行回测失败');
     } finally {
@@ -1880,7 +1949,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         tags,
       });
       setBacktestRuns((prev) => prev.map((item) => (item.id === run.id ? run : item)));
-      setStatus(`已保存历史记录 #${run.id} 的备注和标签`);
+      setStatus(`已保存历史记录 ${formatRunReference(run.displayNo)} 的备注和标签`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '保存历史备注失败');
     }
@@ -2005,10 +2074,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       <div style={{
         minHeight: 0,
         display: 'grid',
-        gridTemplateColumns: activePanel === 'history' ? 'minmax(0, 1fr)' : '340px minmax(0, 1fr)',
+        gridTemplateColumns: hasWorkbenchSidebar ? '340px minmax(0, 1fr)' : 'minmax(0, 1fr)',
         overflow: 'hidden',
       }}>
-        {activePanel !== 'history' && (
+        {hasWorkbenchSidebar && (
         <aside style={{
           minHeight: 0,
           overflow: 'auto',
@@ -2158,102 +2227,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
             </div>
           )}
 
-          {activePanel === 'positions' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <div style={{
-                color: dataCoverageColor,
-                background: dataCoverage.tone === 'ok' ? '#ecfdf5' : '#fffbeb',
-                border: `1px solid ${dataCoverage.tone === 'ok' ? '#99f6e4' : '#f59e0b'}`,
-                borderRadius: 4,
-                padding: '10px 12px',
-                fontSize: 12,
-                lineHeight: 1.6,
-              }}>
-                {dataCoverage.text}
-              </div>
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
-                <div>标的：{selectedSymbol}</div>
-                <div>周期：{selectedTimeframe}</div>
-                <div>首日：{dataStatus?.firstDate || '-'}</div>
-                <div>末日：{dataStatus?.lastDate || '-'}</div>
-                <div>缺口：{dataStatus?.gapDates.length ?? 0}</div>
-                <div>重复：{dataStatus?.duplicateCount ?? 0}</div>
-              </div>
-            </div>
-          )}
-
-          {activePanel === 'trades' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
-                <div>交易次数：{result?.summary.tradeCount ?? 0}</div>
-                <div>盈利次数：{result?.summary.winningTrades ?? 0}</div>
-                <div>亏损次数：{result?.summary.losingTrades ?? 0}</div>
-                <div>胜率：{result ? formatPct(result.summary.winRate) : '--'}</div>
-                <div>当前筛选：{filteredTrades.length}</div>
-              </div>
-
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
-                <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 10 }}>筛选</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                  <label>
-                    <div style={labelStyle}>买卖方向</div>
-                    <select value={tradeSideFilter} onChange={(e) => setTradeSideFilter(e.target.value as TradeSideFilter)} style={fieldStyle}>
-                      <option value="all">全部</option>
-                      <option value="BUY">买入</option>
-                      <option value="SELL">卖出</option>
-                    </select>
-                  </label>
-                  <label>
-                    <div style={labelStyle}>盈亏状态</div>
-                    <select value={tradePnlFilter} onChange={(e) => setTradePnlFilter(e.target.value as TradePnlFilter)} style={fieldStyle}>
-                      <option value="all">全部</option>
-                      <option value="win">盈利</option>
-                      <option value="loss">亏损</option>
-                    </select>
-                  </label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#64748b', fontSize: 13 }}>
-                    <input type="checkbox" checked={groupTradesByDay} onChange={(e) => setGroupTradesByDay(e.target.checked)} />
-                    按日期分组
-                  </label>
-                </div>
-              </div>
-
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
-                <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 10 }}>显示字段</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                  {tradeColumnDefs.map((column) => (
-                    <label key={column.key} style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#64748b', fontSize: 12 }}>
-                      <input
-                        type="checkbox"
-                        checked={tradeColumns[column.key]}
-                        onChange={(e) => setTradeColumns((prev) => ({ ...prev, [column.key]: e.target.checked }))}
-                      />
-                      {column.label}
-                    </label>
-                  ))}
-                </div>
-              </div>
-
-              <button
-                onClick={handleExportTrades}
-                disabled={filteredTrades.length === 0}
-                style={{
-                  height: 36,
-                  borderRadius: 4,
-                  border: '1px solid #0f766e',
-                  background: filteredTrades.length > 0 ? '#ccfbf1' : '#f1f5f9',
-                  color: filteredTrades.length > 0 ? '#0f766e' : '#94a3b8',
-                  cursor: filteredTrades.length > 0 ? 'pointer' : 'not-allowed',
-                }}
-              >
-                导出当前交易 CSV
-              </button>
-              <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
-                字段筛选只影响当前页面展示和导出，不会改动回测结果。
-              </div>
-            </div>
-          )}
-
           {false && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
@@ -2307,7 +2280,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
                 <div>已保存策略：{strategyConfigs.length}</div>
                 <div>关联脚本：{strategyScripts.length}</div>
-                <div>当前回测：{result ? `#${result.runId ?? '-'}` : '暂无'}</div>
+                <div>当前回测：{result ? formatRunReference(result.displayNo) : '暂无'}</div>
               </div>
               <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
                 日志输出后续会接入回测和运行过程日志；当前先显示策略方案和脚本统计。
@@ -2675,6 +2648,70 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                 </div>
               </div>
 
+              {(activePanel === 'trades' || activePanel === 'positions') && (
+                <ResultContextBar {...resultContext} />
+              )}
+
+              {activePanel === 'trades' && (
+                <section style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'end', gap: 10 }}>
+                    <div style={{ color: '#475569', fontSize: 12, lineHeight: 1.6, marginRight: 8 }}>
+                      交易 {result?.summary.tradeCount ?? 0} 笔 · 盈利 {result?.summary.winningTrades ?? 0} 笔 · 亏损 {result?.summary.losingTrades ?? 0} 笔 · 胜率 {result ? formatPct(result.summary.winRate) : '--'}
+                    </div>
+                    <label style={{ minWidth: 110 }}>
+                      <div style={labelStyle}>买卖方向</div>
+                      <select value={tradeSideFilter} onChange={(e) => setTradeSideFilter(e.target.value as TradeSideFilter)} style={fieldStyle}>
+                        <option value="all">全部</option>
+                        <option value="BUY">买入</option>
+                        <option value="SELL">卖出</option>
+                      </select>
+                    </label>
+                    <label style={{ minWidth: 110 }}>
+                      <div style={labelStyle}>盈亏状态</div>
+                      <select value={tradePnlFilter} onChange={(e) => setTradePnlFilter(e.target.value as TradePnlFilter)} style={fieldStyle}>
+                        <option value="all">全部</option>
+                        <option value="win">盈利</option>
+                        <option value="loss">亏损</option>
+                      </select>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, height: 34, color: '#475569', fontSize: 12 }}>
+                      <input type="checkbox" checked={groupTradesByDay} onChange={(e) => setGroupTradesByDay(e.target.checked)} />
+                      按日期分组
+                    </label>
+                    <button
+                      onClick={handleExportTrades}
+                      disabled={filteredTrades.length === 0}
+                      style={{
+                        height: 34,
+                        borderRadius: 4,
+                        border: '1px solid #0f766e',
+                        background: filteredTrades.length > 0 ? '#ccfbf1' : '#f1f5f9',
+                        color: filteredTrades.length > 0 ? '#0f766e' : '#94a3b8',
+                        cursor: filteredTrades.length > 0 ? 'pointer' : 'not-allowed',
+                        padding: '0 10px',
+                      }}
+                    >
+                      导出 CSV
+                    </button>
+                  </div>
+                  <details style={{ marginTop: 10, color: '#475569', fontSize: 12 }}>
+                    <summary style={{ color: '#0f766e', cursor: 'pointer', width: 'fit-content' }}>选择显示字段（当前 {visibleTradeColumns.length} 项）</summary>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 14px', marginTop: 9 }}>
+                      {tradeColumnDefs.map((column) => (
+                        <label key={column.key} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                          <input
+                            type="checkbox"
+                            checked={tradeColumns[column.key]}
+                            onChange={(e) => setTradeColumns((prev) => ({ ...prev, [column.key]: e.target.checked }))}
+                          />
+                          {column.label}
+                        </label>
+                      ))}
+                    </div>
+                  </details>
+                </section>
+              )}
+
               {activePanel === 'overview' && (
               <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(140px, 1fr))', gap: 12 }}>
@@ -2867,13 +2904,13 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     })}
                   </div>
                 )}
-                {result?.experimentManifest && (
+                {resultManifest && (
                   <div style={{ marginTop: 10, padding: '9px 10px', borderRadius: 5, background: '#f1f5f9', color: '#475569', fontSize: 12, lineHeight: 1.65 }}>
                     <div>
-                      回测口径：Bar 收盘信号虚拟成交 · {result.experimentManifest.holdingPolicy === 'overnight' ? '允许跨日' : result.experimentManifest.holdingPolicy === 'intraday' ? '日内平仓' : '期末规则未记录'} · 手续费 {(result.experimentManifest.costModel.commissionRate * 10_000).toFixed(2)} bp · 滑点 {(result.experimentManifest.costModel.slippage * 10_000).toFixed(2)} bp
+                      回测口径：Bar 收盘信号虚拟成交 · {resultManifest.holdingPolicy === 'overnight' ? '允许跨日' : resultManifest.holdingPolicy === 'intraday' ? '日内平仓' : '期末规则未记录'} · {resultCostModel ? `手续费 ${(resultCostModel.commissionRate * 10_000).toFixed(2)} bp · 滑点 ${(resultCostModel.slippage * 10_000).toFixed(2)} bp` : '成本模型未记录'}
                     </div>
                     <div>
-                      实验指纹：{result.experimentManifest.experimentHash.slice(0, 12)} · {result.experimentManifest.barCount} 根 {result.experimentManifest.barRange.timeframe} K 线
+                      实验指纹：{resultManifest.experimentHash?.slice(0, 12) || '未记录'} · {resultManifest.barCount} 根 {resultManifest.barRange?.timeframe || selectedTimeframe} K 线
                     </div>
                   </div>
                 )}
@@ -3070,7 +3107,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                           return (
                             <div key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
                               <button onClick={() => setSelectedHistoryRunId(run.id)} style={{ textAlign: 'left', border: 'none', background: 'transparent', padding: 0, color: '#0f172a', cursor: 'pointer', fontWeight: isSelected ? 700 : 500 }}>
-                                #{run.id}
+                                {formatRunReference(run.displayNo)}
                               </button>
                               <span style={{ minWidth: 0 }}>
                                 <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -3171,12 +3208,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                               <div>区间：{selectedHistoryRun.startDate}-{selectedHistoryRun.endDate}</div>
                               <div>状态：{selectedHistoryRun.status}</div>
                             </div>
-                            {selectedHistoryRun.resultJson?.experimentManifest ? (
+                            {selectedHistoryRun.resultJson?.experimentManifest?.experimentHash ? (
                               <div style={{ padding: '8px 10px', borderRadius: 4, background: '#f1f5f9', color: '#475569' }}>
                                 实验指纹：{selectedHistoryRun.resultJson.experimentManifest.experimentHash.slice(0, 12)} · {selectedHistoryRun.resultJson.experimentManifest.barCount} 根 {selectedHistoryRun.resultJson.experimentManifest.barRange.timeframe} K 线
                               </div>
                             ) : (
-                              <div style={{ color: '#b45309' }}>旧记录未保存实验清单，无法完整复现。</div>
+                              <div style={{ color: '#b45309' }}>该记录的实验清单不完整，无法完整复现。</div>
                             )}
                             <HistoryRunSnapshot run={selectedHistoryRun} />
                             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8, marginTop: 4 }}>
@@ -3404,7 +3441,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     lineHeight: 1.7,
                   }}>
                     <div>输出目录：{result?.outputDir || '--'}</div>
-                    <div>回测记录：{result?.runId ? `#${result.runId}` : '--'}</div>
+                    <div>回测记录：{result?.runId ? formatRunReference(result.displayNo) : '--'}</div>
                     <div>告警数量：{result?.warnings.length || 0}</div>
                     {result && result.warnings.length > 0 ? (
                       result.warnings.map((item) => (

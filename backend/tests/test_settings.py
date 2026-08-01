@@ -74,9 +74,11 @@ def test_backtest_run_insert_has_matching_placeholder_count() -> None:
       self.query = query
 
     def fetchone(self) -> dict[str, object]:
+      if "user_backtest_counter" in self.query:
+        return {"display_no": 1}
       if "market_instrument" in self.query:
         return {"id": 1}
-      return {"id": "00000000-0000-0000-0000-000000000002"}
+      return {"id": "00000000-0000-0000-0000-000000000002", "display_no": 1}
 
   class CursorContext:
     def __enter__(self) -> Cursor:
@@ -106,6 +108,6 @@ def test_backtest_run_insert_has_matching_placeholder_count() -> None:
   original_db = state_store._db
   state_store._db = lambda: ConnectionContext()  # type: ignore[assignment]
   try:
-    assert state_store.create_backtest_run(payload) == "00000000-0000-0000-0000-000000000002"
+    assert state_store.create_backtest_run(payload) == ("00000000-0000-0000-0000-000000000002", 1)
   finally:
     state_store._db = original_db  # type: ignore[assignment]

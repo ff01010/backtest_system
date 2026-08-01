@@ -707,7 +707,7 @@ def run_backtest(payload: schemas.BacktestRunRequest):
 
   run_id = None
   try:
-    run_id = state_store.create_backtest_run(request)
+    run_id, display_no = state_store.create_backtest_run(request)
     result = backtest_runner.run_backtest(request)
     state_store.finish_backtest_run(
       run_id,
@@ -718,6 +718,7 @@ def run_backtest(payload: schemas.BacktestRunRequest):
     )
     return {
       "runId": run_id,
+      "displayNo": display_no,
       "configId": request.get("configId"),
       "configVersionId": request.get("configVersionId"),
       "scriptId": request.get("scriptId"),
@@ -742,9 +743,10 @@ def create_live_run(payload: schemas.BacktestRunRequest):
   request = _model_dump(payload)
   _validate_backtest_request(request)
 
-  run_id = state_store.create_backtest_run(request, status="queued")
+  run_id, display_no = state_store.create_backtest_run(request, status="queued")
   return {
     "runId": run_id,
+    "displayNo": display_no,
     "configId": request.get("configId"),
     "configVersionId": request.get("configVersionId"),
     "scriptId": request.get("scriptId"),

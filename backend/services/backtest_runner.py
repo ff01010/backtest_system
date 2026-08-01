@@ -197,16 +197,53 @@ def _script_output_dir(payload: dict[str, Any]) -> str:
 def _build_script_experiment_manifest(
   payload: dict[str, Any], bars: pd.DataFrame, script_id: str, script_name: str, code_hash: str,
 ) -> dict[str, Any]:
+  timeframe = str(payload.get("timeframe", "5m"))
+  holding_policy = "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
   data_snapshot = market_data.snapshot(
-    payload["symbol"], payload.get("timeframe", "5m"), payload["startDate"], payload["endDate"],
+    payload["symbol"], timeframe, payload["startDate"], payload["endDate"],
   )
-  return {
+  config_hash = _stable_hash({
+    "scriptId": script_id,
+    "strategyParams": payload.get("strategyParams", {}),
+    "symbol": payload["symbol"],
+    "timeframe": timeframe,
+    "startDate": payload["startDate"],
+    "endDate": payload["endDate"],
+    "initialCapital": payload["initialCapital"],
+    "commissionRate": payload["commissionRate"],
+    "slippage": payload["slippage"],
+    "allowLong": payload.get("allowLong", True),
+    "allowShort": payload.get("allowShort", True),
+    "holdingPolicy": holding_policy,
+  })
+  experiment_hash = _stable_hash({
     "engineVersion": "isolated-script-worker-v1",
+    "strategyCodeHash": code_hash,
+    "dataHash": data_snapshot["hash"],
+    "configHash": config_hash,
+  })
+  return {
+    "experimentHash": experiment_hash,
+    "engineVersion": "isolated-script-worker-v1",
+    "signalModel": "on_bar_script",
+    "fillModel": "recorded_price_fill",
+    "randomSeed": 0,
+    "strategyCodeHash": code_hash,
+    "configHash": config_hash,
     "strategySource": {"id": f"script:{script_id}", "name": script_name, "codeHash": code_hash},
     "dataHash": data_snapshot["hash"],
     "databaseSnapshot": data_snapshot,
     "barCount": int(len(bars)),
-    "barRange": {"start": str(bars.iloc[0]["time"]) if not bars.empty else "", "end": str(bars.iloc[-1]["time"]) if not bars.empty else ""},
+    "barRange": {
+      "start": str(bars.iloc[0]["time"]) if not bars.empty else "",
+      "end": str(bars.iloc[-1]["time"]) if not bars.empty else "",
+      "timeframe": timeframe,
+    },
+    "costModel": {
+      "commissionRate": float(payload["commissionRate"]),
+      "slippage": float(payload["slippage"]),
+    },
+    "holdingPolicy": holding_policy,
     "executionEnvironment": "strategy-worker",
   }
 
