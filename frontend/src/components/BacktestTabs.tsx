@@ -16,6 +16,7 @@ export default function BacktestTabs({ activeTab, tabs, onChange }: Props) {
   return (
     <nav
       aria-label="回测工作台导航"
+      className="backtest-tabs"
       style={{
         display: 'flex',
         flexDirection: 'column',
@@ -32,6 +33,7 @@ export default function BacktestTabs({ activeTab, tabs, onChange }: Props) {
           <button
             key={tab.id}
             type="button"
+            className={`backtest-tab${active ? ' is-active' : ''}`}
             onClick={() => onChange(tab.id)}
             aria-label={tab.label}
             title={tab.label}

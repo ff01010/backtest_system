@@ -113,19 +113,19 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
   }, [dates, urlParams.date, setUrlParams]);
 
   return (
-    <div style={{
+    <div className="workspace-shell" style={{
       display: 'flex', flexDirection: 'column', height: '100vh',
       background: 'var(--canvas)', color: 'var(--text)',
       fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif',
       fontSize: typography.base,
       lineHeight: 1.5,
     }}>
-      <div style={{
+      <div className="app-topbar" style={{
         display: 'flex', alignItems: 'center', gap: '4px',
         minHeight: 44, padding: '0 18px', background: 'var(--chrome)',
         borderBottom: '1px solid #2a2e39', flexShrink: 0,
       }}>
-        <div style={{
+        <div className="app-brand" style={{
           color: '#f1f3f7', fontSize: typography.lg, fontWeight: 750,
           marginRight: 14, letterSpacing: '.02em', fontFamily: 'ui-serif, "Songti SC", "Noto Serif SC", serif',
         }}>
@@ -140,6 +140,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
           return (
             <button
               key={item.key}
+              className="app-nav-button"
               onClick={() => setActivePage(item.key)}
               style={{
                 height: 44, padding: '0 12px', borderRadius: 0,

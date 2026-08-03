@@ -49,11 +49,12 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
   };
 
   return (
-    <label style={{ display: 'grid', gap: 6, position: 'relative' }}>
+    <label className="instrument-search" style={{ display: 'grid', gap: 6, position: 'relative' }}>
       <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>{label}</span>
       <div style={{ position: 'relative' }}>
         <Search size={15} color="#0f766e" style={{ position: 'absolute', left: 10, top: 10, pointerEvents: 'none' }} />
         <input
+          className="instrument-search-input"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           onFocus={() => {
@@ -74,11 +75,11 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
           style={inputStyle}
         />
         {open && (
-          <div style={menuStyle}>
+          <div className="instrument-search-menu" style={menuStyle}>
             {error ? <div style={hintStyle}>{error}</div> : items.length === 0 ? (
               <div style={hintStyle}>未找到匹配标的，请先由管理员刷新证券目录。</div>
             ) : items.map((item) => (
-              <button key={item.symbol} type="button" onMouseDown={() => select(item)} style={optionStyle}>
+              <button className="instrument-search-option" key={item.symbol} type="button" onMouseDown={() => select(item)} style={optionStyle}>
                 <strong>{item.symbol}</strong><span>{item.name}</span><small>{item.board === 'star' ? '科创板' : item.board === 'chinext' ? '创业板' : item.market}</small>
               </button>
             ))}
