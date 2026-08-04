@@ -159,6 +159,51 @@ def upsert_market_instruments(items: list[Any]) -> int:
   return len(rows)
 
 
+def replace_market_instruments_from_qmt(items: list[dict[str, str | None]]) -> int:
+  """以完整 QMT 快照替换 PostgreSQL 中的有效股票目录。"""
+  if not items:
+    return 0
+  rows = [
+    (
+      item["symbol"], item["exchange"], item["display_name"], item["instrument_type"],
+      item["board"], _qmt_secid(item["symbol"], item["exchange"]), item["list_date"],
+      item["delist_date"], Jsonb({"source": "qmt"}),
+    )
+    for item in items
+  ]
+  if not settings.DATABASE_URL:
+    raise DatabaseError("未设置 TREND_GRID_DATABASE_URL")
+  try:
+    with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
+      with conn.cursor() as cur:
+        cur.execute("UPDATE market_instrument SET is_active=false WHERE instrument_type='stock'")
+        cur.executemany("""
+          INSERT INTO market_instrument (
+            symbol, exchange, display_name, instrument_type, board, eastmoney_secid,
+            list_date, delist_date, source_metadata, is_active
+          ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, true)
+          ON CONFLICT (exchange, symbol) DO UPDATE SET
+            display_name=EXCLUDED.display_name,
+            instrument_type=EXCLUDED.instrument_type,
+            board=EXCLUDED.board,
+            eastmoney_secid=EXCLUDED.eastmoney_secid,
+            list_date=EXCLUDED.list_date,
+            delist_date=EXCLUDED.delist_date,
+            source_metadata=EXCLUDED.source_metadata,
+            is_active=true,
+            updated_at=now()
+        """, rows)
+    return len(rows)
+  except psycopg.Error as error:
+    raise DatabaseError(str(error)) from error
+
+
+def _qmt_secid(symbol: str | None, exchange: str | None) -> str:
+  if not symbol or not exchange:
+    raise DatabaseError("QMT 证券目录缺少代码或交易所")
+  return f"{'1' if exchange == 'SH' else '0'}.{symbol}"
+
+
 def _normalize_account(row: dict[str, Any]) -> dict[str, Any]:
   return {
     "id": int(row["id"]),
@@ -697,52 +742,3 @@ def finish_backtest_run(run_id: str, status: str, summary: dict[str, Any], outpu
              summary.get("error") if status != "ok" else None, run_id, current_user_id()))
       if cur.rowcount == 0:
         raise KeyError(run_id)
-
-
-def _date_value(value: str | None) -> datetime.date:
-  return datetime.strptime(value or "19700101", "%Y%m%d").date()
-
-
-def log_data_sync_run(payload: dict[str, Any], result: dict[str, Any]) -> int:
-  with _db() as conn:
-    with conn.cursor() as cur:
-      instrument_id = _instrument_id(cur, payload["symbol"])
-      outcome = result.get("cacheStatus") if result.get("status") == "ok" else "failed"
-      if outcome not in {"cache_hit", "fetched", "failed"}:
-        outcome = "fetched" if result.get("status") == "ok" else "failed"
-      details = {"timeframe": payload.get("timeframe", "5m"), "sourceTimeframe": payload.get("timeframe", "5m"),
-                 "mode": payload.get("mode", "incremental"), "newDates": result.get("new_dates", []),
-                 "outputPath": "postgresql://market_minute_bar", "elapsedMs": result.get("elapsed_ms", 0),
-                 "message": result.get("message", "")}
-      cur.execute("""
-        INSERT INTO market_fetch_log (
-          instrument_id, requested_by_user_id, period, adjustment, source, requested_from,
-          requested_to, outcome, row_count, error_message, finished_at, details
-        ) VALUES (%s,%s,%s,'none','eastmoney',%s,%s,%s,%s,%s,now(),%s) RETURNING id
-      """, (instrument_id, current_user_id(), payload.get("timeframe", "5m"),
-             _date_value(payload.get("startDate")), _date_value(payload.get("endDate")), outcome, int(result.get("new_rows", 0)),
-             result.get("message") if outcome == "failed" else None, Jsonb(details)))
-      return int(cur.fetchone()["id"])
-
-
-def list_data_sync_runs(limit: int = 20) -> list[dict[str, Any]]:
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        SELECT f.*, i.symbol, i.exchange FROM market_fetch_log f
-        LEFT JOIN market_instrument i ON i.id=f.instrument_id
-        WHERE f.requested_by_user_id=%s ORDER BY f.started_at DESC LIMIT %s
-      """, (current_user_id(), limit))
-      rows = []
-      for row in cur.fetchall():
-        details = _json(row["details"], {})
-        rows.append({
-          "id": int(row["id"]), "symbol": f"{row['symbol']}.{row['exchange']}",
-          "timeframe": details.get("timeframe", "5m"), "sourceTimeframe": details.get("sourceTimeframe", ""),
-          "startDate": row["requested_from"].strftime("%Y%m%d"), "endDate": row["requested_to"].strftime("%Y%m%d"),
-          "mode": details.get("mode", "incremental"), "status": "ok" if row["outcome"] in {"fetched", "cache_hit"} else "error",
-          "newRows": int(row["row_count"]), "newDates": details.get("newDates", []),
-          "outputPath": details.get("outputPath", ""), "elapsedMs": int(details.get("elapsedMs", 0)),
-          "message": details.get("message", row.get("error_message") or ""), "createdAt": _format_time(row["started_at"]),
-        })
-      return rows

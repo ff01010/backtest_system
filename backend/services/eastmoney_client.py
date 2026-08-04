@@ -118,14 +118,19 @@ def _fetch_market_directory_page(page: int, timeout_seconds: int) -> dict[str, A
 
 def _fetch_json(url: str, timeout_seconds: int) -> dict[str, Any]:
   request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-  try:
-    with urlopen(request, timeout=timeout_seconds) as response:
-      payload = json.loads(response.read().decode("utf-8"))
-  except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
-    raise EastmoneyError(f"东财请求失败: {error}") from error
-  if not isinstance(payload, dict):
-    raise EastmoneyError("东财响应格式无效")
-  return payload
+  last_error: Exception | None = None
+  for attempt in range(3):
+    try:
+      with urlopen(request, timeout=timeout_seconds) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+      if not isinstance(payload, dict):
+        raise EastmoneyError("东财响应格式无效")
+      return payload
+    except (HTTPError, URLError, OSError, TimeoutError, json.JSONDecodeError) as error:
+      last_error = error
+      if attempt < 2:
+        time.sleep(attempt + 1)
+  raise EastmoneyError(f"东财请求失败: {last_error}") from last_error
 
 
 def _parse_market_instrument(row: object) -> MarketInstrument | None:

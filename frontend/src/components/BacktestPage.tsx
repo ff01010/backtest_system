@@ -27,7 +27,6 @@ import {
   fetchStrategyConfigs,
   fetchStrategyScripts,
   runBacktest,
-  runLiveStrategy,
   updateBacktestRunMeta,
   updateStrategyConfig,
   updateStrategyScript,
@@ -57,16 +56,22 @@ interface Props {
   strategies: string[];
   instruments: InstrumentItem[];
   isAdmin: boolean;
+  onViewTradeChart: (selection: {
+    runId: string;
+    symbol: string;
+    timeframe: string;
+    date: string;
+  }) => void;
 }
 
 const panelStyle = {
-  background: '#ffffff',
-  border: '1px solid #d7dde8',
-  borderRadius: 6,
+  background: 'var(--surface)',
+  border: '1px solid var(--border)',
+  borderRadius: 4,
 } as const;
 
 const labelStyle = {
-  color: '#64748b',
+  color: 'var(--text-muted)',
   fontSize: typography.base,
   marginBottom: 6,
 } as const;
@@ -74,9 +79,9 @@ const labelStyle = {
 const fieldStyle = {
   width: '100%',
   height: 34,
-  background: '#f8fafc',
-  color: '#0f172a',
-  border: '1px solid #cbd5e1',
+  background: 'var(--surface-muted)',
+  color: 'var(--text)',
+  border: '1px solid var(--border-strong)',
   borderRadius: 4,
   padding: '0 10px',
   fontSize: typography.base,
@@ -138,6 +143,8 @@ type WorkbenchPanel = 'overview' | 'params' | 'code' | 'trades' | 'positions' | 
 type ChartRange = '1m' | '1y' | 'all';
 type TradeSideFilter = 'all' | 'BUY' | 'SELL';
 type TradePnlFilter = 'all' | 'win' | 'loss';
+type TradeStatusFilter = 'all' | 'filled' | 'skipped';
+type HoldingStatusFilter = 'all' | 'long' | 'short' | 'flat';
 type TradeColumnKey = 'time' | 'executionTime' | 'status' | 'direction' | 'action' | 'source' | 'note' | 'price' | 'pnl';
 type HistoryParamKey =
   | 'configId'
@@ -723,7 +730,14 @@ function buildStrategyDraftFingerprint(input: {
   }));
 }
 
-export default function BacktestPage({ symbol, strategy, strategies, instruments, isAdmin }: Props) {
+export default function BacktestPage({
+  symbol,
+  strategy,
+  strategies,
+  instruments,
+  isAdmin,
+  onViewTradeChart,
+}: Props) {
   const [instrumentList, setInstrumentList] = useState<InstrumentItem[]>(instruments);
   const [accounts, setAccounts] = useState<BacktestAccount[]>([]);
   const [selectedSymbol, setSelectedSymbol] = useState(symbol);
@@ -744,7 +758,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const [loadingDataStatus, setLoadingDataStatus] = useState(false);
   const [loadingBenchmarkDataStatus, setLoadingBenchmarkDataStatus] = useState(false);
   const [params, setParams] = useState<BacktestParams>(DEFAULT_PARAMS);
-  const [mode, setMode] = useState<'backtest' | 'live'>('backtest');
   const [strategyParameterSchema, setStrategyParameterSchema] = useState<StrategyParameterSchema | null>(null);
   const [strategySchemaError, setStrategySchemaError] = useState('');
   const [loadingStrategySchema, setLoadingStrategySchema] = useState(false);
@@ -778,9 +791,13 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const [useLogAxis, setUseLogAxis] = useState(false);
   const [tradeSideFilter, setTradeSideFilter] = useState<TradeSideFilter>('all');
   const [tradePnlFilter, setTradePnlFilter] = useState<TradePnlFilter>('all');
+  const [tradeStatusFilter, setTradeStatusFilter] = useState<TradeStatusFilter>('all');
   const [tradePage, setTradePage] = useState(1);
   const [tradePageSize, setTradePageSize] = useState(50);
   const [groupTradesByDay, setGroupTradesByDay] = useState(false);
+  const [holdingStatusFilter, setHoldingStatusFilter] = useState<HoldingStatusFilter>('all');
+  const [holdingStartDate, setHoldingStartDate] = useState('');
+  const [holdingEndDate, setHoldingEndDate] = useState('');
   const [tradeColumns, setTradeColumns] = useState<Record<TradeColumnKey, boolean>>({
     time: true,
     executionTime: true,
@@ -803,7 +820,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   ), [strategySource]);
   const draftFingerprint = useMemo(() => buildStrategyDraftFingerprint({
     strategy: selectedStrategy,
-    mode,
+    mode: 'backtest',
     symbol: selectedSymbol,
     timeframe: selectedTimeframe,
     benchmarkSymbol: selectedBenchmarkSymbol,
@@ -814,7 +831,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       entryType: scriptForm.entryType,
     },
   }), [
-    mode,
     params,
     scriptForm.code,
     scriptForm.entryType,
@@ -906,7 +922,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
 
   useEffect(() => {
     setTradePage(1);
-  }, [tradeSideFilter, tradePnlFilter, tradePageSize, result]);
+  }, [tradeSideFilter, tradePnlFilter, tradeStatusFilter, tradePageSize, result]);
 
   useEffect(() => {
     setConfigVersions([]);
@@ -1033,7 +1049,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     setConfigVersions([]);
     setPublishedFingerprint('');
     setConfigName(config.name);
-    setMode(config.mode === 'live' ? 'live' : 'backtest');
     setSelectedSymbol(config.symbol);
     setSelectedTimeframe(config.timeframe || '5m');
     setSelectedBenchmarkSymbol(config.benchmarkSymbol || config.symbol);
@@ -1060,7 +1075,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       });
       setPublishedFingerprint(buildStrategyDraftFingerprint({
         strategy: config.strategy,
-        mode: config.mode,
+        mode: 'backtest',
         symbol: config.symbol,
         timeframe: config.timeframe,
         benchmarkSymbol: config.benchmarkSymbol || config.symbol,
@@ -1081,7 +1096,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     name,
     scriptId,
     strategy: strategyId,
-    mode,
+    mode: 'backtest',
     symbol: selectedSymbol,
     timeframe: selectedTimeframe,
     benchmarkSymbol: selectedBenchmarkSymbol || selectedSymbol,
@@ -1481,7 +1496,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         scriptId: selectedScriptId || null,
         accountId: typeof selectedAccountId === 'number' ? selectedAccountId : null,
         account: account?.name || 'default',
-        mode,
+        mode: 'backtest',
         symbol: selectedSymbol,
         benchmarkSymbol: selectedBenchmarkSymbol || selectedSymbol,
         strategy: selectedStrategy,
@@ -1498,13 +1513,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         strategyParams: params,
         runDraft: false,
       };
-      if (mode === 'live') {
-        const data = await runLiveStrategy(payload);
-        setResult(null);
-        refreshBacktestRuns();
-        setStatus(`运行模式已记录 ${formatRunReference(data.displayNo)}，${data.message}`);
-        return;
-      }
       const data = await runBacktest(payload);
       setResult(data);
       refreshDataStatus(selectedSymbol, selectedTimeframe);
@@ -1599,13 +1607,31 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const rangedBenchmark = result ? filterBenchmarkByDates(result.benchmarkEquity, rangedDates) : [];
   const dailyBars = buildDailyBars(rangedEquity, rangedBenchmark);
   const dailyHoldings = result?.dailyHoldings || [];
+  const getHoldingStatus = (holding: BacktestRunResponse['dailyHoldings'][number]): HoldingStatusFilter => {
+    const netQuantity = holding.longQty - holding.shortQty;
+    if (netQuantity > 0) return 'long';
+    if (netQuantity < 0) return 'short';
+    return 'flat';
+  };
+  const filteredDailyHoldings = dailyHoldings.filter((holding) => {
+    if (holdingStartDate && holding.date < holdingStartDate) return false;
+    if (holdingEndDate && holding.date > holdingEndDate) return false;
+    return holdingStatusFilter === 'all' || getHoldingStatus(holding) === holdingStatusFilter;
+  });
+  const latestHolding = filteredDailyHoldings[filteredDailyHoldings.length - 1];
+  const longHoldingDays = filteredDailyHoldings.filter((holding) => getHoldingStatus(holding) === 'long').length;
+  const shortHoldingDays = filteredDailyHoldings.filter((holding) => getHoldingStatus(holding) === 'short').length;
   const allSignals = result
     ? [...result.trades, ...(result.skippedSignals || [])].sort((left, right) => (
       (left.signalTime || left.time).localeCompare(right.signalTime || right.time)
     ))
     : [];
+  const filledSignalCount = allSignals.filter((trade) => trade.status !== 'skipped').length;
+  const skippedSignalCount = allSignals.length - filledSignalCount;
   const filteredTrades = allSignals.filter((trade) => {
     if (tradeSideFilter !== 'all' && trade.side !== tradeSideFilter) return false;
+    if (tradeStatusFilter === 'filled' && trade.status === 'skipped') return false;
+    if (tradeStatusFilter === 'skipped' && trade.status !== 'skipped') return false;
     if (tradePnlFilter === 'win' && trade.pnl <= 0) return false;
     if (tradePnlFilter === 'loss' && trade.pnl >= 0) return false;
     return true;
@@ -1643,7 +1669,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       render: (trade) => {
         const skipped = trade.status === 'skipped';
         return (
-          <span style={{ color: skipped ? '#b45309' : '#0f766e', fontWeight: 700 }}>
+          <span className={`trade-status-chip ${skipped ? 'is-skipped' : 'is-filled'}`} style={{ color: skipped ? '#b45309' : '#0f766e', fontWeight: 700 }}>
             {skipped ? '已跳过' : '已成交'}
           </span>
         );
@@ -1654,7 +1680,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       label: '方向',
       width: 'minmax(100px, 1fr)',
       render: (trade) => (
-        <span style={{ color: trade.side === 'BUY' ? '#dc2626' : '#16a34a', fontWeight: 600 }}>
+        <span className={`trade-side-label ${trade.side === 'BUY' ? 'is-buy' : 'is-sell'}`} style={{ color: trade.side === 'BUY' ? '#dc2626' : '#16a34a', fontWeight: 600 }}>
           {formatTradeDirection(trade.side)}
         </span>
       ),
@@ -1716,7 +1742,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       width: 'minmax(90px, 0.9fr)',
       align: 'right',
       render: (trade) => (
-        <span style={{ color: getPnlColor(trade.pnl), fontWeight: 600 }}>
+        <span className={`trade-pnl-value ${trade.pnl > 0 ? 'is-profit' : trade.pnl < 0 ? 'is-loss' : ''}`} style={{ color: getPnlColor(trade.pnl), fontWeight: 600 }}>
           {trade.pnl.toFixed(2)}
         </span>
       ),
@@ -1725,10 +1751,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const visibleTradeColumns = tradeColumnDefs.filter((column) => tradeColumns[column.key]);
   const tradeGridColumns = visibleTradeColumns.map((column) => column.width).join(' ') || '1fr';
   const coreMetrics = [
-    ['策略收益', result ? formatPct(result.summary.totalReturn) : '--'],
-    ['基准收益', result ? formatPct(result.benchmarkReturn) : '--'],
+    ['总收益', result ? formatPct(result.summary.totalReturn) : '--'],
+    ['年化收益', result ? formatPct(result.summary.annualReturn) : '--'],
     ['超额收益', result ? formatPct(result.excessReturn) : '--'],
-    ['最大回撤率', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
+    ['最大回撤', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
+    ['Sharpe', result ? formatNumber(result.summary.annualSharpe) : '--'],
+    ['交易 / 胜率', result ? `${result.summary.tradeCount} / ${formatPct(result.summary.winRate)}` : '--'],
   ];
   const metricGroups = [
     {
@@ -1780,6 +1808,15 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   const selectedHistoryRun = backtestRuns.find((item) => item.id === selectedHistoryRunId) || null;
   const resultHistoryRun = result?.runId ? backtestRuns.find((item) => item.id === result.runId) || null : null;
   const compareHistoryRun = backtestRuns.find((item) => item.id === compareHistoryRunId) || null;
+  const historyComparisonScope = selectedHistoryRun && compareHistoryRun
+    ? [
+      selectedHistoryRun.symbol === compareHistoryRun.symbol ? '同标的' : '标的不同',
+      selectedHistoryRun.timeframe === compareHistoryRun.timeframe ? '同周期' : '周期不同',
+      selectedHistoryRun.startDate === compareHistoryRun.startDate && selectedHistoryRun.endDate === compareHistoryRun.endDate
+        ? '同区间'
+        : '区间不同',
+    ]
+    : [];
   const resultManifest = result?.experimentManifest;
   const resultCostModel = resultManifest?.costModel;
   const resultContext = {
@@ -1796,7 +1833,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
     slippage: resultCostModel?.slippage ?? Number(params.slippage),
     holdingPolicy: resultManifest?.holdingPolicy || String(params.holdingPolicy),
   };
-  const hasWorkbenchSidebar = !['history', 'trades', 'positions'].includes(activePanel);
+  const hasWorkbenchSidebar = !['history', 'trades', 'positions', 'code'].includes(activePanel);
   const historyParamDiffs = compareHistoryRuns(selectedHistoryRun, compareHistoryRun);
   const historySymbols = useMemo(
     () => Array.from(new Set(backtestRuns.map((run) => run.symbol))).sort(),
@@ -1841,6 +1878,21 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
         note: trade.note,
       }))
     );
+  };
+
+  const handleViewTradeChart = (trade: BacktestRunResponse['trades'][number]) => {
+    if (!result?.runId || trade.status === 'skipped') return;
+    const executionTime = (trade.executionTime || trade.time).replace(/\D/g, '');
+    if (executionTime.length < 8) {
+      setError('该成交记录缺少可定位的实际成交时间');
+      return;
+    }
+    onViewTradeChart({
+      runId: result.runId,
+      symbol: resultContext.symbol,
+      timeframe: resultContext.timeframe || selectedTimeframe,
+      date: executionTime.slice(0, 8),
+    });
   };
 
   const handleApplyBacktestRun = (run: BacktestRunHistory) => {
@@ -1956,7 +2008,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
   };
 
   return (
-    <div style={{
+    <div className="backtest-workbench" style={{
       flex: 1,
       minHeight: 0,
       background: '#eef3f8',
@@ -1965,7 +2017,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
       gridTemplateRows: activePanel === 'overview' ? '52px minmax(0, 1fr)' : 'minmax(0, 1fr)',
       overflow: 'hidden',
     }}>
-      {activePanel === 'overview' && <header style={{
+      {activePanel === 'overview' && <header className="workbench-header" style={{
         display: 'grid',
         gridTemplateColumns: 'minmax(260px, 1fr) auto auto',
         alignItems: 'center',
@@ -2015,31 +2067,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
           </div>
         </div>
 
-        <div style={{ display: 'flex', gap: 6 }}>
-          {[
-            ['backtest', '回测'],
-            ['live', '运行计划'],
-          ].map(([value, label]) => (
-            <button
-              key={value}
-              onClick={() => setMode(value as 'backtest' | 'live')}
-              style={{
-                height: 34,
-                minWidth: 54,
-                borderRadius: 4,
-                border: `1px solid ${mode === value ? '#0f766e' : '#cbd5e1'}`,
-                background: mode === value ? '#ccfbf1' : '#f8fafc',
-                color: mode === value ? '#0f766e' : '#64748b',
-                cursor: 'pointer',
-                fontSize: 14,
-              }}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
         <button
+          className="workbench-primary-action"
           onClick={handleRunBacktest}
           disabled={runDisabled}
           title={!hasSelectedConfig
@@ -2067,25 +2096,45 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
           }}
         >
           <Play size={15} />
-          {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
+          {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : '运行回测'}
         </button>
       </header>}
 
-      <div style={{
+      <div className="workbench-grid" style={{
         minHeight: 0,
         display: 'grid',
-        gridTemplateColumns: hasWorkbenchSidebar ? '340px minmax(0, 1fr)' : 'minmax(0, 1fr)',
+        gridTemplateColumns: hasWorkbenchSidebar
+          ? '64px 340px minmax(0, 1fr)'
+          : '64px minmax(0, 1fr)',
+        gap: 12,
+        padding: 12,
+        background: '#eef3f8',
         overflow: 'hidden',
       }}>
-        {hasWorkbenchSidebar && (
-        <aside style={{
+        <aside className="workbench-nav" style={{
           minHeight: 0,
           overflow: 'auto',
-          borderRight: '1px solid #e2e8f0',
+          border: '1px solid #dbe1ea',
+          borderRadius: 8,
+          background: '#f8fafc',
+        }}>
+          <BacktestTabs
+            activeTab={activePanel}
+            tabs={resultTabs}
+            onChange={(tabId) => setActivePanel(tabId as WorkbenchPanel)}
+          />
+        </aside>
+
+        {hasWorkbenchSidebar && (
+        <aside className="workbench-rail" style={{
+          minHeight: 0,
+          overflow: 'auto',
+          border: '1px solid #dbe1ea',
+          borderRadius: 8,
           background: '#f8fafc',
           padding: 14,
         }}>
-          <div style={{
+          <div className="workbench-rail-title" style={{
             color: '#0f172a',
             fontSize: 15,
             fontWeight: 700,
@@ -2096,11 +2145,11 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
 
           {activePanel === 'overview' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <div style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
+              <div className="workbench-overview-card" style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
                 <div style={{ color: '#64748b', fontSize: 12, marginBottom: 8 }}>当前策略方案</div>
                 <div style={{ color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
                   <div>名称：{activeConfig?.name || configName || '未选择策略方案'}</div>
-                  <div>模式：{mode === 'live' ? '运行' : '回测'}</div>
+                  <div>模式：回测</div>
                   <div>脚本：{activeScript?.name || '未绑定'}</div>
                   <div>标的：{selectedSymbol}</div>
                   <div>基准：{selectedBenchmarkSymbol}</div>
@@ -2185,11 +2234,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       : `将使用已保存策略「${activeConfig.name}」。`
                     : '请先在策略管理中创建并保存策略。'}
                 </div>
-                {mode === 'live' && (
-                  <div style={{ color: '#b45309', fontSize: 12, lineHeight: 1.65, marginTop: 8 }}>
-                    运行计划仅登记任务，当前不会执行实盘交易。
-                  </div>
-                )}
               </section>
             </div>
           )}
@@ -2226,7 +2270,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               </div>
             </div>
           )}
-
           {false && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
@@ -2295,18 +2338,22 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
           minWidth: 0,
           minHeight: 0,
           overflow: 'auto',
-          padding: 16,
-          background: '#eef3f8',
+          padding: activePanel === 'overview' ? 4 : '16px 20px 24px',
+          background: 'transparent',
         }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16, minHeight: '100%' }}>
-            <BacktestTabs
-              activeTab={activePanel}
-              tabs={resultTabs}
-              onChange={(tabId) => setActivePanel(tabId as WorkbenchPanel)}
-            />
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 16,
+            minHeight: '100%',
+            width: activePanel === 'overview' ? '100%' : 'min(1440px, 100%)',
+            margin: activePanel === 'overview' ? 0 : '0 auto',
+          }}>
             {activePanel === 'code' ? (
-            <section style={{
+            <section className="strategy-studio" style={{
               ...panelStyle,
+              width: 'min(1440px, 100%)',
+              margin: '0 auto',
               minHeight: 'calc(100vh - 164px)',
               padding: 16,
               background: '#ffffff',
@@ -2314,18 +2361,21 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               gridTemplateRows: 'auto minmax(0, 1fr)',
               gap: 12,
             }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: 12 }}>
+              <div className="strategy-studio-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: 12 }}>
                 <div>
-                  <div style={{ color: '#0f172a', fontSize: 16, fontWeight: 700 }}>
+                  <div className="strategy-studio-title" style={{ color: '#0f172a', fontSize: 16, fontWeight: 700 }}>
                   {scriptForm.name || '未命名策略'}
                   </div>
-                  <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
-                    当前策略代码
+                  <div className="strategy-studio-subtitle" style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
+                    策略资产、代码快照与回测配置在同一工作台中维护
                   </div>
                 </div>
+                <div className={`strategy-studio-state ${error ? 'is-error' : versionDirty ? 'is-dirty' : hasSelectedConfig ? 'is-ready' : ''}`} aria-live="polite">
+                  {error ? '需处理异常' : versionDirty ? '未保存修改' : hasSelectedConfig ? '已保存版本' : '新建中'}
+                </div>
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '280px minmax(0, 1fr) 340px', gap: 12, minHeight: 0 }}>
-                <section style={{
+              <div className="strategy-studio-grid" style={{ display: 'grid', gridTemplateColumns: '280px minmax(0, 1fr) 340px', gap: 12, minHeight: 0 }}>
+                <section className="strategy-asset-panel" style={{
                   ...panelStyle,
                   padding: 12,
                   background: '#f8fafc',
@@ -2335,7 +2385,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                   minHeight: 0,
                   overflow: 'auto',
                 }}>
-                  <div style={{ color: '#0f172a', fontSize: 14, fontWeight: 700 }}>策略列表</div>
+                  <div className="strategy-panel-heading">
+                    <span>策略资产</span>
+                    <span>{strategyConfigs.length} 个方案</span>
+                  </div>
                   <label>
                     <div style={labelStyle}>策略方案</div>
                     <select
@@ -2358,7 +2411,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     style={fieldStyle}
                   />
                   {renderStrategyDirectionControls()}
-                  <div style={{
+                  <div className={`strategy-save-notice ${versionDirty ? 'is-dirty' : hasSelectedConfig ? 'is-ready' : ''}`} style={{
                     borderRadius: 4,
                     padding: '8px 10px',
                     background: versionDirty ? '#fffbeb' : '#ecfdf5',
@@ -2372,8 +2425,9 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                         ? '当前策略内容已保存，可直接运行回测。'
                         : '新建策略保存后即可运行回测。'}
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}>
+                  <div className="strategy-asset-actions" style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}>
                     <button
+                      className="strategy-save-action"
                       onClick={handleNewScript}
                       style={{
                         height: 34,
@@ -2420,12 +2474,12 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       删除策略
                     </button>
                   </div>
-                  <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
+                  <div className="strategy-asset-note" style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
                     保存会同时更新代码和参数。每次回测会保存当时快照，可在历史回测中回溯。
                   </div>
                 </section>
 
-                <section style={{
+                <section className="strategy-editor-panel" style={{
                   ...panelStyle,
                   padding: 12,
                   background: '#ffffff',
@@ -2434,7 +2488,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                   gap: 12,
                   minHeight: 0,
                 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+                  <div className="strategy-editor-heading" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
                     <div>
                       <div style={{ color: '#0f172a', fontSize: 14, fontWeight: 700 }}>
                         {selectedStrategy === 'user_script' ? '可编辑策略代码' : '实际运行代码'}
@@ -2447,7 +2501,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     </div>
                   </div>
                   {selectedStrategy === 'user_script' ? (
-                    <div style={{ display: 'grid', gridTemplateRows: 'auto auto minmax(0, 1fr) auto', gap: 10, minHeight: 0 }}>
+                    <div className="strategy-editor-body" style={{ display: 'grid', gridTemplateRows: 'auto auto minmax(0, 1fr) auto', gap: 10, minHeight: 0 }}>
                       <input
                         value={scriptForm.name}
                         onChange={(e) => updateScriptForm({ name: e.target.value })}
@@ -2461,6 +2515,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                         style={fieldStyle}
                       />
                       <textarea
+                        className="strategy-code-editor"
                         value={scriptForm.code}
                         onChange={(e) => updateScriptForm({ code: e.target.value })}
                         spellCheck={false}
@@ -2470,7 +2525,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                           fontSize: 13, lineHeight: 1.55, fontFamily: 'Consolas, monospace', outline: 'none',
                         }}
                       />
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+                      <div className="strategy-editor-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
                         <span style={{ color: '#64748b', fontSize: 12 }}>
                           接口：on_bar(bar, state)；每根已完成的 {selectedTimeframe} K 线触发，按收盘价成交；支持导入后端已安装模块。
                         </span>
@@ -2479,6 +2534,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     </div>
                   ) : (
                     <textarea
+                      className="strategy-code-editor is-readonly"
                       value={strategySourceCode || strategySourceError}
                       readOnly
                       spellCheck={false}
@@ -2491,7 +2547,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                   )}
                 </section>
 
-                <section style={{
+                <section className="strategy-config-panel" style={{
                   ...panelStyle,
                   padding: 12,
                   background: '#f8fafc',
@@ -2501,7 +2557,10 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                   minHeight: 0,
                   overflow: 'auto',
                 }}>
-                  <div style={{ color: '#0f172a', fontSize: 14, fontWeight: 700 }}>参数与运行</div>
+                  <div className="strategy-panel-heading">
+                    <span>回测配置</span>
+                    <span>运行前检查</span>
+                  </div>
                   <InstrumentSearchField label="运行标的" value={selectedSymbol} onChange={setSelectedSymbol} />
                   <label>
                     <div style={labelStyle}>运行周期</div>
@@ -2583,7 +2642,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     {benchmarkCoverage.text}
                   </div>
                   {(status || error) && (
-                    <div style={{
+                    <div className={`strategy-runtime-message ${error ? 'is-error' : ''}`} style={{
                       color: error ? '#b91c1c' : '#0f766e',
                       background: error ? '#fef2f2' : '#ecfdf5',
                       border: `1px solid ${error ? '#fecaca' : '#99f6e4'}`,
@@ -2594,8 +2653,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       {error || status}
                     </div>
                   )}
-                  <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                    <button style={{
+                  <div className="strategy-run-actions" style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                    <button className="strategy-run-action" style={{
                       flex: 1,
                       height: 34,
                       borderRadius: 4,
@@ -2610,7 +2669,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       opacity: runDisabled ? 0.7 : 1,
                     }} onClick={handleRunBacktest} disabled={runDisabled} title={versionDirty ? '请先保存策略' : !hasSelectedConfig ? '请先保存策略' : !runPreflightReady ? '请等待运行前检查通过' : undefined}>
                       <Play size={14} />
-                      {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : mode === 'live' ? '记录运行计划' : '运行回测'}
+                      {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : '运行回测'}
                     </button>
                     <button style={{
                       width: 38,
@@ -2629,10 +2688,20 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                   </div>
                 </section>
               </div>
+              <div className={`strategy-studio-statusbar ${error ? 'is-error' : versionDirty ? 'is-dirty' : hasSelectedConfig ? 'is-ready' : ''}`} aria-live="polite">
+                <span>{statusMessage}</span>
+                <span>
+                  {runDisabled
+                    ? versionDirty
+                      ? '保存后可运行回测'
+                      : '完成策略配置后可运行回测'
+                    : `${selectedSymbol} · ${selectedTimeframe} · 已通过运行前检查`}
+                </span>
+              </div>
             </section>
             ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <div className="analysis-main" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <div className="analysis-heading" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
                 <div>
                   <div style={{ color: '#0f172a', fontSize: typography.xl, fontWeight: 700 }}>
                     {activePanelLabel}
@@ -2641,7 +2710,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     {activePanel === 'overview' && '收益概览、基准对比和交易摘要'}
                     {activePanel === 'params' && '当前参数位于左侧，可随策略一起保存'}
                     {activePanel === 'trades' && '单笔信号记录与后续字段筛选'}
-                    {activePanel === 'positions' && '每日持仓与收益快照待接入'}
+                    {activePanel === 'positions' && '每日持仓、资产构成与收益快照'}
                     {activePanel === 'history' && '回测记录与结果快照追溯'}
                     {activePanel === 'logs' && '回测与运行日志待接入'}
                   </div>
@@ -2653,48 +2722,62 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               )}
 
               {activePanel === 'trades' && (
-                <section style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'end', gap: 10 }}>
-                    <div style={{ color: '#475569', fontSize: 12, lineHeight: 1.6, marginRight: 8 }}>
-                      交易 {result?.summary.tradeCount ?? 0} 笔 · 盈利 {result?.summary.winningTrades ?? 0} 笔 · 亏损 {result?.summary.losingTrades ?? 0} 笔 · 胜率 {result ? formatPct(result.summary.winRate) : '--'}
+                <section className="trade-filter-panel" style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
+                  <div className="trade-filter-layout" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'end', gap: 10 }}>
+                    <div className="trade-filter-summary" aria-label="信号执行摘要">
+                      <div><span>信号</span><strong>{allSignals.length}</strong></div>
+                      <div><span>已成交</span><strong className="is-filled">{filledSignalCount}</strong></div>
+                      <div><span>已跳过</span><strong className="is-skipped">{skippedSignalCount}</strong></div>
+                      <div><span>胜率</span><strong>{result ? formatPct(result.summary.winRate) : '--'}</strong></div>
                     </div>
-                    <label style={{ minWidth: 110 }}>
-                      <div style={labelStyle}>买卖方向</div>
-                      <select value={tradeSideFilter} onChange={(e) => setTradeSideFilter(e.target.value as TradeSideFilter)} style={fieldStyle}>
-                        <option value="all">全部</option>
-                        <option value="BUY">买入</option>
-                        <option value="SELL">卖出</option>
-                      </select>
-                    </label>
-                    <label style={{ minWidth: 110 }}>
-                      <div style={labelStyle}>盈亏状态</div>
-                      <select value={tradePnlFilter} onChange={(e) => setTradePnlFilter(e.target.value as TradePnlFilter)} style={fieldStyle}>
-                        <option value="all">全部</option>
-                        <option value="win">盈利</option>
-                        <option value="loss">亏损</option>
-                      </select>
-                    </label>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, height: 34, color: '#475569', fontSize: 12 }}>
-                      <input type="checkbox" checked={groupTradesByDay} onChange={(e) => setGroupTradesByDay(e.target.checked)} />
-                      按日期分组
-                    </label>
-                    <button
-                      onClick={handleExportTrades}
-                      disabled={filteredTrades.length === 0}
-                      style={{
-                        height: 34,
-                        borderRadius: 4,
-                        border: '1px solid #0f766e',
-                        background: filteredTrades.length > 0 ? '#ccfbf1' : '#f1f5f9',
-                        color: filteredTrades.length > 0 ? '#0f766e' : '#94a3b8',
-                        cursor: filteredTrades.length > 0 ? 'pointer' : 'not-allowed',
-                        padding: '0 10px',
-                      }}
-                    >
-                      导出 CSV
-                    </button>
+                    <div className="trade-filter-controls">
+                      <label style={{ minWidth: 110 }}>
+                        <div style={labelStyle}>买卖方向</div>
+                        <select value={tradeSideFilter} onChange={(e) => setTradeSideFilter(e.target.value as TradeSideFilter)} style={fieldStyle}>
+                          <option value="all">全部</option>
+                          <option value="BUY">买入</option>
+                          <option value="SELL">卖出</option>
+                        </select>
+                      </label>
+                      <label style={{ minWidth: 110 }}>
+                        <div style={labelStyle}>执行状态</div>
+                        <select value={tradeStatusFilter} onChange={(e) => setTradeStatusFilter(e.target.value as TradeStatusFilter)} style={fieldStyle}>
+                          <option value="all">全部</option>
+                          <option value="filled">已成交</option>
+                          <option value="skipped">已跳过</option>
+                        </select>
+                      </label>
+                      <label style={{ minWidth: 110 }}>
+                        <div style={labelStyle}>盈亏状态</div>
+                        <select value={tradePnlFilter} onChange={(e) => setTradePnlFilter(e.target.value as TradePnlFilter)} style={fieldStyle}>
+                          <option value="all">全部</option>
+                          <option value="win">盈利</option>
+                          <option value="loss">亏损</option>
+                        </select>
+                      </label>
+                      <label className="trade-group-toggle" style={{ display: 'flex', alignItems: 'center', gap: 6, height: 34, color: '#475569', fontSize: 12 }}>
+                        <input type="checkbox" checked={groupTradesByDay} onChange={(e) => setGroupTradesByDay(e.target.checked)} />
+                        按日期分组
+                      </label>
+                      <button
+                        className="trade-export-action"
+                        onClick={handleExportTrades}
+                        disabled={filteredTrades.length === 0}
+                        style={{
+                          height: 34,
+                          borderRadius: 4,
+                          border: '1px solid #0f766e',
+                          background: filteredTrades.length > 0 ? '#ccfbf1' : '#f1f5f9',
+                          color: filteredTrades.length > 0 ? '#0f766e' : '#94a3b8',
+                          cursor: filteredTrades.length > 0 ? 'pointer' : 'not-allowed',
+                          padding: '0 10px',
+                        }}
+                      >
+                        导出 {filteredTrades.length} 条 CSV
+                      </button>
+                    </div>
                   </div>
-                  <details style={{ marginTop: 10, color: '#475569', fontSize: 12 }}>
+                  <details className="trade-column-controls" style={{ marginTop: 10, color: '#475569', fontSize: 12 }}>
                     <summary style={{ color: '#0f766e', cursor: 'pointer', width: 'fit-content' }}>选择显示字段（当前 {visibleTradeColumns.length} 项）</summary>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 14px', marginTop: 9 }}>
                       {tradeColumnDefs.map((column) => (
@@ -2714,11 +2797,11 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
 
               {activePanel === 'overview' && (
               <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(140px, 1fr))', gap: 12 }}>
+                <div className="result-metrics-strip" style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(128px, 1fr))', gap: 8, overflowX: 'auto', paddingBottom: 2 }}>
                   {coreMetrics.map(([name, value]) => (
-                    <div key={name} style={{ ...panelStyle, padding: 14, background: '#ffffff' }}>
-                      <div style={{ color: '#64748b', fontSize: 12 }}>{name}</div>
-                      <div style={{ color: '#0f172a', fontSize: 24, fontWeight: 700, marginTop: 8 }}>
+                    <div className="result-metric-card" key={name} style={{ ...panelStyle, minWidth: 128, padding: '12px 14px', background: 'var(--surface)' }}>
+                      <div style={{ color: 'var(--text-muted)', fontSize: 12 }}>{name}</div>
+                      <div style={{ color: 'var(--text)', fontSize: 21, fontWeight: 700, marginTop: 8, fontVariantNumeric: 'tabular-nums' }}>
                         {value}
                       </div>
                     </div>
@@ -2729,7 +2812,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               )}
 
               {activePanel === 'overview' && (
-              <section style={{ ...panelStyle, padding: 16, background: '#ffffff' }}>
+              <section className="analytics-card" style={{ ...panelStyle, padding: 16, background: '#ffffff' }}>
                 <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12, marginBottom: 16 }}>
                   <div>
                     <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>完整指标</div>
@@ -2745,7 +2828,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       '交易质量': '信号胜负、盈亏结构与交易频率。',
                     };
                     return (
-                      <div key={group.title} style={{ border: '1px solid #d7dde8', borderRadius: 6, overflow: 'hidden' }}>
+                      <div className="metric-group-card" key={group.title} style={{ border: '1px solid #d7dde8', borderRadius: 6, overflow: 'hidden' }}>
                         <div style={{ padding: '12px 14px', background: '#f8fafc', borderBottom: '1px solid #d7dde8' }}>
                           <div style={{ color: '#0f172a', fontSize: 14, fontWeight: 700 }}>{group.title}</div>
                           <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.5, marginTop: 4 }}>{descriptions[group.title]}</div>
@@ -2769,7 +2852,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               )}
 
               {activePanel === 'overview' && (
-              <section style={{ ...panelStyle, minHeight: 360, padding: 16, background: '#ffffff' }}>
+              <section className="equity-chart-card" style={{ ...panelStyle, minHeight: 360, padding: 16, background: '#ffffff' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
                   <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>净值曲线</div>
                   {result && (
@@ -2923,11 +3006,15 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               )}
 
               {(activePanel === 'overview' || activePanel === 'trades') && (
-              <section style={{ ...panelStyle, padding: 16, background: '#ffffff' }}>
-                <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700, marginBottom: 12 }}>
-                  信号明细
+              <section className="trade-ledger-card" style={{ ...panelStyle, padding: 16, background: '#ffffff' }}>
+                <div className="trade-ledger-heading">
+                  <div>
+                    <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>信号执行账本</div>
+                    <div>按信号时间追溯策略动作、成交结果与单笔收益。</div>
+                  </div>
+                  {activePanel === 'trades' && <span>当前筛选 {filteredTrades.length} 条</span>}
                 </div>
-                <div style={{
+                <div className="trade-ledger-toolbar" style={{
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'space-between',
@@ -2939,7 +3026,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     展示 {tradePageStart}-{tradePageEnd} / {filteredTrades.length} 条筛选信号
                     {result ? `，其中已成交 ${result.trades.length} 笔` : ''}
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div className="trade-pagination" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span style={{ color: '#64748b', fontSize: 12 }}>每页</span>
                     <select
                       value={tradePageSize}
@@ -2985,12 +3072,13 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     </button>
                   </div>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: tradeGridColumns, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', paddingBottom: 8 }}>
+                <div className="trade-ledger-table-head" style={{ display: 'grid', gridTemplateColumns: `${tradeGridColumns} 68px`, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', paddingBottom: 8 }}>
                   {visibleTradeColumns.map((column) => (
                     <span key={column.key} style={{ textAlign: column.align || 'left' }}>
                       {column.label}
                     </span>
                   ))}
+                  <span>复盘</span>
                 </div>
                 {result && filteredTrades.length > 0 && visibleTradeColumns.length > 0 ? (
                   pagedTrades.map((trade, index) => {
@@ -2998,14 +3086,20 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     const previousTrade = pagedTrades[index - 1];
                     const previousDate = previousTrade ? ((previousTrade.time || '').slice(0, 8) || '未知日期') : '';
                     const showGroupTitle = groupTradesByDay && currentDate !== previousDate;
+                    const dayTrades = showGroupTitle
+                      ? pagedTrades.filter((item) => ((item.time || '').slice(0, 8) || '未知日期') === currentDate)
+                      : [];
+                    const dayFilledCount = dayTrades.filter((item) => item.status !== 'skipped').length;
+                    const dayPnl = dayTrades.reduce((total, item) => total + item.pnl, 0);
                     return (
                       <div key={`${trade.time}-${trade.direction}-${index}`}>
                         {showGroupTitle && (
-                          <div style={{ color: '#0f766e', fontSize: 12, fontWeight: 700, padding: '10px 0 4px', borderBottom: '1px solid #e2e8f0' }}>
-                            {currentDate}
+                          <div className="trade-day-group" style={{ color: '#0f766e', fontSize: 12, fontWeight: 700, padding: '10px 0 4px', borderBottom: '1px solid #e2e8f0' }}>
+                            <span>{currentDate}</span>
+                            <span>{dayTrades.length} 条信号 · 成交 {dayFilledCount} 笔 · 当日盈亏 {dayPnl.toFixed(2)}</span>
                           </div>
                         )}
-                        <div style={{ display: 'grid', gridTemplateColumns: tradeGridColumns, gap: 8, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '8px 0', alignItems: 'center' }}>
+                        <div className={`trade-ledger-row ${trade.status === 'skipped' ? 'is-skipped' : 'is-filled'}`} style={{ display: 'grid', gridTemplateColumns: `${tradeGridColumns} 68px`, gap: 8, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '8px 0', alignItems: 'center' }}>
                           {visibleTradeColumns.map((column) => (
                             <span key={column.key} style={{
                               textAlign: column.align || 'left',
@@ -3017,6 +3111,22 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                               {column.render(trade)}
                             </span>
                           ))}
+                          <button
+                            type="button"
+                            disabled={!result?.runId || trade.status === 'skipped'}
+                            onClick={() => handleViewTradeChart(trade)}
+                            style={{
+                              border: 'none',
+                              background: 'transparent',
+                              color: result?.runId && trade.status !== 'skipped' ? '#2962ff' : '#94a3b8',
+                              cursor: result?.runId && trade.status !== 'skipped' ? 'pointer' : 'not-allowed',
+                              padding: 0,
+                              textAlign: 'left',
+                              fontSize: 12,
+                            }}
+                          >
+                            查看 K 线
+                          </button>
                         </div>
                       </div>
                     );
@@ -3041,8 +3151,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               )}
 
               {activePanel === 'history' && (
-                <section style={{ ...panelStyle, padding: 16, background: '#ffffff', minHeight: 320 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+                <section className="history-ledger-card" style={{ ...panelStyle, padding: 16, background: '#ffffff', minHeight: 320 }}>
+                  <div className="history-ledger-heading" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 }}>
                     <div>
                       <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>
                         历史回测
@@ -3066,7 +3176,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                       刷新
                     </button>
                   </div>
-                  <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                  <div className="history-index-controls" style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
                     <input
                       value={historyQuery}
                       onChange={(e) => {
@@ -3089,8 +3199,8 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     </select>
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 16 }}>
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', padding: '0 10px 8px' }}>
+                    <div className="history-experiment-table" style={{ minWidth: 0 }}>
+                      <div className="history-experiment-head" style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', padding: '0 10px 8px' }}>
                         <span>ID</span>
                         <span>策略</span>
                         <span>标的/基准</span>
@@ -3105,7 +3215,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                         pagedHistoryRuns.map((run) => {
                           const isSelected = run.id === selectedHistoryRunId;
                           return (
-                            <div key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
+                            <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
                               <button onClick={() => setSelectedHistoryRunId(run.id)} style={{ textAlign: 'left', border: 'none', background: 'transparent', padding: 0, color: '#0f172a', cursor: 'pointer', fontWeight: isSelected ? 700 : 500 }}>
                                 {formatRunReference(run.displayNo)}
                               </button>
@@ -3189,7 +3299,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                     </div>
 
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0 }}>
-                      <div style={{ ...panelStyle, padding: 14, background: '#ffffff' }}>
+                      <div className="history-summary-card history-detail-card" style={{ ...panelStyle, padding: 14, background: '#ffffff' }}>
                       <div style={{ color: '#0f172a', fontSize: typography.md, fontWeight: 700, marginBottom: 4 }}>
                         {selectedHistoryRun ? `回测 #${selectedHistoryRun.id} · 实验摘要` : '实验摘要'}
                       </div>
@@ -3314,7 +3424,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                         )}
                       </div>
 
-                      <div style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
+                      <div className="history-compare-card" style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
                         <div style={{ color: '#0f172a', fontSize: typography.md, fontWeight: 700, marginBottom: 10 }}>参数对比</div>
                         {backtestRuns.length > 1 ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -3334,6 +3444,11 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                                   ))}
                               </select>
                             </label>
+                            {selectedHistoryRun && compareHistoryRun && (
+                              <div className={`history-comparison-scope ${historyComparisonScope.every((item) => item.startsWith('同')) ? 'is-comparable' : 'is-mixed'}`}>
+                                {historyComparisonScope.join(' · ')}
+                              </div>
+                            )}
                             {selectedHistoryRun && compareHistoryRun && (
                               <div style={{ overflow: 'auto', border: '1px solid #e2e8f0', borderRadius: 6 }}>
                                 <div style={{ display: 'grid', gridTemplateColumns: '130px 1fr 1fr 1fr', gap: 8, padding: '8px 10px', background: '#f8fafc', color: '#64748b', fontSize: 11, fontWeight: 700 }}>
@@ -3391,23 +3506,70 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               )}
 
               {activePanel === 'positions' && (
-                <section style={{ ...panelStyle, padding: 16, background: '#ffffff', minHeight: 320 }}>
-                  <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700, marginBottom: 12 }}>
-                    持仓收益
+                <section className="holding-ledger-card" style={{ ...panelStyle, padding: 16, background: '#ffffff', minHeight: 320 }}>
+                  <div className="holding-ledger-heading">
+                    <div>
+                      <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>持仓收益</div>
+                      <div>基于本次回测的每日收盘快照，不代表实时账户。</div>
+                    </div>
+                    <span>{filteredDailyHoldings.length} / {dailyHoldings.length} 个交易日</span>
                   </div>
                   {dailyHoldings.length > 0 ? (
-                    <div style={{ overflow: 'auto', border: '1px solid #d7dde8', borderRadius: 6 }}>
-                      <div style={{ display: 'grid', gridTemplateColumns: '110px 90px 80px 80px 110px 120px 120px 120px 120px 110px', gap: 0, minWidth: 1040, background: '#f8fafc', color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8' }}>
+                    <>
+                      <div className="holding-summary-grid">
+                        {[
+                          ['期末总资产', latestHolding ? formatMoney(latestHolding.totalEquity) : '--', 'is-equity'],
+                          ['期末现金', latestHolding ? formatMoney(latestHolding.cash) : '--', ''],
+                          ['期末净市值', latestHolding ? formatMoney(latestHolding.marketValue) : '--', ''],
+                          ['筛选期盈亏', latestHolding ? formatMoney(filteredDailyHoldings.reduce((total, item) => total + item.dailyPnl, 0)) : '--', latestHolding && filteredDailyHoldings.reduce((total, item) => total + item.dailyPnl, 0) < 0 ? 'is-loss' : 'is-profit'],
+                          ['持仓天数', `${longHoldingDays + shortHoldingDays} 天`, ''],
+                        ].map(([label, value, tone]) => (
+                          <div className={`holding-summary-card ${tone}`} key={label}>
+                            <span>{label}</span>
+                            <strong>{value}</strong>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="holding-filter-bar">
+                        <label>
+                          <div style={labelStyle}>起始日期</div>
+                          <input type="date" value={holdingStartDate} onChange={(e) => setHoldingStartDate(e.target.value)} style={fieldStyle} />
+                        </label>
+                        <label>
+                          <div style={labelStyle}>结束日期</div>
+                          <input type="date" value={holdingEndDate} onChange={(e) => setHoldingEndDate(e.target.value)} style={fieldStyle} />
+                        </label>
+                        <label>
+                          <div style={labelStyle}>仓位状态</div>
+                          <select value={holdingStatusFilter} onChange={(e) => setHoldingStatusFilter(e.target.value as HoldingStatusFilter)} style={fieldStyle}>
+                            <option value="all">全部状态</option>
+                            <option value="long">净多仓</option>
+                            <option value="short">净空仓</option>
+                            <option value="flat">空仓</option>
+                          </select>
+                        </label>
+                        <button type="button" onClick={() => { setHoldingStartDate(''); setHoldingEndDate(''); setHoldingStatusFilter('all'); }}>
+                          清除筛选
+                        </button>
+                      </div>
+                      <div className="holding-exposure-strip" aria-label="仓位构成摘要">
+                        <span>净多仓 {longHoldingDays} 天</span>
+                        <span>净空仓 {shortHoldingDays} 天</span>
+                        <span>空仓 {filteredDailyHoldings.length - longHoldingDays - shortHoldingDays} 天</span>
+                        <span>收盘快照按 {selectedTimeframe} K 线回测结果汇总</span>
+                      </div>
+                    <div className="holding-table-wrap" style={{ overflow: 'auto', border: '1px solid #d7dde8', borderRadius: 6 }}>
+                      <div className="holding-table-head" style={{ display: 'grid', gridTemplateColumns: '110px 90px 80px 80px 110px 120px 120px 120px 120px 110px', gap: 0, minWidth: 1040, background: '#f8fafc', color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8' }}>
                         {['日期', '收盘', '多仓', '空仓', '现金', '多头市值', '空头市值', '净市值', '总资产', '日盈亏'].map((label) => (
                           <div key={label} style={{ padding: '10px 12px', fontWeight: 700 }}>{label}</div>
                         ))}
                       </div>
-                      {dailyHoldings.map((item) => (
-                        <div key={item.date} style={{ display: 'grid', gridTemplateColumns: '110px 90px 80px 80px 110px 120px 120px 120px 120px 110px', minWidth: 1040, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0' }}>
+                      {filteredDailyHoldings.map((item) => (
+                        <div className={`holding-table-row is-${getHoldingStatus(item)}`} key={item.date} style={{ display: 'grid', gridTemplateColumns: '110px 90px 80px 80px 110px 120px 120px 120px 120px 110px', minWidth: 1040, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0' }}>
                           <div style={{ padding: '9px 12px' }}>{item.date}</div>
                           <div style={{ padding: '9px 12px' }}>{formatNumber(item.close)}</div>
-                          <div style={{ padding: '9px 12px' }}>{item.longQty}</div>
-                          <div style={{ padding: '9px 12px' }}>{item.shortQty}</div>
+                          <div style={{ padding: '9px 12px' }}><span className="holding-quantity is-long">{item.longQty}</span></div>
+                          <div style={{ padding: '9px 12px' }}><span className="holding-quantity is-short">{item.shortQty}</span></div>
                           <div style={{ padding: '9px 12px' }}>{formatMoney(item.cash)}</div>
                           <div style={{ padding: '9px 12px' }}>{formatMoney(item.longMarketValue)}</div>
                           <div style={{ padding: '9px 12px' }}>{formatMoney(item.shortMarketValue)}</div>
@@ -3416,7 +3578,11 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
                           <div style={{ padding: '9px 12px', color: getPnlColor(item.dailyPnl) }}>{formatMoney(item.dailyPnl)}</div>
                         </div>
                       ))}
+                      {filteredDailyHoldings.length === 0 && (
+                        <div className="holding-empty-row">当前筛选条件下没有持仓快照。</div>
+                      )}
                     </div>
+                    </>
                   ) : (
                     <div style={{ color: '#64748b', fontSize: 13, lineHeight: 1.8 }}>
                       运行一次回测后，这里会展示每日持仓、现金、市值和总资产。
@@ -3582,38 +3748,6 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               {formatStrategyName(selectedStrategy)}
             </div>
           </div>
-
-          <div style={{
-            border: '1px solid #d7dde8',
-            borderRadius: 6,
-            padding: 10,
-            background: '#ffffff',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 10,
-          }}>
-            <div style={labelStyle}>执行模式</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-              {[
-                ['backtest', '回测'],
-                ['live', '运行'],
-              ].map(([value, label]) => (
-                <button
-                  key={value}
-                  onClick={() => setMode(value as 'backtest' | 'live')}
-                  style={{
-                    height: 32,
-                    borderRadius: 4,
-                    border: `1px solid ${mode === value ? '#0f766e' : '#cbd5e1'}`,
-                    background: mode === value ? '#ccfbf1' : '#f8fafc',
-                    color: mode === value ? '#0f766e' : '#64748b',
-                    cursor: 'pointer',
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
 
             <label>
               <div style={labelStyle}>策略</div>
@@ -3908,7 +4042,7 @@ export default function BacktestPage({ symbol, strategy, strategies, instruments
               opacity: runDisabled ? 0.7 : 1,
             }} onClick={handleRunBacktest} disabled={runDisabled}>
               <Play size={14} />
-              {running ? '运行中...' : mode === 'live' ? '启动运行' : '运行回测'}
+              {running ? '运行中...' : '运行回测'}
             </button>
             <button style={{
               width: 38, height: 34, borderRadius: 4,

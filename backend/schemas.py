@@ -194,6 +194,27 @@ class BacktestTrade(BaseModel):
   status: str = "filled"
 
 
+class BacktestChartTrade(BaseModel):
+  id: str
+  executionTime: str
+  signalTime: str
+  action: str
+  side: str
+  price: float
+  quantity: int
+  note: str
+
+
+class BacktestChartResponse(BaseModel):
+  runId: str
+  displayNo: int
+  symbol: str
+  timeframe: str
+  date: str
+  bars: list[dict[str, float | str | int]]
+  trades: list[BacktestChartTrade]
+
+
 class DailyHoldingPoint(BaseModel):
   date: str
   close: float
@@ -345,28 +366,6 @@ class StrategyConfigUpdate(BaseModel):
   accountId: int | None = None
   paramsJson: dict[str, Any] = Field(default_factory=dict)
   enabled: bool = True
-
-
-class DataSyncRequest(BaseModel):
-  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
-  timeframe: str = "5m"
-  startDate: str | None = Field(default=None, pattern=r"^\d{8}$")
-  endDate: str | None = Field(default=None, pattern=r"^\d{8}$")
-  mode: str = "incremental"
-
-
-class DataSyncBatchRequest(BaseModel):
-  symbols: list[str]
-  timeframe: str = "5m"
-  startDate: str | None = Field(default=None, pattern=r"^\d{8}$")
-  endDate: str | None = Field(default=None, pattern=r"^\d{8}$")
-  mode: str = "incremental"
-
-
-class DataRefillRequest(BaseModel):
-  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
-  timeframe: str = "5m"
-  dates: list[str]
 
 
 class DateItem(BaseModel):

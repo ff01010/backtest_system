@@ -8,6 +8,7 @@ export interface ViewerParams {
   strategy: string;
   modules: DisplayModule[];
   sides: DisplaySide[];
+  runId?: string;
 }
 
 const DEFAULTS: ViewerParams = {
@@ -31,6 +32,7 @@ function updateUrl(params: ViewerParams): void {
   if (params.strategy !== 'trend_grid') sp.set('strategy', params.strategy);
   if (params.modules.length < 2) sp.set('modules', params.modules.join(','));
   if (params.sides.length < 2) sp.set('sides', params.sides.join(','));
+  if (params.runId) sp.set('runId', params.runId);
   const qs = sp.toString();
   const newUrl = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
   window.history.replaceState(null, '', newUrl);
@@ -49,6 +51,7 @@ export function readUrlParams(): ViewerParams {
     sides: (sp.get('sides') || 'BUY,SELL').split(',').filter(
       (s): s is DisplaySide => s === 'BUY' || s === 'SELL'
     ),
+    runId: sp.get('runId') || undefined,
   };
 }
 

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import math
+
 from backend.backtesting.engine import BarBacktestEngine, RecordedPriceExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade, legacy_trades_to_fills
 from backend.backtesting.models import Bar, OrderIntent, OrderSide, PortfolioSnapshot, PositionEffect
+from backend.services.backtest_runner import _compute_performance_stats
 from backend.backtesting.trend_grid_compat import (
   LegacyTrendGridIntentStrategy,
   LegacyTrendGridOnBarStrategy,
@@ -39,6 +42,16 @@ def test_bar_engine_applies_fills_and_realized_pnl() -> None:
   assert result.final_portfolio.positions == {}
   assert result.final_portfolio.cash == 10_097.329
   assert result.final_portfolio.equity == 10_097.329
+
+
+def test_performance_stats_uses_sample_standard_deviation_for_sharpe() -> None:
+  stats = _compute_performance_stats(100.0, {
+    "20260730": 1.0,
+    "20260731": 2.02,
+  })
+
+  assert math.isclose(stats["annualVolatility"], 0.11, rel_tol=1e-5)
+  assert math.isclose(stats["annualSharpe"], 33.0, rel_tol=1e-5)
 
 
 def test_limit_order_waits_until_price_is_reachable() -> None:
