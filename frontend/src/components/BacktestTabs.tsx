@@ -15,16 +15,15 @@ interface Props {
 export default function BacktestTabs({ activeTab, tabs, onChange }: Props) {
   return (
     <nav
-      aria-label="回测结果导航"
+      aria-label="回测工作台导航"
+      className="backtest-tabs"
       style={{
         display: 'flex',
-        alignItems: 'center',
-        gap: 4,
-        padding: 4,
-        border: '1px solid #d7dde8',
-        borderRadius: 8,
+        flexDirection: 'column',
+        alignItems: 'stretch',
+        gap: 3,
+        padding: 8,
         background: '#f8fafc',
-        overflowX: 'auto',
       }}
     >
       {tabs.map((tab) => {
@@ -34,18 +33,22 @@ export default function BacktestTabs({ activeTab, tabs, onChange }: Props) {
           <button
             key={tab.id}
             type="button"
+            className={`backtest-tab${active ? ' is-active' : ''}`}
             onClick={() => onChange(tab.id)}
+            aria-label={tab.label}
+            title={tab.label}
             style={{
-              display: 'inline-flex',
-              flex: '0 0 auto',
+              display: 'flex',
+              width: '100%',
+              justifyContent: 'center',
               alignItems: 'center',
-              gap: 6,
-              minHeight: 32,
-              padding: '0 10px',
-              border: `1px solid ${active ? '#0f766e' : 'transparent'}`,
-              borderRadius: 5,
-              background: active ? '#ccfbf1' : 'transparent',
-              color: active ? '#0f766e' : '#64748b',
+              minHeight: 36,
+              padding: 0,
+              border: 'none',
+              borderLeft: `3px solid ${active ? 'var(--accent)' : 'transparent'}`,
+              borderRadius: 4,
+              background: active ? 'var(--surface)' : 'transparent',
+              color: active ? 'var(--text)' : 'var(--text-muted)',
               cursor: 'pointer',
               fontSize: 13,
               fontWeight: active ? 700 : 500,
@@ -53,7 +56,6 @@ export default function BacktestTabs({ activeTab, tabs, onChange }: Props) {
             }}
           >
             <Icon size={15} />
-            {tab.label}
           </button>
         );
       })}

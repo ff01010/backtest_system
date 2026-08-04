@@ -60,8 +60,8 @@ export default function Sidebar({
     },
   };
 
-  const A_COLOR = '#FF6B6B';
-  const B_COLOR = '#0f766e';
+  const A_COLOR = 'var(--profit)';
+  const B_COLOR = 'var(--loss)';
 
   return (
     <div style={style.container}>

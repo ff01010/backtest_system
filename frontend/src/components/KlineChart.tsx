@@ -10,7 +10,13 @@ import {
   type Time,
   ColorType,
 } from 'lightweight-charts';
-import type { ChartResponse, TradeMarker, DisplayModule, DisplaySide } from '../types';
+import type {
+  BacktestChartTrade,
+  ChartResponse,
+  TradeMarker,
+  DisplayModule,
+  DisplaySide,
+} from '../types';
 import { formatChartTimestamp, toChartTimestamp } from '../utils/chartTime';
 
 interface Props {
@@ -22,15 +28,59 @@ interface Props {
   signalSource?: 'actual' | 'theoretical';
   label?: string;
   labelColor?: string;
+  backtestTrades?: BacktestChartTrade[];
+  backtestDisplayNo?: number;
 }
 
 // markerSize → lightweight-charts 原生 size 值 (Circle/Arrow 尺寸基数)
 const MARKER_SIZE_MAP = { small: 1, normal: 2, large: 3 };
 
-const A_COLOR = '#FF6B6B';
-const B_COLOR = '#0f766e';
+const A_COLOR = '#f23645';
+const B_COLOR = '#089981';
+const BACKTEST_BUY_COLOR = '#f23645';
+const BACKTEST_SELL_COLOR = '#089981';
 
-export default function KlineChart({ data, modules, sides, showPrices, markerSize, signalSource, label, labelColor }: Props) {
+const BACKTEST_ACTION_LABELS: Record<BacktestChartTrade['action'], string> = {
+  buy_open: '买开',
+  sell_close: '卖平',
+  sell_open: '卖开',
+  buy_close: '买平',
+  buy: '买入',
+  sell: '卖出',
+};
+
+function compactTradeTime(value: string): string {
+  return value.replace(/\D/g, '').slice(0, 12);
+}
+
+function alignTradeToBarTime(trade: BacktestChartTrade, bars: ChartResponse['bars']): number | null {
+  const target = compactTradeTime(trade.executionTime);
+  if (target.length !== 12 || bars.length === 0) return null;
+  const targetTime = toChartTimestamp(
+    `${target.slice(0, 4)}-${target.slice(4, 6)}-${target.slice(6, 8)}T${target.slice(8, 10)}:${target.slice(10, 12)}:00`
+  );
+  const aligned = bars.find((bar) => toChartTimestamp(bar.time) >= targetTime) || bars[bars.length - 1];
+  return toChartTimestamp(aligned.time);
+}
+
+function escapeTooltipText(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[char] || char));
+}
+
+export default function KlineChart({
+  data,
+  modules,
+  sides,
+  showPrices,
+  markerSize,
+  signalSource,
+  label,
+  labelColor,
+  backtestTrades,
+  backtestDisplayNo,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
@@ -45,6 +95,10 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
   modulesRef.current = modules;
   const sidesRef = useRef(sides);
   sidesRef.current = sides;
+  const backtestTradesRef = useRef(backtestTrades);
+  backtestTradesRef.current = backtestTrades;
+  const backtestDisplayNoRef = useRef(backtestDisplayNo);
+  backtestDisplayNoRef.current = backtestDisplayNo;
 
   const scale = MARKER_SIZE_MAP[markerSize];
 
@@ -55,15 +109,15 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
     const chart = createChart(containerRef.current, {
       layout: {
         background: { type: ColorType.Solid, color: '#ffffff' },
-        textColor: '#64748b',
+        textColor: '#5d606b',
       },
       grid: {
-        vertLines: { color: '#edf2f5' },
-        horzLines: { color: '#edf2f5' },
+        vertLines: { color: '#f0f3f7' },
+        horzLines: { color: '#f0f3f7' },
       },
       crosshair: { mode: 0 },
       rightPriceScale: {
-        borderColor: '#d7e0e8',
+        borderColor: '#e0e3eb',
         scaleMargins: { top: 0.05, bottom: 0.22 },
       },
       localization: {
@@ -78,7 +132,7 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
         },
       },
       timeScale: {
-        borderColor: '#d7e0e8',
+        borderColor: '#e0e3eb',
         timeVisible: true,
         secondsVisible: false,
         barSpacing: 12,
@@ -88,17 +142,17 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
     });
 
     const candleSeries = chart.addCandlestickSeries({
-      upColor: '#ef4444',
-      downColor: '#22c55e',
-      borderUpColor: '#ef4444',
-      borderDownColor: '#22c55e',
-      wickUpColor: '#ef4444',
-      wickDownColor: '#22c55e',
+      upColor: '#f23645',
+      downColor: '#089981',
+      borderUpColor: '#f23645',
+      borderDownColor: '#089981',
+      wickUpColor: '#f23645',
+      wickDownColor: '#089981',
     });
     candleSeriesRef.current = candleSeries;
 
     const closeSeries = chart.addLineSeries({
-      color: '#40556a',
+      color: '#5d606b',
       lineWidth: 1,
       lastValueVisible: false,
       priceLineVisible: false,
@@ -107,7 +161,7 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
     closeSeriesRef.current = closeSeries;
 
     const volumeSeries = chart.addHistogramSeries({
-      color: '#c7d5e0',
+      color: '#c9cdd4',
       priceFormat: { type: 'volume' },
       priceScaleId: 'volume',
     });
@@ -141,9 +195,9 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
     const tooltip = document.createElement('div');
     tooltip.style.cssText = `
       display: none; position: absolute; z-index: 1000;
-      background: #ffffff; color: #14263a; padding: 8px 12px;
-      border-radius: 6px; font-size: 12px; font-family: Consolas, monospace;
-      border: 1px solid #d7e0e8; box-shadow: 0 8px 22px rgba(26, 53, 77, .12); pointer-events: none; max-width: 300px;
+      background: #ffffff; color: #131722; padding: 8px 12px;
+      border-radius: 4px; font-size: 12px; font-family: Consolas, monospace;
+      border: 1px solid #e0e3eb; box-shadow: 0 8px 22px rgba(19, 23, 34, .12); pointer-events: none; max-width: 300px;
       line-height: 1.5;
     `;
     containerRef.current.appendChild(tooltip);
@@ -153,6 +207,8 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
       const d = dataRef.current;
       const mods = modulesRef.current;
       const sds = sidesRef.current;
+      const runTrades = backtestTradesRef.current;
+      const displayNo = backtestDisplayNoRef.current;
 
       if (!param.time || !param.point || !d) {
         tooltip.style.display = 'none';
@@ -164,6 +220,28 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
         return;
       }
       const barTime = param.time;
+      if (runTrades !== undefined) {
+        const relatedTrades = runTrades.filter(
+          (trade) => alignTradeToBarTime(trade, d.bars) === barTime
+        );
+        if (relatedTrades.length === 0) {
+          tooltip.style.display = 'none';
+          return;
+        }
+        const title = displayNo ? `<strong>#${displayNo}</strong> ` : '';
+        const lines = relatedTrades.map((trade) => {
+          const isBuy = trade.action.startsWith('buy');
+          const color = isBuy ? BACKTEST_BUY_COLOR : BACKTEST_SELL_COLOR;
+          const note = trade.note ? ` · ${escapeTooltipText(trade.note)}` : '';
+          return `<span style="color:${color}">${BACKTEST_ACTION_LABELS[trade.action]}</span> ${trade.price.toFixed(2)} ×${trade.quantity}${note}`;
+        });
+        tooltip.innerHTML = `${title}${lines.join('<br/>')}`;
+        tooltip.style.display = 'block';
+        const rect = containerRef.current!.getBoundingClientRect();
+        tooltip.style.left = `${Math.min(param.point.x + 15, rect.width - 310)}px`;
+        tooltip.style.top = `${Math.max(param.point.y - 60, 10)}px`;
+        return;
+      }
       const related = d.markers.filter(
         (m) => toChartTimestamp(m.barTime) === barTime
           && mods.includes(m.module) && sds.includes(m.side)
@@ -237,8 +315,43 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
 
     const displayMarkers: SeriesMarker<Time>[] = [];
 
+    if (backtestTrades !== undefined && data) {
+      const grouped = new Map<number, BacktestChartTrade[]>();
+      for (const trade of backtestTrades) {
+        const time = alignTradeToBarTime(trade, data.bars);
+        if (time === null) continue;
+        const items = grouped.get(time) || [];
+        items.push(trade);
+        grouped.set(time, items);
+      }
+
+      for (const [time, trades] of grouped) {
+        if (trades.length > 1) {
+          displayMarkers.push({
+            time: time as Time,
+            text: `${trades.length} 笔`,
+            shape: 'circle',
+            color: '#64748b',
+            position: 'inBar',
+            size: scale,
+          });
+          continue;
+        }
+        const trade = trades[0];
+        const isBuy = trade.action.startsWith('buy');
+        displayMarkers.push({
+          time: time as Time,
+          text: BACKTEST_ACTION_LABELS[trade.action],
+          shape: isBuy ? 'arrowUp' : 'arrowDown',
+          color: isBuy ? BACKTEST_BUY_COLOR : BACKTEST_SELL_COLOR,
+          position: isBuy ? 'belowBar' : 'aboveBar',
+          size: scale,
+        });
+      }
+    }
+
     // ── 实际信号 markers（默认）──
-    if (signalSource !== 'theoretical' && data?.markers.length) {
+    if (backtestTrades === undefined && signalSource !== 'theoretical' && data?.markers.length) {
       const grouped = new Map<string, TradeMarker[]>();
       for (const m of data.markers) {
         if (!modules.includes(m.module)) continue;
@@ -271,7 +384,7 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
     }
 
     // ── 理论信号 markers ──
-    if (signalSource === 'theoretical' && data?.theoretical) {
+    if (backtestTrades === undefined && signalSource === 'theoretical' && data?.theoretical) {
       for (const s of data.theoretical) {
         if (!modules.includes(s.module)) continue;
         if (s.barIndex >= data.bars.length) continue;
@@ -300,7 +413,7 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
 
     displayMarkers.sort((a, b) => Number(a.time) - Number(b.time));
     candle.setMarkers(displayMarkers);
-  }, [data, modules, sides, showPrices, scale]);
+  }, [backtestTrades, data, modules, sides, showPrices, scale, signalSource]);
 
   useEffect(() => {
     updateMarkers();
@@ -314,8 +427,8 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
       {label && (
         <div style={{
           position: 'absolute', top: 6, left: 8, zIndex: 5,
-          color: labelColor || '#64748b', fontSize: 12, fontWeight: 'bold',
-          background: 'rgba(255,255,255,.88)', border: '1px solid #d7e0e8', padding: '2px 8px', borderRadius: 3,
+          color: labelColor || '#5d606b', fontSize: 12, fontWeight: 'bold',
+          background: 'rgba(255,255,255,.88)', border: '1px solid #e0e3eb', padding: '2px 8px', borderRadius: 3,
           pointerEvents: 'none',
         }}>
           {label}
@@ -325,12 +438,22 @@ export default function KlineChart({ data, modules, sides, showPrices, markerSiz
         position: 'absolute', top: 6, right: 56, zIndex: 5,
         display: 'flex', flexDirection: 'column', gap: 2,
         padding: '3px 6px', borderRadius: 3,
-        background: 'rgba(255, 255, 255, .9)', color: '#64748b', border: '1px solid #d7e0e8',
+        background: 'rgba(255, 255, 255, .9)', color: '#5d606b', border: '1px solid #e0e3eb',
         fontSize: 10, lineHeight: 1.4, pointerEvents: 'none',
       }}>
-        <span style={{ color: '#40556a' }}>━ 收盘</span>
-        <span style={{ color: A_COLOR }}>▲▼ A</span>
-        <span style={{ color: B_COLOR }}>▲▼ B</span>
+        {backtestTrades !== undefined ? (
+          <>
+            <span style={{ color: '#5d606b' }}>━ 收盘</span>
+            <span style={{ color: BACKTEST_BUY_COLOR }}>▲ 买入</span>
+            <span style={{ color: BACKTEST_SELL_COLOR }}>▼ 卖出</span>
+          </>
+        ) : (
+          <>
+            <span style={{ color: '#5d606b' }}>━ 收盘</span>
+            <span style={{ color: A_COLOR }}>▲▼ A</span>
+            <span style={{ color: B_COLOR }}>▲▼ B</span>
+          </>
+        )}
       </div>
     </div>
   );
