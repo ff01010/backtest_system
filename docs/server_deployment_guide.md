@@ -115,6 +115,25 @@ quant-backtest-artifacts       回测输出文件
 
 ## 5. 首次部署或升级步骤
 
+### 推荐：使用一键发布脚本
+
+日常升级应优先使用项目内置脚本。脚本会校验当前为 `main` 分支且工作区没有未提交改动，然后依次拉取最新代码、启动并等待 PostgreSQL 健康、执行数据库迁移、重建并启动策略执行器、后端和前端，最后请求健康检查接口确认发布结果。
+
+```bash
+cd /opt/projects/quant_backtest_platform_git
+./scripts/deploy-server.sh
+```
+
+若首次执行提示没有权限，可授予脚本执行权限后重试：
+
+```bash
+chmod +x scripts/deploy-server.sh
+```
+
+脚本会再次执行 `git pull --ff-only origin main`；即使已手动拉取，重复执行也是安全的。若工作区有本地未提交修改，脚本会终止发布，需先确认并处理这些修改，不能直接覆盖。
+
+### 手工发布步骤
+
 ### 第一步：更新主分支代码
 
 ```bash

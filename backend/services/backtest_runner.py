@@ -163,6 +163,7 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     ],
     "initialCapital": float(payload["initialCapital"]),
     "commissionRate": float(payload["commissionRate"]),
+    "slippage": float(payload["slippage"]),
     "holdingPolicy": "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday",
   })
   daily_holdings = _build_worker_daily_holdings(

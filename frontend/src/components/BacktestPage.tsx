@@ -320,8 +320,8 @@ function validateParams(params: BacktestParams) {
   if (!Number.isFinite(commissionRate) || commissionRate < 0) {
     errors.push('手续费率不能小于 0');
   }
-  if (!Number.isFinite(slippage) || slippage < 0) {
-    errors.push('滑点不能小于 0');
+  if (!Number.isFinite(slippage) || slippage < 0 || slippage >= 1) {
+    errors.push('滑点应大于等于 0 且小于 1');
   }
   if (!hasEnabledTradeDirection(params.allowLong, params.allowShort)) {
     errors.push('至少选择一个交易方向');
@@ -2618,6 +2618,13 @@ export default function BacktestPage({
                   <label>
                     <div style={labelStyle}>手续费率</div>
                     <input value={params.commissionRate} onChange={(e) => setParam('commissionRate', e.target.value)} style={fieldStyle} />
+                  </label>
+                  <label>
+                    <div style={labelStyle}>滑点</div>
+                    <input value={params.slippage} onChange={(e) => setParam('slippage', e.target.value)} style={fieldStyle} />
+                    <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.45, marginTop: 5 }}>
+                      固定比例；0.001 表示 0.1%，买入上调、卖出下调。
+                    </div>
                   </label>
                   <div style={{
                     color: dataCoverageColor,

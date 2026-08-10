@@ -18,6 +18,7 @@ class WorkerRunRequest(BaseModel):
   bars: list[dict[str, Any]]
   initialCapital: float = Field(gt=0)
   commissionRate: float = Field(ge=0)
+  slippage: float = Field(default=0, ge=0, lt=1)
   holdingPolicy: str = "intraday"
 
 
@@ -61,7 +62,7 @@ def run(payload: WorkerRunRequest) -> dict[str, Any]:
     engine = BarBacktestEngine(
       initial_cash=payload.initialCapital,
       commission_rate=payload.commissionRate,
-      execution_model=RecordedPriceExecutionModel(),
+      execution_model=RecordedPriceExecutionModel(slippage=payload.slippage),
       holding_policy=payload.holdingPolicy,
     )
     result = engine.run(strategy, bars)

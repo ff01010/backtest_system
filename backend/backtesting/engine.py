@@ -397,6 +397,11 @@ class ClosePriceExecutionModel:
 class RecordedPriceExecutionModel:
   """按迁移基线中记录的成交价格回放订单。"""
 
+  def __init__(self, slippage: float = 0.0) -> None:
+    if slippage < 0:
+      raise ValueError("滑点不能小于 0")
+    self._slippage = float(slippage)
+
   def create_fill(
     self,
     order: OrderIntent,
@@ -406,17 +411,26 @@ class RecordedPriceExecutionModel:
     raw_price = order.metadata.get("recorded_price")
     if raw_price is None:
       raise ValueError("回放订单缺少 recorded_price")
+    base_price = float(raw_price)
+    price = base_price * (1 + self._slippage) if order.side == OrderSide.BUY else base_price * (1 - self._slippage)
+    metadata = dict(order.metadata)
+    metadata.update({
+      "base_price": base_price,
+      "slippage_rate": self._slippage,
+      "slippage_amount": abs(price - base_price),
+      "price_source": f"当前 Bar 收盘价 + 固定滑点 {self._slippage * 10_000:.2f} bp",
+    })
     return Fill(
       time=bar.time,
       symbol=order.symbol,
       side=order.side,
       quantity=order.quantity,
-      price=float(raw_price),
-      fee=_transaction_fee(order.side, float(raw_price), order.quantity, commission_rate),
+      price=price,
+      fee=_transaction_fee(order.side, price, order.quantity, commission_rate),
       reason=order.reason,
       position_effect=order.position_effect,
       position_key=order.position_key,
-      metadata=dict(order.metadata),
+      metadata=metadata,
     )
 
 
