@@ -49,10 +49,6 @@ def _reset_day(state, trade_date, open_price):
   state['final_close_done'] = False
 
 
-def _hhmm(bar_time):
-  return int(bar_time[8:12]) if len(bar_time) >= 12 else 0
-
-
 def _is_trade_time(hhmm):
   return (930 <= hhmm < MORNING_FORCE_CLOSE_TIME) or (1300 <= hhmm < FORCE_CLOSE_TIME)
 
@@ -206,15 +202,15 @@ def _sync_with_portfolio(state, position):
 def on_bar(bar, state):
   """每根已完成 1m K 线执行一次，方向由回测方案统一控制。"""
   bar_time = bar['time']
-  trade_date = bar_time[:8]
-  if len(bar_time) < 12 or not trade_date or state.get('last_processed_bar') == bar_time:
+  trade_date = bar['tradeDate']
+  hhmm = bar['hhmm']
+  if not trade_date or hhmm is None or state.get('last_processed_bar') == bar_time:
     return []
   if state.get('trade_date') != trade_date:
     _reset_day(state, trade_date, bar['open'])
   _sync_with_portfolio(state, bar['position'])
   state['last_processed_bar'] = bar_time
   state['processed_bar_keys'].append(bar_time)
-  hhmm = _hhmm(bar_time)
   orders = []
   if _is_trade_time(hhmm):
     _check_exit_rules(state, bar, orders)

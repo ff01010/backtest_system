@@ -77,7 +77,7 @@ try {
   if (-not $SkipBuild) {
     $upArguments += '--build'
   }
-  $upArguments += 'strategy-worker', 'backend', 'frontend'
+  $upArguments += 'redis', 'strategy-worker', 'l2-runner', 'backend', 'frontend'
   Invoke-Compose $upArguments
   Invoke-Compose @('ps')
   Wait-ApplicationHealthy $httpPort

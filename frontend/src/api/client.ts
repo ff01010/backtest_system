@@ -3,6 +3,7 @@ import type {
   BacktestChartResponse,
   BacktestRunHistory,
   BacktestRunResponse,
+  BacktestErrorDetail,
   ChartResponse,
   DataStatus,
   InstrumentItem,
@@ -16,6 +17,16 @@ import type {
 } from '../types';
 
 const BASE = '/api';
+
+export class BacktestRequestError extends Error {
+  detail: BacktestErrorDetail;
+
+  constructor(detail: BacktestErrorDetail) {
+    super(detail.message);
+    this.name = 'BacktestRequestError';
+    this.detail = detail;
+  }
+}
 
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { credentials: 'include' });
@@ -147,14 +158,46 @@ export interface BacktestRunPayload {
   slippage: number;
   allowLong: boolean;
   allowShort: boolean;
+  strategyCategory: 'core_position_overlay' | 'directional_holding';
   holdingPolicy: 'intraday' | 'overnight';
+  fillModel: 'bar_close' | 'l2_quote';
+  baseQuantity: number;
+  baseCostPrice: number;
+  t0Enabled: boolean;
   isDefault: boolean;
   strategyParams?: Record<string, string | boolean>;
   runDraft?: boolean;
 }
 
-export async function runBacktest(payload: BacktestRunPayload): Promise<BacktestRunResponse> {
-  return sendJson<BacktestRunResponse>(`${BASE}/backtest/run`, 'POST', payload);
+export interface QueuedBacktestResponse {
+  runId: string;
+  displayNo: number;
+  configId: string | null;
+  configVersionId: string | null;
+  scriptId: string | null;
+  status: 'queued';
+  fillModel: 'l2_quote';
+  message: string;
+}
+
+export async function runBacktest(payload: BacktestRunPayload): Promise<BacktestRunResponse | QueuedBacktestResponse> {
+  const res = await fetch(`${BASE}/backtest/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const response: unknown = await res.json().catch(() => null);
+    const detail = response && typeof response === 'object'
+      ? (response as { detail?: { errorDetail?: BacktestErrorDetail } }).detail?.errorDetail
+      : undefined;
+    if (detail && (detail.category === 'strategy_error' || detail.category === 'system_error')) {
+      throw new BacktestRequestError(detail);
+    }
+    throw new Error(`API ${res.status}: 回测请求失败`);
+  }
+  return res.json();
 }
 
 export interface LiveStrategyResponse {
@@ -186,6 +229,15 @@ export async function fetchBacktestRuns(
 export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistory> {
   const data = await fetchJson<{ run: BacktestRunHistory }>(`${BASE}/backtest/runs/${runId}`);
   return data.run;
+}
+
+export async function cancelL2BacktestRun(runId: string): Promise<{ runId: string; status: 'cancelling' }> {
+  const res = await fetch(`${BASE}/backtest/runs/${runId}/cancel`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+  if (!res.ok) throw new Error(`API ${res.status}: 取消回测失败`);
+  return res.json();
 }
 
 export async function fetchBacktestRunChart(

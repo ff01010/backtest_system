@@ -13,6 +13,7 @@ import type { ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createAccount,
+  cancelL2BacktestRun,
   createStrategyConfig,
   createStrategyScript,
   deleteStrategyConfig,
@@ -26,6 +27,7 @@ import {
   fetchStrategySource,
   fetchStrategyConfigs,
   fetchStrategyScripts,
+  BacktestRequestError,
   runBacktest,
   updateBacktestRunMeta,
   updateStrategyConfig,
@@ -34,6 +36,7 @@ import {
 import type { BacktestRunPayload, BacktestTimeframeAvailability } from '../api/client';
 import type {
   BacktestAccount,
+  BacktestErrorDetail,
   BacktestRunHistory,
   BacktestRunResponse,
   BenchmarkPoint,
@@ -88,14 +91,19 @@ const fieldStyle = {
 } as const;
 
 const DEFAULT_PARAMS = {
-  startDate: '20260601',
-  endDate: '20260626',
+  startDate: '2026-06-01',
+  endDate: '2026-06-26',
   initialCapital: '1000000',
   commissionRate: '0.0003',
   slippage: '0',
   allowLong: true,
   allowShort: true,
-  holdingPolicy: 'intraday',
+  strategyCategory: 'directional_holding',
+  holdingPolicy: 'overnight',
+  fillModel: 'bar_close',
+  baseQuantity: '0',
+  baseCostPrice: '0',
+  t0Enabled: false,
   minMarketCap: '10000000000',
   maxMarketCap: '80000000000',
   minRevenueYoy: '0.10',
@@ -109,6 +117,8 @@ const DEFAULT_PARAMS = {
   stopLoss: '-0.20',
   indexTrendFilter: true,
 };
+
+const L2_TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '45m', '60m', '1d'];
 
 const EXPERIMENT_PARAM_KEYS = new Set([
   'startDate',
@@ -162,7 +172,12 @@ type HistoryParamKey =
   | 'slippage'
   | 'allowLong'
   | 'allowShort'
-  | 'holdingPolicy';
+  | 'strategyCategory'
+  | 'holdingPolicy'
+  | 'fillModel'
+  | 'baseQuantity'
+  | 'baseCostPrice'
+  | 't0Enabled';
 
 const HISTORY_PARAM_LABELS: Record<HistoryParamKey, string> = {
   configId: '策略方案 ID',
@@ -180,7 +195,12 @@ const HISTORY_PARAM_LABELS: Record<HistoryParamKey, string> = {
   slippage: '滑点',
   allowLong: '允许做多',
   allowShort: '允许做空',
+  strategyCategory: '策略类别',
   holdingPolicy: '持仓规则',
+  fillModel: '成交模式',
+  baseQuantity: '底仓数量',
+  baseCostPrice: '底仓成本价',
+  t0Enabled: '启用底仓做T',
 };
 
 interface NetSeriesPoint {
@@ -202,7 +222,8 @@ interface NetSeries {
 function getDefaultScriptCode(timeframe: string): string {
   return `# on_bar(bar, state) 会在每根已完成的 ${timeframe} K 线调用一次。
 # 当前规则：本 Bar 收盘产生信号，并按本 Bar 收盘价虚拟成交。
-# bar 可读：time/open/high/low/close/volume/cash/equity/position/params。
+# 时间：time 为 YYYYMMDDHHMMSS；tradeDate 为 YYYY-MM-DD；hhmm 例如 931。
+# bar 可读：time/datetime/tradeDate/hhmm/open/high/low/close/volume/cash/equity/position/params。
 # action 支持 buy_open、sell_open、sell_close、buy_close。
 def on_bar(bar, state):
   if bar['position'] == 0 and bar['close'] > bar['open']:
@@ -223,7 +244,15 @@ function createEmptyScriptForm(timeframe = '5m') {
 }
 
 function isValidDate(value: string) {
-  return /^\d{8}$/.test(value);
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+}
+
+export function normalizeApiDate(value: string) {
+  return /^\d{8}$/.test(value) ? `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}` : value;
+}
+
+function getStrategyCategoryLabel(value: unknown): string {
+  return value === 'core_position_overlay' ? '底仓增强策略' : '方向性持仓策略';
 }
 
 export function shouldFetchBacktestTimeframes(startDate: string, endDate: string): boolean {
@@ -244,6 +273,10 @@ export function isCustomScriptStrategy(strategyId: string): boolean {
 
 export function hasSavedStrategyId(strategyId: string): boolean {
   return strategyId.length > 0;
+}
+
+export function hasLegacyTimeSlice(code: string): boolean {
+  return /bar\s*\[\s*['"]time['"]\s*\]\s*\[/.test(code);
 }
 
 export function hasEnabledTradeDirection(allowLong: boolean, allowShort: boolean): boolean {
@@ -310,12 +343,40 @@ function validateParams(params: BacktestParams) {
   const slippage = Number(params.slippage);
 
   if (!isValidDate(params.startDate) || !isValidDate(params.endDate)) {
-    errors.push('日期格式应为 YYYYMMDD');
+    errors.push('日期格式应为 YYYY-MM-DD');
   } else if (params.startDate > params.endDate) {
     errors.push('开始日期不能晚于结束日期');
   }
   if (!Number.isFinite(initialCapital) || initialCapital <= 0) {
     errors.push('初始资金必须大于 0');
+  }
+  const isCorePositionOverlay = params.strategyCategory === 'core_position_overlay';
+  const baseQuantity = Number(params.baseQuantity);
+  const baseCostPrice = Number(params.baseCostPrice);
+  if (!Number.isInteger(baseQuantity) || baseQuantity < 0) {
+    errors.push('底仓数量必须是非负整数');
+  } else if (baseQuantity === 0 && baseCostPrice !== 0) {
+    errors.push('底仓数量为 0 时底仓成本价必须为 0');
+  } else if (baseQuantity > 0 && (!Number.isFinite(baseCostPrice) || baseCostPrice <= 0)) {
+    errors.push('底仓数量大于 0 时必须填写底仓成本价');
+  }
+  if (isCorePositionOverlay && (baseQuantity <= 0 || baseCostPrice <= 0)) {
+    errors.push('底仓增强策略必须填写有效的底仓数量和成本价');
+  }
+  if (isCorePositionOverlay && params.fillModel !== 'l2_quote') {
+    errors.push('底仓增强策略仅支持基础 L2 十档盘口回测');
+  }
+  if (isCorePositionOverlay && !params.t0Enabled) {
+    errors.push('底仓增强策略必须启用底仓做 T');
+  }
+  if (!isCorePositionOverlay && (baseQuantity > 0 || baseCostPrice !== 0 || params.t0Enabled)) {
+    errors.push('方向性持仓策略不能设置底仓或启用底仓做 T');
+  }
+  if (params.t0Enabled && baseQuantity <= 0) {
+    errors.push('启用底仓做 T 时底仓数量必须大于 0');
+  }
+  if (params.fillModel !== 'l2_quote' && (baseQuantity > 0 || params.t0Enabled)) {
+    errors.push('底仓做 T 仅支持基础 L2 十档盘口回测');
   }
   if (!Number.isFinite(commissionRate) || commissionRate < 0) {
     errors.push('手续费率不能小于 0');
@@ -519,6 +580,7 @@ interface ResultContextBarProps {
   commissionRate: number | null;
   slippage: number | null;
   holdingPolicy: string | undefined;
+  strategyCategory: unknown;
 }
 
 function ResultContextBar({
@@ -532,6 +594,7 @@ function ResultContextBar({
   commissionRate,
   slippage,
   holdingPolicy,
+  strategyCategory,
 }: ResultContextBarProps): ReactNode {
   return (
     <section style={{ ...panelStyle, padding: '10px 12px', background: '#ffffff' }}>
@@ -547,7 +610,8 @@ function ResultContextBar({
           <span>基准：{benchmarkSymbol || symbol}</span>
           <span>手续费：{commissionRate == null ? '--' : `${(commissionRate * 10_000).toFixed(2)} bp`}</span>
           <span>滑点：{slippage == null ? '--' : `${(slippage * 10_000).toFixed(2)} bp`}</span>
-          <span>持仓规则：{holdingPolicy === 'overnight' ? '允许跨日' : holdingPolicy === 'intraday' ? '日内平仓' : '未记录'}</span>
+          <span>策略类别：{getStrategyCategoryLabel(strategyCategory)}</span>
+          <span>持仓规则：{strategyCategory === 'core_position_overlay' ? '日终恢复底仓' : holdingPolicy === 'overnight' ? '允许跨日' : '未记录'}</span>
         </div>
       </details>
     </section>
@@ -589,6 +653,17 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
   const scriptSnapshot = asHistoryRecord(run.scriptSnapshot);
   const dataVersion = asHistoryRecord(run.dataVersion);
   const strategyParams = asHistoryRecord(run.paramsSnapshot);
+  const dataSnapshot = asHistoryRecord(run.resultJson?.dataSnapshot);
+  const temporaryAggregation = asHistoryRecord(dataSnapshot.temporaryBarAggregation);
+  const temporaryDays = Array.isArray(temporaryAggregation.days) ? temporaryAggregation.days : [];
+  const cacheSummary = temporaryDays.map((item) => {
+    const day = asHistoryRecord(item);
+    return `${String(day.tradeDate ?? '--')}: ${String(day.cacheStatus ?? '--')}`;
+  }).join('；');
+  const qualitySummary = temporaryDays.map((item) => {
+    const day = asHistoryRecord(item);
+    return `${String(day.tradeDate ?? '--')}: ${String(day.quality ?? '--')}`;
+  }).join('；');
   const snapshotEntries = Object.entries(strategyParams)
     .filter(([key]) => !EXPERIMENT_PARAM_KEYS.has(key))
     .map(([key, value]) => ({ label: key, value }));
@@ -633,6 +708,18 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
             { label: '数据指纹', value: shortenHistoryHash(dataVersion.dataHash ?? manifest?.dataHash) },
           ]}
         />
+        {Object.keys(temporaryAggregation).length > 0 && (
+          <HistorySnapshotGroup
+            title="L2 临时聚合"
+            entries={[
+              { label: 'Bar 来源', value: temporaryAggregation.inputTable },
+              { label: '聚合版本', value: temporaryAggregation.aggregationVersion },
+              { label: '映射版本', value: temporaryAggregation.mappingVersion },
+              { label: '缓存状态', value: cacheSummary || '--' },
+              { label: 'Bar 质量', value: qualitySummary || '--' },
+            ]}
+          />
+        )}
       </div>
       <details open style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: '8px 10px' }}>
         <summary style={{ color: '#475569', cursor: 'pointer', fontWeight: 700 }}>
@@ -651,6 +738,40 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
           <div style={{ color: '#b45309', marginTop: 8 }}>该旧记录未保存策略参数快照。</div>
         )}
       </details>
+    </div>
+  );
+}
+
+function getRunErrorDetail(run: BacktestRunHistory): BacktestErrorDetail | null {
+  const detail = run.summaryJson.errorDetail;
+  if (detail) return detail;
+  if (run.status === 'cancelled') {
+    return {
+      category: 'system_error', code: 'task.cancelled', message: '回测任务已取消。',
+      hint: '可在确认参数后重新运行。', retryable: false, taskId: run.id,
+    };
+  }
+  if (run.status === 'error') {
+    return {
+      category: 'system_error', code: 'system.legacy_error', message: '该历史回测未保存可定位错误信息。',
+      hint: '请重新运行；如持续失败，请提供任务编号给维护人员。', retryable: true, taskId: run.id,
+    };
+  }
+  return null;
+}
+
+function BacktestErrorCard({ detail }: { detail: BacktestErrorDetail }): ReactNode {
+  const isStrategy = detail.category === 'strategy_error';
+  const location = [detail.callback, detail.symbol, detail.eventTime].filter(Boolean).join(' · ');
+  return (
+    <div style={{ border: `1px solid ${isStrategy ? '#fdba74' : '#fecaca'}`, background: isStrategy ? '#fff7ed' : '#fef2f2', borderRadius: 6, padding: 12, color: '#7c2d12', fontSize: 13, lineHeight: 1.6 }}>
+      <div style={{ fontWeight: 700, color: isStrategy ? '#9a3412' : '#b91c1c' }}>
+        {isStrategy ? '策略执行失败' : '回测未完成'}
+      </div>
+      {location && <div style={{ color: '#9a3412', marginTop: 3 }}>{location}</div>}
+      <div style={{ marginTop: 5 }}>原因：{detail.message}</div>
+      {detail.hint && <div style={{ marginTop: 3 }}>建议：{detail.hint}</div>}
+      {detail.taskId && <div style={{ marginTop: 6, color: '#64748b', fontSize: 12 }}>任务编号：<code>{detail.taskId}</code></div>}
     </div>
   );
 }
@@ -749,8 +870,11 @@ export default function BacktestPage({
   const [newAccountName, setNewAccountName] = useState('');
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
+  const [backtestErrorDetail, setBacktestErrorDetail] = useState<BacktestErrorDetail | null>(null);
   const [running, setRunning] = useState(false);
+  const [cancellingL2Run, setCancellingL2Run] = useState(false);
   const [result, setResult] = useState<BacktestRunResponse | null>(null);
+  const [pendingL2Run, setPendingL2Run] = useState<{ runId: string; displayNo: number } | null>(null);
   const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
   const [benchmarkDataStatus, setBenchmarkDataStatus] = useState<DataStatus | null>(null);
   const [dataStatusError, setDataStatusError] = useState('');
@@ -849,6 +973,52 @@ export default function BacktestPage({
     refreshStrategyAssets();
     refreshBacktestRuns();
   }, []);
+
+  useEffect(() => {
+    if (!pendingL2Run) return undefined;
+    let disposed = false;
+    const poll = async () => {
+      try {
+        const run = await fetchBacktestRun(pendingL2Run.runId);
+        if (disposed) return;
+        if (run.status === 'ok' && run.resultJson) {
+          setResult({
+            ...run.resultJson,
+            runId: run.id,
+            displayNo: run.displayNo,
+            configId: run.configId,
+            configVersionId: run.configVersionId,
+            scriptId: run.scriptId,
+          });
+          setHoldingStartDate('');
+          setHoldingEndDate('');
+          setHoldingStatusFilter('all');
+          setPendingL2Run(null);
+          setActivePanel('overview');
+          setStatus(`L2 回测 ${formatRunReference(run.displayNo)} 已完成，交易 ${run.resultJson.summary.tradeCount} 笔`);
+          refreshBacktestRuns();
+          return;
+        }
+        if (run.status === 'error' || run.status === 'cancelled') {
+          setPendingL2Run(null);
+          setBacktestErrorDetail(getRunErrorDetail(run));
+          setSelectedHistoryRunId(run.id);
+          setActivePanel('history');
+          setStatus('');
+          setError('');
+          refreshBacktestRuns();
+        }
+      } catch {
+        // 网络瞬时失败不应中断正在运行的 L2 回测轮询。
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 2000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [pendingL2Run]);
 
   useEffect(() => {
     if (!hasSelectedConfig || !publishedFingerprint) return;
@@ -1112,12 +1282,35 @@ export default function BacktestPage({
     setParams((prev) => ({ ...prev, [key]: value }));
   };
 
+  const setStrategyCategory = (strategyCategory: 'core_position_overlay' | 'directional_holding') => {
+    setParams((prev) => strategyCategory === 'core_position_overlay'
+      ? { ...prev, strategyCategory, fillModel: 'l2_quote', holdingPolicy: 'intraday', t0Enabled: true }
+      : {
+        ...prev,
+        strategyCategory,
+        holdingPolicy: 'overnight',
+        baseQuantity: '0',
+        baseCostPrice: '0',
+        t0Enabled: false,
+      });
+    if (strategyCategory === 'core_position_overlay' && !L2_TIMEFRAMES.includes(selectedTimeframe)) {
+      setSelectedTimeframe('1m');
+    }
+  };
+
   const updateScriptForm = (changes: Partial<typeof scriptForm>) => {
     setScriptForm((prev) => ({ ...prev, ...changes }));
   };
 
   const setVersionTimeframe = (timeframe: string) => {
     setSelectedTimeframe(timeframe);
+  };
+
+  const setFillModel = (fillModel: 'bar_close' | 'l2_quote') => {
+    setParam('fillModel', fillModel);
+    if (fillModel === 'l2_quote' && !L2_TIMEFRAMES.includes(selectedTimeframe)) {
+      setSelectedTimeframe('1m');
+    }
   };
 
   const refreshBenchmarkDataStatus = async (targetSymbol: string, timeframe: string) => {
@@ -1238,11 +1431,7 @@ export default function BacktestPage({
       );
     }
     if (strategyParameterFields.length === 0) {
-      return (
-        <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.5 }}>
-          当前策略未提供参数模板
-        </div>
-      );
+      return null;
     }
     return (
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -1474,6 +1663,7 @@ export default function BacktestPage({
   const handleRunBacktest = async () => {
     setError('');
     setStatus('');
+    setBacktestErrorDetail(null);
     if (!hasSelectedConfig) {
       setError('请先选择策略方案，再运行回测');
       return;
@@ -1508,18 +1698,39 @@ export default function BacktestPage({
         slippage: Number(params.slippage),
         allowLong: params.allowLong,
         allowShort: params.allowShort,
-        holdingPolicy: params.holdingPolicy === 'overnight' ? 'overnight' : 'intraday',
+        strategyCategory: params.strategyCategory === 'core_position_overlay' ? 'core_position_overlay' : 'directional_holding',
+        holdingPolicy: params.strategyCategory === 'core_position_overlay' ? 'intraday' : 'overnight',
+        fillModel: params.fillModel === 'l2_quote' ? 'l2_quote' : 'bar_close',
+        baseQuantity: Number(params.baseQuantity),
+        baseCostPrice: Number(params.baseCostPrice),
+        t0Enabled: params.t0Enabled,
         isDefault: false,
         strategyParams: params,
         runDraft: false,
       };
       const data = await runBacktest(payload);
+      if (!('summary' in data)) {
+        await refreshBacktestRuns();
+        setPendingL2Run({ runId: data.runId, displayNo: data.displayNo });
+        setActivePanel('overview');
+        setStatus(`L2 回测 ${formatRunReference(data.displayNo)} 已进入队列，完成后将自动展示概览和信号明细`);
+        return;
+      }
       setResult(data);
-      refreshDataStatus(selectedSymbol, selectedTimeframe);
+      setHoldingStartDate('');
+      setHoldingEndDate('');
+      setHoldingStatusFilter('all');
+      if (payload.fillModel === 'bar_close') {
+        refreshDataStatus(selectedSymbol, selectedTimeframe);
+      }
       refreshBacktestRuns();
       setStatus(`回测完成 ${formatRunReference(data.displayNo)}，交易 ${data.summary.tradeCount} 笔`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : '回测失败');
+      if (e instanceof BacktestRequestError) {
+        setBacktestErrorDetail(e.detail);
+      } else {
+        setError(e instanceof Error ? e.message : '回测失败');
+      }
     } finally {
       setRunning(false);
     }
@@ -1593,29 +1804,78 @@ export default function BacktestPage({
   const formatOptionalNumber = (value: unknown) => (
     typeof value === 'number' ? formatNumber(value) : '--'
   );
-  const dataCoverage = buildDataCoverage('运行标的', dataStatus, loadingDataStatus, dataStatusError);
-  const benchmarkCoverage = buildDataCoverage(
-    '基准标的',
-    benchmarkDataStatus,
-    loadingBenchmarkDataStatus,
-    benchmarkDataStatusError,
-  );
-  const runPreflightReady = dataCoverage.tone === 'ok' && benchmarkCoverage.tone === 'ok';
-  const dataCoverageColor = dataCoverage.tone === 'ok' ? '#0f766e' : '#b45309';
-  const rangedEquity = result ? filterEquityByRange(result.equity, chartRange) : [];
+  const isCorePositionOverlay = params.strategyCategory === 'core_position_overlay';
+  const isL2Quote = params.fillModel === 'l2_quote';
+  const timeframeOptions = isL2Quote
+    ? L2_TIMEFRAMES.map((timeframe) => ({ timeframe, available: true }))
+    : backtestTimeframes;
+  const dataCoverage = isL2Quote
+    ? { tone: 'info', text: 'L2 任务将由 Runner 校验上游 Bar、十档快照与逐笔成交的完整交集。' }
+    : buildDataCoverage('运行标的', dataStatus, loadingDataStatus, dataStatusError);
+  const benchmarkCoverage = isL2Quote
+    ? { tone: 'info', text: 'L2 模式不使用 QMT 基准覆盖；结果会保存 L2 数据来源版本。' }
+    : buildDataCoverage(
+      '基准标的',
+      benchmarkDataStatus,
+      loadingBenchmarkDataStatus,
+      benchmarkDataStatusError,
+    );
+  const runPreflightReady = isL2Quote || (dataCoverage.tone === 'ok' && benchmarkCoverage.tone === 'ok');
+  const dataCoverageColor = dataCoverage.tone === 'ok' ? '#0f766e' : dataCoverage.tone === 'info' ? '#1d4ed8' : '#b45309';
+  const resultHistoryRun = result?.runId ? backtestRuns.find((item) => item.id === result.runId) || null : null;
+  const resultStrategyCategory = result?.strategyCategory || result?.experimentManifest?.strategyCategory || resultHistoryRun?.strategyCategory || params.strategyCategory;
+  const isOverlayResult = resultStrategyCategory === 'core_position_overlay';
+  const resultParams = resultHistoryRun ? asHistoryRecord(resultHistoryRun.paramsJson) : {};
+  const resultInitialCash = Number(resultParams.initialCapital ?? params.initialCapital);
+  const resultBaseQuantity = Number(resultParams.baseQuantity ?? params.baseQuantity);
+  const resultBaseCostPrice = Number(resultParams.baseCostPrice ?? params.baseCostPrice);
+  const initialTotalEquity = Number.isFinite(resultInitialCash)
+    ? resultInitialCash + (isOverlayResult && Number.isFinite(resultBaseQuantity) && Number.isFinite(resultBaseCostPrice)
+      ? resultBaseQuantity * resultBaseCostPrice
+      : 0)
+    : null;
+  const holdingDefaultStartDate = normalizeApiDate(resultHistoryRun?.startDate || params.startDate);
+  const holdingDefaultEndDate = normalizeApiDate(resultHistoryRun?.endDate || params.endDate);
+  const effectiveHoldingStartDate = holdingStartDate || holdingDefaultStartDate;
+  const effectiveHoldingEndDate = holdingEndDate || holdingDefaultEndDate;
+  const normalizedEquity = result ? result.equity.map((point) => ({ ...point, date: normalizeApiDate(point.date) })) : [];
+  const rangedEquity = filterEquityByRange(normalizedEquity, chartRange);
   const rangedDates = new Set(rangedEquity.map((point) => point.date));
   const rangedBenchmark = result ? filterBenchmarkByDates(result.benchmarkEquity, rangedDates) : [];
   const dailyBars = buildDailyBars(rangedEquity, rangedBenchmark);
-  const dailyHoldings = result?.dailyHoldings || [];
+  const dailyHoldings = (result?.dailyHoldings || []).map((holding) => ({ ...holding, date: normalizeApiDate(holding.date) }));
   const getHoldingStatus = (holding: BacktestRunResponse['dailyHoldings'][number]): HoldingStatusFilter => {
     const netQuantity = holding.longQty - holding.shortQty;
     if (netQuantity > 0) return 'long';
     if (netQuantity < 0) return 'short';
     return 'flat';
   };
+
+  const activeL2Run = useMemo(() => {
+    const pending = pendingL2Run ? backtestRuns.find((run) => run.id === pendingL2Run.runId) : null;
+    if (pending && (pending.status === 'queued' || pending.status === 'running')) return pending;
+    return backtestRuns.find((run) => run.fillModel === 'l2_quote' && run.status === 'running')
+      || backtestRuns.find((run) => run.fillModel === 'l2_quote' && run.status === 'queued')
+      || null;
+  }, [backtestRuns, pendingL2Run]);
+
+  const handleCancelL2Run = async () => {
+    if (!activeL2Run) return;
+    setCancellingL2Run(true);
+    setError('');
+    try {
+      await cancelL2BacktestRun(activeL2Run.id);
+      setStatus(`L2 回测 ${formatRunReference(activeL2Run.displayNo)} 正在取消，当前处理块结束后停止`);
+      await refreshBacktestRuns();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '取消回测失败');
+    } finally {
+      setCancellingL2Run(false);
+    }
+  };
   const filteredDailyHoldings = dailyHoldings.filter((holding) => {
-    if (holdingStartDate && holding.date < holdingStartDate) return false;
-    if (holdingEndDate && holding.date > holdingEndDate) return false;
+    if (effectiveHoldingStartDate && holding.date < effectiveHoldingStartDate) return false;
+    if (effectiveHoldingEndDate && holding.date > effectiveHoldingEndDate) return false;
     return holdingStatusFilter === 'all' || getHoldingStatus(holding) === holdingStatusFilter;
   });
   const latestHolding = filteredDailyHoldings[filteredDailyHoldings.length - 1];
@@ -1750,7 +2010,14 @@ export default function BacktestPage({
   ];
   const visibleTradeColumns = tradeColumnDefs.filter((column) => tradeColumns[column.key]);
   const tradeGridColumns = visibleTradeColumns.map((column) => column.width).join(' ') || '1fr';
-  const coreMetrics = [
+  const coreMetrics = isOverlayResult ? [
+    ['做T超额收益', result ? formatMoney(result.summary.t0ExcessPnl) : '--'],
+    ['做T超额收益率', result ? formatPct(result.summary.t0ExcessReturn) : '--'],
+    ['底仓持有收益率', result ? formatPct(result.summary.baseHoldingReturn) : '--'],
+    ['总账户收益率', result ? formatPct(result.summary.totalReturn) : '--'],
+    ['最大回撤', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
+    ['交易 / 胜率', result ? `${result.summary.tradeCount} / ${formatPct(result.summary.winRate)}` : '--'],
+  ] : [
     ['总收益', result ? formatPct(result.summary.totalReturn) : '--'],
     ['年化收益', result ? formatPct(result.summary.annualReturn) : '--'],
     ['超额收益', result ? formatPct(result.excessReturn) : '--'],
@@ -1761,7 +2028,15 @@ export default function BacktestPage({
   const metricGroups = [
     {
       title: '收益',
-      rows: [
+      rows: isOverlayResult ? [
+        ['总收益', result ? formatMoney(result.summary.totalPnl) : '--'],
+        ['最终权益', result ? formatMoney(result.summary.finalEquity) : '--'],
+        ['总收益率', result ? formatPct(result.summary.totalReturn) : '--'],
+        ['底仓持有收益率', result ? formatPct(result.summary.baseHoldingReturn) : '--'],
+        ['做T超额收益', result ? formatMoney(result.summary.t0ExcessPnl) : '--'],
+        ['做T超额收益率', result ? formatPct(result.summary.t0ExcessReturn) : '--'],
+        ['年化收益', result ? formatPct(result.summary.annualReturn) : '--'],
+      ] : [
         ['总收益', result ? formatMoney(result.summary.totalPnl) : '--'],
         ['最终权益', result ? formatMoney(result.summary.finalEquity) : '--'],
         ['总收益率', result ? formatPct(result.summary.totalReturn) : '--'],
@@ -1796,17 +2071,16 @@ export default function BacktestPage({
   ];
 
   const resultTabs = [
+    { id: 'code' as WorkbenchPanel, label: '策略代码', icon: Code2 },
     { id: 'overview' as WorkbenchPanel, label: '概览', icon: FileSliders },
     { id: 'trades' as WorkbenchPanel, label: '信号明细', icon: History },
-    { id: 'positions' as WorkbenchPanel, label: '持仓收益', icon: Database },
+    { id: 'positions' as WorkbenchPanel, label: isOverlayResult ? '底仓增强收益' : '持仓收益', icon: Database },
     { id: 'history' as WorkbenchPanel, label: '历史回测', icon: History },
-    { id: 'code' as WorkbenchPanel, label: '策略管理', icon: Code2 },
   ];
   const activeConfig = strategyConfigs.find((item) => item.id === selectedConfigId);
   const activeScript = strategyScripts.find((item) => item.id === selectedScriptId);
   const configNameById = new Map(strategyConfigs.map((item) => [item.id, item.name]));
   const selectedHistoryRun = backtestRuns.find((item) => item.id === selectedHistoryRunId) || null;
-  const resultHistoryRun = result?.runId ? backtestRuns.find((item) => item.id === result.runId) || null : null;
   const compareHistoryRun = backtestRuns.find((item) => item.id === compareHistoryRunId) || null;
   const historyComparisonScope = selectedHistoryRun && compareHistoryRun
     ? [
@@ -1832,6 +2106,7 @@ export default function BacktestPage({
     commissionRate: resultCostModel?.commissionRate ?? Number(params.commissionRate),
     slippage: resultCostModel?.slippage ?? Number(params.slippage),
     holdingPolicy: resultManifest?.holdingPolicy || String(params.holdingPolicy),
+    strategyCategory: result?.strategyCategory || resultManifest?.strategyCategory || resultHistoryRun?.strategyCategory || params.strategyCategory,
   };
   const hasWorkbenchSidebar = !['history', 'trades', 'positions', 'code'].includes(activePanel);
   const historyParamDiffs = compareHistoryRuns(selectedHistoryRun, compareHistoryRun);
@@ -1855,7 +2130,7 @@ export default function BacktestPage({
   const historyRangeEnd = Math.min(historyPageStart + historyPageSize, filteredHistoryRuns.length);
   const historyGridColumns = 'minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 74px';
   const activePanelLabel = resultTabs.find((item) => item.id === activePanel)?.label || '概览';
-  const runDisabled = running || !hasSelectedConfig || versionDirty;
+  const runDisabled = running || activeL2Run != null || !hasSelectedConfig || versionDirty;
   const statusMessage = error || status || (versionDirty
     ? '策略内容已修改，请先保存策略后运行回测。'
     : activeConfig ? `当前策略：${activeConfig.name}` : '请先新建并保存策略');
@@ -1891,7 +2166,7 @@ export default function BacktestPage({
       runId: result.runId,
       symbol: resultContext.symbol,
       timeframe: resultContext.timeframe || selectedTimeframe,
-      date: executionTime.slice(0, 8),
+      date: normalizeApiDate(executionTime.slice(0, 8)),
     });
   };
 
@@ -1918,14 +2193,19 @@ export default function BacktestPage({
     setParams({
       ...DEFAULT_PARAMS,
       ...savedStrategyParams,
-      startDate: run.startDate,
-      endDate: run.endDate,
+      startDate: normalizeApiDate(run.startDate),
+      endDate: normalizeApiDate(run.endDate),
       initialCapital: textValue('initialCapital', DEFAULT_PARAMS.initialCapital),
       commissionRate: textValue('commissionRate', DEFAULT_PARAMS.commissionRate),
       slippage: textValue('slippage', DEFAULT_PARAMS.slippage),
       allowLong: boolValue('allowLong', DEFAULT_PARAMS.allowLong),
       allowShort: boolValue('allowShort', DEFAULT_PARAMS.allowShort),
-      holdingPolicy: textValue('holdingPolicy', DEFAULT_PARAMS.holdingPolicy),
+      strategyCategory: textValue('strategyCategory', run.strategyCategory || (Number(saved.baseQuantity || 0) > 0 || saved.t0Enabled === true ? 'core_position_overlay' : 'directional_holding')),
+      holdingPolicy: run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity || 0) > 0 || saved.t0Enabled === true ? 'intraday' : 'overnight',
+      fillModel: textValue('fillModel', run.fillModel || DEFAULT_PARAMS.fillModel),
+      baseQuantity: textValue('baseQuantity', DEFAULT_PARAMS.baseQuantity),
+      baseCostPrice: textValue('baseCostPrice', DEFAULT_PARAMS.baseCostPrice),
+      t0Enabled: boolValue('t0Enabled', DEFAULT_PARAMS.t0Enabled),
     });
     setStatus(`已恢复历史回测 ${formatRunReference(run.displayNo)} 的参数`);
   };
@@ -1943,6 +2223,9 @@ export default function BacktestPage({
       configVersionId: run.configVersionId,
       scriptId: run.scriptId,
     });
+    setHoldingStartDate('');
+    setHoldingEndDate('');
+    setHoldingStatusFilter('all');
     setActivePanel('overview');
     setStatus(`正在查看历史回测 ${formatRunReference(run.displayNo)} 的结果`);
   };
@@ -1952,6 +2235,7 @@ export default function BacktestPage({
     const account = accounts.find((item) => item.id === run.accountId);
     setError('');
     setStatus('');
+    setBacktestErrorDetail(null);
     setRunning(true);
     try {
       const data = await runBacktest({
@@ -1965,23 +2249,42 @@ export default function BacktestPage({
         benchmarkSymbol: run.benchmarkSymbol,
         strategy: run.strategy,
         timeframe: run.timeframe || '5m',
-        startDate: run.startDate,
-        endDate: run.endDate,
+        startDate: normalizeApiDate(run.startDate),
+        endDate: normalizeApiDate(run.endDate),
         initialCapital: Number(saved.initialCapital ?? 1_000_000),
         commissionRate: Number(saved.commissionRate ?? 0),
         slippage: Number(saved.slippage ?? 0),
         allowLong: saved.allowLong !== false,
         allowShort: saved.allowShort !== false,
-        holdingPolicy: saved.holdingPolicy === 'overnight' ? 'overnight' : 'intraday',
+        strategyCategory: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'core_position_overlay' : 'directional_holding',
+        holdingPolicy: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'intraday' : 'overnight',
+        fillModel: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'l2_quote' : (run.fillModel === 'l2_quote' ? 'l2_quote' : 'bar_close'),
+        baseQuantity: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseQuantity ?? 0 : 0),
+        baseCostPrice: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseCostPrice ?? 0 : 0),
+        t0Enabled: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true,
         isDefault: false,
         strategyParams: (saved.strategyParams || {}) as Record<string, string | boolean>,
       });
+      if (!('summary' in data)) {
+        await refreshBacktestRuns();
+        setPendingL2Run({ runId: data.runId, displayNo: data.displayNo });
+        setActivePanel('overview');
+        setStatus(`L2 回测 ${formatRunReference(data.displayNo)} 已重新进入队列，完成后将自动展示结果`);
+        return;
+      }
       setResult(data);
+      setHoldingStartDate('');
+      setHoldingEndDate('');
+      setHoldingStatusFilter('all');
       await refreshBacktestRuns();
       setActivePanel('overview');
       setStatus(`已重新运行回测 ${formatRunReference(run.displayNo)}，新记录为 ${formatRunReference(data.displayNo)}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : '重新运行回测失败');
+      if (e instanceof BacktestRequestError) {
+        setBacktestErrorDetail(e.detail);
+      } else {
+        setError(e instanceof Error ? e.message : '重新运行回测失败');
+      }
     } finally {
       setRunning(false);
     }
@@ -2067,53 +2370,74 @@ export default function BacktestPage({
           </div>
         </div>
 
-        <button
-          className="workbench-primary-action"
-          onClick={handleRunBacktest}
-          disabled={runDisabled}
-          title={!hasSelectedConfig
-            ? '请先选择策略方案'
-            : versionDirty
-              ? '请先保存策略'
-              : !runPreflightReady
-                ? '请等待运行前检查通过'
-                : undefined}
-          style={{
-            height: 36,
-            borderRadius: 4,
-            border: `1px solid ${runDisabled ? '#cbd5e1' : '#0f766e'}`,
-            background: runDisabled ? '#f1f5f9' : '#ccfbf1',
-            color: runDisabled ? '#94a3b8' : '#0f766e',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: 7,
-            padding: '0 14px',
-            cursor: running ? 'wait' : runDisabled ? 'not-allowed' : 'pointer',
-            opacity: runDisabled ? 0.7 : 1,
-            fontWeight: 700,
-            fontSize: 14,
-          }}
-        >
-          <Play size={15} />
-          {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : '运行回测'}
-        </button>
+        {activeL2Run ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: '#a16207', fontSize: 12 }}>
+              L2 回测 {formatRunReference(activeL2Run.displayNo)} {activeL2Run.status === 'queued' ? '排队中' : '运行中'}
+            </span>
+            <button
+              onClick={handleCancelL2Run}
+              disabled={cancellingL2Run}
+              style={{ height: 36, borderRadius: 4, border: '1px solid #dc2626', background: '#fef2f2', color: '#b91c1c', padding: '0 14px', cursor: cancellingL2Run ? 'wait' : 'pointer', fontWeight: 700, fontSize: 14 }}
+            >
+              {cancellingL2Run ? '正在取消...' : '取消回测'}
+            </button>
+          </div>
+        ) : (
+          <button
+            className="workbench-primary-action"
+            onClick={handleRunBacktest}
+            disabled={runDisabled}
+            title={!hasSelectedConfig
+              ? '请先选择策略方案'
+              : versionDirty
+                ? '请先保存策略'
+                : !runPreflightReady
+                  ? '请等待运行前检查通过'
+                  : undefined}
+            style={{
+              height: 36,
+              borderRadius: 4,
+              border: `1px solid ${runDisabled ? '#cbd5e1' : '#0f766e'}`,
+              background: runDisabled ? '#f1f5f9' : '#ccfbf1',
+              color: runDisabled ? '#94a3b8' : '#0f766e',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 7,
+              padding: '0 14px',
+              cursor: running ? 'wait' : runDisabled ? 'not-allowed' : 'pointer',
+              opacity: runDisabled ? 0.7 : 1,
+              fontWeight: 700,
+              fontSize: 14,
+            }}
+          >
+            <Play size={15} />
+            {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : '运行回测'}
+          </button>
+        )}
       </header>}
 
       <div className="workbench-grid" style={{
         minHeight: 0,
         display: 'grid',
         gridTemplateColumns: hasWorkbenchSidebar
-          ? '64px 340px minmax(0, 1fr)'
-          : '64px minmax(0, 1fr)',
+          ? '56px 340px minmax(0, 1fr)'
+          : '56px minmax(0, 1fr)',
         gap: 12,
         padding: 12,
         background: '#eef3f8',
         overflow: 'hidden',
+        position: 'relative',
       }}>
+        {backtestErrorDetail && (
+          <div style={{ position: 'absolute', top: 12, right: 12, width: 'min(560px, calc(100% - 24px))', zIndex: 5 }}>
+            <BacktestErrorCard detail={backtestErrorDetail} />
+          </div>
+        )}
         <aside className="workbench-nav" style={{
           minHeight: 0,
-          overflow: 'auto',
+          overflow: 'visible',
           border: '1px solid #dbe1ea',
           borderRadius: 8,
           background: '#f8fafc',
@@ -2171,17 +2495,27 @@ export default function BacktestPage({
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                   <label>
                     <div style={labelStyle}>开始日期</div>
-                    <input value={params.startDate} onChange={(e) => setParam('startDate', e.target.value)} style={fieldStyle} />
+                    <input type="date" value={params.startDate} onChange={(e) => setParam('startDate', e.target.value)} style={fieldStyle} />
                   </label>
                   <label>
                     <div style={labelStyle}>结束日期</div>
-                    <input value={params.endDate} onChange={(e) => setParam('endDate', e.target.value)} style={fieldStyle} />
+                    <input type="date" value={params.endDate} onChange={(e) => setParam('endDate', e.target.value)} style={fieldStyle} />
                   </label>
                 </div>
               </section>
 
               <section style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700 }}>资金与交易规则</div>
+                <label>
+                  <div style={labelStyle}>策略类别</div>
+                  <select value={params.strategyCategory} onChange={(e) => setStrategyCategory(e.target.value === 'core_position_overlay' ? 'core_position_overlay' : 'directional_holding')} style={fieldStyle}>
+                    <option value="directional_holding">方向性持仓策略</option>
+                    <option value="core_position_overlay">底仓增强策略</option>
+                  </select>
+                  <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.55, marginTop: 6 }}>
+                    {isCorePositionOverlay ? '围绕固定底仓做T；日终恢复到底仓，核心评价做T超额收益。' : '在信号触发时开仓、平仓并跨日持有；核心评价持仓与方向收益。'}
+                  </div>
+                </label>
                 <label>
                   <div style={labelStyle}>初始资金</div>
                   <input value={params.initialCapital} onChange={(e) => setParam('initialCapital', e.target.value)} style={fieldStyle} />
@@ -2197,24 +2531,6 @@ export default function BacktestPage({
                 <div style={{ borderTop: '1px solid #e2e8f0', paddingTop: 10, color: '#64748b', fontSize: 12, lineHeight: 1.55 }}>
                   策略方向：{params.allowLong ? '允许做多' : '不做多'} · {params.allowShort ? '允许做空' : '不做空'}；请在“策略管理”中修改并保存策略。
                 </div>
-                {['trend_follow', 'grid_mean_reversion', 'trend_grid', 'trend_grid_both'].includes(selectedStrategy) && (
-                  <div style={{ borderTop: '1px solid #e2e8f0', paddingTop: 10 }}>
-                    <div style={{ ...labelStyle, marginBottom: 7 }}>持仓规则</div>
-                    <select
-                      value={params.holdingPolicy}
-                      onChange={(e) => setParam('holdingPolicy', e.target.value)}
-                      style={fieldStyle}
-                    >
-                      <option value="intraday">日内平仓</option>
-                      <option value="overnight">允许跨日</option>
-                    </select>
-                    <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.55, marginTop: 6 }}>
-                      {params.holdingPolicy === 'overnight'
-                        ? '保留期末仓位，按最后价格计入未实现盈亏。'
-                        : '最后一个 Bar 禁止新开仓，收盘自动结算剩余仓位。'}
-                    </div>
-                  </div>
-                )}
               </section>
 
               <section style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
@@ -2527,7 +2843,7 @@ export default function BacktestPage({
                       />
                       <div className="strategy-editor-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
                         <span style={{ color: '#64748b', fontSize: 12 }}>
-                          接口：on_bar(bar, state)；每根已完成的 {selectedTimeframe} K 线触发，按收盘价成交；支持导入后端已安装模块。
+                          接口：on_bar(bar, state)；L2 脚本可选 on_quote(quote, state) 与 on_order_event(event, state)。time 为 YYYYMMDDHHMMSS，tradeDate 为 YYYY-MM-DD，hhmm 例如 931；{params.fillModel === 'l2_quote' ? '定义 on_quote 时连续回放 3 秒快照，新订单仅可用后续快照撮合。' : '按收盘价成交。'}支持导入后端已安装模块。
                         </span>
                         <span style={{ color: '#64748b', fontSize: 12 }}>代码将随“保存策略”一并保存。</span>
                       </div>
@@ -2563,19 +2879,46 @@ export default function BacktestPage({
                   </div>
                   <InstrumentSearchField label="运行标的" value={selectedSymbol} onChange={setSelectedSymbol} />
                   <label>
+                    <div style={labelStyle}>策略类别</div>
+                    <select value={params.strategyCategory} onChange={(e) => setStrategyCategory(e.target.value === 'core_position_overlay' ? 'core_position_overlay' : 'directional_holding')} style={fieldStyle}>
+                      <option value="directional_holding">方向性持仓策略</option>
+                      <option value="core_position_overlay">底仓增强策略</option>
+                    </select>
+                    <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
+                      {isCorePositionOverlay ? '底仓增强固定使用 L2，并在日终恢复底仓。' : '方向性持仓允许跨日保留实际仓位。'}
+                    </div>
+                  </label>
+                  <label>
+                    <div style={labelStyle}>成交模式</div>
+                    <select
+                      value={params.fillModel}
+                      onChange={(e) => setFillModel(e.target.value === 'l2_quote' ? 'l2_quote' : 'bar_close')}
+                      style={fieldStyle}
+                      disabled={isCorePositionOverlay}
+                    >
+                      <option value="bar_close">Bar 收盘价快速回测</option>
+                      <option value="l2_quote">基础 L2 十档盘口回测（异步）</option>
+                    </select>
+                    {isL2Quote && (
+                      <div style={{ color: '#1d4ed8', fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
+                        on_bar 在 Bar 结束时触发；定义 on_quote 的脚本会连续接收 3 秒盘口，新委托只使用严格晚于当前事件的盘口成交。纯 on_bar 脚本仍按订单驱动读取盘口。
+                      </div>
+                    )}
+                  </label>
+                  <label>
                     <div style={labelStyle}>运行周期</div>
                     <select
                       value={selectedTimeframe}
                       onChange={(e) => setVersionTimeframe(e.target.value)}
                       style={fieldStyle}
                     >
-                      {backtestTimeframes.map((item) => (
+                      {timeframeOptions.map((item) => (
                         <option key={item.timeframe} value={item.timeframe}>
-                          {item.timeframe}{item.available ? '（QMT 数据已导入）' : '（QMT 数据未覆盖）'}
+                          {item.timeframe}{isL2Quote ? '（L2 固定周期）' : item.available ? '（QMT 数据已导入）' : '（QMT 数据未覆盖）'}
                         </option>
                       ))}
                     </select>
-                    {backtestTimeframes.length === 0 && (
+                    {!isL2Quote && backtestTimeframes.length === 0 && (
                       <div style={{ color: '#b45309', fontSize: 12, marginTop: 5 }}>
                         正在读取回测引擎支持的周期。
                       </div>
@@ -2594,21 +2937,23 @@ export default function BacktestPage({
                       {formatStrategyName(selectedStrategy)}
                     </div>
                   </div>
-                  <div style={{
-                    ...panelStyle,
-                    padding: '10px',
-                    background: '#ffffff',
-                  }}>
-                    {renderStrategyParameterForm()}
-                  </div>
+                  {(loadingStrategySchema || strategySchemaError || strategyParameterFields.length > 0) && (
+                    <div style={{
+                      ...panelStyle,
+                      padding: '10px',
+                      background: '#ffffff',
+                    }}>
+                      {renderStrategyParameterForm()}
+                    </div>
+                  )}
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                     <label>
                       <div style={labelStyle}>开始日期</div>
-                      <input value={params.startDate} onChange={(e) => setParam('startDate', e.target.value)} style={fieldStyle} />
+                      <input type="date" value={params.startDate} onChange={(e) => setParam('startDate', e.target.value)} style={fieldStyle} />
                     </label>
                     <label>
                       <div style={labelStyle}>结束日期</div>
-                      <input value={params.endDate} onChange={(e) => setParam('endDate', e.target.value)} style={fieldStyle} />
+                      <input type="date" value={params.endDate} onChange={(e) => setParam('endDate', e.target.value)} style={fieldStyle} />
                     </label>
                   </div>
                   <label>
@@ -2626,6 +2971,27 @@ export default function BacktestPage({
                       固定比例；0.001 表示 0.1%，买入上调、卖出下调。
                     </div>
                   </label>
+                  {isCorePositionOverlay && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, borderTop: '1px solid #dbe3ef', paddingTop: 10 }}>
+                      <div style={{ color: '#0f172a', fontSize: 12, fontWeight: 700 }}>底仓增强</div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                        <label>
+                          <div style={labelStyle}>底仓数量</div>
+                          <input value={params.baseQuantity} onChange={(e) => setParam('baseQuantity', e.target.value)} style={fieldStyle} />
+                        </label>
+                        <label>
+                          <div style={labelStyle}>底仓成本价</div>
+                          <input value={params.baseCostPrice} onChange={(e) => setParam('baseCostPrice', e.target.value)} style={fieldStyle} />
+                        </label>
+                      </div>
+                      <div style={{ color: '#0f766e', fontSize: 12, fontWeight: 700 }}>
+                        已启用底仓做 T 额度限制
+                      </div>
+                      <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>
+                        当日买入股票不可卖出；做 T 额度只允许底仓参与有限次成交。日终会恢复至底仓，必要时按最后十档快照强制结算。
+                      </div>
+                    </div>
+                  )}
                   <div style={{
                     color: dataCoverageColor,
                     background: dataCoverage.tone === 'ok' ? '#ecfdf5' : '#fffbeb',
@@ -2717,7 +3083,7 @@ export default function BacktestPage({
                     {activePanel === 'overview' && '收益概览、基准对比和交易摘要'}
                     {activePanel === 'params' && '当前参数位于左侧，可随策略一起保存'}
                     {activePanel === 'trades' && '单笔信号记录与后续字段筛选'}
-                    {activePanel === 'positions' && '每日持仓、资产构成与收益快照'}
+                    {activePanel === 'positions' && (isOverlayResult ? '日终底仓恢复、账户权益与做T增厚核对' : '每日持仓、资产构成与收益快照')}
                     {activePanel === 'history' && '回测记录与结果快照追溯'}
                     {activePanel === 'logs' && '回测与运行日志待接入'}
                   </div>
@@ -3222,7 +3588,7 @@ export default function BacktestPage({
                         pagedHistoryRuns.map((run) => {
                           const isSelected = run.id === selectedHistoryRunId;
                           return (
-                            <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
+                            <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} onDoubleClick={() => handleViewHistoryResult(run)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
                               <button onClick={() => setSelectedHistoryRunId(run.id)} style={{ textAlign: 'left', border: 'none', background: 'transparent', padding: 0, color: '#0f172a', cursor: 'pointer', fontWeight: isSelected ? 700 : 500 }}>
                                 {formatRunReference(run.displayNo)}
                               </button>
@@ -3231,7 +3597,7 @@ export default function BacktestPage({
                                   {run.configId ? (configNameById.get(run.configId) || `方案 ${run.configId}`) : '未绑定方案'}
                                 </div>
                                 <div style={{ color: '#64748b', marginTop: 2 }}>
-                                  {run.configId ? '已保存策略快照' : '未关联策略'}
+                                  {getStrategyCategoryLabel(run.strategyCategory)} · {run.configId ? '已保存策略快照' : '未关联策略'}
                                 </div>
                               </span>
                               <span>
@@ -3315,6 +3681,7 @@ export default function BacktestPage({
                       </div>
                         {selectedHistoryRun ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, color: '#334155', fontSize: 12, lineHeight: 1.6 }}>
+                            {getRunErrorDetail(selectedHistoryRun) && <BacktestErrorCard detail={getRunErrorDetail(selectedHistoryRun)!} />}
                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                               <div>方案：{selectedHistoryRun.configId ? (configNameById.get(selectedHistoryRun.configId) || `方案 ${selectedHistoryRun.configId}`) : '未绑定'}</div>
                               <div>策略快照：{selectedHistoryRun.scriptSnapshot ? '已保存' : '--'}</div>
@@ -3451,9 +3818,14 @@ export default function BacktestPage({
                                   ))}
                               </select>
                             </label>
-                            {selectedHistoryRun && compareHistoryRun && (
+                            {selectedHistoryRun && compareHistoryRun && selectedHistoryRun.strategyCategory === compareHistoryRun.strategyCategory && (
                               <div className={`history-comparison-scope ${historyComparisonScope.every((item) => item.startsWith('同')) ? 'is-comparable' : 'is-mixed'}`}>
                                 {historyComparisonScope.join(' · ')}
+                              </div>
+                            )}
+                            {selectedHistoryRun && compareHistoryRun && selectedHistoryRun.strategyCategory !== compareHistoryRun.strategyCategory && (
+                              <div style={{ color: '#b45309', fontSize: 12, lineHeight: 1.5 }}>
+                                两条回测属于不同策略类别，收益口径不可直接比较；仍可查看参数差异。
                               </div>
                             )}
                             {selectedHistoryRun && compareHistoryRun && (
@@ -3516,8 +3888,8 @@ export default function BacktestPage({
                 <section className="holding-ledger-card" style={{ ...panelStyle, padding: 16, background: '#ffffff', minHeight: 320 }}>
                   <div className="holding-ledger-heading">
                     <div>
-                      <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>持仓收益</div>
-                      <div>基于本次回测的每日收盘快照，不代表实时账户。</div>
+                      <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>{isOverlayResult ? '底仓增强收益' : '持仓收益'}</div>
+                      <div>{isOverlayResult ? '用于核对日终底仓恢复、现金和做T增厚；不作为选股能力评价。' : '基于本次回测的每日收盘快照，不代表实时账户。'}</div>
                     </div>
                     <span>{filteredDailyHoldings.length} / {dailyHoldings.length} 个交易日</span>
                   </div>
@@ -3525,6 +3897,7 @@ export default function BacktestPage({
                     <>
                       <div className="holding-summary-grid">
                         {[
+                          ['初始总资产', formatMoney(initialTotalEquity), ''],
                           ['期末总资产', latestHolding ? formatMoney(latestHolding.totalEquity) : '--', 'is-equity'],
                           ['期末现金', latestHolding ? formatMoney(latestHolding.cash) : '--', ''],
                           ['期末净市值', latestHolding ? formatMoney(latestHolding.marketValue) : '--', ''],
@@ -3540,11 +3913,11 @@ export default function BacktestPage({
                       <div className="holding-filter-bar">
                         <label>
                           <div style={labelStyle}>起始日期</div>
-                          <input type="date" value={holdingStartDate} onChange={(e) => setHoldingStartDate(e.target.value)} style={fieldStyle} />
+                          <input type="date" value={effectiveHoldingStartDate} onChange={(e) => setHoldingStartDate(e.target.value)} style={fieldStyle} />
                         </label>
                         <label>
                           <div style={labelStyle}>结束日期</div>
-                          <input type="date" value={holdingEndDate} onChange={(e) => setHoldingEndDate(e.target.value)} style={fieldStyle} />
+                          <input type="date" value={effectiveHoldingEndDate} onChange={(e) => setHoldingEndDate(e.target.value)} style={fieldStyle} />
                         </label>
                         <label>
                           <div style={labelStyle}>仓位状态</div>
@@ -3573,7 +3946,7 @@ export default function BacktestPage({
                       </div>
                       {filteredDailyHoldings.map((item) => (
                         <div className={`holding-table-row is-${getHoldingStatus(item)}`} key={item.date} style={{ display: 'grid', gridTemplateColumns: '110px 90px 80px 80px 110px 120px 120px 120px 120px 110px', minWidth: 1040, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0' }}>
-                          <div style={{ padding: '9px 12px' }}>{item.date}</div>
+                          <div style={{ padding: '9px 12px' }}>{normalizeApiDate(item.date)}</div>
                           <div style={{ padding: '9px 12px' }}>{formatNumber(item.close)}</div>
                           <div style={{ padding: '9px 12px' }}><span className="holding-quantity is-long">{item.longQty}</span></div>
                           <div style={{ padding: '9px 12px' }}><span className="holding-quantity is-short">{item.shortQty}</span></div>
@@ -3915,14 +4288,20 @@ export default function BacktestPage({
               }}
             />
               <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>
-                保存后可绑定为“自定义脚本”运行策略。脚本必须实现 on_bar(bar, state)，不得 import 或访问本地文件。
+                时间字段：time 为 YYYYMMDDHHMMSS，tradeDate 为 YYYY-MM-DD，hhmm 例如 931。脚本必须实现 on_bar(bar, state)；L2 可选 on_quote(quote, state) 和 on_order_event(event, state)。不得访问本地文件。
               </div>
+              {hasLegacyTimeSlice(scriptForm.code) && (
+                <div style={{ color: '#a16207', fontSize: 11, lineHeight: 1.5 }}>
+                  检测到对 bar['time'] 的切片。旧脚本仍兼容；新策略请使用 tradeDate 和 hhmm，避免依赖字符串位置。
+                </div>
+              )}
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <label>
               <div style={labelStyle}>开始日期</div>
               <input
+                type="date"
                 value={params.startDate}
                 onChange={(e) => setParam('startDate', e.target.value)}
                 style={fieldStyle}
@@ -3931,6 +4310,7 @@ export default function BacktestPage({
             <label>
               <div style={labelStyle}>结束日期</div>
               <input
+                type="date"
                 value={params.endDate}
                 onChange={(e) => setParam('endDate', e.target.value)}
                 style={fieldStyle}

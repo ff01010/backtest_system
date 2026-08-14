@@ -14,6 +14,7 @@ TIMEFRAMES = ["1m", "2m", "3m", "4m", "5m", "10m", "15m", "30m", "45m", "60m", "
 
 # 回测引擎已验证的运行周期。图表和数据管理可继续使用 TIMEFRAMES 中的其它周期。
 BACKTEST_TIMEFRAMES = ("1m", "5m")
+L2_BACKTEST_TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "45m", "60m", "1d")
 
 # 信号文件命名模板
 SIGNAL_FILENAME = "signal_{strategy}_{date}.csv"
@@ -33,6 +34,21 @@ CLICKHOUSE_HTTP_URL = os.getenv("TREND_GRID_CLICKHOUSE_HTTP_URL", "")
 CLICKHOUSE_USER = os.getenv("TREND_GRID_CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASSWORD = os.getenv("TREND_GRID_CLICKHOUSE_PASSWORD", "")
 CLICKHOUSE_TIMEOUT_SECONDS = int(os.getenv("TREND_GRID_CLICKHOUSE_TIMEOUT_SECONDS", "30"))
+
+# L2 服务仅使用部署端提供的映射配置，用户请求不能指定表或列。
+L2_BAR_MAPPING_JSON = os.getenv("TREND_GRID_L2_BAR_MAPPING_JSON", "")
+L2_QUOTE_MAPPING_JSON = os.getenv("TREND_GRID_L2_QUOTE_MAPPING_JSON", "")
+L2_EVENT_MAPPING_JSON = os.getenv("TREND_GRID_L2_EVENT_MAPPING_JSON", "")
+L2_REDIS_HOST = os.getenv("TREND_GRID_L2_REDIS_HOST", "redis")
+L2_REDIS_PORT = int(os.getenv("TREND_GRID_L2_REDIS_PORT", "6379"))
+L2_BAR_CACHE_TTL_SECONDS = int(os.getenv("TREND_GRID_L2_BAR_CACHE_TTL_SECONDS", "2592000"))
+L2_TEMP_BAR_AGGREGATION_VERSION = os.getenv("TREND_GRID_L2_TEMP_BAR_AGGREGATION_VERSION", "tick_quote_session_v4")
+L2_TEMP_MAPPING_VERSION = os.getenv("TREND_GRID_L2_TEMP_MAPPING_VERSION", "tick_quote_depth_v3")
+L2_JOB_LEASE_SECONDS = int(os.getenv("TREND_GRID_L2_JOB_LEASE_SECONDS", "90"))
+L2_RUNNER_POLL_SECONDS = float(os.getenv("TREND_GRID_L2_RUNNER_POLL_SECONDS", "2"))
+L2_PAGE_SIZE = int(os.getenv("TREND_GRID_L2_PAGE_SIZE", "2000"))
+L2_QUOTE_PREFETCH_SIZE = int(os.getenv("TREND_GRID_L2_QUOTE_PREFETCH_SIZE", "16"))
+L2_WORKER_SESSION_LIMIT = int(os.getenv("TREND_GRID_L2_WORKER_SESSION_LIMIT", "2"))
 
 # 当前部署尚未配置 HTTPS，默认关闭 Secure 以保证同源 HTTP 登录可用。
 AUTH_COOKIE_SECURE = os.getenv("TREND_GRID_AUTH_COOKIE_SECURE", "false").lower() == "true"
@@ -95,3 +111,8 @@ def validate_timeframe(tf: str) -> bool:
 def validate_backtest_timeframe(tf: str) -> bool:
   """校验周期是否被当前回测引擎支持。"""
   return tf in BACKTEST_TIMEFRAMES
+
+
+def validate_l2_backtest_timeframe(tf: str) -> bool:
+  """校验 L2 回测支持的预聚合周期。"""
+  return tf in L2_BACKTEST_TIMEFRAMES

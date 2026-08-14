@@ -103,10 +103,12 @@ class PortfolioLedger:
     return list(self._fills)
 
   def snapshot(self) -> PortfolioSnapshot:
-    long_by_key = self._snapshot_positions_by_key(self._long_positions)
-    short_by_key = self._snapshot_positions_by_key(self._short_positions)
-    long_positions = self._aggregate_positions(long_by_key)
-    short_positions = self._aggregate_positions(short_by_key)
+    long_by_identity = self._snapshot_positions_by_identity(self._long_positions)
+    short_by_identity = self._snapshot_positions_by_identity(self._short_positions)
+    long_by_key = self._snapshot_positions_by_key(long_by_identity)
+    short_by_key = self._snapshot_positions_by_key(short_by_identity)
+    long_positions = self._aggregate_positions(long_by_identity)
+    short_positions = self._aggregate_positions(short_by_identity)
     positions = self._net_positions(long_positions, short_positions)
     return PortfolioSnapshot(
       cash=round(self._cash, 8),
@@ -116,6 +118,8 @@ class PortfolioLedger:
       short_positions=short_positions,
       long_positions_by_key=long_by_key,
       short_positions_by_key=short_by_key,
+      long_positions_by_identity=long_by_identity,
+      short_positions_by_identity=short_by_identity,
       realized_pnl=round(self._realized_pnl, 8),
     )
 
@@ -123,6 +127,14 @@ class PortfolioLedger:
     if price <= 0:
       raise ValueError("市值价格必须大于 0")
     self._last_prices[symbol] = float(price)
+
+  def initialize_long_position(self, symbol: str, quantity: int, average_price: float, position_key: str) -> None:
+    """登记回测开始前已持有的外部底仓，不变动可用现金。"""
+    if quantity <= 0 or average_price <= 0:
+      raise ValueError("初始底仓数量和成本价必须大于 0")
+    position = self._long_positions.setdefault((symbol, position_key), _SidePosition())
+    self._add_position(position, quantity, average_price)
+    self.mark(symbol, average_price)
 
   def equity(self) -> float:
     long_value = self._market_value(self._long_positions)
@@ -149,6 +161,8 @@ class PortfolioLedger:
       price=fill.price,
       fee=fill.fee,
       reason=fill.reason,
+      position_effect=fill.position_effect,
+      position_key=fill.position_key,
       realized_pnl=round(realized_pnl, 8),
       metadata=fill.metadata,
     )
@@ -309,17 +323,26 @@ class PortfolioLedger:
 
   @staticmethod
   def _snapshot_positions_by_key(
-    positions: dict[tuple[str, str], _SidePosition],
+    positions: dict[tuple[str, str], PositionSnapshot],
   ) -> dict[str, PositionSnapshot]:
     return {
-      position_key: PositionSnapshot(symbol, position.quantity, position.average_price)
+      position_key: position
+      for (_, position_key), position in positions.items()
+    }
+
+  @staticmethod
+  def _snapshot_positions_by_identity(
+    positions: dict[tuple[str, str], _SidePosition],
+  ) -> dict[tuple[str, str], PositionSnapshot]:
+    return {
+      (symbol, position_key): PositionSnapshot(symbol, position.quantity, position.average_price)
       for (symbol, position_key), position in positions.items()
       if position.quantity > 0
     }
 
   @staticmethod
   def _aggregate_positions(
-    positions_by_key: dict[str, PositionSnapshot],
+    positions_by_key: dict[tuple[str, str], PositionSnapshot],
   ) -> dict[str, PositionSnapshot]:
     totals: dict[str, _SidePosition] = {}
     for position in positions_by_key.values():
