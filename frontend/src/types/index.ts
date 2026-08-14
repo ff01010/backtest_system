@@ -135,6 +135,10 @@ export type NullableMetric = number | null;
 export interface BacktestSummary {
   totalPnl: NullableMetric;
   totalReturn: NullableMetric;
+  baseHoldingPnl?: NullableMetric;
+  baseHoldingReturn?: NullableMetric;
+  t0ExcessPnl?: NullableMetric;
+  t0ExcessReturn?: NullableMetric;
   maxDrawdown: NullableMetric;
   maxDrawdownRate: NullableMetric;
   annualVolatility: NullableMetric;
@@ -201,6 +205,12 @@ export interface BacktestRunResponse {
   configId: string | null;
   configVersionId: string | null;
   scriptId: string | null;
+  strategyCategory?: 'core_position_overlay' | 'directional_holding';
+  resultSchemaVersion?: number;
+  strategyMetrics?: {
+    t0Metrics?: Record<string, NullableMetric>;
+    holdingMetrics?: Record<string, NullableMetric>;
+  };
   outputDir: string;
   summary: BacktestSummary;
   equity: EquityPoint[];
@@ -212,7 +222,20 @@ export interface BacktestRunResponse {
   trades: BacktestTrade[];
   skippedSignals?: BacktestTrade[];
   experimentManifest?: ExperimentManifest;
+  dataSnapshot?: Record<string, unknown>;
   warnings: string[];
+}
+
+export interface BacktestErrorDetail {
+  category: 'strategy_error' | 'system_error';
+  code: string;
+  message: string;
+  hint?: string | null;
+  callback?: 'on_bar' | 'on_quote' | 'on_order_event' | null;
+  eventTime?: string | null;
+  symbol?: string | null;
+  retryable: boolean;
+  taskId?: string | null;
 }
 
 export interface ExperimentManifest {
@@ -235,6 +258,8 @@ export interface ExperimentManifest {
     slippage: number;
   };
   holdingPolicy?: 'intraday' | 'overnight';
+  strategyCategory?: 'core_position_overlay' | 'directional_holding';
+  resultSchemaVersion?: number;
 }
 
 export interface StrategyScript {
@@ -323,11 +348,12 @@ export interface BacktestRunHistory {
   dataVersion: Record<string, unknown> | null;
   benchmarkSymbol: string | null;
   strategy: string;
+  strategyCategory?: 'core_position_overlay' | 'directional_holding';
   startDate: string;
   endDate: string;
   paramsJson: Record<string, unknown>;
   status: string;
-  summaryJson: Partial<BacktestSummary> & Record<string, unknown>;
+  summaryJson: Partial<BacktestSummary> & { errorDetail?: BacktestErrorDetail; error?: string } & Record<string, unknown>;
   outputDir: string;
   note: string;
   tags: string[];

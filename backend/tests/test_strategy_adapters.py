@@ -254,6 +254,23 @@ def test_legacy_backtest_request_defaults_to_allowing_long() -> None:
   assert request.holdingPolicy == "intraday"
 
 
+def test_strategy_category_enforces_its_execution_semantics() -> None:
+  overlay = schemas.BacktestRunRequest(
+    symbol="688981.SH", startDate="20260101", endDate="20260131",
+    initialCapital=1_000_000, commissionRate=0.0003, slippage=0,
+    strategyCategory="core_position_overlay", holdingPolicy="intraday", fillModel="l2_quote",
+    baseQuantity=1_000, baseCostPrice=10, t0Enabled=True,
+  )
+
+  assert overlay.strategyCategory == "core_position_overlay"
+  with pytest.raises(ValueError, match="方向性持仓策略不能设置底仓"):
+    schemas.BacktestRunRequest(
+      symbol="688981.SH", startDate="20260101", endDate="20260131",
+      initialCapital=1_000_000, commissionRate=0.0003, slippage=0,
+      strategyCategory="directional_holding", baseQuantity=1_000, baseCostPrice=10,
+    )
+
+
 def test_intraday_holding_policy_locks_entries_and_settles_positions(tmp_path: Any) -> None:
   config = backtest_runner._build_config({
     "strategy": "trend_grid",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from backend.backtesting.engine import BarBacktestEngine, RecordedPriceExecutionModel
+from backend.backtesting.engine import BarBacktestEngine, PortfolioLedger, RecordedPriceExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade, legacy_trades_to_fills
 from backend.backtesting.models import Bar, OrderIntent, OrderSide, PortfolioSnapshot, PositionEffect
 from backend.services.backtest_runner import _compute_performance_stats
@@ -42,6 +42,19 @@ def test_bar_engine_applies_fills_and_realized_pnl() -> None:
   assert result.final_portfolio.positions == {}
   assert result.final_portfolio.cash == 10_097.329
   assert result.final_portfolio.equity == 10_097.329
+
+
+def test_portfolio_snapshot_preserves_symbol_and_position_key_identity() -> None:
+  ledger = PortfolioLedger(initial_cash=10_000)
+  ledger.initialize_long_position("688981.SH", 200, 10, "core")
+  ledger.initialize_long_position("688525.SH", 300, 20, "core")
+
+  snapshot = ledger.snapshot()
+
+  assert snapshot.long_positions_by_identity[("688981.SH", "core")].quantity == 200
+  assert snapshot.long_positions_by_identity[("688525.SH", "core")].quantity == 300
+  assert snapshot.long_positions["688981.SH"].quantity == 200
+  assert snapshot.long_positions["688525.SH"].quantity == 300
 
 
 def test_performance_stats_uses_sample_standard_deviation_for_sharpe() -> None:

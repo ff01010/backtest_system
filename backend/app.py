@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend import settings
+from backend.date_codec import TradingDateError, format_legacy_date, normalize_date_range
 from backend import schemas
 from backend.strategies.catalog import get_strategy_source_snapshot
 from backend.strategies.scripted import validate_script_code
@@ -34,10 +35,21 @@ from backend.services import (
   strategy_adapters,
 )
 from backend.services import auth
+from backend.services.backtest_errors import error_detail, error_summary
 from backend.services.user_context import get_current_user, reset_current_user, set_current_user
 
 app = FastAPI(title="Trend Grid Viewer", version="0.1.0")
 logger = logging.getLogger(__name__)
+
+
+def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, Any]:
+  return error_summary(error, run_id)
+
+
+def _backtest_failure_response(error: Exception, run_id: str | None) -> HTTPException:
+  detail = error_detail(error, run_id).to_dict()
+  status_code = 404 if detail["code"] == "data.unavailable" else 422
+  return HTTPException(status_code, {"errorDetail": detail})
 
 
 @app.on_event("startup")
@@ -101,6 +113,7 @@ def _backtest_chart_trades(
   date: str,
 ) -> tuple[list[dict[str, Any]], int]:
   """筛选指定交易日的成交记录，不猜测缺失的历史字段。"""
+  trade_date_key = format_legacy_date(date)
   result = run.get("resultJson") or {}
   trades: list[dict[str, Any]] = []
   unsupported_count = 0
@@ -115,7 +128,7 @@ def _backtest_chart_trades(
       action = side.lower()
     if (
       not execution_time
-      or execution_time[:8] != date
+      or execution_time[:8] != trade_date_key
       or action not in {"buy_open", "sell_close", "sell_open", "buy_close", "buy", "sell"}
       or side not in {"BUY", "SELL"}
       or not isinstance(price, (int, float))
@@ -247,11 +260,15 @@ def _validate_backtest_request(request: dict) -> None:
     raise HTTPException(422, f"非法标的: {request['symbol']}")
   if request.get("benchmarkSymbol") and not settings.validate_symbol(request["benchmarkSymbol"]):
     raise HTTPException(422, f"非法对比标的: {request['benchmarkSymbol']}")
-  if not settings.validate_date(request["startDate"]) or not settings.validate_date(request["endDate"]):
-    raise HTTPException(422, "日期格式必须为 YYYYMMDD")
-  if request["startDate"] > request["endDate"]:
-    raise HTTPException(422, "开始日期不能晚于结束日期")
-  if not settings.validate_backtest_timeframe(request["timeframe"]):
+  try:
+    request["startDate"], request["endDate"] = normalize_date_range(request["startDate"], request["endDate"])
+  except TradingDateError as error:
+    raise HTTPException(422, str(error)) from error
+  fill_model = request.get("fillModel", "bar_close")
+  if fill_model == "l2_quote":
+    if not settings.validate_l2_backtest_timeframe(request["timeframe"]):
+      raise HTTPException(422, f"L2 回测不支持 {request['timeframe']}")
+  elif not settings.validate_backtest_timeframe(request["timeframe"]):
     raise HTTPException(422, f"当前回测引擎不支持 {request['timeframe']}")
   if not strategy_adapters.has_strategy(request["strategy"]):
     raise HTTPException(422, f"不支持的策略: {request['strategy']}")
@@ -262,6 +279,10 @@ def _validate_backtest_request(request: dict) -> None:
 
   if request["strategy"] != "user_script":
     raise HTTPException(422, "当前仅支持数据库中的用户脚本策略")
+
+  if fill_model == "l2_quote":
+    request["fillModel"] = "l2_quote"
+    return
 
   try:
     market_snapshots = {}
@@ -529,8 +550,7 @@ def create_strategy_config(payload: schemas.StrategyConfigCreate):
     raise HTTPException(422, f"非法标的: {request['symbol']}")
   if request.get("benchmarkSymbol") and not settings.validate_symbol(request["benchmarkSymbol"]):
     raise HTTPException(422, f"非法买入持有基准: {request['benchmarkSymbol']}")
-  if not settings.validate_backtest_timeframe(request["timeframe"]):
-    raise HTTPException(422, f"当前回测引擎不支持 {request['timeframe']}")
+  _validate_strategy_config_timeframe(request)
   try:
     config = state_store.create_strategy_config(request)
     return {"config": config}
@@ -547,8 +567,7 @@ def update_strategy_config(config_id: str, payload: schemas.StrategyConfigUpdate
     raise HTTPException(422, f"非法标的: {request['symbol']}")
   if request.get("benchmarkSymbol") and not settings.validate_symbol(request["benchmarkSymbol"]):
     raise HTTPException(422, f"非法买入持有基准: {request['benchmarkSymbol']}")
-  if not settings.validate_backtest_timeframe(request["timeframe"]):
-    raise HTTPException(422, f"当前回测引擎不支持 {request['timeframe']}")
+  _validate_strategy_config_timeframe(request)
   try:
     config = state_store.update_strategy_config(config_id, request)
     return {"config": config}
@@ -558,6 +577,22 @@ def update_strategy_config(config_id: str, payload: schemas.StrategyConfigUpdate
     raise HTTPException(409, f"策略配置名称已存在: {payload.name}")
   except state_store.DatabaseError as e:
     raise HTTPException(500, f"PostgreSQL 更新策略配置失败: {e}")
+
+
+def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
+  """策略方案按保存的成交模式使用对应的周期白名单。"""
+  params_json = request.get("paramsJson")
+  params = params_json.get("params", {}) if isinstance(params_json, dict) else {}
+  fill_model = params.get("fillModel", "bar_close") if isinstance(params, dict) else "bar_close"
+  timeframe = str(request["timeframe"])
+  supported = (
+    settings.validate_l2_backtest_timeframe(timeframe)
+    if fill_model == "l2_quote"
+    else settings.validate_backtest_timeframe(timeframe)
+  )
+  if not supported:
+    engine_name = "L2 回测" if fill_model == "l2_quote" else "当前回测引擎"
+    raise HTTPException(422, f"{engine_name}不支持 {timeframe}")
 
 
 @app.post("/api/strategy-configs/{config_id}/publish")
@@ -605,7 +640,7 @@ def backtest_run_detail(run_id: str):
 @app.get("/api/backtest/runs/{run_id}/chart", response_model=schemas.BacktestChartResponse)
 def backtest_run_chart(
   run_id: str,
-  date: str = Query(..., pattern=r"^\d{8}$"),
+  date: str = Query(...),
   timeframe: str | None = Query(default=None),
 ):
   """返回当前用户指定回测的一日行情与已成交买卖点。"""
@@ -614,6 +649,10 @@ def backtest_run_chart(
   except KeyError as error:
     raise HTTPException(404, "回测记录不存在") from error
 
+  try:
+    date, _ = normalize_date_range(date, date)
+  except TradingDateError as error:
+    raise HTTPException(422, str(error)) from error
   selected_timeframe = timeframe or str(run["timeframe"])
   if not settings.validate_timeframe(selected_timeframe):
     raise HTTPException(422, f"不支持的周期: {selected_timeframe}")
@@ -651,12 +690,13 @@ def backtest_timeframes(
   start_date: str | None = Query(default=None, alias="startDate"),
   end_date: str | None = Query(default=None, alias="endDate"),
 ):
-  if start_date and not settings.validate_date(start_date):
-    raise HTTPException(422, f"非法开始日期: {start_date}")
-  if end_date and not settings.validate_date(end_date):
-    raise HTTPException(422, f"非法结束日期: {end_date}")
-  if start_date and end_date and start_date > end_date:
-    raise HTTPException(422, "开始日期不能晚于结束日期")
+  if bool(start_date) != bool(end_date):
+    raise HTTPException(422, "开始日期和结束日期必须同时提供")
+  if start_date and end_date:
+    try:
+      start_date, end_date = normalize_date_range(start_date, end_date)
+    except TradingDateError as error:
+      raise HTTPException(422, str(error)) from error
   return {"timeframes": data_repository.get_backtest_timeframes(symbol, start_date, end_date)}
 
 
@@ -666,12 +706,10 @@ def backtest_timeframes_batch(
   start_date: str = Query(..., alias="startDate"),
   end_date: str = Query(..., alias="endDate"),
 ):
-  if not settings.validate_date(start_date):
-    raise HTTPException(422, f"非法开始日期: {start_date}")
-  if not settings.validate_date(end_date):
-    raise HTTPException(422, f"非法结束日期: {end_date}")
-  if start_date > end_date:
-    raise HTTPException(422, "开始日期不能晚于结束日期")
+  try:
+    start_date, end_date = normalize_date_range(start_date, end_date)
+  except TradingDateError as error:
+    raise HTTPException(422, str(error)) from error
   requested = list(dict.fromkeys(item.strip() for item in symbols.split(",") if item.strip()))
   if not requested or len(requested) > 100:
     raise HTTPException(422, "标的数量必须在 1 至 100 之间")
@@ -689,6 +727,22 @@ def backtest_timeframes_batch(
 def run_backtest(payload: schemas.BacktestRunRequest):
   request = _model_dump(payload)
   _validate_backtest_request(request)
+
+  if request.get("fillModel") == "l2_quote":
+    try:
+      run_id, display_no = state_store.create_l2_backtest_job(request)
+      return {
+        "runId": run_id,
+        "displayNo": display_no,
+        "configId": request.get("configId"),
+        "configVersionId": request.get("configVersionId"),
+        "scriptId": request.get("scriptId"),
+        "status": "queued",
+        "fillModel": "l2_quote",
+        "message": "L2 回测已进入队列，等待 l2-runner 执行",
+      }
+    except ValueError as error:
+      raise HTTPException(422, str(error)) from error
 
   run_id = None
   try:
@@ -710,17 +764,31 @@ def run_backtest(payload: schemas.BacktestRunRequest):
       **result,
     }
   except FileNotFoundError as e:
+    logger.exception("同步回测任务失败: %s", run_id)
     if run_id is not None:
-      state_store.finish_backtest_run(run_id, "error", {"error": str(e)}, "")
-    raise HTTPException(404, str(e))
+      summary = _backtest_error_summary(e, run_id)
+      state_store.finish_backtest_run(run_id, "error", summary, "")
+    raise _backtest_failure_response(e, run_id)
   except ValueError as e:
+    logger.exception("同步回测任务失败: %s", run_id)
     if run_id is not None:
-      state_store.finish_backtest_run(run_id, "error", {"error": str(e)}, "")
-    raise HTTPException(422, str(e))
+      summary = _backtest_error_summary(e, run_id)
+      state_store.finish_backtest_run(run_id, "error", summary, "")
+    raise _backtest_failure_response(e, run_id)
   except Exception as e:
+    logger.exception("同步回测任务失败: %s", run_id)
     if run_id is not None:
-      state_store.finish_backtest_run(run_id, "error", {"error": str(e)}, "")
-    raise HTTPException(500, f"回测失败: {e}")
+      summary = _backtest_error_summary(e, run_id)
+      state_store.finish_backtest_run(run_id, "error", summary, "")
+    raise _backtest_failure_response(e, run_id)
+
+
+@app.post("/api/backtest/runs/{run_id}/cancel")
+def cancel_l2_backtest_run(run_id: str):
+  """请求取消尚未结束的 L2 回测；Runner 在当前块结束后清理会话。"""
+  if not state_store.request_l2_backtest_cancel(run_id):
+    raise HTTPException(404, "未找到可取消的 L2 回测任务")
+  return {"runId": run_id, "status": "cancelling"}
 
 
 @app.post("/api/backtest/live")
@@ -754,7 +822,7 @@ def dates(
 @app.get("/api/chart")
 def chart(
   symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
-  date: str = Query(..., pattern=r"^\d{8}$"),
+  date: str = Query(...),
   timeframe: str = Query("5m"),
   strategy: str = Query("trend_grid"),
   signal_file: str = Query(""),

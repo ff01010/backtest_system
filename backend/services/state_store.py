@@ -277,6 +277,18 @@ def _normalize_version(row: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
   request = _json(row["requested_params"], {})
+  fill_model = row.get("fill_model") or "bar_close_signal_fill"
+  raw_result = _json(row.get("result_json"), None)
+  result = raw_result
+  summary = _json(row.get("result_summary"), {})
+  if fill_model == "l2_quote" and isinstance(raw_result, dict):
+    from backend.l2.result_adapter import normalize_l2_result
+
+    result = normalize_l2_result(raw_result, request)
+    summary = result["summary"]
+  category = request.get("strategyCategory")
+  if category not in {"core_position_overlay", "directional_holding"}:
+    category = "core_position_overlay" if int(request.get("baseQuantity") or 0) > 0 or bool(request.get("t0Enabled")) else "directional_holding"
   return {
     "id": _uuid(row["id"]),
     "displayNo": int(row["display_no"]),
@@ -286,22 +298,23 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
     "accountId": int(row["account_id"]) if row.get("account_id") is not None else None,
     "symbol": row.get("symbol") or request.get("symbol", ""),
     "timeframe": row.get("timeframe") or request.get("timeframe", "5m"),
-    "fillModel": row.get("fill_model") or "bar_close_signal_fill",
+    "fillModel": fill_model,
     "scriptSnapshot": _json(row.get("script_snapshot"), None),
     "paramsSnapshot": _json(row.get("params_snapshot"), {}),
     "dataVersion": _json(row.get("market_data_snapshot"), None),
     "benchmarkSymbol": row.get("benchmark_symbol") or request.get("benchmarkSymbol"),
     "strategy": request.get("strategy", "user_script"),
+    "strategyCategory": category,
     "startDate": request.get("startDate", ""),
     "endDate": request.get("endDate", ""),
     "paramsJson": request,
     "status": {"succeeded": "ok", "failed": "error"}.get(row["status"], row["status"]),
     "executionKind": row.get("execution_kind", "published"),
-    "summaryJson": _json(row.get("result_summary"), {}),
+    "summaryJson": summary,
     "outputDir": row.get("output_dir", ""),
     "note": row.get("note", ""),
     "tags": _json(row.get("tags"), []),
-    "resultJson": _json(row.get("result_json"), None),
+    "resultJson": result,
     "createdAt": _format_time(row["created_at"]),
     "finishedAt": _format_time(row.get("finished_at")),
   }
@@ -686,6 +699,121 @@ def create_backtest_run(payload: dict[str, Any], status: str = "running") -> tup
              Jsonb(params_snapshot), payload.get("executionKind", "published")))
       row = cur.fetchone()
       return _uuid(row["id"]) or "", int(row["display_no"])
+
+
+def create_l2_backtest_job(payload: dict[str, Any]) -> tuple[str, int]:
+  """创建异步 L2 回测任务；PostgreSQL 是其唯一状态真源。"""
+  run_id, display_no = create_backtest_run(payload, status="queued")
+  owner_user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("UPDATE backtest_run SET fill_model=%s WHERE id=%s AND owner_user_id=%s", (
+        "l2_quote", run_id, owner_user_id,
+      ))
+      cur.execute("""
+        INSERT INTO l2_backtest_job (run_id, owner_user_id, payload)
+        VALUES (%s, %s, %s)
+      """, (run_id, owner_user_id, Jsonb(payload)))
+  return run_id, display_no
+
+
+def claim_l2_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
+  """原子领取一个任务，并为本次尝试生成不可复用令牌。"""
+  if not worker_id.strip() or lease_seconds <= 0:
+    raise ValueError("L2 runner 标识和租约时长必须有效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        WITH candidate AS (
+          SELECT run_id
+          FROM l2_backtest_job
+          WHERE (status='queued' AND NOT cancel_requested)
+             OR (status='running' AND lease_expires_at < now() AND NOT cancel_requested)
+          ORDER BY created_at
+          FOR UPDATE SKIP LOCKED
+          LIMIT 1
+        )
+        UPDATE l2_backtest_job AS job
+        SET status='running', attempt_no=attempt_no + 1, attempt_token=gen_random_uuid(),
+          lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
+          started_at=COALESCE(started_at, now()), updated_at=now()
+        FROM candidate
+        WHERE job.run_id=candidate.run_id
+        RETURNING job.run_id, job.owner_user_id, job.payload, job.attempt_no, job.attempt_token
+      """, (lease_seconds, worker_id))
+      row = cur.fetchone()
+      if not row:
+        return None
+      cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
+      return {
+        "runId": _uuid(row["run_id"]),
+        "ownerUserId": _uuid(row["owner_user_id"]),
+        "payload": _json(row["payload"], {}),
+        "attemptNo": int(row["attempt_no"]),
+        "attemptToken": _uuid(row["attempt_token"]),
+      }
+
+
+def heartbeat_l2_backtest_job(run_id: str, attempt_token: str, lease_seconds: int) -> bool:
+  """仅持有当前 attempt_token 的 runner 可以续租。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE l2_backtest_job
+        SET lease_expires_at=now() + make_interval(secs => %s), updated_at=now()
+        WHERE run_id=%s AND attempt_token=%s AND status='running' AND NOT cancel_requested
+      """, (lease_seconds, run_id, attempt_token))
+      return cur.rowcount == 1
+
+
+def finish_l2_backtest_job(
+  run_id: str,
+  attempt_token: str,
+  status: str,
+  summary: dict[str, Any],
+  result: dict[str, Any] | None = None,
+) -> bool:
+  """按尝试令牌提交终态，旧 runner 无法覆盖新的运行结果。"""
+  if status not in {"succeeded", "failed", "cancelled"}:
+    raise ValueError("L2 任务终态无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE l2_backtest_job
+        SET status=%s, error_message=%s, lease_expires_at=NULL, finished_at=now(), updated_at=now()
+        WHERE run_id=%s AND attempt_token=%s AND status='running'
+        RETURNING run_id
+      """, (status, summary.get("error") if status != "succeeded" else None, run_id, attempt_token))
+      if cur.fetchone() is None:
+        return False
+      cur.execute("""
+        UPDATE backtest_run
+        SET status=%s, result_summary=%s, result_json=%s, error_message=%s, finished_at=now()
+        WHERE id=%s
+      """, (status, Jsonb(summary), Jsonb(result) if result else None,
+             summary.get("error") if status != "succeeded" else None, run_id))
+      return True
+
+
+def request_l2_backtest_cancel(run_id: str) -> bool:
+  """请求取消尚未结束的 L2 任务。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE l2_backtest_job
+        SET cancel_requested=true,
+          status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
+          finished_at=CASE WHEN status='queued' THEN now() ELSE finished_at END,
+          updated_at=now()
+        WHERE run_id=%s AND status IN ('queued', 'running')
+        RETURNING status
+      """, (run_id,))
+      row = cur.fetchone()
+      if row is None:
+        return False
+      if row["status"] == "cancelled":
+        cur.execute("UPDATE backtest_run SET status='cancelled', finished_at=now() WHERE id=%s", (run_id,))
+      return True
 
 
 def _run_query(where: str = "") -> str:

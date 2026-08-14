@@ -106,7 +106,12 @@ class PortfolioSnapshot:
   short_positions: dict[str, PositionSnapshot] = field(default_factory=dict)
   long_positions_by_key: dict[str, PositionSnapshot] = field(default_factory=dict)
   short_positions_by_key: dict[str, PositionSnapshot] = field(default_factory=dict)
+  long_positions_by_identity: dict[tuple[str, str], PositionSnapshot] = field(default_factory=dict)
+  short_positions_by_identity: dict[tuple[str, str], PositionSnapshot] = field(default_factory=dict)
   realized_pnl: float = 0.0
+  base_position: int = 0
+  sellable_quantity: int | None = None
+  t0_available_quantity: int | None = None
 
 
 @dataclass(frozen=True)

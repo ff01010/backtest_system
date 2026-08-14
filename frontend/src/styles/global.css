@@ -186,6 +186,21 @@ button, input, select, textarea {
   box-shadow: var(--shadow-sm);
 }
 
+.workbench-nav {
+  position: relative;
+  z-index: 3;
+  width: 56px;
+  min-width: 56px;
+  overflow: visible !important;
+  transition: width 180ms ease, box-shadow 180ms ease;
+}
+
+.workbench-nav:hover,
+.workbench-nav:focus-within {
+  width: 154px;
+  box-shadow: 0 8px 24px rgba(20, 36, 31, 0.14);
+}
+
 .workbench-rail {
   padding: 16px !important;
 }
@@ -217,8 +232,9 @@ button, input, select, textarea {
 }
 
 .backtest-tabs {
-  padding: 10px 7px !important;
+  padding: 8px 5px !important;
   background: transparent !important;
+  overflow: hidden;
 }
 
 .backtest-tab {
@@ -227,6 +243,39 @@ button, input, select, textarea {
   border-left: 0 !important;
   border-radius: var(--radius-sm) !important;
   transition: color 160ms ease, background 160ms ease, transform 160ms ease;
+  justify-content: center !important;
+  gap: 0;
+  padding: 0 !important;
+  overflow: hidden;
+  text-align: left;
+}
+
+.backtest-tab > svg {
+  flex: 0 0 15px;
+}
+
+.backtest-tab-label {
+  display: inline-block;
+  max-width: 0;
+  opacity: 0;
+  white-space: nowrap;
+  transform: translateX(-6px);
+  overflow: hidden;
+  transition: max-width 180ms ease, opacity 140ms ease, transform 180ms ease;
+}
+
+.workbench-nav:hover .backtest-tab,
+.workbench-nav:focus-within .backtest-tab {
+  justify-content: flex-start !important;
+  gap: 10px;
+  padding: 0 16px !important;
+}
+
+.workbench-nav:hover .backtest-tab-label,
+.workbench-nav:focus-within .backtest-tab-label {
+  max-width: 96px;
+  opacity: 1;
+  transform: translateX(0);
 }
 
 .backtest-tab::after {

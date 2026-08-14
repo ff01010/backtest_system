@@ -54,9 +54,10 @@ export default function BacktestTabs({ activeTab, tabs, onChange }: Props) {
               fontWeight: active ? 700 : 500,
               whiteSpace: 'nowrap',
             }}
-          >
-            <Icon size={15} />
-          </button>
+            >
+              <Icon size={15} />
+              <span className="backtest-tab-label">{tab.label}</span>
+            </button>
         );
       })}
     </nav>

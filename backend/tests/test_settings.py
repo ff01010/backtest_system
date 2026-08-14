@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from backend import settings
+from backend import app
 from backend.services import data_repository
 from backend.services import state_store
 
@@ -37,6 +38,19 @@ def test_backtest_timeframes_are_explicit() -> None:
   assert settings.validate_backtest_timeframe("1m")
   assert settings.validate_backtest_timeframe("5m")
   assert not settings.validate_backtest_timeframe("2m")
+
+
+def test_l2_strategy_config_accepts_derived_l2_timeframe() -> None:
+  app._validate_strategy_config_timeframe({
+    "timeframe": "3m",
+    "paramsJson": {"params": {"fillModel": "l2_quote"}},
+  })
+
+  with pytest.raises(app.HTTPException, match="当前回测引擎不支持 3m"):
+    app._validate_strategy_config_timeframe({
+      "timeframe": "3m",
+      "paramsJson": {"params": {"fillModel": "bar_close"}},
+    })
 
 
 def test_backtest_timeframe_availability_uses_database_cache(monkeypatch: pytest.MonkeyPatch) -> None:

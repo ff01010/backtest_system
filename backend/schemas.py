@@ -2,7 +2,9 @@
 """Pydantic 响应模型"""
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from backend.date_codec import TradingDateError, format_api_date
 
 
 class BarData(BaseModel):
@@ -122,8 +124,8 @@ class BacktestRunRequest(BaseModel):
   benchmarkSymbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   strategy: str = "user_script"
   timeframe: str = "5m"
-  startDate: str = Field(pattern=r"^\d{8}$")
-  endDate: str = Field(pattern=r"^\d{8}$")
+  startDate: str
+  endDate: str
   initialCapital: float = Field(gt=0)
   commissionRate: float = Field(ge=0)
   slippage: float = Field(ge=0)
@@ -132,9 +134,22 @@ class BacktestRunRequest(BaseModel):
   orderPct: float | None = Field(default=None, ge=0)
   allowLong: bool = True
   allowShort: bool = True
+  strategyCategory: Literal["core_position_overlay", "directional_holding"] | None = None
   holdingPolicy: Literal["intraday", "overnight"] = "intraday"
+  fillModel: Literal["bar_close", "l2_quote"] = "bar_close"
+  baseQuantity: int = Field(default=0, ge=0)
+  baseCostPrice: float = Field(default=0, ge=0)
+  t0Enabled: bool = False
   strategyParams: dict[str, Any] = Field(default_factory=dict)
   runDraft: bool = False
+
+  @field_validator("startDate", "endDate", mode="before")
+  @classmethod
+  def normalize_date(cls, value: object) -> str:
+    try:
+      return format_api_date(value)  # type: ignore[arg-type]
+    except TradingDateError as error:
+      raise ValueError(str(error)) from error
 
   @model_validator(mode="after")
   def validate_trade_direction(self) -> "BacktestRunRequest":
@@ -142,12 +157,38 @@ class BacktestRunRequest(BaseModel):
     allow_short = getattr(self, "allowShort", True)
     if not allow_long and not allow_short:
       raise ValueError("至少选择一个交易方向")
+    if self.strategyCategory == "core_position_overlay":
+      if self.fillModel != "l2_quote":
+        raise ValueError("底仓增强策略仅支持基础 L2 盘口回测")
+      if self.baseQuantity <= 0 or self.baseCostPrice <= 0:
+        raise ValueError("底仓增强策略必须填写有效的底仓数量和成本价")
+      if not self.t0Enabled:
+        raise ValueError("底仓增强策略必须启用底仓做 T")
+      if self.holdingPolicy != "intraday":
+        raise ValueError("底仓增强策略必须在日终恢复底仓")
+    elif self.strategyCategory == "directional_holding":
+      if self.baseQuantity > 0 or self.baseCostPrice != 0 or self.t0Enabled:
+        raise ValueError("方向性持仓策略不能设置底仓或启用底仓做 T")
+      if self.holdingPolicy != "overnight":
+        raise ValueError("方向性持仓策略必须允许跨日持仓")
+    if self.baseQuantity == 0 and self.baseCostPrice != 0:
+      raise ValueError("底仓数量为 0 时底仓成本价必须为 0")
+    if self.baseQuantity > 0 and self.baseCostPrice <= 0:
+      raise ValueError("底仓数量大于 0 时必须填写底仓成本价")
+    if self.t0Enabled and self.baseQuantity <= 0:
+      raise ValueError("启用底仓做 T 时底仓数量必须大于 0")
+    if self.fillModel != "l2_quote" and (self.baseQuantity > 0 or self.t0Enabled):
+      raise ValueError("底仓做 T 仅支持基础 L2 盘口回测")
     return self
 
 
 class BacktestSummary(BaseModel):
   totalPnl: float | None
   totalReturn: float | None
+  baseHoldingPnl: float | None = None
+  baseHoldingReturn: float | None = None
+  t0ExcessPnl: float | None = None
+  t0ExcessReturn: float | None = None
   maxDrawdown: float | None
   maxDrawdownRate: float | None
   annualVolatility: float | None
