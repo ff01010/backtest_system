@@ -11,6 +11,7 @@ from typing import Any, Iterator, Protocol, Sequence
 
 from backend.l2.models import CoverageSnapshot, NormalizedBar, QuoteLevel, QuoteSnapshot, SourceMappingProfile, TradeEvent
 from backend.services import clickhouse_client
+from backend.time_utils import now_shanghai_iso_datetime
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
@@ -533,7 +534,7 @@ class TemporaryQuoteBarProvider:
           "inputTable": self._profile.table_name,
           "aggregationVersion": self._aggregation_version,
           "mappingVersion": self._mapping_version,
-          "generatedAt": datetime.now().isoformat(timespec="seconds"),
+          "generatedAt": now_shanghai_iso_datetime(),
           "sourcePolicy": "closed_day_append_only",
         },
       )

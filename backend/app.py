@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from backend import settings
 from backend.date_codec import TradingDateError, format_legacy_date, normalize_date_range
 from backend import schemas
+from backend.time_utils import format_epoch_as_shanghai
 from backend.strategies.catalog import get_strategy_source_snapshot
 from backend.strategies.scripted import validate_script_code
 from backend.services import (
@@ -434,7 +435,6 @@ def strategy_source(strategy_id: str):
 def signal_files():
   """列出 SIGNAL_ROOT 及其子目录下所有可用的信号 CSV 文件"""
   import os as _os
-  import time as _time
   root = settings.SIGNAL_ROOT
   files = []
   if _os.path.isdir(root):
@@ -445,7 +445,7 @@ def signal_files():
           rel = _os.path.relpath(fpath, root)
           try:
             mtime = _os.path.getmtime(fpath)
-            mtime_str = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(mtime))
+            mtime_str = format_epoch_as_shanghai(mtime)
           except OSError:
             mtime_str = ""
           files.append({"name": rel.replace("\\", "/"), "mtime": mtime_str})

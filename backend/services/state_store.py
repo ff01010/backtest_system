@@ -15,6 +15,7 @@ from psycopg.types.json import Jsonb
 
 from backend import settings
 from backend.services.user_context import get_current_user
+from backend.time_utils import format_shanghai_datetime
 
 
 class DatabaseError(RuntimeError):
@@ -79,7 +80,7 @@ def _to_float(value: Any) -> float | None:
 
 
 def _format_time(value: Any) -> str:
-  return value.strftime("%Y-%m-%d %H:%M:%S") if value else ""
+  return format_shanghai_datetime(value) if value else ""
 
 
 def _json(value: Any, fallback: Any) -> Any:
