@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   hasEnabledTradeDirection,
+  hasLegacyTimeSlice,
   hasSavedStrategyId,
   isCustomScriptStrategy,
 } from '../components/BacktestPage';
@@ -21,5 +22,10 @@ describe('isCustomScriptStrategy', () => {
   it('空策略 ID 不应被当作已保存的策略', () => {
     expect(hasSavedStrategyId('')).toBe(false);
     expect(hasSavedStrategyId('9f5e9cf6-83d5-44d5-a070-0d1d062d11aa')).toBe(true);
+  });
+
+  it('识别应迁移的旧时间切片写法', () => {
+    expect(hasLegacyTimeSlice("hhmm = bar['time'][8:12]")).toBe(true);
+    expect(hasLegacyTimeSlice("hhmm = bar['hhmm']")).toBe(false);
   });
 });

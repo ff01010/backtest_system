@@ -18,6 +18,7 @@ import pandas as pd
 
 from backend.services import market_data, signal_parser, time_mapper, zigzag_detector
 from backend import settings
+from backend.date_codec import format_api_date, format_legacy_date
 
 
 def list_instruments() -> list[dict[str, Any]]:
@@ -176,6 +177,8 @@ def load_chart_data(symbol: str, date: str, timeframe: str, strategy: str = "tre
   """
   warnings: list[str] = []
   markers: list[dict[str, Any]] = []
+  date = format_api_date(date)
+  legacy_date = format_legacy_date(date)
 
   # — 从 ClickHouse 加载 K 线 —
   kline_mtime = "database"
@@ -197,7 +200,7 @@ def load_chart_data(symbol: str, date: str, timeframe: str, strategy: str = "tre
     if not os.path.isfile(signal_path):
       return {"error": f"信号文件不存在: {signal_file}"}
   else:
-    signal_path = settings.resolve_signal_path(date, symbol, strategy)
+    signal_path = settings.resolve_signal_path(legacy_date, symbol, strategy)
   signal_mtime = None
   if os.path.exists(signal_path):
     signal_mtime = _format_mtime(signal_path)
@@ -219,7 +222,7 @@ def load_chart_data(symbol: str, date: str, timeframe: str, strategy: str = "tre
             continue
 
           # 时间映射
-          bar_dt = time_mapper.map_signal_to_bar(parsed["time"], date)
+          bar_dt = time_mapper.map_signal_to_bar(parsed["time"], legacy_date)
           if bar_dt is None:
             continue
 
@@ -307,7 +310,8 @@ def _build_annotations(bars: list[dict], date: str, symbol: str, strategy: str =
 
   # 解析信号 CSV
   bar_time_index = {b["time"]: i for i, b in enumerate(bars)}
-  signal_path = settings.resolve_signal_path(date, symbol, strategy)
+  legacy_date = format_legacy_date(date)
+  signal_path = settings.resolve_signal_path(legacy_date, symbol, strategy)
   if not os.path.exists(signal_path):
     return ann
 
@@ -319,7 +323,7 @@ def _build_annotations(bars: list[dict], date: str, symbol: str, strategy: str =
         if row.get("code", "").strip() != symbol:
           continue
         t = row["time"]
-        bar_dt = time_mapper.map_signal_to_bar(t, date)
+        bar_dt = time_mapper.map_signal_to_bar(t, legacy_date)
         if not bar_dt:
           continue
         bar_ts = f"{bar_dt[:4]}-{bar_dt[4:6]}-{bar_dt[6:8]}T{bar_dt[8:10]}:{bar_dt[10:12]}:00"

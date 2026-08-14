@@ -160,7 +160,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
         </div>
       </div>
 
-      {activePage === 'signals' ? (
+      {activePage === 'signals' && (
         <>
           <Toolbar
             symbol={urlParams.symbol}
@@ -203,7 +203,9 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
 
           <StatusBar data={chartData} error={error} loading={loading} />
         </>
-      ) : activePage === 'backtest' ? (
+      )}
+
+      <div style={{ display: activePage === 'backtest' ? 'contents' : 'none' }}>
         <BacktestPage
           symbol={urlParams.symbol}
           strategy={urlParams.strategy}
@@ -215,7 +217,9 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
             setActivePage('signals');
           }}
         />
-      ) : (
+      </div>
+
+      {activePage === 'users' && (
         <UserManagementPage />
       )}
     </div>

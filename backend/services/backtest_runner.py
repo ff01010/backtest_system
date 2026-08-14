@@ -163,7 +163,8 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     ],
     "initialCapital": float(payload["initialCapital"]),
     "commissionRate": float(payload["commissionRate"]),
-    "holdingPolicy": "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday",
+    "slippage": float(payload["slippage"]),
+    "holdingPolicy": _holding_policy(payload),
   })
   daily_holdings = _build_worker_daily_holdings(
     bars, worker_result["portfolioSnapshots"], payload["symbol"], float(payload["initialCapital"]),
@@ -176,6 +177,9 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
   )
   benchmark_return = _compute_benchmark_return(benchmark_equity)
   return {
+    "strategyCategory": _strategy_category(payload),
+    "resultSchemaVersion": 2,
+    "strategyMetrics": _strategy_metrics(_strategy_category(payload), summary),
     "outputDir": _script_output_dir(payload),
     "summary": summary,
     "equity": _build_portfolio_equity(daily_holdings),
@@ -200,7 +204,7 @@ def _build_script_experiment_manifest(
   payload: dict[str, Any], bars: pd.DataFrame, script_id: str, script_name: str, code_hash: str,
 ) -> dict[str, Any]:
   timeframe = str(payload.get("timeframe", "5m"))
-  holding_policy = "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
+  holding_policy = _holding_policy(payload)
   data_snapshot = market_data.snapshot(
     payload["symbol"], timeframe, payload["startDate"], payload["endDate"],
   )
@@ -217,6 +221,8 @@ def _build_script_experiment_manifest(
     "allowLong": payload.get("allowLong", True),
     "allowShort": payload.get("allowShort", True),
     "holdingPolicy": holding_policy,
+    "strategyCategory": _strategy_category(payload),
+    "resultSchemaVersion": 2,
   })
   experiment_hash = _stable_hash({
     "engineVersion": "isolated-script-worker-v1",
@@ -246,6 +252,8 @@ def _build_script_experiment_manifest(
       "slippage": float(payload["slippage"]),
     },
     "holdingPolicy": holding_policy,
+    "strategyCategory": _strategy_category(payload),
+    "resultSchemaVersion": 2,
     "executionEnvironment": "strategy-worker",
   }
 
@@ -325,6 +333,9 @@ def _build_bar_backtest_response(
   )
   benchmark_return = _compute_benchmark_return(benchmark_equity)
   return {
+    "strategyCategory": _strategy_category(payload),
+    "resultSchemaVersion": 2,
+    "strategyMetrics": _strategy_metrics(_strategy_category(payload), summary),
     "outputDir": config["backtest"]["output_dir"],
     "summary": summary,
     "equity": _build_portfolio_equity(daily_holdings),
@@ -413,6 +424,9 @@ def run_midcap_earnings_backtest(payload: dict[str, Any]) -> dict[str, Any]:
   benchmark_return = _compute_benchmark_return(benchmark_equity)
 
   return {
+    "strategyCategory": "directional_holding",
+    "resultSchemaVersion": 2,
+    "strategyMetrics": _strategy_metrics("directional_holding", summary),
     "outputDir": config["backtest"]["output_dir"],
     "summary": summary,
     "equity": equity,
@@ -521,6 +535,8 @@ def _build_experiment_manifest(
       "slippage": float(payload["slippage"]),
     },
     "holdingPolicy": config["backtest"]["holding_policy"],
+    "strategyCategory": _strategy_category(payload),
+    "resultSchemaVersion": 2,
   }
 
 
@@ -537,9 +553,7 @@ def _build_config(payload: dict[str, Any]) -> dict[str, Any]:
   bc["allow_long"] = bool(payload.get("allowLong", True))
   bc["allow_short"] = bool(payload.get("allowShort", True))
   bc["signal_only"] = True
-  bc["holding_policy"] = (
-    "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
-  )
+  bc["holding_policy"] = _holding_policy(payload)
   run_name = (
     f"{payload['strategy']}_{payload['symbol']}_"
     f"{payload['startDate']}_{payload['endDate']}"
@@ -557,6 +571,36 @@ def _build_config(payload: dict[str, Any]) -> dict[str, Any]:
 
   _apply_position_params(strategy, payload)
   return config
+
+
+def _strategy_category(payload: dict[str, Any]) -> str:
+  category = str(payload.get("strategyCategory") or "")
+  if category in {"core_position_overlay", "directional_holding"}:
+    return category
+  return "core_position_overlay" if int(payload.get("baseQuantity", 0)) > 0 or bool(payload.get("t0Enabled", False)) else "directional_holding"
+
+
+def _holding_policy(payload: dict[str, Any]) -> str:
+  if payload.get("strategyCategory") not in {"core_position_overlay", "directional_holding"}:
+    return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
+  return "intraday" if _strategy_category(payload) == "core_position_overlay" else "overnight"
+
+
+def _strategy_metrics(category: str, summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+  if category == "core_position_overlay":
+    return {"t0Metrics": {
+      "baseHoldingPnl": summary.get("baseHoldingPnl"),
+      "baseHoldingReturn": summary.get("baseHoldingReturn"),
+      "t0ExcessPnl": summary.get("t0ExcessPnl"),
+      "t0ExcessReturn": summary.get("t0ExcessReturn"),
+    }}
+  return {"holdingMetrics": {
+    "totalPnl": summary.get("totalPnl"),
+    "totalReturn": summary.get("totalReturn"),
+    "maxDrawdown": summary.get("maxDrawdown"),
+    "maxDrawdownRate": summary.get("maxDrawdownRate"),
+    "finalEquity": summary.get("finalEquity"),
+  }}
 
 
 def _apply_position_params(strategy: dict[str, Any], payload: dict[str, Any]) -> None:

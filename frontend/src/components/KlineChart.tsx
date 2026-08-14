@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 import {
   createChart,
   type IChartApi,
@@ -49,6 +49,44 @@ const BACKTEST_ACTION_LABELS: Record<BacktestChartTrade['action'], string> = {
   sell: '卖出',
 };
 
+interface BacktestTradeMarkerLayout {
+  key: string;
+  time: number;
+  x: number;
+  y: number;
+  anchorY: number;
+  radius: number;
+  color: string;
+  label: string | null;
+  trades: BacktestChartTrade[];
+}
+
+function isBacktestBuyAction(action: BacktestChartTrade['action']): boolean {
+  return action.startsWith('buy');
+}
+
+function getBacktestMarkerLabel(action: BacktestChartTrade['action']): string {
+  if (action === 'buy_close' || action === 'sell_close') return '平';
+  return isBacktestBuyAction(action) ? 'B' : 'S';
+}
+
+function getBacktestMarkerColor(action: BacktestChartTrade['action']): string {
+  return isBacktestBuyAction(action) ? BACKTEST_BUY_COLOR : BACKTEST_SELL_COLOR;
+}
+
+function isSameBacktestMarkerLayout(
+  current: BacktestTradeMarkerLayout[],
+  next: BacktestTradeMarkerLayout[]
+): boolean {
+  return current.length === next.length && current.every((item, index) => {
+    const candidate = next[index];
+    return item.key === candidate.key
+      && Math.abs(item.x - candidate.x) < 0.1
+      && Math.abs(item.y - candidate.y) < 0.1
+      && Math.abs(item.anchorY - candidate.anchorY) < 0.1;
+  });
+}
+
 function compactTradeTime(value: string): string {
   return value.replace(/\D/g, '').slice(0, 12);
 }
@@ -87,6 +125,9 @@ export default function KlineChart({
   const closeSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const tooltipRef = useRef<HTMLDivElement | null>(null);
+  const [backtestMarkerLayouts, setBacktestMarkerLayouts] = useState<BacktestTradeMarkerLayout[]>([]);
+  const backtestMarkerLayoutsRef = useRef<BacktestTradeMarkerLayout[]>([]);
+  const requestBacktestMarkerLayoutRef = useRef<() => void>(() => {});
 
   // 用 ref 存储最新值，避免 crosshair handler 因闭包过期而反复订阅
   const dataRef = useRef(data);
@@ -99,8 +140,65 @@ export default function KlineChart({
   backtestTradesRef.current = backtestTrades;
   const backtestDisplayNoRef = useRef(backtestDisplayNo);
   backtestDisplayNoRef.current = backtestDisplayNo;
+  backtestMarkerLayoutsRef.current = backtestMarkerLayouts;
 
   const scale = MARKER_SIZE_MAP[markerSize];
+
+  const updateBacktestMarkerLayouts = useCallback(() => {
+    const chart = chartRef.current;
+    const candle = candleSeriesRef.current;
+    if (!chart || !candle || !data || backtestTrades === undefined) {
+      setBacktestMarkerLayouts((current) => current.length === 0 ? current : []);
+      return;
+    }
+
+    const barsByTime = new Map(data.bars.map((bar) => [toChartTimestamp(bar.time), bar]));
+    const grouped = new Map<number, BacktestChartTrade[]>();
+    for (const trade of backtestTrades) {
+      const time = alignTradeToBarTime(trade, data.bars);
+      if (time === null) continue;
+      grouped.set(time, [...(grouped.get(time) || []), trade]);
+    }
+
+    const next: BacktestTradeMarkerLayout[] = [];
+    for (const [time, timeTrades] of grouped) {
+      const bar = barsByTime.get(time);
+      const x = chart.timeScale().timeToCoordinate(time as Time);
+      if (!bar || x === null) continue;
+      const priceGroups = new Map<number, BacktestChartTrade[]>();
+      for (const trade of timeTrades) {
+        priceGroups.set(trade.price, [...(priceGroups.get(trade.price) || []), trade]);
+      }
+      for (const [price, priceTrades] of priceGroups) {
+        const y = candle.priceToCoordinate(price);
+        if (y === null) continue;
+        const action = priceTrades[0].action;
+        const sameDirection = priceTrades.every((trade) => trade.action === action);
+        const anchorPrice = sameDirection
+          ? (isBacktestBuyAction(action) ? bar.low : bar.high)
+          : bar.close;
+        const anchorY = candle.priceToCoordinate(anchorPrice);
+        if (anchorY === null) continue;
+        const isSingleTrade = timeTrades.length === 1;
+        next.push({
+          key: `${time}:${price}`,
+          time,
+          x,
+          y,
+          anchorY,
+          radius: isSingleTrade ? 10 : 4.5,
+          color: sameDirection ? getBacktestMarkerColor(action) : '#64748b',
+          label: isSingleTrade ? getBacktestMarkerLabel(action) : null,
+          trades: priceTrades,
+        });
+      }
+    }
+
+    next.sort((left, right) => left.time - right.time || left.y - right.y);
+    setBacktestMarkerLayouts((current) => isSameBacktestMarkerLayout(current, next) ? current : next);
+  }, [backtestTrades, data]);
+
+  requestBacktestMarkerLayoutRef.current = updateBacktestMarkerLayouts;
 
   // ── 初始化图表（仅一次）─────────────────────────────────
   useEffect(() => {
@@ -203,14 +301,26 @@ export default function KlineChart({
     containerRef.current.appendChild(tooltip);
     tooltipRef.current = tooltip;
 
+    let layoutFrame = 0;
+    const scheduleBacktestMarkerLayout = () => {
+      if (layoutFrame !== 0) return;
+      layoutFrame = window.requestAnimationFrame(() => {
+        layoutFrame = 0;
+        requestBacktestMarkerLayoutRef.current();
+      });
+    };
+
+    chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleBacktestMarkerLayout);
     chart.subscribeCrosshairMove((param) => {
+      scheduleBacktestMarkerLayout();
       const d = dataRef.current;
       const mods = modulesRef.current;
       const sds = sidesRef.current;
       const runTrades = backtestTradesRef.current;
       const displayNo = backtestDisplayNoRef.current;
 
-      if (!param.time || !param.point || !d) {
+      const point = param.point;
+      if (!param.time || !point || !d) {
         tooltip.style.display = 'none';
         return;
       }
@@ -221,6 +331,14 @@ export default function KlineChart({
       }
       const barTime = param.time;
       if (runTrades !== undefined) {
+        const hoveredMarker = backtestMarkerLayoutsRef.current.find((marker) => (
+          marker.time === barTime
+          && Math.hypot(marker.x - point.x, marker.y - point.y) <= marker.radius + 6
+        ));
+        if (!hoveredMarker) {
+          tooltip.style.display = 'none';
+          return;
+        }
         const relatedTrades = runTrades.filter(
           (trade) => alignTradeToBarTime(trade, d.bars) === barTime
         );
@@ -238,8 +356,8 @@ export default function KlineChart({
         tooltip.innerHTML = `${title}${lines.join('<br/>')}`;
         tooltip.style.display = 'block';
         const rect = containerRef.current!.getBoundingClientRect();
-        tooltip.style.left = `${Math.min(param.point.x + 15, rect.width - 310)}px`;
-        tooltip.style.top = `${Math.max(param.point.y - 60, 10)}px`;
+        tooltip.style.left = `${Math.min(point.x + 15, rect.width - 310)}px`;
+        tooltip.style.top = `${Math.max(point.y - 60, 10)}px`;
         return;
       }
       const related = d.markers.filter(
@@ -262,13 +380,15 @@ export default function KlineChart({
       tooltip.innerHTML = lines.join('<br/>');
       tooltip.style.display = 'block';
       const rect = containerRef.current!.getBoundingClientRect();
-      tooltip.style.left = `${Math.min(param.point.x + 15, rect.width - 310)}px`;
-      tooltip.style.top = `${Math.max(param.point.y - 60, 10)}px`;
+      tooltip.style.left = `${Math.min(point.x + 15, rect.width - 310)}px`;
+      tooltip.style.top = `${Math.max(point.y - 60, 10)}px`;
     });
 
     return () => {
       window.removeEventListener('resize', handleResize);
       ro.disconnect();
+      if (layoutFrame !== 0) window.cancelAnimationFrame(layoutFrame);
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(scheduleBacktestMarkerLayout);
       if (tooltip) tooltip.remove();
       chart.remove();
       chartRef.current = null;
@@ -308,47 +428,16 @@ export default function KlineChart({
     chart.timeScale().fitContent();
   }, [data]);
 
+  useEffect(() => {
+    updateBacktestMarkerLayouts();
+  }, [updateBacktestMarkerLayouts]);
+
   // ── 更新 marker ────────────────────────────────────────
   const updateMarkers = useCallback(() => {
     const candle = candleSeriesRef.current;
     if (!candle) return;
 
     const displayMarkers: SeriesMarker<Time>[] = [];
-
-    if (backtestTrades !== undefined && data) {
-      const grouped = new Map<number, BacktestChartTrade[]>();
-      for (const trade of backtestTrades) {
-        const time = alignTradeToBarTime(trade, data.bars);
-        if (time === null) continue;
-        const items = grouped.get(time) || [];
-        items.push(trade);
-        grouped.set(time, items);
-      }
-
-      for (const [time, trades] of grouped) {
-        if (trades.length > 1) {
-          displayMarkers.push({
-            time: time as Time,
-            text: `${trades.length} 笔`,
-            shape: 'circle',
-            color: '#64748b',
-            position: 'inBar',
-            size: scale,
-          });
-          continue;
-        }
-        const trade = trades[0];
-        const isBuy = trade.action.startsWith('buy');
-        displayMarkers.push({
-          time: time as Time,
-          text: BACKTEST_ACTION_LABELS[trade.action],
-          shape: isBuy ? 'arrowUp' : 'arrowDown',
-          color: isBuy ? BACKTEST_BUY_COLOR : BACKTEST_SELL_COLOR,
-          position: isBuy ? 'belowBar' : 'aboveBar',
-          size: scale,
-        });
-      }
-    }
 
     // ── 实际信号 markers（默认）──
     if (backtestTrades === undefined && signalSource !== 'theoretical' && data?.markers.length) {
@@ -424,6 +513,39 @@ export default function KlineChart({
       style={{ width: '100%', height: '100%', minHeight: '300px', position: 'relative' }}
     >
       <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+      {backtestTrades !== undefined && backtestMarkerLayouts.length > 0 && (
+        <svg
+          aria-hidden="true"
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', zIndex: 4, pointerEvents: 'none' }}
+        >
+          {backtestMarkerLayouts.map((marker) => (
+            <g key={marker.key}>
+              <line
+                x1={marker.x}
+                x2={marker.x}
+                y1={marker.y}
+                y2={marker.anchorY}
+                stroke="#ffffff"
+                strokeWidth={1.5}
+                strokeDasharray="3 3"
+              />
+              <circle cx={marker.x} cy={marker.y} r={marker.radius} fill={marker.color} stroke="#ffffff" strokeWidth={1.5} />
+              {marker.label && (
+                <text
+                  x={marker.x}
+                  y={marker.y + 3.5}
+                  fill="#ffffff"
+                  fontSize={marker.label === '平' ? 9 : 11}
+                  fontWeight={700}
+                  textAnchor="middle"
+                >
+                  {marker.label}
+                </text>
+              )}
+            </g>
+          ))}
+        </svg>
+      )}
       {label && (
         <div style={{
           position: 'absolute', top: 6, left: 8, zIndex: 5,

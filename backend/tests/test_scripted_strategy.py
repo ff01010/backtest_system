@@ -5,8 +5,10 @@ from pathlib import Path
 import pytest
 
 from backend.backtesting.engine import BarBacktestEngine
-from backend.backtesting.models import Bar
-from backend.strategies.scripted import ScriptedBarStrategy, validate_script_code
+from backend.backtesting.models import Bar, PortfolioSnapshot, PositionSnapshot
+from backend.l2.models import QuoteLevel, QuoteSnapshot
+from backend.services.backtest_errors import StrategyExecutionError, error_summary
+from backend.strategies.scripted import ScriptedBarStrategy, quote_mode_for_script, validate_script_code
 
 
 def _qmt_script_strategy(
@@ -74,6 +76,145 @@ def on_bar(bar, state):
     strategy._to_orders([{'action': 'buy_open', 'quantity': True}], bar)
 
 
+def test_quote_callback_uses_continuous_mode_and_preserves_client_key() -> None:
+  strategy = ScriptedBarStrategy(14, """
+def on_bar(bar, state):
+  return []
+
+def on_quote(quote, state):
+  return [{'action': 'buy_open', 'quantity': 100, 'clientOrderKey': 'opening'}]
+""", {})
+  quote = QuoteSnapshot(
+    "688981.SH", "20260727", "2026-07-27 09:30:03", 1,
+    (QuoteLevel(10, 100),), (QuoteLevel(10.01, 100),), 10.01,
+  )
+  orders = strategy.on_quote(quote, PortfolioSnapshot(cash=100_000, equity=100_000, positions={}))
+
+  assert strategy.quote_mode == "continuous"
+  assert orders[0].metadata["client_order_key"] == "opening"
+  assert quote_mode_for_script("def on_bar(bar, state):\n  return []\n") == "order_driven"
+
+
+def test_continuous_mode_requires_quote_callback() -> None:
+  with pytest.raises(ValueError, match="必须定义 on_quote"):
+    ScriptedBarStrategy(15, "def on_bar(bar, state):\n  return []\n", {}, "continuous")
+
+
+@pytest.mark.parametrize("symbol", ["600584.SH", "688981.SH"])
+def test_v6_template_requests_opening_position_from_first_quote(symbol: str) -> None:
+  code = Path("backend/strategies/staged_entry_long_v6_l2.py").read_text(encoding="utf-8")
+  strategy = ScriptedBarStrategy("v6", code, {"allowLong": True, "allowShort": True})
+  quote = QuoteSnapshot(
+    symbol, "20260727", "2026-07-27 09:30:03", 1,
+    (QuoteLevel(10, 1_000),), (QuoteLevel(10.01, 1_000),), 10,
+  )
+
+  orders = strategy.on_quote(quote, PortfolioSnapshot(cash=1_000_000, equity=1_000_000, positions={}))
+
+  assert strategy.quote_mode == "continuous"
+  assert [(item.quantity, item.metadata["client_order_key"]) for item in orders] == [(200, "opening")]
+
+
+def test_script_context_unifies_compact_and_l2_iso_time() -> None:
+  strategy = ScriptedBarStrategy(11, """
+def on_bar(bar, state):
+  return []
+""", {})
+  portfolio = PortfolioSnapshot(cash=100_000, equity=100_000, positions={})
+
+  compact = strategy._context(Bar("20260727093000", "688981.SH", 10, 10, 10, 10), portfolio)
+  l2_iso = strategy._context(Bar("2026-07-27 09:30:00", "688981.SH", 10, 10, 10, 10), portfolio)
+
+  assert compact["time"] == "20260727093000"
+  assert compact["datetime"] == "2026-07-27 09:30:00"
+  assert compact["tradeDate"] == "2026-07-27"
+  assert compact["hhmm"] == 930
+  assert l2_iso == compact
+
+
+def test_script_context_excludes_base_position_from_strategy_position() -> None:
+  strategy = ScriptedBarStrategy(13, """
+def on_bar(bar, state):
+  return []
+""", {})
+  portfolio = PortfolioSnapshot(
+    cash=100_000,
+    equity=150_000,
+    positions={"688981.SH": PositionSnapshot("688981.SH", 5_000, 10)},
+    long_positions_by_key={
+      "base_position": PositionSnapshot("688981.SH", 5_000, 10),
+      "script:13:overlay_long": PositionSnapshot("688981.SH", 1_000, 11),
+    },
+    short_positions_by_key={
+      "script:13:overlay_short": PositionSnapshot("688981.SH", 400, 12),
+    },
+    base_position=5_000,
+  )
+
+  context = strategy._context(Bar("20260727093000", "688981.SH", 10, 10, 10, 10), portfolio)
+
+  assert context["position"] == 600
+  assert context["strategyPosition"] == 600
+  assert context["basePosition"] == 5_000
+
+
+def test_script_context_error_explains_supported_time_contract() -> None:
+  strategy = ScriptedBarStrategy(12, """
+def on_bar(bar, state):
+  return []
+""", {})
+  portfolio = PortfolioSnapshot(cash=100_000, equity=100_000, positions={})
+
+  with pytest.raises(StrategyExecutionError) as raised:
+    strategy.on_bar(Bar("not-a-time", "688981.SH", 10, 10, 10, 10), portfolio)
+
+  assert raised.value.detail.code == "strategy.invalid_time"
+  assert raised.value.detail.callback == "on_bar"
+  assert raised.value.detail.symbol == "688981.SH"
+
+
+def test_script_runtime_error_keeps_quote_callback_location_without_raw_exception() -> None:
+  strategy = ScriptedBarStrategy("quote-error", """
+def on_bar(bar, state):
+  return []
+
+def on_quote(quote, state):
+  return missing_variable
+""", {})
+  quote = QuoteSnapshot(
+    "688981.SH", "20260727", "2026-07-27 09:30:03", 1,
+    (QuoteLevel(10, 100),), (QuoteLevel(10.01, 100),), 10.01,
+  )
+
+  with pytest.raises(StrategyExecutionError) as raised:
+    strategy.on_quote(quote, PortfolioSnapshot(cash=100_000, equity=100_000, positions={}))
+
+  detail = raised.value.detail
+  assert detail.category == "strategy_error"
+  assert detail.callback == "on_quote"
+  assert detail.event_time == "2026-07-27 09:30:03"
+  assert detail.symbol == "688981.SH"
+  assert detail.message == "策略引用了未定义的变量或函数。"
+  assert "missing_variable" not in error_summary(raised.value, "run-1")["error"]
+
+
+def test_script_order_event_error_keeps_event_location() -> None:
+  strategy = ScriptedBarStrategy("event-error", """
+def on_bar(bar, state):
+  return []
+
+def on_order_event(event, state):
+  raise KeyError('internal_field')
+""", {})
+
+  with pytest.raises(StrategyExecutionError) as raised:
+    strategy.on_order_event({"symbol": "688981.SH", "signalTime": "2026-07-27 09:31:00"})
+
+  assert raised.value.detail.callback == "on_order_event"
+  assert raised.value.detail.event_time == "2026-07-27 09:31:00"
+  assert raised.value.detail.symbol == "688981.SH"
+
+
 def test_script_runtime_skips_disallowed_open_direction() -> None:
   strategy = ScriptedBarStrategy(8, """
 def on_bar(bar, state):
@@ -129,6 +270,15 @@ def test_qmt_trend_follow_script_records_skipped_direction_signal() -> None:
   assert len(strategy.skipped_signals) == 1
   assert strategy.skipped_signals[0]["action"] == "SELL_OPEN"
   assert strategy.skipped_signals[0]["status"] == "skipped"
+
+
+def test_qmt_trend_follow_script_accepts_l2_iso_completion_time() -> None:
+  strategy = _qmt_script_strategy(13)
+  result = BarBacktestEngine(1_000_000).run(strategy, [
+    Bar("2026-07-27 09:31:00", "688981.SH", 10, 10, 10, 10),
+  ])
+
+  assert result.fills == []
 
 
 def test_qmt_trend_follow_script_applies_two_take_profit_levels() -> None:

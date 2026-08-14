@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from backend import settings
+from backend.date_codec import TradingDateError, format_api_date, normalize_date_range, parse_trading_date
 from backend.services import clickhouse_client
 
 
@@ -26,12 +27,14 @@ class MarketDataError(ValueError):
 
 def ensure_cached(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:
   """兼容旧调用方：QMT 数据只检查覆盖，不在回测时联网抓取。"""
+  start_date, end_date = _normalized_range(start_date, end_date)
   _require_complete(symbol, timeframe, start_date, end_date)
   return {"status": "qmt_available", "fetchedDates": [], "rowCount": 0}
 
 
 def load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
   """从 ClickHouse 读取 QMT 原始 K 线，必要时由 1 分钟线派生周期。"""
+  start_date, end_date = _normalized_range(start_date, end_date)
   _require_complete(symbol, timeframe, start_date, end_date)
   source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
   rows = _query_kline_rows(symbol, source_period, start_date, end_date)
@@ -45,6 +48,8 @@ def load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd
 
 def timeframe_status(symbol: str, start_date: str | None, end_date: str | None) -> list[dict[str, Any]]:
   """返回回测可用周期与 QMT 覆盖情况，不触发任何上游请求。"""
+  if start_date and end_date:
+    start_date, end_date = _normalized_range(start_date, end_date)
   items: list[dict[str, Any]] = []
   for timeframe in settings.BACKTEST_TIMEFRAMES:
     if not start_date or not end_date:
@@ -68,7 +73,7 @@ def list_dates(symbol: str, timeframe: str) -> list[dict[str, Any]]:
     rows = clickhouse_client.query_rows(query)
   except clickhouse_client.ClickHouseError as error:
     raise MarketDataError(str(error)) from error
-  return [{"date": str(row["trade_date"]).replace("-", ""), "hasKline": True, "hasSignal": False} for row in rows]
+  return [{"date": format_api_date(str(row["trade_date"])), "hasKline": True, "hasSignal": False} for row in rows]
 
 
 def status(symbol: str, timeframe: str, preview_limit: int = 20) -> dict[str, Any]:
@@ -89,8 +94,8 @@ def status(symbol: str, timeframe: str, preview_limit: int = 20) -> dict[str, An
     raise MarketDataError(f"读取 QMT 数据状态失败: {error}") from error
   return {
     "symbol": symbol, "timeframe": timeframe, "path": f"clickhouse://{_DATABASE}.qmt_kline",
-    "exists": int(summary.get("bar_count") or 0) > 0, "firstDate": _compact_date(summary.get("first_date")),
-    "lastDate": _compact_date(summary.get("last_date")), "barCount": int(summary.get("bar_count") or 0),
+    "exists": int(summary.get("bar_count") or 0) > 0, "firstDate": _api_date_or_none(summary.get("first_date")),
+    "lastDate": _api_date_or_none(summary.get("last_date")), "barCount": int(summary.get("bar_count") or 0),
     "fileSize": 0, "mtime": str(summary.get("updated_at") or "") or None, "duplicateCount": 0,
     "nonTradingCount": 0, "expectedBarsPerDay": None, "gapDates": [], "preview": preview,
   }
@@ -98,6 +103,7 @@ def status(symbol: str, timeframe: str, preview_limit: int = 20) -> dict[str, An
 
 def snapshot(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:
   """返回回测数据快照标识，记录读取的数据范围和最新导入时间。"""
+  start_date, end_date = _normalized_range(start_date, end_date)
   _require_complete(symbol, timeframe, start_date, end_date)
   source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
   query = f"""
@@ -122,6 +128,7 @@ def snapshot(symbol: str, timeframe: str, start_date: str, end_date: str) -> dic
 
 
 def _require_complete(symbol: str, timeframe: str, start_date: str, end_date: str) -> None:
+  start_date, end_date = _normalized_range(start_date, end_date)
   _validate_request(timeframe, start_date, end_date)
   statuses = _coverage_status(symbol, timeframe, start_date, end_date)
   invalid = [item["date"] for item in statuses if item["status"] != "complete"]
@@ -150,6 +157,7 @@ def _cached_timeframe_status(symbol: str, timeframe: str, start_date: str, end_d
 
 
 def _coverage_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> list[dict[str, str]]:
+  start_date, end_date = _normalized_range(start_date, end_date)
   _validate_symbol(symbol)
   source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
   query = f"""
@@ -163,7 +171,7 @@ def _coverage_status(symbol: str, timeframe: str, start_date: str, end_date: str
     rows = clickhouse_client.query_rows(query)
   except clickhouse_client.ClickHouseError as error:
     raise MarketDataError(str(error)) from error
-  return [{"date": _compact_date(row["trade_date"]) or "", "status": str(row["status"])} for row in rows]
+  return [{"date": format_api_date(str(row["trade_date"])), "status": str(row["status"])} for row in rows]
 
 
 def _query_kline_rows(symbol: str, period: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
@@ -236,8 +244,7 @@ def _validate_request(timeframe: str, start_date: str, end_date: str) -> None:
   supported = _DIRECT_PERIODS | set(_DERIVED_PERIODS)
   if timeframe not in supported:
     raise MarketDataError(f"QMT 数据暂不支持周期: {timeframe}")
-  if not settings.validate_date(start_date) or not settings.validate_date(end_date) or start_date > end_date:
-    raise MarketDataError("行情日期范围无效")
+  _normalized_range(start_date, end_date)
 
 
 def _validate_symbol(symbol: str) -> None:
@@ -246,19 +253,26 @@ def _validate_symbol(symbol: str) -> None:
 
 
 def _epoch_range(start_date: str, end_date: str) -> tuple[int, int]:
-  start = datetime.strptime(start_date, "%Y%m%d").replace(tzinfo=_TIMEZONE)
-  end = datetime.strptime(end_date, "%Y%m%d").replace(hour=23, minute=59, second=59, microsecond=999000, tzinfo=_TIMEZONE)
+  start = datetime.combine(parse_trading_date(start_date), datetime.min.time(), tzinfo=_TIMEZONE)
+  end = datetime.combine(parse_trading_date(end_date), datetime.max.time(), tzinfo=_TIMEZONE)
   return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
 def _date_sql(value: str) -> str:
-  return datetime.strptime(value, "%Y%m%d").strftime("%Y-%m-%d")
+  return format_api_date(value)
 
 
-def _compact_date(value: Any) -> str | None:
+def _api_date_or_none(value: Any) -> str | None:
   if value is None:
     return None
-  return str(value).replace("-", "")
+  return format_api_date(str(value))
+
+
+def _normalized_range(start_date: str, end_date: str) -> tuple[str, str]:
+  try:
+    return normalize_date_range(start_date, end_date)
+  except TradingDateError as error:
+    raise MarketDataError(str(error)) from error
 
 
 def _unavailable_timeframe(timeframe: str, reason: str) -> dict[str, Any]:
