@@ -199,6 +199,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
                   markerSize="normal"
                   backtestTrades={urlParams.runId ? backtestChart?.trades ?? [] : undefined}
                   backtestDisplayNo={backtestChart?.displayNo}
+                  backtestStrategyCategory={backtestChart?.strategyCategory}
                 />
             </div>
           </div>

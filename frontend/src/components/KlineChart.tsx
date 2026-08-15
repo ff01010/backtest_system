@@ -30,6 +30,7 @@ interface Props {
   labelColor?: string;
   backtestTrades?: BacktestChartTrade[];
   backtestDisplayNo?: number;
+  backtestStrategyCategory?: 'core_position_overlay' | 'directional_holding';
 }
 
 // markerSize → lightweight-charts 原生 size 值 (Circle/Arrow 尺寸基数)
@@ -39,6 +40,8 @@ const A_COLOR = '#f23645';
 const B_COLOR = '#089981';
 const BACKTEST_BUY_COLOR = '#f23645';
 const BACKTEST_SELL_COLOR = '#089981';
+const BACKTEST_T_COLOR = '#f59e0b';
+const BACKTEST_MARKER_MIN_VERTICAL_GAP = 24;
 
 const BACKTEST_ACTION_LABELS: Record<BacktestChartTrade['action'], string> = {
   buy_open: '买开',
@@ -53,6 +56,7 @@ interface BacktestTradeMarkerLayout {
   key: string;
   time: number;
   x: number;
+  anchorX: number;
   y: number;
   anchorY: number;
   radius: number;
@@ -65,13 +69,38 @@ function isBacktestBuyAction(action: BacktestChartTrade['action']): boolean {
   return action.startsWith('buy');
 }
 
-function getBacktestMarkerLabel(action: BacktestChartTrade['action']): string {
-  if (action === 'buy_close' || action === 'sell_close') return '平';
+function isBacktestCloseAction(action: BacktestChartTrade['action']): boolean {
+  return action === 'buy_close' || action === 'sell_close';
+}
+
+function getBacktestMarkerLabel(
+  action: BacktestChartTrade['action'],
+  strategyCategory: Props['backtestStrategyCategory'],
+): string {
+  if (isBacktestCloseAction(action)) {
+    return strategyCategory === 'core_position_overlay' ? 'T' : '平';
+  }
   return isBacktestBuyAction(action) ? 'B' : 'S';
 }
 
-function getBacktestMarkerColor(action: BacktestChartTrade['action']): string {
+function getBacktestMarkerColor(
+  action: BacktestChartTrade['action'],
+  strategyCategory: Props['backtestStrategyCategory'],
+): string {
+  if (isBacktestCloseAction(action) && strategyCategory === 'core_position_overlay') {
+    return BACKTEST_T_COLOR;
+  }
   return isBacktestBuyAction(action) ? BACKTEST_BUY_COLOR : BACKTEST_SELL_COLOR;
+}
+
+function getBacktestTradeLabel(
+  action: BacktestChartTrade['action'],
+  strategyCategory: Props['backtestStrategyCategory'],
+): string {
+  if (isBacktestCloseAction(action) && strategyCategory === 'core_position_overlay') {
+    return `T（${BACKTEST_ACTION_LABELS[action]}）`;
+  }
+  return BACKTEST_ACTION_LABELS[action];
 }
 
 function isSameBacktestMarkerLayout(
@@ -82,13 +111,33 @@ function isSameBacktestMarkerLayout(
     const candidate = next[index];
     return item.key === candidate.key
       && Math.abs(item.x - candidate.x) < 0.1
+      && Math.abs(item.anchorX - candidate.anchorX) < 0.1
       && Math.abs(item.y - candidate.y) < 0.1
-      && Math.abs(item.anchorY - candidate.anchorY) < 0.1;
+      && Math.abs(item.anchorY - candidate.anchorY) < 0.1
+      && item.color === candidate.color
+      && item.label === candidate.label;
   });
 }
 
 function compactTradeTime(value: string): string {
   return value.replace(/\D/g, '').slice(0, 12);
+}
+
+function spreadBacktestMarkerYPositions(positions: number[]): number[] {
+  const result = [...positions];
+  let start = 0;
+  for (let index = 1; index <= positions.length; index += 1) {
+    if (index < positions.length && positions[index] - positions[index - 1] <= BACKTEST_MARKER_MIN_VERTICAL_GAP) continue;
+    const count = index - start;
+    if (count > 1) {
+      const center = positions.slice(start, index).reduce((sum, value) => sum + value, 0) / count;
+      for (let offset = 0; offset < count; offset += 1) {
+        result[start + offset] = center + (offset - (count - 1) / 2) * BACKTEST_MARKER_MIN_VERTICAL_GAP;
+      }
+    }
+    start = index;
+  }
+  return result;
 }
 
 function alignTradeToBarTime(trade: BacktestChartTrade, bars: ChartResponse['bars']): number | null {
@@ -118,6 +167,7 @@ export default function KlineChart({
   labelColor,
   backtestTrades,
   backtestDisplayNo,
+  backtestStrategyCategory,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -140,6 +190,8 @@ export default function KlineChart({
   backtestTradesRef.current = backtestTrades;
   const backtestDisplayNoRef = useRef(backtestDisplayNo);
   backtestDisplayNoRef.current = backtestDisplayNo;
+  const backtestStrategyCategoryRef = useRef(backtestStrategyCategory);
+  backtestStrategyCategoryRef.current = backtestStrategyCategory;
   backtestMarkerLayoutsRef.current = backtestMarkerLayouts;
 
   const scale = MARKER_SIZE_MAP[markerSize];
@@ -165,38 +217,46 @@ export default function KlineChart({
       const bar = barsByTime.get(time);
       const x = chart.timeScale().timeToCoordinate(time as Time);
       if (!bar || x === null) continue;
-      const priceGroups = new Map<number, BacktestChartTrade[]>();
+      const actionGroups = new Map<BacktestChartTrade['action'], BacktestChartTrade[]>();
       for (const trade of timeTrades) {
-        priceGroups.set(trade.price, [...(priceGroups.get(trade.price) || []), trade]);
+        actionGroups.set(trade.action, [...(actionGroups.get(trade.action) || []), trade]);
       }
-      for (const [price, priceTrades] of priceGroups) {
-        const y = candle.priceToCoordinate(price);
-        if (y === null) continue;
-        const action = priceTrades[0].action;
-        const sameDirection = priceTrades.every((trade) => trade.action === action);
-        const anchorPrice = sameDirection
-          ? (isBacktestBuyAction(action) ? bar.low : bar.high)
-          : bar.close;
-        const anchorY = candle.priceToCoordinate(anchorPrice);
-        if (anchorY === null) continue;
-        const isSingleTrade = timeTrades.length === 1;
+      const groups = Array.from(actionGroups.entries()).map(([action, actionTrades]) => {
+        const quantity = actionTrades.reduce((total, trade) => total + trade.quantity, 0);
+        const price = quantity > 0
+          ? actionTrades.reduce((total, trade) => total + trade.price * trade.quantity, 0) / quantity
+          : actionTrades[0].price;
+        return { action, price, trades: actionTrades };
+      });
+      const markerGroups = groups.map((group) => {
+        const y = candle.priceToCoordinate(group.price);
+        const anchorPrice = isBacktestBuyAction(group.action) ? bar.low : bar.high;
+        return { ...group, anchorY: candle.priceToCoordinate(anchorPrice), y };
+      }).filter((group): group is typeof group & { y: number; anchorY: number } => (
+        group.y !== null && group.anchorY !== null
+      ));
+      markerGroups.sort((left, right) => left.y - right.y || left.action.localeCompare(right.action));
+      const displayYs = spreadBacktestMarkerYPositions(markerGroups.map((group) => group.y));
+      for (const [index, group] of markerGroups.entries()) {
+        const { action, trades: actionTrades, anchorY } = group;
         next.push({
-          key: `${time}:${price}`,
+          key: `${time}:${action}`,
           time,
           x,
-          y,
+          anchorX: x,
+          y: displayYs[index],
           anchorY,
-          radius: isSingleTrade ? 10 : 4.5,
-          color: sameDirection ? getBacktestMarkerColor(action) : '#64748b',
-          label: isSingleTrade ? getBacktestMarkerLabel(action) : null,
-          trades: priceTrades,
+          radius: 10,
+          color: getBacktestMarkerColor(action, backtestStrategyCategory),
+          label: getBacktestMarkerLabel(action, backtestStrategyCategory),
+          trades: actionTrades,
         });
       }
     }
 
     next.sort((left, right) => left.time - right.time || left.y - right.y);
     setBacktestMarkerLayouts((current) => isSameBacktestMarkerLayout(current, next) ? current : next);
-  }, [backtestTrades, data]);
+  }, [backtestStrategyCategory, backtestTrades, data]);
 
   requestBacktestMarkerLayoutRef.current = updateBacktestMarkerLayouts;
 
@@ -318,6 +378,7 @@ export default function KlineChart({
       const sds = sidesRef.current;
       const runTrades = backtestTradesRef.current;
       const displayNo = backtestDisplayNoRef.current;
+      const strategyCategory = backtestStrategyCategoryRef.current;
 
       const point = param.point;
       if (!param.time || !point || !d) {
@@ -348,10 +409,9 @@ export default function KlineChart({
         }
         const title = displayNo ? `<strong>#${displayNo}</strong> ` : '';
         const lines = relatedTrades.map((trade) => {
-          const isBuy = trade.action.startsWith('buy');
-          const color = isBuy ? BACKTEST_BUY_COLOR : BACKTEST_SELL_COLOR;
+          const color = getBacktestMarkerColor(trade.action, strategyCategory);
           const note = trade.note ? ` · ${escapeTooltipText(trade.note)}` : '';
-          return `<span style="color:${color}">${BACKTEST_ACTION_LABELS[trade.action]}</span> ${trade.price.toFixed(2)} ×${trade.quantity}${note}`;
+          return `<span style="color:${color}">${getBacktestTradeLabel(trade.action, strategyCategory)}</span> ${trade.price.toFixed(2)} ×${trade.quantity}${note}`;
         });
         tooltip.innerHTML = `${title}${lines.join('<br/>')}`;
         tooltip.style.display = 'block';
@@ -521,10 +581,10 @@ export default function KlineChart({
           {backtestMarkerLayouts.map((marker) => (
             <g key={marker.key}>
               <line
-                x1={marker.x}
+                x1={marker.anchorX}
                 x2={marker.x}
-                y1={marker.y}
-                y2={marker.anchorY}
+                y1={marker.anchorY}
+                y2={marker.y}
                 stroke="#ffffff"
                 strokeWidth={1.5}
                 strokeDasharray="3 3"
@@ -568,6 +628,7 @@ export default function KlineChart({
             <span style={{ color: '#5d606b' }}>━ 收盘</span>
             <span style={{ color: BACKTEST_BUY_COLOR }}>▲ 买入</span>
             <span style={{ color: BACKTEST_SELL_COLOR }}>▼ 卖出</span>
+            {backtestStrategyCategory === 'core_position_overlay' && <span style={{ color: BACKTEST_T_COLOR }}>● T</span>}
           </>
         ) : (
           <>

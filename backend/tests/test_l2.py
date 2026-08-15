@@ -250,6 +250,23 @@ def test_temporary_quote_profile_scales_only_depth_prices() -> None:
   assert quote.asks[0].price == pytest.approx(30.97)
 
 
+def test_temporary_quote_profile_adapts_depth_prices_already_in_yuan() -> None:
+  adapter = ClickHouseL2Adapter(load_temporary_quote_profile())
+  row = {
+    "symbol": "688981.SH", "trade_date": "2026-07-06", "time": "2026-07-06 10:15:03",
+    "last_price": 139.8,
+    **{f"bid_price_{index}": 139.8 for index in range(1, 11)},
+    **{f"bid_volume_{index}": 100 for index in range(1, 11)},
+    **{f"ask_price_{index}": 139.81 for index in range(1, 11)},
+    **{f"ask_volume_{index}": 100 for index in range(1, 11)},
+  }
+
+  quote = adapter._quote_from_row(row, 1)
+
+  assert quote.bids[0].price == pytest.approx(139.8)
+  assert quote.asks[0].price == pytest.approx(139.81)
+
+
 def test_quote_adapter_treats_zero_price_levels_as_empty_side() -> None:
   adapter = ClickHouseL2Adapter(load_temporary_quote_profile())
   row = {

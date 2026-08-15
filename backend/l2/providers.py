@@ -337,20 +337,44 @@ class ClickHouseL2Adapter:
     )
 
   def _quote_from_row(self, row: dict[str, Any], derived_sequence: int) -> QuoteSnapshot:
-    bids = self._quote_levels(row, "bid")
-    asks = self._quote_levels(row, "ask")
+    last_price = self._price(row["last_price"], "last_price")
+    quote_price_scale = self._temporary_quote_price_scale(row, last_price)
+    bids = self._quote_levels(row, "bid", quote_price_scale)
+    asks = self._quote_levels(row, "ask", quote_price_scale)
     sequence = int(row["sequence"]) if "sequence" in self._profile.columns else derived_sequence
-    return QuoteSnapshot(str(row["symbol"]), str(row["trade_date"]), str(row["time"]), sequence, bids, asks, self._price(row["last_price"], "last_price"), str(row.get("source_version") or ""))
+    return QuoteSnapshot(str(row["symbol"]), str(row["trade_date"]), str(row["time"]), sequence, bids, asks, last_price, str(row.get("source_version") or ""))
 
-  def _quote_levels(self, row: dict[str, Any], side: str) -> tuple[QuoteLevel, ...]:
+  def _quote_levels(
+    self, row: dict[str, Any], side: str, price_scale: float | None = None,
+  ) -> tuple[QuoteLevel, ...]:
     levels: list[QuoteLevel] = []
     for index in range(1, 11):
-      price = self._price(row[f"{side}_price_{index}"], f"{side}_price_{index}")
+      value = row[f"{side}_price_{index}"]
+      price = self._price(value, f"{side}_price_{index}") if price_scale is None else float(value) * price_scale
       volume = self._volume(row[f"{side}_volume_{index}"])
       if price == 0:
         continue
       levels.append(QuoteLevel(price, volume))
     return tuple(levels)
+
+  def _temporary_quote_price_scale(self, row: dict[str, Any], last_price: float) -> float | None:
+    """兼容临时十档表历史分区中元与万分之一元并存的情况。"""
+    if self._profile.table_name != "quant.tick_quote" or last_price <= 0:
+      return None
+    raw_prices = [
+      float(row[f"{side}_price_{index}"])
+      for side in ("bid", "ask")
+      for index in range(1, 11)
+      if float(row[f"{side}_price_{index}"]) > 0
+    ]
+    ratios = [price / last_price for price in raw_prices]
+    direct_count = sum(0.5 <= ratio <= 1.5 for ratio in ratios)
+    scaled_count = sum(5_000 <= ratio <= 15_000 for ratio in ratios)
+    if direct_count and not scaled_count:
+      return 1.0
+    if scaled_count and not direct_count:
+      return 0.0001
+    return None
 
   def _validate_unique_quote_times(self, symbol: str, trade_date: str) -> None:
     query = (

@@ -709,6 +709,7 @@ def backtest_run_chart(
     "symbol": run["symbol"],
     "timeframe": selected_timeframe,
     "date": date,
+    "strategyCategory": run.get("strategyCategory") or "directional_holding",
     "bars": bars,
     "trades": trades,
   }

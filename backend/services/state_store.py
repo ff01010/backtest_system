@@ -99,18 +99,19 @@ def _symbol_parts(symbol: str) -> tuple[str, str, str]:
 
 def _instrument_id(cur: Any, symbol: str, name: str = "") -> int:
   code, exchange, secid = _symbol_parts(symbol)
+  normalized_name = name.strip()
   cur.execute("""
     INSERT INTO market_instrument (
       symbol, exchange, display_name, instrument_type, board, eastmoney_secid
     ) VALUES (%s, %s, %s, 'stock', 'unknown', %s)
     ON CONFLICT (exchange, symbol) DO UPDATE
       SET display_name = CASE
-        WHEN EXCLUDED.display_name <> '' THEN EXCLUDED.display_name
+        WHEN %s <> '' THEN EXCLUDED.display_name
         ELSE market_instrument.display_name
       END,
       updated_at = now()
     RETURNING id
-  """, (code, exchange, name or symbol, secid))
+  """, (code, exchange, normalized_name or symbol, secid, normalized_name))
   return int(cur.fetchone()["id"])
 
 

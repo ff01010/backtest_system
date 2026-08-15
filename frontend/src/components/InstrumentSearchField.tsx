@@ -77,7 +77,7 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
         {open && (
           <div className="instrument-search-menu" style={menuStyle}>
             {error ? <div style={hintStyle}>{error}</div> : items.length === 0 ? (
-              <div style={hintStyle}>未找到匹配标的，请先由管理员刷新证券目录。</div>
+              <div style={hintStyle}>未找到匹配标的，证券目录会在系统启动时自动同步。</div>
             ) : items.map((item) => (
               <button className="instrument-search-option" key={item.symbol} type="button" onMouseDown={() => select(item)} style={optionStyle}>
                 <strong>{item.symbol}</strong><span>{item.name}</span><small>{item.board === 'star' ? '科创板' : item.board === 'chinext' ? '创业板' : item.market}</small>
