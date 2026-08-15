@@ -17,8 +17,9 @@ from backend.l2.config import has_profile, load_profile, load_temporary_quote_pr
 from backend.l2.models import NormalizedBar, QuoteSnapshot, TradeEvent, parse_timestamp
 from backend.l2.providers import ClickHouseL2Adapter, L2DataError, RedisJsonCache, TemporaryQuoteBarProvider, VersionedBarCache
 from backend.l2.result_adapter import normalize_l2_result
-from backend.services.backtest_errors import error_summary
+from backend.services.backtest_errors import error_detail, error_summary
 from backend.services import state_store, strategy_worker
+from backend.services.system_error_log import system_error_log_record
 from backend.strategies.scripted import quote_mode_for_script
 
 logger = logging.getLogger(__name__)
@@ -50,17 +51,21 @@ class L2Runner:
   def _run_job(self, job: dict[str, Any]) -> None:
     session_id: str | None = None
     completed = False
+    stage = "l2.initialize"
     try:
       started_at = time.perf_counter()
       payload = dict(job["payload"])
       bar_provider = self._bar_provider()
       quote_provider = ClickHouseL2Adapter(load_profile("quote") if has_profile("quote") else load_temporary_quote_profile())
       bar_read_started = time.perf_counter()
+      stage = "l2.bar_load"
       bars = bar_provider.load_bars(payload["symbol"], payload["timeframe"], payload["startDate"], payload["endDate"])
+      stage = "l2.strategy_session"
       session_id = strategy_worker.create_l2_session(self._session_payload(payload))
       quote_mode = _quote_mode(payload)
       performance = _new_performance(quote_mode)
       performance["barReadMs"] = _elapsed_ms(bar_read_started)
+      stage = "l2.market_replay"
       for trade_date, day_bars in _bars_by_day(bars).items():
         if quote_mode == "continuous":
           _replay_day_continuous(
@@ -72,6 +77,7 @@ class L2Runner:
             session_id, day_bars, quote_provider, payload["symbol"], trade_date,
             job, performance,
           )
+      stage = "l2.result_finalize"
       raw_result = strategy_worker.finish_l2_session(session_id)
       session_id = None
       raw_result["dataSnapshot"] = _data_snapshot(bar_provider, quote_provider, payload, quote_mode)
@@ -85,8 +91,13 @@ class L2Runner:
     except Exception as error:
       logger.exception("L2 回测任务失败: %s", job["runId"])
       status = "cancelled" if "租约丢失或已取消" in str(error) else "failed"
+      system_error = None
+      if status == "failed" and error_detail(error, job["runId"]).category == "system_error":
+        system_error = system_error_log_record(error, "l2_runner", stage)
       state_store.finish_l2_backtest_job(
         job["runId"], job["attemptToken"], status, error_summary(error, job["runId"]),
+        system_error=system_error.to_dict() if system_error else None,
+        owner_user_id=job["ownerUserId"],
       )
     finally:
       if session_id is not None:

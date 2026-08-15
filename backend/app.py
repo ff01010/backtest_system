@@ -17,6 +17,8 @@ _viewer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _viewer_dir not in sys.path:
   sys.path.insert(0, _viewer_dir)
 
+_STRATEGY_GUIDE_PATH = os.path.join(_viewer_dir, "docs", "玄龄回测系统使用手册.md")
+
 from fastapi import FastAPI, Query, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,6 +39,7 @@ from backend.services import (
 )
 from backend.services import auth
 from backend.services.backtest_errors import error_detail, error_summary
+from backend.services.system_error_log import system_error_log_record
 from backend.services.user_context import get_current_user, reset_current_user, set_current_user
 
 app = FastAPI(title="Trend Grid Viewer", version="0.1.0")
@@ -51,6 +54,11 @@ def _backtest_failure_response(error: Exception, run_id: str | None) -> HTTPExce
   detail = error_detail(error, run_id).to_dict()
   status_code = 404 if detail["code"] == "data.unavailable" else 422
   return HTTPException(status_code, {"errorDetail": detail})
+
+
+def _sync_system_error_record(error: Exception) -> dict[str, Any] | None:
+  record = system_error_log_record(error, "sync_runner", "sync.backtest_execute")
+  return record.to_dict() if record else None
 
 
 @app.on_event("startup")
@@ -316,6 +324,20 @@ def health():
   return {"status": "ok"}
 
 
+def _load_strategy_guide() -> str:
+  """只读取固定策略手册，避免通用文件读取接口带来的路径穿越风险。"""
+  try:
+    with open(_STRATEGY_GUIDE_PATH, "r", encoding="utf-8") as guide_file:
+      return guide_file.read()
+  except OSError as error:
+    raise HTTPException(503, "策略编写指南暂不可用，请稍后重试") from error
+
+
+@app.get("/api/strategy-guide")
+def strategy_guide():
+  return {"title": "策略编写指南", "content": _load_strategy_guide()}
+
+
 @app.post("/api/auth/login")
 def login(payload: schemas.LoginRequest, request: Request, response: Response):
   """校验用户名密码并签发仅浏览器可见的 HttpOnly 会话 Cookie。"""
@@ -406,6 +428,23 @@ def reset_user_password(user_id: str, payload: schemas.PasswordReset, request: R
   except KeyError as error:
     raise HTTPException(404, "用户不存在") from error
   return {"ok": True}
+
+
+@app.get("/api/admin/system-errors")
+def admin_system_errors(
+  request: Request,
+  limit: int = Query(100, ge=1, le=200),
+  user_id: str | None = Query(default=None, alias="userId"),
+  run_id: str | None = Query(default=None, alias="runId"),
+  error_code: str | None = Query(default=None, alias="errorCode"),
+  from_time: str | None = Query(default=None, alias="fromTime"),
+  to_time: str | None = Query(default=None, alias="toTime"),
+):
+  """返回管理员可见的安全系统错误摘要，不含原始堆栈和凭据。"""
+  _require_admin(request)
+  return {"items": state_store.list_system_error_logs(
+    limit, user_id, run_id, error_code, from_time, to_time,
+  )}
 
 
 @app.get("/api/strategies")
@@ -767,19 +806,19 @@ def run_backtest(payload: schemas.BacktestRunRequest):
     logger.exception("同步回测任务失败: %s", run_id)
     if run_id is not None:
       summary = _backtest_error_summary(e, run_id)
-      state_store.finish_backtest_run(run_id, "error", summary, "")
+      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e))
     raise _backtest_failure_response(e, run_id)
   except ValueError as e:
     logger.exception("同步回测任务失败: %s", run_id)
     if run_id is not None:
       summary = _backtest_error_summary(e, run_id)
-      state_store.finish_backtest_run(run_id, "error", summary, "")
+      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e))
     raise _backtest_failure_response(e, run_id)
   except Exception as e:
     logger.exception("同步回测任务失败: %s", run_id)
     if run_id is not None:
       summary = _backtest_error_summary(e, run_id)
-      state_store.finish_backtest_run(run_id, "error", summary, "")
+      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e))
     raise _backtest_failure_response(e, run_id)
 
 

@@ -65,6 +65,6 @@ compose=(docker compose --env-file "$env_file" -f "$compose_file" -f "$clickhous
 "${compose[@]}" up -d postgres
 wait_for_postgres
 "${compose[@]}" --profile migration run --rm migrate
-"${compose[@]}" up -d --build strategy-worker backend frontend
+"${compose[@]}" up -d --build strategy-worker backend l2-runner frontend
 "${compose[@]}" ps
 wait_for_application "$(read_http_port)"

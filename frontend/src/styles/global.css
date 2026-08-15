@@ -1286,3 +1286,346 @@ button, input, select, textarea {
     margin-left: 0;
   }
 }
+
+.strategy-guide-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  color: #334155;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 8px 10px;
+}
+
+.strategy-guide-trigger:hover {
+  border-color: #0f766e;
+  color: #0f766e;
+}
+
+.strategy-guide-backdrop {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(15, 23, 42, 0.36);
+}
+
+.strategy-guide-drawer {
+  display: flex;
+  width: min(960px, calc(100vw - 28px));
+  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+  background: #fff;
+  box-shadow: -18px 0 48px rgba(15, 23, 42, 0.2);
+}
+
+.strategy-guide-drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  border-bottom: 1px solid #e2e8f0;
+  padding: 22px 28px 18px;
+}
+
+.strategy-guide-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #0f766e;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.strategy-guide-drawer-header h2 {
+  margin: 5px 0 4px;
+  color: #0f172a;
+  font-size: 21px;
+}
+
+.strategy-guide-drawer-header p {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.strategy-guide-close {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #475569;
+  cursor: pointer;
+}
+
+.strategy-guide-close:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+
+.strategy-guide-layout {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  grid-template-columns: 194px minmax(0, 1fr);
+}
+
+.strategy-guide-toc {
+  overflow-y: auto;
+  border-right: 1px solid #e2e8f0;
+  background: #f8fafc;
+  padding: 18px 12px;
+}
+
+.strategy-guide-toc button {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 3px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #475569;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 7px 6px;
+  text-align: left;
+  text-decoration: none;
+}
+
+.strategy-guide-toc button:hover {
+  background: #e2e8f0;
+  color: #0f766e;
+}
+
+.strategy-guide-scroll {
+  overflow-y: auto;
+  scroll-behavior: smooth;
+}
+
+.strategy-guide-content {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 30px 34px 48px;
+  color: #334155;
+  font-size: 14px;
+  line-height: 1.72;
+}
+
+.strategy-guide-heading {
+  color: #0f172a;
+  scroll-margin-top: 18px;
+}
+
+.strategy-guide-heading.level-1 {
+  margin: 0 0 16px;
+  font-size: 26px;
+}
+
+.strategy-guide-heading.level-2 {
+  margin: 34px 0 12px;
+  border-bottom: 1px solid #e2e8f0;
+  font-size: 18px;
+  padding-bottom: 8px;
+}
+
+.strategy-guide-heading.level-3 {
+  margin: 22px 0 8px;
+  font-size: 15px;
+}
+
+.strategy-guide-paragraph {
+  margin: 10px 0;
+}
+
+.strategy-guide-quote {
+  margin: 14px 0;
+  border-left: 3px solid #14b8a6;
+  background: #f0fdfa;
+  color: #134e4a;
+  padding: 9px 12px;
+}
+
+.strategy-guide-list {
+  margin: 10px 0;
+  padding-left: 22px;
+}
+
+.strategy-guide-list li + li {
+  margin-top: 4px;
+}
+
+.strategy-guide-code {
+  margin: 16px 0;
+  overflow: hidden;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  background: #0f172a;
+}
+
+.strategy-guide-code-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #334155;
+  color: #cbd5e1;
+  font-size: 12px;
+  padding: 8px 10px;
+}
+
+.strategy-guide-code-actions > div {
+  display: flex;
+  gap: 6px;
+}
+
+.strategy-guide-code-actions button,
+.strategy-guide-state button {
+  border: 1px solid #475569;
+  border-radius: 5px;
+  background: #1e293b;
+  color: #e2e8f0;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+.strategy-guide-code-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.strategy-guide-code-actions button:hover {
+  background: #334155;
+}
+
+.strategy-guide-code-actions button.is-primary {
+  border-color: #0f766e;
+  background: #0f766e;
+  color: #fff;
+}
+
+.strategy-guide-code pre {
+  overflow-x: auto;
+  margin: 0;
+  color: #e2e8f0;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 14px;
+}
+
+.strategy-guide-copy-error {
+  margin: 0;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 12px;
+  padding: 6px 10px;
+}
+
+.strategy-guide-table-wrap {
+  overflow-x: auto;
+  margin: 16px 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+}
+
+.strategy-guide-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.strategy-guide-table th,
+.strategy-guide-table td {
+  border-bottom: 1px solid #e2e8f0;
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.strategy-guide-table th {
+  background: #f8fafc;
+  color: #0f172a;
+  font-weight: 600;
+}
+
+.strategy-guide-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.strategy-guide-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 220px;
+  color: #64748b;
+  padding: 28px;
+}
+
+.strategy-guide-state.is-error {
+  flex-direction: column;
+  color: #b91c1c;
+}
+
+.strategy-guide-state.is-error span {
+  color: #64748b;
+  font-size: 13px;
+}
+
+.strategy-guide-state button {
+  border-color: #0f766e;
+  background: #0f766e;
+  color: #fff;
+}
+
+@media (max-width: 680px) {
+  .strategy-guide-drawer {
+    width: 100%;
+  }
+
+  .strategy-guide-drawer-header {
+    padding: 18px 18px 14px;
+  }
+
+  .strategy-guide-layout {
+    display: block;
+    overflow-y: auto;
+  }
+
+  .strategy-guide-toc {
+    display: flex;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: 0;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 8px 12px;
+  }
+
+  .strategy-guide-toc button {
+    width: auto;
+    min-width: max-content;
+  }
+
+  .strategy-guide-scroll {
+    overflow-y: visible;
+  }
+
+  .strategy-guide-content {
+    padding: 22px 18px 36px;
+  }
+}
