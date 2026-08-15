@@ -3,6 +3,18 @@
 
 import os
 
+
+def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+  raw = os.getenv(name, str(default))
+  try:
+    value = int(raw)
+  except ValueError as error:
+    raise ValueError(f"{name} 必须是整数") from error
+  if not minimum <= value <= maximum:
+    raise ValueError(f"{name} 必须在 {minimum} 至 {maximum} 之间")
+  return value
+
+
 # K 线数据根目录。各周期位于 {KLINE_ROOT}/{timeframe}/{symbol}/ 下。
 KLINE_ROOT = os.getenv("TREND_GRID_KLINE_ROOT", "./runtime/kline")
 
@@ -47,7 +59,7 @@ L2_TEMP_MAPPING_VERSION = os.getenv("TREND_GRID_L2_TEMP_MAPPING_VERSION", "tick_
 L2_JOB_LEASE_SECONDS = int(os.getenv("TREND_GRID_L2_JOB_LEASE_SECONDS", "90"))
 L2_RUNNER_POLL_SECONDS = float(os.getenv("TREND_GRID_L2_RUNNER_POLL_SECONDS", "2"))
 L2_PAGE_SIZE = int(os.getenv("TREND_GRID_L2_PAGE_SIZE", "2000"))
-L2_QUOTE_PREFETCH_SIZE = int(os.getenv("TREND_GRID_L2_QUOTE_PREFETCH_SIZE", "16"))
+L2_QUOTE_PREFETCH_SIZE = _read_bounded_int("TREND_GRID_L2_QUOTE_PREFETCH_SIZE", 128, 16, 512)
 L2_WORKER_SESSION_LIMIT = int(os.getenv("TREND_GRID_L2_WORKER_SESSION_LIMIT", "2"))
 
 # 当前部署尚未配置 HTTPS，默认关闭 Secure 以保证同源 HTTP 登录可用。

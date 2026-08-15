@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import time
+from collections import deque
 from dataclasses import asdict
 from datetime import datetime
 from itertools import chain
@@ -226,11 +227,16 @@ def _replay_day(
     quote_cursor = quote.time
 
   if bool(demand.get("dayEndQuoteRequired")):
-    started = time.perf_counter()
-    final_quote = quote_provider.last_quote_before(symbol, trade_date, session_end)
-    performance["quoteQueries"] += 1
-    performance["sourceReadMs"] += _elapsed_ms(started)
-    if final_quote is not None and final_quote.time != quote_cursor:
+    final_quote = quote_buffer.last_before(session_end)
+    if final_quote is None:
+      started = time.perf_counter()
+      final_quote = quote_provider.last_quote_before(symbol, trade_date, session_end)
+      performance["quoteQueries"] += 1
+      performance["quoteBufferMisses"] += 1
+      performance["sourceReadMs"] += _elapsed_ms(started)
+    else:
+      performance["quoteBufferHits"] += 1
+    if final_quote is not None and (quote_cursor is None or parse_timestamp(final_quote.time) > parse_timestamp(quote_cursor)):
       demand = _process_quote(session_id, final_quote, trade_date, job, performance)
       quote_cursor = final_quote.time
   strategy_worker.finish_l2_day(session_id, trade_date)
@@ -287,7 +293,7 @@ def _continuous_stream_chunks(
 
 
 class _QuotePrefetchBuffer:
-  """只在有待成交订单时预取当前 Bar 内的连续竞价快照。"""
+  """只在有待成交订单时预取有界的后续连续竞价快照。"""
 
   def __init__(
     self,
@@ -300,30 +306,41 @@ class _QuotePrefetchBuffer:
     self._symbol = symbol
     self._trade_date = trade_date
     self._performance = performance
-    self._quotes: list[QuoteSnapshot] = []
+    self._quotes: deque[QuoteSnapshot] = deque()
 
   def next(self, quote_cursor: str | None, demand: dict[str, Any], before_time: str) -> QuoteSnapshot | None:
     after_time = _later_timestamp(quote_cursor, _required_timestamp(demand))
     self._discard_before(after_time)
+    reused_buffer = bool(self._quotes)
     if not self._quotes:
-      self._prefetch(after_time, before_time)
+      self._prefetch(after_time)
     if not self._quotes or parse_timestamp(self._quotes[0].time) >= parse_timestamp(before_time):
       return None
-    return self._quotes.pop(0)
+    if reused_buffer:
+      self._performance["quoteBufferHits"] += 1
+    return self._quotes.popleft()
+
+  def last_before(self, before_time: str) -> QuoteSnapshot | None:
+    for quote in reversed(self._quotes):
+      if parse_timestamp(quote.time) < parse_timestamp(before_time):
+        return quote
+    return None
 
   def _discard_before(self, after_time: str) -> None:
     while self._quotes and parse_timestamp(self._quotes[0].time) <= parse_timestamp(after_time):
-      self._quotes.pop(0)
+      self._quotes.popleft()
 
-  def _prefetch(self, after_time: str, before_time: str) -> None:
+  def _prefetch(self, after_time: str) -> None:
     started = time.perf_counter()
     quotes = self._quote_provider.quotes_after(
-      self._symbol, self._trade_date, after_time, before_time, settings.L2_QUOTE_PREFETCH_SIZE,
+      self._symbol, self._trade_date, after_time, None, settings.L2_QUOTE_PREFETCH_SIZE,
     )
     self._performance["quoteQueries"] += 1
+    self._performance["quoteBufferMisses"] += 1
     self._performance["quoteRowsPrefetched"] += len(quotes)
     self._performance["sourceReadMs"] += _elapsed_ms(started)
     self._quotes.extend(quotes)
+    self._performance["maxQuoteBufferRows"] = max(self._performance["maxQuoteBufferRows"], len(self._quotes))
 
 
 def _process_quote(
@@ -372,6 +389,9 @@ def _new_performance(quote_mode: str = "order_driven") -> dict[str, Any]:
     "quotesFetched": 0,
     "quoteRowsPrefetched": 0,
     "quoteQueries": 0,
+    "quoteBufferHits": 0,
+    "quoteBufferMisses": 0,
+    "maxQuoteBufferRows": 0,
     "workerCalls": 0,
     "chunkCount": 0,
     "quoteReadBatches": 0,
