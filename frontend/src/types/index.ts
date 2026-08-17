@@ -86,6 +86,7 @@ export interface BacktestChartResponse {
   symbol: string;
   timeframe: string;
   date: string;
+  strategyCategory: 'core_position_overlay' | 'directional_holding';
   bars: BarData[];
   trades: BacktestChartTrade[];
 }

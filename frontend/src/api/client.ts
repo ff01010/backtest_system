@@ -55,6 +55,10 @@ export async function fetchHealth(): Promise<{ status: string }> {
   return fetchJson(`${BASE}/health`);
 }
 
+export async function fetchStrategyGuide(): Promise<{ title: string; content: string }> {
+  return fetchJson(`${BASE}/strategy-guide`);
+}
+
 export interface SessionUser {
   id: string;
   username: string;
@@ -66,6 +70,24 @@ export interface ManagedUser extends SessionUser {
   status: 'active' | 'disabled';
   createdAt: string;
   lastLoginAt: string | null;
+}
+
+export interface SystemErrorLogEntry {
+  id: number;
+  runId: string;
+  displayNo: number;
+  userId: string;
+  username: string;
+  displayName: string;
+  symbol: string;
+  timeframe: string;
+  source: string;
+  stage: string;
+  code: string;
+  reason: string;
+  exceptionType: string;
+  context: Record<string, string>;
+  occurredAt: string;
 }
 
 export async function login(username: string, password: string): Promise<SessionUser> {
@@ -99,6 +121,21 @@ export async function updateUser(userId: string, payload: { displayName: string;
 
 export async function resetUserPassword(userId: string, password: string): Promise<void> {
   await sendJson<{ ok: boolean }>(`${BASE}/admin/users/${userId}/reset-password`, 'POST', { password });
+}
+
+export async function fetchSystemErrorLogs(filters: {
+  userId?: string;
+  runId?: string;
+  errorCode?: string;
+  fromTime?: string;
+  toTime?: string;
+} = {}): Promise<SystemErrorLogEntry[]> {
+  const search = new URLSearchParams({ limit: '100' });
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value) search.set(key, value);
+  });
+  const data = await fetchJson<{ items: SystemErrorLogEntry[] }>(`${BASE}/admin/system-errors?${search}`);
+  return data.items;
 }
 
 export async function fetchInstruments(): Promise<InstrumentItem[]> {

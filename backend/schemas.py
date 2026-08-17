@@ -252,6 +252,7 @@ class BacktestChartResponse(BaseModel):
   symbol: str
   timeframe: str
   date: str
+  strategyCategory: Literal["core_position_overlay", "directional_holding"]
   bars: list[dict[str, float | str | int]]
   trades: list[BacktestChartTrade]
 

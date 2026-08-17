@@ -16,6 +16,7 @@ from psycopg.rows import dict_row
 from backend import settings
 from backend.services import state_store
 from backend.services.user_context import CurrentUser
+from backend.time_utils import format_shanghai_datetime
 
 
 SESSION_COOKIE = "quant_backtest_session"
@@ -84,8 +85,8 @@ def _normalize_user(row: dict[str, Any]) -> dict[str, Any]:
     "displayName": row["display_name"],
     "role": row["role"],
     "status": row["status"],
-    "createdAt": row["created_at"].strftime("%Y-%m-%d %H:%M:%S"),
-    "lastLoginAt": row["last_login_at"].strftime("%Y-%m-%d %H:%M:%S") if row["last_login_at"] else None,
+    "createdAt": format_shanghai_datetime(row["created_at"]),
+    "lastLoginAt": format_shanghai_datetime(row["last_login_at"]) or None,
   }
 
 
