@@ -11,7 +11,6 @@ if _viewer_dir not in sys.path:
 
 import csv
 import re
-import time
 from typing import Any
 
 import pandas as pd
@@ -19,6 +18,7 @@ import pandas as pd
 from backend.services import market_data, signal_parser, time_mapper, zigzag_detector
 from backend import settings
 from backend.date_codec import format_api_date, format_legacy_date
+from backend.time_utils import format_epoch_as_shanghai
 
 
 def list_instruments() -> list[dict[str, Any]]:
@@ -389,6 +389,6 @@ def _format_mtime(filepath: str) -> str | None:
   """返回文件的 ISO 修改时间"""
   try:
     mtime = os.path.getmtime(filepath)
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(mtime))
+    return format_epoch_as_shanghai(mtime).replace(" ", "T")
   except OSError:
     return None

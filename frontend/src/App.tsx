@@ -4,6 +4,7 @@ import KlineChart from './components/KlineChart';
 import StatusBar from './components/StatusBar';
 import BacktestPage from './components/BacktestPage';
 import LoginPage from './components/LoginPage';
+import SystemErrorLogPage from './components/SystemErrorLogPage';
 import UserManagementPage from './components/UserManagementPage';
 import {
   fetchBacktestRunChart,
@@ -20,7 +21,7 @@ import type { BacktestChartResponse, ChartResponse, DateItem, DisplayModule, Dis
 import { typography } from './styles/typography';
 
 function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogout: () => void }) {
-  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'users'>('backtest');
+  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'users' | 'systemErrors'>('backtest');
   const [urlParams, setUrlParams] = useUrlState();
 
   const [instruments, setInstruments] = useState<InstrumentItem[]>([]);
@@ -135,6 +136,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
           { key: 'backtest' as const, label: '策略回测' },
           { key: 'signals' as const, label: '信号可视化' },
           ...(currentUser.role === 'admin' ? [{ key: 'users' as const, label: '人员管理' }] : []),
+          ...(currentUser.role === 'admin' ? [{ key: 'systemErrors' as const, label: '系统错误日志' }] : []),
         ].map((item) => {
           const active = activePage === item.key;
           return (
@@ -197,6 +199,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
                   markerSize="normal"
                   backtestTrades={urlParams.runId ? backtestChart?.trades ?? [] : undefined}
                   backtestDisplayNo={backtestChart?.displayNo}
+                  backtestStrategyCategory={backtestChart?.strategyCategory}
                 />
             </div>
           </div>
@@ -221,6 +224,10 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
 
       {activePage === 'users' && (
         <UserManagementPage />
+      )}
+
+      {activePage === 'systemErrors' && (
+        <SystemErrorLogPage />
       )}
     </div>
   );

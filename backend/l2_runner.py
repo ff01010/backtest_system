@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import time
+from collections import deque
 from dataclasses import asdict
 from datetime import datetime
 from itertools import chain
@@ -17,8 +18,9 @@ from backend.l2.config import has_profile, load_profile, load_temporary_quote_pr
 from backend.l2.models import NormalizedBar, QuoteSnapshot, TradeEvent, parse_timestamp
 from backend.l2.providers import ClickHouseL2Adapter, L2DataError, RedisJsonCache, TemporaryQuoteBarProvider, VersionedBarCache
 from backend.l2.result_adapter import normalize_l2_result
-from backend.services.backtest_errors import error_summary
+from backend.services.backtest_errors import error_detail, error_summary
 from backend.services import state_store, strategy_worker
+from backend.services.system_error_log import system_error_log_record
 from backend.strategies.scripted import quote_mode_for_script
 
 logger = logging.getLogger(__name__)
@@ -50,17 +52,21 @@ class L2Runner:
   def _run_job(self, job: dict[str, Any]) -> None:
     session_id: str | None = None
     completed = False
+    stage = "l2.initialize"
     try:
       started_at = time.perf_counter()
       payload = dict(job["payload"])
       bar_provider = self._bar_provider()
       quote_provider = ClickHouseL2Adapter(load_profile("quote") if has_profile("quote") else load_temporary_quote_profile())
       bar_read_started = time.perf_counter()
+      stage = "l2.bar_load"
       bars = bar_provider.load_bars(payload["symbol"], payload["timeframe"], payload["startDate"], payload["endDate"])
+      stage = "l2.strategy_session"
       session_id = strategy_worker.create_l2_session(self._session_payload(payload))
       quote_mode = _quote_mode(payload)
       performance = _new_performance(quote_mode)
       performance["barReadMs"] = _elapsed_ms(bar_read_started)
+      stage = "l2.market_replay"
       for trade_date, day_bars in _bars_by_day(bars).items():
         if quote_mode == "continuous":
           _replay_day_continuous(
@@ -72,6 +78,7 @@ class L2Runner:
             session_id, day_bars, quote_provider, payload["symbol"], trade_date,
             job, performance,
           )
+      stage = "l2.result_finalize"
       raw_result = strategy_worker.finish_l2_session(session_id)
       session_id = None
       raw_result["dataSnapshot"] = _data_snapshot(bar_provider, quote_provider, payload, quote_mode)
@@ -85,8 +92,13 @@ class L2Runner:
     except Exception as error:
       logger.exception("L2 回测任务失败: %s", job["runId"])
       status = "cancelled" if "租约丢失或已取消" in str(error) else "failed"
+      system_error = None
+      if status == "failed" and error_detail(error, job["runId"]).category == "system_error":
+        system_error = system_error_log_record(error, "l2_runner", stage)
       state_store.finish_l2_backtest_job(
         job["runId"], job["attemptToken"], status, error_summary(error, job["runId"]),
+        system_error=system_error.to_dict() if system_error else None,
+        owner_user_id=job["ownerUserId"],
       )
     finally:
       if session_id is not None:
@@ -215,11 +227,16 @@ def _replay_day(
     quote_cursor = quote.time
 
   if bool(demand.get("dayEndQuoteRequired")):
-    started = time.perf_counter()
-    final_quote = quote_provider.last_quote_before(symbol, trade_date, session_end)
-    performance["quoteQueries"] += 1
-    performance["sourceReadMs"] += _elapsed_ms(started)
-    if final_quote is not None and final_quote.time != quote_cursor:
+    final_quote = quote_buffer.last_before(session_end)
+    if final_quote is None:
+      started = time.perf_counter()
+      final_quote = quote_provider.last_quote_before(symbol, trade_date, session_end)
+      performance["quoteQueries"] += 1
+      performance["quoteBufferMisses"] += 1
+      performance["sourceReadMs"] += _elapsed_ms(started)
+    else:
+      performance["quoteBufferHits"] += 1
+    if final_quote is not None and (quote_cursor is None or parse_timestamp(final_quote.time) > parse_timestamp(quote_cursor)):
       demand = _process_quote(session_id, final_quote, trade_date, job, performance)
       quote_cursor = final_quote.time
   strategy_worker.finish_l2_day(session_id, trade_date)
@@ -276,7 +293,7 @@ def _continuous_stream_chunks(
 
 
 class _QuotePrefetchBuffer:
-  """只在有待成交订单时预取当前 Bar 内的连续竞价快照。"""
+  """只在有待成交订单时预取有界的后续连续竞价快照。"""
 
   def __init__(
     self,
@@ -289,30 +306,41 @@ class _QuotePrefetchBuffer:
     self._symbol = symbol
     self._trade_date = trade_date
     self._performance = performance
-    self._quotes: list[QuoteSnapshot] = []
+    self._quotes: deque[QuoteSnapshot] = deque()
 
   def next(self, quote_cursor: str | None, demand: dict[str, Any], before_time: str) -> QuoteSnapshot | None:
     after_time = _later_timestamp(quote_cursor, _required_timestamp(demand))
     self._discard_before(after_time)
+    reused_buffer = bool(self._quotes)
     if not self._quotes:
-      self._prefetch(after_time, before_time)
+      self._prefetch(after_time)
     if not self._quotes or parse_timestamp(self._quotes[0].time) >= parse_timestamp(before_time):
       return None
-    return self._quotes.pop(0)
+    if reused_buffer:
+      self._performance["quoteBufferHits"] += 1
+    return self._quotes.popleft()
+
+  def last_before(self, before_time: str) -> QuoteSnapshot | None:
+    for quote in reversed(self._quotes):
+      if parse_timestamp(quote.time) < parse_timestamp(before_time):
+        return quote
+    return None
 
   def _discard_before(self, after_time: str) -> None:
     while self._quotes and parse_timestamp(self._quotes[0].time) <= parse_timestamp(after_time):
-      self._quotes.pop(0)
+      self._quotes.popleft()
 
-  def _prefetch(self, after_time: str, before_time: str) -> None:
+  def _prefetch(self, after_time: str) -> None:
     started = time.perf_counter()
     quotes = self._quote_provider.quotes_after(
-      self._symbol, self._trade_date, after_time, before_time, settings.L2_QUOTE_PREFETCH_SIZE,
+      self._symbol, self._trade_date, after_time, None, settings.L2_QUOTE_PREFETCH_SIZE,
     )
     self._performance["quoteQueries"] += 1
+    self._performance["quoteBufferMisses"] += 1
     self._performance["quoteRowsPrefetched"] += len(quotes)
     self._performance["sourceReadMs"] += _elapsed_ms(started)
     self._quotes.extend(quotes)
+    self._performance["maxQuoteBufferRows"] = max(self._performance["maxQuoteBufferRows"], len(self._quotes))
 
 
 def _process_quote(
@@ -361,6 +389,9 @@ def _new_performance(quote_mode: str = "order_driven") -> dict[str, Any]:
     "quotesFetched": 0,
     "quoteRowsPrefetched": 0,
     "quoteQueries": 0,
+    "quoteBufferHits": 0,
+    "quoteBufferMisses": 0,
+    "maxQuoteBufferRows": 0,
     "workerCalls": 0,
     "chunkCount": 0,
     "quoteReadBatches": 0,

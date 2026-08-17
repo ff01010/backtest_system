@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
@@ -248,6 +248,23 @@ def test_temporary_quote_profile_scales_only_depth_prices() -> None:
   assert quote.last_price == 30.9
   assert quote.bids[0].price == pytest.approx(30.87)
   assert quote.asks[0].price == pytest.approx(30.97)
+
+
+def test_temporary_quote_profile_adapts_depth_prices_already_in_yuan() -> None:
+  adapter = ClickHouseL2Adapter(load_temporary_quote_profile())
+  row = {
+    "symbol": "688981.SH", "trade_date": "2026-07-06", "time": "2026-07-06 10:15:03",
+    "last_price": 139.8,
+    **{f"bid_price_{index}": 139.8 for index in range(1, 11)},
+    **{f"bid_volume_{index}": 100 for index in range(1, 11)},
+    **{f"ask_price_{index}": 139.81 for index in range(1, 11)},
+    **{f"ask_volume_{index}": 100 for index in range(1, 11)},
+  }
+
+  quote = adapter._quote_from_row(row, 1)
+
+  assert quote.bids[0].price == pytest.approx(139.8)
+  assert quote.asks[0].price == pytest.approx(139.81)
 
 
 def test_quote_adapter_treats_zero_price_levels_as_empty_side() -> None:
@@ -496,7 +513,7 @@ def test_order_driven_runner_queries_quote_only_after_order(monkeypatch: pytest.
     def __init__(self) -> None:
       self.calls: list[tuple[str, str, int]] = []
 
-    def quotes_after(self, symbol: str, trade_date: str, after_time: str, before_time: str, limit: int):
+    def quotes_after(self, symbol: str, trade_date: str, after_time: str, before_time: str | None, limit: int):
       self.calls.append((after_time, before_time, limit))
       return [_quote("2026-01-02 09:31:03")] if len(self.calls) == 1 else []
 
@@ -525,9 +542,64 @@ def test_order_driven_runner_queries_quote_only_after_order(monkeypatch: pytest.
   performance = _new_performance()
   _replay_day("session", [_bar()], provider, "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
 
-  assert provider.calls == [("2026-01-02 09:31:00", "2026-01-02 14:57:00", 16)]
+  assert provider.calls == [("2026-01-02 09:31:00", None, 128)]
   assert performance["quotesFetched"] == 1
   assert performance["quoteRowsPrefetched"] == 1
+
+
+def test_order_driven_runner_reuses_future_quote_buffer_without_forward_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
+  class QuoteProvider:
+    def __init__(self) -> None:
+      self.calls: list[tuple[str, str | None, int]] = []
+
+    def quotes_after(self, symbol: str, trade_date: str, after_time: str, before_time: str | None, limit: int):
+      self.calls.append((after_time, before_time, limit))
+      return [_quote("2026-01-02 09:31:03"), _quote("2026-01-02 09:32:03")]
+
+    def last_quote_before(self, *args: Any, **kwargs: Any):
+      return None
+
+  provider = QuoteProvider()
+  second_bar = replace(_bar(), start_time="2026-01-02 09:31:00", end_time="2026-01-02 09:32:00")
+  events: list[str] = []
+  bar_calls = 0
+
+  def process_bars(_: str, payload: dict[str, Any]) -> dict[str, Any]:
+    nonlocal bar_calls
+    bar = payload["bars"][0]
+    events.append(f"bar:{bar['end_time']}")
+    bar_calls += 1
+    return {
+      "processedBars": 1,
+      "quoteDemand": "waiting_quote",
+      "nextQuoteAfter": bar["end_time"],
+      "dayEndQuoteRequired": False,
+    }
+
+  def process_quote(_: str, payload: dict[str, Any]) -> dict[str, Any]:
+    events.append(f"quote:{payload['quote']['time']}")
+    return {"quoteDemand": "idle", "dayEndQuoteRequired": False}
+
+  monkeypatch.setattr("backend.l2_runner.strategy_worker.begin_l2_day", lambda *args: None)
+  monkeypatch.setattr("backend.l2_runner.strategy_worker.process_l2_bars", process_bars)
+  monkeypatch.setattr("backend.l2_runner.strategy_worker.process_l2_quote", process_quote)
+  monkeypatch.setattr("backend.l2_runner.strategy_worker.finish_l2_day", lambda *args: None)
+  monkeypatch.setattr("backend.l2_runner.state_store.heartbeat_l2_backtest_job", lambda *args: True)
+
+  performance = _new_performance()
+  _replay_day("session", [_bar(), second_bar], provider, "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
+
+  assert bar_calls == 2
+  assert events == [
+    "bar:2026-01-02 09:31:00",
+    "quote:2026-01-02 09:31:03",
+    "bar:2026-01-02 09:32:00",
+    "quote:2026-01-02 09:32:03",
+  ]
+  assert provider.calls == [("2026-01-02 09:31:00", None, 128)]
+  assert performance["quoteQueries"] == 1
+  assert performance["quoteBufferHits"] == 1
+  assert performance["maxQuoteBufferRows"] == 2
 
 
 @pytest.mark.parametrize(("value", "expected"), [("2026-01-02", "2026-01-02"), ("20260102", "2026-01-02")])

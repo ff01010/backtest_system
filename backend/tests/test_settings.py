@@ -40,6 +40,16 @@ def test_backtest_timeframes_are_explicit() -> None:
   assert not settings.validate_backtest_timeframe("2m")
 
 
+def test_quote_prefetch_size_has_safe_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setenv("TEST_L2_PREFETCH_SIZE", "128")
+
+  assert settings._read_bounded_int("TEST_L2_PREFETCH_SIZE", 16, 16, 512) == 128
+
+  monkeypatch.setenv("TEST_L2_PREFETCH_SIZE", "513")
+  with pytest.raises(ValueError, match="16 至 512"):
+    settings._read_bounded_int("TEST_L2_PREFETCH_SIZE", 16, 16, 512)
+
+
 def test_l2_strategy_config_accepts_derived_l2_timeframe() -> None:
   app._validate_strategy_config_timeframe({
     "timeframe": "3m",

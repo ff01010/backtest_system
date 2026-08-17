@@ -35,6 +35,19 @@ read_http_port() {
   echo "$port"
 }
 
+validate_clickhouse_network() {
+  local clickhouse_url
+  clickhouse_url="$(grep -E '^TREND_GRID_CLICKHOUSE_HTTP_URL=' "$env_file" | tail -n 1 | cut -d= -f2- || true)"
+  clickhouse_url="${clickhouse_url//[[:space:]]/}"
+  [[ "$clickhouse_url" == "http://quant-clickhouse:8123" ]] || fail "deploy/.env 中的 TREND_GRID_CLICKHOUSE_HTTP_URL 必须为 http://quant-clickhouse:8123"
+  docker network inspect quant-net >/dev/null 2>&1 || fail "缺少 ClickHouse Docker 网络：quant-net"
+}
+
+verify_clickhouse_connectivity() {
+  docker exec quant-backtest-l2-runner python -c "import urllib.request; response = urllib.request.urlopen('http://quant-clickhouse:8123/ping', timeout=5); assert response.read().strip() == b'Ok.'" \
+    || fail "l2-runner 无法通过 quant-clickhouse:8123 连接 ClickHouse"
+}
+
 wait_for_application() {
   local port="$1" attempt health_url
   health_url="http://127.0.0.1:${port}/api/health"
@@ -62,9 +75,12 @@ git fetch origin main
 git pull --ff-only origin main
 
 compose=(docker compose --env-file "$env_file" -f "$compose_file" -f "$clickhouse_compose_file")
+validate_clickhouse_network
+"${compose[@]}" config >/dev/null || fail "Docker Compose 配置校验失败"
 "${compose[@]}" up -d postgres
 wait_for_postgres
 "${compose[@]}" --profile migration run --rm migrate
-"${compose[@]}" up -d --build strategy-worker backend frontend
+"${compose[@]}" up -d --build strategy-worker backend l2-runner frontend
+verify_clickhouse_connectivity
 "${compose[@]}" ps
 wait_for_application "$(read_http_port)"

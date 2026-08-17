@@ -1,4 +1,5 @@
 import {
+  BookOpen,
   Code2,
   Database,
   FileSliders,
@@ -52,6 +53,7 @@ import type {
 import { typography } from '../styles/typography';
 import BacktestTabs from './BacktestTabs';
 import InstrumentSearchField from './InstrumentSearchField';
+import StrategyGuideDrawer from './StrategyGuideDrawer';
 
 interface Props {
   symbol: string;
@@ -905,6 +907,7 @@ export default function BacktestPage({
   const [publishedFingerprint, setPublishedFingerprint] = useState('');
   const [configName, setConfigName] = useState('');
   const [scriptForm, setScriptForm] = useState(createEmptyScriptForm());
+  const [strategyGuideOpen, setStrategyGuideOpen] = useState(false);
   const hasSelectedScript = hasSavedStrategyId(selectedScriptId);
   const hasSelectedConfig = hasSavedStrategyId(selectedConfigId);
   const [activePanel, setActivePanel] = useState<WorkbenchPanel>('overview');
@@ -1300,6 +1303,13 @@ export default function BacktestPage({
 
   const updateScriptForm = (changes: Partial<typeof scriptForm>) => {
     setScriptForm((prev) => ({ ...prev, ...changes }));
+  };
+
+  const handleUseStrategyGuideExample = (code: string) => {
+    if (!window.confirm('写入示例会覆盖当前未保存的策略代码，是否继续？')) return;
+    updateScriptForm({ code });
+    setStatus('已将指南示例写入编辑器，请检查并保存后再运行回测');
+    setError('');
   };
 
   const setVersionTimeframe = (timeframe: string) => {
@@ -2815,6 +2825,16 @@ export default function BacktestPage({
                           : (strategySource ? `代码指纹：${strategySource.codeHash.slice(0, 12)}` : '正在读取代码快照')}
                       </div>
                     </div>
+                    {selectedStrategy === 'user_script' && (
+                      <button
+                        className="strategy-guide-trigger"
+                        onClick={() => setStrategyGuideOpen(true)}
+                        type="button"
+                      >
+                        <BookOpen size={15} />
+                        策略编写指南
+                      </button>
+                    )}
                   </div>
                   {selectedStrategy === 'user_script' ? (
                     <div className="strategy-editor-body" style={{ display: 'grid', gridTemplateRows: 'auto auto minmax(0, 1fr) auto', gap: 10, minHeight: 0 }}>
@@ -2862,6 +2882,11 @@ export default function BacktestPage({
                     />
                   )}
                 </section>
+                <StrategyGuideDrawer
+                  open={strategyGuideOpen}
+                  onClose={() => setStrategyGuideOpen(false)}
+                  onUseExample={handleUseStrategyGuideExample}
+                />
 
                 <section className="strategy-config-panel" style={{
                   ...panelStyle,

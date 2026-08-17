@@ -15,6 +15,7 @@ from psycopg.types.json import Jsonb
 
 from backend import settings
 from backend.services.user_context import get_current_user
+from backend.time_utils import format_shanghai_datetime
 
 
 class DatabaseError(RuntimeError):
@@ -79,7 +80,7 @@ def _to_float(value: Any) -> float | None:
 
 
 def _format_time(value: Any) -> str:
-  return value.strftime("%Y-%m-%d %H:%M:%S") if value else ""
+  return format_shanghai_datetime(value) if value else ""
 
 
 def _json(value: Any, fallback: Any) -> Any:
@@ -98,18 +99,19 @@ def _symbol_parts(symbol: str) -> tuple[str, str, str]:
 
 def _instrument_id(cur: Any, symbol: str, name: str = "") -> int:
   code, exchange, secid = _symbol_parts(symbol)
+  normalized_name = name.strip()
   cur.execute("""
     INSERT INTO market_instrument (
       symbol, exchange, display_name, instrument_type, board, eastmoney_secid
     ) VALUES (%s, %s, %s, 'stock', 'unknown', %s)
     ON CONFLICT (exchange, symbol) DO UPDATE
       SET display_name = CASE
-        WHEN EXCLUDED.display_name <> '' THEN EXCLUDED.display_name
+        WHEN %s <> '' THEN EXCLUDED.display_name
         ELSE market_instrument.display_name
       END,
       updated_at = now()
     RETURNING id
-  """, (code, exchange, name or symbol, secid))
+  """, (code, exchange, normalized_name or symbol, secid, normalized_name))
   return int(cur.fetchone()["id"])
 
 
@@ -772,6 +774,8 @@ def finish_l2_backtest_job(
   status: str,
   summary: dict[str, Any],
   result: dict[str, Any] | None = None,
+  system_error: dict[str, Any] | None = None,
+  owner_user_id: str | None = None,
 ) -> bool:
   """按尝试令牌提交终态，旧 runner 无法覆盖新的运行结果。"""
   if status not in {"succeeded", "failed", "cancelled"}:
@@ -792,6 +796,8 @@ def finish_l2_backtest_job(
         WHERE id=%s
       """, (status, Jsonb(summary), Jsonb(result) if result else None,
              summary.get("error") if status != "succeeded" else None, run_id))
+      if status == "failed" and system_error and owner_user_id:
+        _insert_system_error(cur, run_id, owner_user_id, system_error)
       return True
 
 
@@ -849,6 +855,45 @@ def get_backtest_run(run_id: str) -> dict[str, Any]:
       return _normalize_run(row)
 
 
+def list_system_error_logs(
+  limit: int = 100,
+  user_id: str | None = None,
+  run_id: str | None = None,
+  error_code: str | None = None,
+  from_time: str | None = None,
+  to_time: str | None = None,
+) -> list[dict[str, Any]]:
+  """仅管理员调用的跨用户系统错误列表。"""
+  clauses: list[str] = []
+  params: list[Any] = []
+  for value, clause in (
+    (user_id, "e.owner_user_id=%s"),
+    (run_id, "e.run_id=%s"),
+    (error_code, "e.error_code=%s"),
+    (from_time, "e.occurred_at >= %s::timestamptz"),
+    (to_time, "e.occurred_at <= %s::timestamptz"),
+  ):
+    if value:
+      clauses.append(clause)
+      params.append(value)
+  where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+  params.append(limit)
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(f"""
+        SELECT e.*, u.username, u.display_name, r.display_no,
+          i.symbol || '.' || i.exchange AS symbol, r.timeframe
+        FROM system_error_log e
+        JOIN app_user u ON u.id=e.owner_user_id
+        JOIN backtest_run r ON r.id=e.run_id
+        LEFT JOIN market_instrument i ON i.id=r.instrument_id
+        {where}
+        ORDER BY e.occurred_at DESC, e.id DESC
+        LIMIT %s
+      """, params)
+      return [_normalize_system_error(row) for row in cur.fetchall()]
+
+
 def update_backtest_run_meta(run_id: str, note: str, tags: list[str]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
@@ -858,7 +903,14 @@ def update_backtest_run_meta(run_id: str, note: str, tags: list[str]) -> dict[st
   return get_backtest_run(run_id)
 
 
-def finish_backtest_run(run_id: str, status: str, summary: dict[str, Any], output_dir: str, result: dict[str, Any] | None = None) -> None:
+def finish_backtest_run(
+  run_id: str,
+  status: str,
+  summary: dict[str, Any],
+  output_dir: str,
+  result: dict[str, Any] | None = None,
+  system_error: dict[str, Any] | None = None,
+) -> None:
   db_status = "succeeded" if status == "ok" else "failed"
   with _db() as conn:
     with conn.cursor() as cur:
@@ -870,3 +922,42 @@ def finish_backtest_run(run_id: str, status: str, summary: dict[str, Any], outpu
              summary.get("error") if status != "ok" else None, run_id, current_user_id()))
       if cur.rowcount == 0:
         raise KeyError(run_id)
+      if db_status == "failed" and system_error:
+        _insert_system_error(cur, run_id, current_user_id(), system_error)
+
+
+def _insert_system_error(
+  cur: Any,
+  run_id: str,
+  owner_user_id: str,
+  record: dict[str, Any],
+) -> None:
+  cur.execute("""
+    INSERT INTO system_error_log (
+      run_id, owner_user_id, source, stage, error_code, reason,
+      exception_type, context_json
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+  """, (
+    run_id, owner_user_id, record["source"], record["stage"], record["code"],
+    record["reason"], record["exception_type"], Jsonb(record["context"]),
+  ))
+
+
+def _normalize_system_error(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "id": int(row["id"]),
+    "runId": _uuid(row["run_id"]),
+    "displayNo": int(row["display_no"]),
+    "userId": _uuid(row["owner_user_id"]),
+    "username": row["username"],
+    "displayName": row["display_name"],
+    "symbol": row.get("symbol") or "",
+    "timeframe": row.get("timeframe") or "",
+    "source": row["source"],
+    "stage": row["stage"],
+    "code": row["error_code"],
+    "reason": row["reason"],
+    "exceptionType": row["exception_type"],
+    "context": _json(row.get("context_json"), {}),
+    "occurredAt": _format_time(row["occurred_at"]),
+  }
