@@ -52,6 +52,7 @@ def load_temporary_quote_profile() -> SourceMappingProfile:
       "last_price": "last_price",
       "volume": "volume",
       "amount": "amount",
+      "cum_amount": "cum_amount",
       **{f"bid_price_{index}": f"bid_price_{index}" for index in range(1, 11)},
       **{f"bid_volume_{index}": f"bid_vol_{index}" for index in range(1, 11)},
       **{f"ask_price_{index}": f"ask_price_{index}" for index in range(1, 11)},

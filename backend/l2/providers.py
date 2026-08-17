@@ -602,10 +602,11 @@ class TemporaryQuoteBarProvider:
       f"{column['trade_date']}={ClickHouseL2Adapter._literal(trade_date)}"
     )
     return f"""
-WITH source AS (
+WITH 4294967296.0 AS uint32_modulus,
+source AS (
   SELECT {column['symbol']} AS symbol, {column['trade_date']} AS trade_date,
     {column['time']} AS event_time, {column['last_price']} AS last_price,
-    {column['volume']} AS volume, {column['amount']} AS amount,
+    {column['volume']} AS volume, {column['amount']} AS amount, {column['cum_amount']} AS cum_amount,
     multiIf(
       {column['time']} >= {morning_start} AND {column['time']} < {morning_end}, {morning_start},
       {column['time']} >= {afternoon_start} AND {column['time']} < {afternoon_end}, {afternoon_start},
@@ -625,8 +626,28 @@ WITH source AS (
     lagInFrame(event_time, 1, event_time) OVER (
       PARTITION BY symbol, trade_date, session_start ORDER BY event_time
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS previous_time
+    ) AS previous_time,
+    lagInFrame(cum_amount, 1, cum_amount) OVER (
+      PARTITION BY symbol, trade_date, session_start ORDER BY event_time
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS previous_cum_amount
   FROM session_rows
+), normalized AS (
+  SELECT *,
+    multiIf(
+      event_time = previous_time, amount,
+      cum_amount >= previous_cum_amount, cum_amount - previous_cum_amount,
+      previous_cum_amount >= uint32_modulus * 0.9 AND cum_amount <= uint32_modulus * 0.1,
+        cum_amount + uint32_modulus - previous_cum_amount,
+      0
+    ) AS amount_increment,
+    multiIf(
+      event_time = previous_time, amount >= 0,
+      cum_amount >= previous_cum_amount, 1,
+      previous_cum_amount >= uint32_modulus * 0.9 AND cum_amount <= uint32_modulus * 0.1, 1,
+      0
+    ) AS amount_valid
+  FROM measured
 ), bars AS (
   SELECT symbol, trade_date, bucket_start, {bar_end} AS bar_end,
     argMinIf(last_price, event_time, last_price > 0) AS open,
@@ -634,12 +655,12 @@ WITH source AS (
     minIf(last_price, last_price > 0) AS low,
     argMaxIf(last_price, event_time, last_price > 0) AS close,
     sumIf(volume, volume >= 0) AS aggregated_volume,
-    sumIf(amount, amount >= 0) AS aggregated_amount,
+    sumIf(amount_increment, amount_valid = 1) AS aggregated_amount,
     count() AS snapshot_count,
     max(dateDiff('millisecond', previous_time, event_time)) AS max_gap_ms,
     countIf(last_price > 0) AS valid_price_count,
-    countIf(volume < 0 OR amount < 0) AS invalid_increment_count
-  FROM measured
+    countIf(volume < 0 OR amount_valid = 0) AS invalid_increment_count
+  FROM normalized
   GROUP BY symbol, trade_date, bucket_start
 )
 SELECT symbol, toString(trade_date) AS trade_date,
@@ -665,7 +686,7 @@ ORDER BY trade_date, bucket_start
   def _validate_profile(self) -> None:
     if self._validated:
       return
-    required = {"symbol", "trade_date", "time", "last_price", "volume", "amount"}
+    required = {"symbol", "trade_date", "time", "last_price", "volume", "amount", "cum_amount"}
     if not _TABLE.fullmatch(self._profile.table_name) or not required <= self._profile.columns.keys():
       raise L2DataError("临时 L2 快照映射不完整")
     mapped = {self._profile.columns[item] for item in required}

@@ -621,6 +621,16 @@ def test_temporary_aggregation_does_not_require_fixed_snapshot_count() -> None:
   assert "max_gap_ms <=" not in query
   assert "14:57:00" in query
   assert "15:00:00" not in query
+  assert "cum_amount AS cum_amount" in query
+  assert "4294967296.0 AS uint32_modulus" in query
+  assert "cum_amount + uint32_modulus - previous_cum_amount" in query
+  assert "countIf(volume < 0 OR amount_valid = 0)" in query
+
+
+def test_temporary_quote_profile_maps_cumulative_amount_for_wrap_repair() -> None:
+  profile = load_temporary_quote_profile()
+
+  assert profile.columns["cum_amount"] == "cum_amount"
 
 
 def test_continuous_quote_filter_excludes_closing_auction() -> None:
