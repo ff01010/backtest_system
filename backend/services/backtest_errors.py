@@ -39,6 +39,16 @@ class BacktestErrorDetail:
       self.event_time, self.symbol, self.retryable, task_id,
     )
 
+  def with_event_context(
+    self,
+    symbol: str | None,
+    event_time: str | None,
+  ) -> "BacktestErrorDetail":
+    return BacktestErrorDetail(
+      self.category, self.code, self.message, self.hint, self.callback,
+      self.event_time or event_time, self.symbol or symbol, self.retryable, self.task_id,
+    )
+
 
 class BacktestExecutionError(RuntimeError):
   """已经完成脱敏的回测领域异常。"""
@@ -75,8 +85,20 @@ class StrategyExecutionError(BacktestExecutionError, ValueError):
 class RemoteBacktestError(BacktestExecutionError):
   """保留 worker 已脱敏的结构化错误，避免 HTTP 传输时退化为字符串。"""
 
+  def __init__(
+    self,
+    detail: BacktestErrorDetail,
+    diagnostic: dict[str, str] | None = None,
+  ) -> None:
+    super().__init__(detail)
+    self.diagnostic = diagnostic or {}
+
   @classmethod
-  def from_dict(cls, value: dict[str, Any]) -> "RemoteBacktestError":
+  def from_dict(
+    cls,
+    value: dict[str, Any],
+    diagnostic: dict[str, str] | None = None,
+  ) -> "RemoteBacktestError":
     return cls(BacktestErrorDetail(
       category=str(value.get("category") or "system_error"),
       code=str(value.get("code") or "system.internal"),
@@ -87,7 +109,7 @@ class RemoteBacktestError(BacktestExecutionError):
       symbol=_optional_text(value.get("symbol")),
       retryable=bool(value.get("retryable", False)),
       task_id=_optional_text(value.get("taskId")),
-    ))
+    ), diagnostic)
 
 
 def error_detail(error: Exception, task_id: str | None = None) -> BacktestErrorDetail:

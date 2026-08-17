@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import socket
 from dataclasses import asdict
@@ -15,6 +16,7 @@ from backend.time_utils import now_shanghai_iso_datetime
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+logger = logging.getLogger(__name__)
 
 
 class L2DataError(RuntimeError):
@@ -427,13 +429,21 @@ class VersionedBarCache:
   def __init__(self, cache: RedisJsonCache | None, ttl_seconds: int) -> None:
     self._cache = cache
     self._ttl = ttl_seconds
+    self._last_error: str | None = None
+    self._reported_errors: set[str] = set()
+
+  @property
+  def last_error(self) -> str | None:
+    return self._last_error
 
   def get(self, aggregation_version: str | None, mapping_version: str | None, symbol: str, trade_date: str, period: str) -> list[NormalizedBar] | None:
+    self._last_error = None
     if self._cache is None or not aggregation_version or not mapping_version:
       return None
     try:
       value = self._cache.get(self._key(aggregation_version, mapping_version, symbol, trade_date, period))
-    except L2DataError:
+    except L2DataError as error:
+      self._record_error("读取", error)
       return None
     if value is None:
       return None
@@ -448,17 +458,27 @@ class VersionedBarCache:
     period: str,
     bars: Sequence[NormalizedBar],
     metadata: dict[str, Any] | None = None,
-  ) -> None:
+  ) -> bool:
+    self._last_error = None
     if self._cache is None or not aggregation_version or not mapping_version:
-      return
+      return False
     try:
       self._cache.set(
         self._key(aggregation_version, mapping_version, symbol, trade_date, period),
         {"bars": [asdict(item) for item in bars], "metadata": metadata or {}},
         self._ttl,
       )
-    except L2DataError:
-      return
+    except L2DataError as error:
+      self._record_error("写入", error)
+      return False
+    return True
+
+  def _record_error(self, operation: str, error: L2DataError) -> None:
+    self._last_error = str(error)
+    message = f"{operation}:{self._last_error}"
+    if message not in self._reported_errors:
+      logger.warning("L2 Bar Redis 缓存%s失败，将降级为 ClickHouse 聚合：%s", operation, error)
+      self._reported_errors.add(message)
 
   @staticmethod
   def _key(aggregation_version: str, mapping_version: str, symbol: str, trade_date: str, period: str) -> str:
@@ -547,7 +567,7 @@ class TemporaryQuoteBarProvider:
     quality = _summarize_quality(bars)
     self._quality_by_day[trade_date] = quality
     if quality == "complete":
-      self._cache.set(
+      cached = self._cache.set(
         self._aggregation_version,
         self._mapping_version,
         symbol,
@@ -562,7 +582,7 @@ class TemporaryQuoteBarProvider:
           "sourcePolicy": "closed_day_append_only",
         },
       )
-      self._cache_status[trade_date] = "miss"
+      self._cache_status[trade_date] = "miss" if cached else "miss_unavailable"
     else:
       self._cache_status[trade_date] = "miss_unusable"
     return bars
@@ -621,30 +641,33 @@ source AS (
   WHERE {source_where}
 ), session_rows AS (
   SELECT * FROM source WHERE session_start IS NOT NULL
+), normalized_source AS (
+  SELECT *, if(cum_amount < 0, cum_amount + uint32_modulus, cum_amount) AS normalized_cum_amount
+  FROM session_rows
 ), measured AS (
   SELECT *, {bucket} AS bucket_start,
     lagInFrame(event_time, 1, event_time) OVER (
       PARTITION BY symbol, trade_date, session_start ORDER BY event_time
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS previous_time,
-    lagInFrame(cum_amount, 1, cum_amount) OVER (
+    lagInFrame(normalized_cum_amount, 1, normalized_cum_amount) OVER (
       PARTITION BY symbol, trade_date, session_start ORDER BY event_time
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS previous_cum_amount
-  FROM session_rows
+  FROM normalized_source
 ), normalized AS (
   SELECT *,
     multiIf(
       event_time = previous_time, amount,
-      cum_amount >= previous_cum_amount, cum_amount - previous_cum_amount,
-      previous_cum_amount >= uint32_modulus * 0.9 AND cum_amount <= uint32_modulus * 0.1,
-        cum_amount + uint32_modulus - previous_cum_amount,
+      normalized_cum_amount >= previous_cum_amount, normalized_cum_amount - previous_cum_amount,
+      previous_cum_amount >= uint32_modulus * 0.9 AND normalized_cum_amount <= uint32_modulus * 0.1,
+        normalized_cum_amount + uint32_modulus - previous_cum_amount,
       0
     ) AS amount_increment,
     multiIf(
       event_time = previous_time, amount >= 0,
-      cum_amount >= previous_cum_amount, 1,
-      previous_cum_amount >= uint32_modulus * 0.9 AND cum_amount <= uint32_modulus * 0.1, 1,
+      normalized_cum_amount >= previous_cum_amount, 1,
+      previous_cum_amount >= uint32_modulus * 0.9 AND normalized_cum_amount <= uint32_modulus * 0.1, 1,
       0
     ) AS amount_valid
   FROM measured

@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from backend import settings
-from backend.services.backtest_errors import error_detail
+from backend.services.backtest_errors import RemoteBacktestError, error_detail
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,9 @@ def system_error_log_record(error: Exception, source: str, stage: str) -> System
   """仅将系统错误转换为管理员日志；策略错误继续由原有页面展示。"""
   if error_detail(error).category != "system_error":
     return None
+
+  if isinstance(error, RemoteBacktestError) and error.diagnostic:
+    return _remote_worker_record(error, source, stage)
 
   cause = _root_cause(error)
   if isinstance(cause, socket.gaierror):
@@ -63,6 +66,28 @@ def system_error_log_record(error: Exception, source: str, stage: str) -> System
     source, stage, "system.unclassified",
     "未分类系统异常；请使用任务编号在容器日志中查看原始堆栈。",
     type(cause).__name__, {},
+  )
+
+
+def _remote_worker_record(
+  error: RemoteBacktestError,
+  source: str,
+  stage: str,
+) -> SystemErrorLogRecord:
+  """记录 worker 已返回的受限诊断正文，供管理员定位回放失败。"""
+  diagnostic = error.diagnostic
+  context = {"service": "strategy_worker"}
+  if error.detail.symbol:
+    context["symbol"] = error.detail.symbol
+  if error.detail.event_time:
+    context["eventTime"] = error.detail.event_time
+  return SystemErrorLogRecord(
+    source,
+    stage,
+    "worker.execution_rejected",
+    diagnostic.get("reason") or error.detail.message,
+    diagnostic.get("exceptionType") or type(error).__name__,
+    context,
   )
 
 

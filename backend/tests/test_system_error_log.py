@@ -1,7 +1,7 @@
 import socket
 
 from backend import settings
-from backend.services.backtest_errors import BacktestErrorDetail, StrategyExecutionError
+from backend.services.backtest_errors import BacktestErrorDetail, RemoteBacktestError, StrategyExecutionError
 from backend.services.clickhouse_client import ClickHouseError
 from backend.services.system_error_log import system_error_log_record
 
@@ -25,3 +25,27 @@ def test_strategy_error_is_not_written_to_system_error_log() -> None:
   ))
 
   assert system_error_log_record(error, "l2_runner", "l2.market_replay") is None
+
+
+def test_remote_worker_diagnostic_is_saved_for_administrator() -> None:
+  error = RemoteBacktestError.from_dict(
+    {
+      "category": "system_error",
+      "code": "system.internal",
+      "message": "回测执行异常，请稍后重试。",
+      "eventTime": "2026-04-03 09:31:02",
+      "symbol": "688126.SH",
+    },
+    {"exceptionType": "ValueError", "reason": "平仓数量超过可用持仓"},
+  )
+
+  record = system_error_log_record(error, "l2_runner", "l2.market_replay")
+
+  assert record is not None
+  assert record.code == "worker.execution_rejected"
+  assert record.reason == "平仓数量超过可用持仓"
+  assert record.context == {
+    "service": "strategy_worker",
+    "symbol": "688126.SH",
+    "eventTime": "2026-04-03 09:31:02",
+  }

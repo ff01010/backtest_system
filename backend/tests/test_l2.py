@@ -11,7 +11,7 @@ from backend.backtesting.models import OrderIntent, OrderSide, PositionEffect
 from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot, SourceMappingProfile, TradeEvent, parse_timestamp
 from backend.l2.config import load_temporary_quote_profile
-from backend.l2.providers import ClickHouseL2Adapter, TemporaryQuoteBarProvider, VersionedBarCache
+from backend.l2.providers import ClickHouseL2Adapter, L2DataError, TemporaryQuoteBarProvider, VersionedBarCache
 from backend.l2.result_adapter import normalize_l2_result
 from backend.l2_runner import L2Runner, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day
 from backend.services import clickhouse_client
@@ -221,6 +221,28 @@ def test_unknown_cache_version_does_not_use_redis_cache() -> None:
 
   assert result is None
   assert probe.calls == []
+
+
+def test_temporary_bar_marks_redis_unavailable_in_cache_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+  class FailingCache:
+    def get(self, key: str) -> None:
+      raise L2DataError("Redis 缓存不可用: Authentication required")
+
+    def set(self, key: str, value: dict[str, object], ttl_seconds: int) -> None:
+      raise L2DataError("Redis 缓存不可用: Authentication required")
+
+  provider = TemporaryQuoteBarProvider(
+    load_temporary_quote_profile(),
+    VersionedBarCache(FailingCache(), 60),
+    "tick_quote_session_v4",
+    "tick_quote_depth_v3",
+  )
+  monkeypatch.setattr(provider, "_aggregate_day", lambda *args: [_bar()])
+
+  provider._load_day("688981.SH", "2026-01-02", "1m")
+
+  day = provider.cache_snapshot()["days"][0]
+  assert day["cacheStatus"] == "miss_unavailable"
 
 
 def test_temporary_quote_mapping_uses_actual_depth_volume_columns() -> None:
@@ -623,7 +645,8 @@ def test_temporary_aggregation_does_not_require_fixed_snapshot_count() -> None:
   assert "15:00:00" not in query
   assert "cum_amount AS cum_amount" in query
   assert "4294967296.0 AS uint32_modulus" in query
-  assert "cum_amount + uint32_modulus - previous_cum_amount" in query
+  assert "if(cum_amount < 0, cum_amount + uint32_modulus, cum_amount) AS normalized_cum_amount" in query
+  assert "normalized_cum_amount + uint32_modulus - previous_cum_amount" in query
   assert "countIf(volume < 0 OR amount_valid = 0)" in query
 
 

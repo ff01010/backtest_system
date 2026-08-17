@@ -1,8 +1,17 @@
 # -*- coding: utf-8 -*-
 """认证摘要和隔离策略执行的无数据库单元测试。"""
 
+import io
+import json
+from urllib.error import HTTPError
+
+import pytest
+from fastapi import HTTPException
+
+from backend.services import strategy_worker
 from backend.services.auth import hash_password, verify_password
-from backend.worker_app import WorkerRunRequest, run
+from backend.services.backtest_errors import RemoteBacktestError
+from backend.worker_app import WorkerL2QuoteRequest, WorkerRunRequest, process_l2_quote, run
 
 
 def test_password_hash_round_trip() -> None:
@@ -44,3 +53,51 @@ def test_worker_applies_slippage_to_script_trade_price() -> None:
 
   assert round(result["trades"][0]["price"], 2) == 10.01
   assert result["trades"][0]["priceSource"] == "当前 Bar 收盘价 + 固定滑点 10.00 bp"
+
+
+def test_l2_quote_error_has_diagnostic_and_quote_context(monkeypatch) -> None:
+  class FailingSession:
+    def process_quote(self, payload: WorkerL2QuoteRequest) -> dict[str, object]:
+      raise ValueError("平仓数量超过可用持仓")
+
+  monkeypatch.setattr("backend.worker_app._session", lambda session_id: FailingSession())
+  payload = WorkerL2QuoteRequest(
+    tradeDate="2026-04-03",
+    quote={"symbol": "688126.SH", "time": "2026-04-03 09:31:02"},
+  )
+
+  with pytest.raises(HTTPException) as raised:
+    process_l2_quote("session-1", payload)
+
+  detail = raised.value.detail
+  assert detail["diagnostic"]["reason"] == "平仓数量超过可用持仓"
+  assert detail["errorDetail"]["symbol"] == "688126.SH"
+  assert detail["errorDetail"]["eventTime"] == "2026-04-03 09:31:02"
+
+
+def test_strategy_worker_keeps_structured_quote_diagnostic(monkeypatch) -> None:
+  response = json.dumps({"detail": {
+    "errorDetail": {
+      "category": "system_error",
+      "code": "system.internal",
+      "message": "回测执行异常，请稍后重试。",
+      "symbol": "688126.SH",
+      "eventTime": "2026-04-03 09:31:02",
+    },
+    "diagnostic": {
+      "exceptionType": "ValueError",
+      "reason": "平仓数量超过可用持仓",
+    },
+  }}).encode("utf-8")
+  error = HTTPError("http://worker/quotes", 422, "unprocessable", None, io.BytesIO(response))
+
+  def raise_http_error(*args: object, **kwargs: object) -> object:
+    raise error
+
+  monkeypatch.setattr(strategy_worker, "urlopen", raise_http_error)
+
+  with pytest.raises(RemoteBacktestError) as raised:
+    strategy_worker.process_l2_quote("session-1", {"tradeDate": "2026-04-03", "quote": {}})
+
+  assert raised.value.diagnostic["reason"] == "平仓数量超过可用持仓"
+  assert raised.value.detail.event_time == "2026-04-03 09:31:02"
