@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from backend.services.system_error_catalog import classify_system_error
+
 
 @dataclass(frozen=True)
 class BacktestErrorDetail:
@@ -116,14 +118,10 @@ def error_detail(error: Exception, task_id: str | None = None) -> BacktestErrorD
   """把任意异常降级为可公开的结构化错误。"""
   if isinstance(error, BacktestExecutionError):
     return error.detail.with_task_id(task_id or error.detail.task_id)
-  if isinstance(error, FileNotFoundError):
-    return BacktestErrorDetail(
-      "system_error", "data.unavailable", "所选区间没有可用行情数据。",
-      "请检查标的、日期和周期后重试。", retryable=False, task_id=task_id,
-    )
+  classified = classify_system_error(error)
   return BacktestErrorDetail(
-    "system_error", "system.internal", "回测执行异常，请稍后重试。",
-    "如持续出现，请提供任务编号给维护人员。", retryable=True, task_id=task_id,
+    "system_error", classified.code, classified.public_message,
+    classified.public_hint, retryable=classified.retryable, task_id=task_id,
   )
 
 

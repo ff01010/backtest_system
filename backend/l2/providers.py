@@ -46,7 +46,6 @@ class L2QuoteProvider(Protocol):
   ) -> list[QuoteSnapshot]:
     """返回严格晚于时间游标的有限条连续竞价快照。"""
 
-
 class L2EventProvider(Protocol):
   """逐笔成交的只读协议。"""
 

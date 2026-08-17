@@ -1,4 +1,5 @@
 import socket
+from http.client import ResponseNotReady
 
 from backend import settings
 from backend.services.backtest_errors import BacktestErrorDetail, RemoteBacktestError, StrategyExecutionError
@@ -15,8 +16,33 @@ def test_unresolved_clickhouse_host_is_safe_and_actionable(monkeypatch) -> None:
 
   assert record is not None
   assert record.code == "clickhouse.host_unresolved"
+  assert record.category == "clickhouse"
+  assert record.retryable is False
   assert record.reason == "ClickHouse 主机名无法解析：quant-clickhouse"
   assert record.context == {"service": "clickhouse", "host": "quant-clickhouse"}
+
+
+def test_clickhouse_connection_state_error_is_not_retryable() -> None:
+  error = ClickHouseError("ClickHouse 查询失败: Request-sent")
+  error.__cause__ = ResponseNotReady("Request-sent")
+
+  record = system_error_log_record(error, "l2_runner", "l2.market_replay", "run-74")
+
+  assert record is not None
+  assert record.code == "clickhouse.connection_state_invalid"
+  assert record.category == "clickhouse"
+  assert record.retryable is False
+  assert record.exception_type == "ResponseNotReady"
+  assert record.raw_log_ref == "container=quant-backtest-l2-runner; taskId=run-74; stage=l2.market_replay"
+
+
+def test_unknown_system_error_is_not_marked_retryable() -> None:
+  record = system_error_log_record(RuntimeError("unexpected"), "l2_runner", "l2.market_replay", "run-75")
+
+  assert record is not None
+  assert record.code == "internal.unexpected"
+  assert record.category == "internal"
+  assert record.retryable is False
 
 
 def test_strategy_error_is_not_written_to_system_error_log() -> None:
@@ -43,6 +69,8 @@ def test_remote_worker_diagnostic_is_saved_for_administrator() -> None:
 
   assert record is not None
   assert record.code == "worker.execution_rejected"
+  assert record.category == "worker"
+  assert record.retryable is False
   assert record.reason == "平仓数量超过可用持仓"
   assert record.context == {
     "service": "strategy_worker",

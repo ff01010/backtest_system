@@ -38,6 +38,7 @@ from backend.services import (
   strategy_adapters,
 )
 from backend.services import auth
+from backend.services.user_context import CurrentUser
 from backend.services.backtest_errors import error_detail, error_summary
 from backend.services.system_error_log import system_error_log_record
 from backend.services.user_context import get_current_user, reset_current_user, set_current_user
@@ -56,8 +57,8 @@ def _backtest_failure_response(error: Exception, run_id: str | None) -> HTTPExce
   return HTTPException(status_code, {"errorDetail": detail})
 
 
-def _sync_system_error_record(error: Exception) -> dict[str, Any] | None:
-  record = system_error_log_record(error, "sync_runner", "sync.backtest_execute")
+def _sync_system_error_record(error: Exception, run_id: str) -> dict[str, Any] | None:
+  record = system_error_log_record(error, "sync_runner", "sync.backtest_execute", run_id)
   return record.to_dict() if record else None
 
 
@@ -388,16 +389,21 @@ def current_user(request: Request):
   }}
 
 
-def _require_admin(request: Request) -> None:
+def _require_admin(request: Request) -> CurrentUser:
   user = auth.get_user_by_token(request.cookies.get(auth.SESSION_COOKIE))
   if not user or not user.is_admin:
     raise HTTPException(403, "仅管理员可执行此操作")
+  return user
 
 
 @app.get("/api/admin/users")
-def admin_users(request: Request):
+def admin_users(
+  request: Request,
+  page: int = Query(1, ge=1),
+  page_size: int = Query(20, ge=1, le=100, alias="pageSize"),
+):
   _require_admin(request)
-  return {"users": auth.list_users()}
+  return auth.list_users(page, page_size)
 
 
 @app.post("/api/admin/users")
@@ -428,6 +434,17 @@ def reset_user_password(user_id: str, payload: schemas.PasswordReset, request: R
   except KeyError as error:
     raise HTTPException(404, "用户不存在") from error
   return {"ok": True}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def delete_user(user_id: str, request: Request):
+  actor = _require_admin(request)
+  try:
+    return auth.delete_user(user_id, actor.id)
+  except KeyError as error:
+    raise HTTPException(404, "用户不存在") from error
+  except auth.UserManagementError as error:
+    raise HTTPException(422, str(error)) from error
 
 
 @app.get("/api/admin/system-errors")
@@ -807,19 +824,19 @@ def run_backtest(payload: schemas.BacktestRunRequest):
     logger.exception("同步回测任务失败: %s", run_id)
     if run_id is not None:
       summary = _backtest_error_summary(e, run_id)
-      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e))
+      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e, run_id))
     raise _backtest_failure_response(e, run_id)
   except ValueError as e:
     logger.exception("同步回测任务失败: %s", run_id)
     if run_id is not None:
       summary = _backtest_error_summary(e, run_id)
-      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e))
+      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e, run_id))
     raise _backtest_failure_response(e, run_id)
   except Exception as e:
     logger.exception("同步回测任务失败: %s", run_id)
     if run_id is not None:
       summary = _backtest_error_summary(e, run_id)
-      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e))
+      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e, run_id))
     raise _backtest_failure_response(e, run_id)
 
 

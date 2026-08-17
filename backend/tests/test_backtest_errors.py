@@ -1,24 +1,39 @@
 """回测对外错误必须可定位且不泄露内部异常。"""
 
+from http.client import ResponseNotReady
+
 from backend.services.backtest_errors import RemoteBacktestError, StrategyExecutionError, error_summary
+from backend.services.clickhouse_client import ClickHouseError
 
 
 def test_unknown_error_is_sanitized() -> None:
   summary = error_summary(RuntimeError("postgresql://secret@internal-host:5432/query"), "run-42")
 
-  assert summary["error"] == "回测执行异常，请稍后重试。"
+  assert summary["error"] == "回测服务发生内部错误。"
   assert summary["errorDetail"] == {
     "category": "system_error",
-    "code": "system.internal",
-    "message": "回测执行异常，请稍后重试。",
-    "hint": "如持续出现，请提供任务编号给维护人员。",
+    "code": "internal.unexpected",
+    "message": "回测服务发生内部错误。",
+    "hint": "请联系管理员处理后再重试。",
     "callback": None,
     "eventTime": None,
     "symbol": None,
-    "retryable": True,
+    "retryable": False,
     "taskId": "run-42",
   }
   assert "internal-host" not in str(summary)
+
+
+def test_clickhouse_connection_state_error_is_safe_and_not_retryable() -> None:
+  error = ClickHouseError("ClickHouse 查询失败: Request-sent")
+  error.__cause__ = ResponseNotReady("Request-sent")
+
+  summary = error_summary(error, "run-74")
+
+  assert summary["errorDetail"]["code"] == "clickhouse.connection_state_invalid"
+  assert summary["errorDetail"]["message"] == "回测服务内部连接状态异常。"
+  assert summary["errorDetail"]["retryable"] is False
+  assert "Request-sent" not in str(summary)
 
 
 def test_strategy_error_is_safe_and_locatable() -> None:

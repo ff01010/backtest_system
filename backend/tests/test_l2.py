@@ -569,6 +569,42 @@ def test_order_driven_runner_queries_quote_only_after_order(monkeypatch: pytest.
   assert performance["quoteRowsPrefetched"] == 1
 
 
+def test_order_driven_runner_uses_actual_last_quote_for_day_end(monkeypatch: pytest.MonkeyPatch) -> None:
+  class QuoteProvider:
+    def quotes_after(self, *args: Any, **kwargs: Any) -> list[QuoteSnapshot]:
+      return [_quote("2026-01-02 14:51:03")]
+
+    def last_quote_before(self, symbol: str, trade_date: str, before_time: str) -> QuoteSnapshot:
+      assert before_time == "2026-01-02 14:57:00"
+      return _quote("2026-01-02 14:56:57")
+
+  processed_quotes: list[str] = []
+  monkeypatch.setattr("backend.l2_runner.strategy_worker.begin_l2_day", lambda *args: None)
+  monkeypatch.setattr(
+    "backend.l2_runner.strategy_worker.process_l2_bars",
+    lambda *args: {
+      "processedBars": 1,
+      "quoteDemand": "waiting_quote",
+      "nextQuoteAfter": "2026-01-02 14:51:00",
+      "dayEndQuoteRequired": False,
+    },
+  )
+  monkeypatch.setattr(
+    "backend.l2_runner.strategy_worker.process_l2_quote",
+    lambda _session, payload: processed_quotes.append(payload["quote"]["time"]) or {
+      "quoteDemand": "idle", "dayEndQuoteRequired": True,
+    },
+  )
+  monkeypatch.setattr("backend.l2_runner.strategy_worker.finish_l2_day", lambda *args: None)
+  monkeypatch.setattr("backend.l2_runner.state_store.heartbeat_l2_backtest_job", lambda *args: True)
+
+  performance = _new_performance()
+  _replay_day("session", [_bar()], QuoteProvider(), "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
+
+  assert processed_quotes == ["2026-01-02 14:51:03", "2026-01-02 14:56:57"]
+  assert performance["quoteQueries"] == 2
+
+
 def test_order_driven_runner_reuses_future_quote_buffer_without_forward_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
   class QuoteProvider:
     def __init__(self) -> None:

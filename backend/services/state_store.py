@@ -935,11 +935,12 @@ def _insert_system_error(
   cur.execute("""
     INSERT INTO system_error_log (
       run_id, owner_user_id, source, stage, error_code, reason,
-      exception_type, context_json
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+      exception_type, context_json, category, retryable, raw_log_ref
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
   """, (
     run_id, owner_user_id, record["source"], record["stage"], record["code"],
     record["reason"], record["exception_type"], Jsonb(record["context"]),
+    record["category"], record["retryable"], record["raw_log_ref"],
   ))
 
 
@@ -956,8 +957,11 @@ def _normalize_system_error(row: dict[str, Any]) -> dict[str, Any]:
     "source": row["source"],
     "stage": row["stage"],
     "code": row["error_code"],
+    "category": row.get("category") or "internal",
+    "retryable": bool(row.get("retryable")),
     "reason": row["reason"],
     "exceptionType": row["exception_type"],
     "context": _json(row.get("context_json"), {}),
+    "rawLogRef": row.get("raw_log_ref") or "",
     "occurredAt": _format_time(row["occurred_at"]),
   }

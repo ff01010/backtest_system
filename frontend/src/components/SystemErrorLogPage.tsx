@@ -81,7 +81,7 @@ export default function SystemErrorLogPage() {
         <div style={tablePanelStyle}>
           <table style={tableStyle}>
             <thead><tr style={tableHeadStyle}>
-              <th style={cellStyle}>发生时间</th><th style={cellStyle}>使用者</th><th style={cellStyle}>任务</th><th style={cellStyle}>标的 / 周期</th><th style={cellStyle}>阶段</th><th style={cellStyle}>具体原因</th>
+              <th style={cellStyle}>发生时间</th><th style={cellStyle}>使用者</th><th style={cellStyle}>任务</th><th style={cellStyle}>标的 / 周期</th><th style={cellStyle}>阶段</th><th style={cellStyle}>分类 / 重试</th><th style={cellStyle}>管理员原因</th>
             </tr></thead>
             <tbody>{items.map((item) => <tr key={item.id} onClick={() => setSelectedId(item.id)} style={{ ...rowStyle, background: selectedId === item.id ? 'var(--surface-muted)' : 'transparent' }}>
               <td style={cellStyle}>{item.occurredAt}</td>
@@ -89,6 +89,7 @@ export default function SystemErrorLogPage() {
               <td style={cellStyle}><strong>#{item.displayNo}</strong><span style={monoStyle}>{item.runId}</span></td>
               <td style={cellStyle}>{item.symbol || '—'}<span style={subtextStyle}>{item.timeframe || '—'}</span></td>
               <td style={cellStyle}><span style={codeBadgeStyle}>{item.stage}</span><span style={subtextStyle}>{item.code}</span></td>
+              <td style={cellStyle}><span style={categoryBadgeStyle}>{item.category}</span><span style={{ ...subtextStyle, color: item.retryable ? '#9a5d00' : 'var(--text-muted)' }}>{item.retryable ? '可重试' : '不可直接重试'}</span></td>
               <td style={{ ...cellStyle, maxWidth: 340 }}>{item.reason}</td>
             </tr>)}</tbody>
           </table>
@@ -100,9 +101,11 @@ export default function SystemErrorLogPage() {
           <div style={detailGridStyle}>
             <Detail label="异常类型" value={selected.exceptionType} /><Detail label="来源" value={selected.source} />
             <Detail label="任务 UUID" value={selected.runId} mono /><Detail label="错误代码" value={selected.code} mono />
+            <Detail label="错误分类" value={selected.category} mono /><Detail label="是否可重试" value={selected.retryable ? '是（瞬态错误）' : '否（需先处理原因）'} />
+            <Detail label="原始日志索引" value={selected.rawLogRef} mono />
             {Object.entries(selected.context).map(([key, value]) => <Detail key={key} label={key} value={value} mono />)}
           </div>
-          <p style={{ margin: '14px 0 0', color: 'var(--text-muted)', fontSize: 12 }}>为防止泄露服务器路径、凭据和请求内容，原始堆栈仅保留在服务器容器日志中。</p>
+          <p style={{ margin: '14px 0 0', color: 'var(--text-muted)', fontSize: 12 }}>原始堆栈仅保留在服务器容器日志中。使用“原始日志索引”可在受控运维环境查询对应任务与阶段，页面不直接展示敏感日志正文。</p>
         </section> : null}
       </div>
     </section>
@@ -131,6 +134,7 @@ const cellStyle = { padding: '11px 13px', textAlign: 'left' as const, verticalAl
 const subtextStyle = { display: 'block', marginTop: 3, color: 'var(--text-muted)', fontSize: 11 };
 const monoStyle = { ...subtextStyle, fontFamily: 'ui-monospace, Consolas, monospace', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis' as const, whiteSpace: 'nowrap' as const };
 const codeBadgeStyle = { display: 'inline-block', borderRadius: 4, background: '#edf4f6', color: '#17605a', fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 11, padding: '3px 5px' };
+const categoryBadgeStyle = { display: 'inline-block', borderRadius: 999, background: '#fff3da', color: '#895500', fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 11, padding: '3px 7px' };
 const emptyStyle = { padding: 38, color: 'var(--text-muted)', textAlign: 'center' as const };
 const detailStyle = { marginTop: 14, border: '1px solid var(--border)', borderLeft: '3px solid var(--accent)', borderRadius: 9, background: 'var(--surface)', padding: 16 };
 const detailGridStyle = { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 14, marginTop: 14 };
