@@ -132,9 +132,20 @@ _L2_SESSION_LIMIT = int(os.getenv("TREND_GRID_L2_WORKER_SESSION_LIMIT", "2"))
 _l2_sessions: dict[str, "L2WorkerSession"] = {}
 
 
-def _worker_http_error(error: Exception) -> HTTPException:
+def _worker_http_error(
+  error: Exception,
+  symbol: str | None = None,
+  event_time: str | None = None,
+) -> HTTPException:
   """worker 只向调度端返回已脱敏的结构化错误。"""
-  return HTTPException(422, {"errorDetail": error_detail(error).to_dict()})
+  detail = error_detail(error).with_event_context(symbol, event_time)
+  return HTTPException(422, {
+    "errorDetail": detail.to_dict(),
+    "diagnostic": {
+      "exceptionType": type(error).__name__,
+      "reason": str(error)[:500],
+    },
+  })
 
 
 class L2WorkerSession:
@@ -332,7 +343,14 @@ def process_l2_quote(session_id: str, payload: WorkerL2QuoteRequest) -> dict[str
   try:
     return session.process_quote(payload)
   except ValueError as error:
-    raise HTTPException(422, str(error)) from error
+    quote = payload.quote
+    symbol = quote.get("symbol")
+    event_time = quote.get("time")
+    raise _worker_http_error(
+      error,
+      symbol if isinstance(symbol, str) else None,
+      event_time if isinstance(event_time, str) else None,
+    ) from error
 
 
 @app.post("/l2/sessions/{session_id}/days/{trade_date}/finish")

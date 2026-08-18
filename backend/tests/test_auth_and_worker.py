@@ -1,8 +1,18 @@
 # -*- coding: utf-8 -*-
 """认证摘要和隔离策略执行的无数据库单元测试。"""
 
+import io
+import json
+from contextlib import contextmanager
+from urllib.error import HTTPError
+
+import pytest
+from fastapi import HTTPException
+
+from backend.services import auth, strategy_worker
 from backend.services.auth import hash_password, verify_password
-from backend.worker_app import WorkerRunRequest, run
+from backend.services.backtest_errors import RemoteBacktestError
+from backend.worker_app import WorkerL2QuoteRequest, WorkerRunRequest, process_l2_quote, run
 
 
 def test_password_hash_round_trip() -> None:
@@ -10,6 +20,108 @@ def test_password_hash_round_trip() -> None:
 
   assert verify_password("correct-horse-battery-staple", encoded) is True
   assert verify_password("wrong-password", encoded) is False
+
+
+def test_delete_user_rejects_current_login() -> None:
+  with pytest.raises(auth.UserManagementError, match="当前登录账号"):
+    auth.delete_user("user-1", "user-1")
+
+
+def test_list_users_clamps_page_to_available_range(monkeypatch: pytest.MonkeyPatch) -> None:
+  class Cursor:
+    def __init__(self) -> None:
+      self.params: tuple[int, int] | None = None
+      self.last_sql = ""
+
+    def __enter__(self) -> "Cursor":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def execute(self, sql: str, params: tuple[int, int] | None = None) -> None:
+      self.last_sql = sql
+      self.params = params
+
+    def fetchone(self) -> dict[str, int]:
+      return {"value": 21}
+
+    def fetchall(self) -> list[dict[str, object]]:
+      return []
+
+  class Connection:
+    def __init__(self) -> None:
+      self.cursor_instance = Cursor()
+
+    def __enter__(self) -> "Connection":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def cursor(self) -> Cursor:
+      return self.cursor_instance
+
+  @contextmanager
+  def system_db():
+    yield Connection()
+
+  monkeypatch.setattr(auth, "_system_db", system_db)
+
+  result = auth.list_users(8, 20)
+
+  assert result == {"users": [], "page": 2, "pageSize": 20, "total": 21}
+
+
+@pytest.mark.parametrize(("has_history", "expected_action"), [(False, "deleted"), (True, "disabled")])
+def test_delete_user_preserves_backtest_history(monkeypatch: pytest.MonkeyPatch, has_history: bool, expected_action: str) -> None:
+  class Cursor:
+    def __init__(self) -> None:
+      self.calls: list[str] = []
+      self.last_sql = ""
+
+    def __enter__(self) -> "Cursor":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def execute(self, sql: str, _params: object = None) -> None:
+      self.last_sql = sql
+      self.calls.append(sql)
+
+    def fetchone(self) -> dict[str, object]:
+      if "SELECT id, role, status" in self.last_sql:
+        return {"id": "user-1", "role": "user", "status": "active"}
+      return {"value": has_history}
+
+  class Connection:
+    def __init__(self) -> None:
+      self.cursor_instance = Cursor()
+
+    def __enter__(self) -> "Connection":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def cursor(self) -> Cursor:
+      return self.cursor_instance
+
+  connection = Connection()
+
+  @contextmanager
+  def system_db():
+    yield connection
+
+  monkeypatch.setattr(auth, "_system_db", system_db)
+
+  result = auth.delete_user("user-1", "admin-1")
+
+  assert result["action"] == expected_action
+  statements = "\n".join(connection.cursor_instance.calls)
+  assert ("DELETE FROM app_user" in statements) is (not has_history)
+  assert ("status='disabled'" in statements) is has_history
 
 
 def test_worker_runs_script_without_database_access() -> None:
@@ -44,3 +156,51 @@ def test_worker_applies_slippage_to_script_trade_price() -> None:
 
   assert round(result["trades"][0]["price"], 2) == 10.01
   assert result["trades"][0]["priceSource"] == "当前 Bar 收盘价 + 固定滑点 10.00 bp"
+
+
+def test_l2_quote_error_has_diagnostic_and_quote_context(monkeypatch) -> None:
+  class FailingSession:
+    def process_quote(self, payload: WorkerL2QuoteRequest) -> dict[str, object]:
+      raise ValueError("平仓数量超过可用持仓")
+
+  monkeypatch.setattr("backend.worker_app._session", lambda session_id: FailingSession())
+  payload = WorkerL2QuoteRequest(
+    tradeDate="2026-04-03",
+    quote={"symbol": "688126.SH", "time": "2026-04-03 09:31:02"},
+  )
+
+  with pytest.raises(HTTPException) as raised:
+    process_l2_quote("session-1", payload)
+
+  detail = raised.value.detail
+  assert detail["diagnostic"]["reason"] == "平仓数量超过可用持仓"
+  assert detail["errorDetail"]["symbol"] == "688126.SH"
+  assert detail["errorDetail"]["eventTime"] == "2026-04-03 09:31:02"
+
+
+def test_strategy_worker_keeps_structured_quote_diagnostic(monkeypatch) -> None:
+  response = json.dumps({"detail": {
+    "errorDetail": {
+      "category": "system_error",
+      "code": "system.internal",
+      "message": "回测执行异常，请稍后重试。",
+      "symbol": "688126.SH",
+      "eventTime": "2026-04-03 09:31:02",
+    },
+    "diagnostic": {
+      "exceptionType": "ValueError",
+      "reason": "平仓数量超过可用持仓",
+    },
+  }}).encode("utf-8")
+  error = HTTPError("http://worker/quotes", 422, "unprocessable", None, io.BytesIO(response))
+
+  def raise_http_error(*args: object, **kwargs: object) -> object:
+    raise error
+
+  monkeypatch.setattr(strategy_worker, "urlopen", raise_http_error)
+
+  with pytest.raises(RemoteBacktestError) as raised:
+    strategy_worker.process_l2_quote("session-1", {"tradeDate": "2026-04-03", "quote": {}})
+
+  assert raised.value.diagnostic["reason"] == "平仓数量超过可用持仓"
+  assert raised.value.detail.event_time == "2026-04-03 09:31:02"

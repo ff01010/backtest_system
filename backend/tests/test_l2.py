@@ -11,7 +11,7 @@ from backend.backtesting.models import OrderIntent, OrderSide, PositionEffect
 from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot, SourceMappingProfile, TradeEvent, parse_timestamp
 from backend.l2.config import load_temporary_quote_profile
-from backend.l2.providers import ClickHouseL2Adapter, TemporaryQuoteBarProvider, VersionedBarCache
+from backend.l2.providers import ClickHouseL2Adapter, L2DataError, TemporaryQuoteBarProvider, VersionedBarCache
 from backend.l2.result_adapter import normalize_l2_result
 from backend.l2_runner import L2Runner, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day
 from backend.services import clickhouse_client
@@ -221,6 +221,28 @@ def test_unknown_cache_version_does_not_use_redis_cache() -> None:
 
   assert result is None
   assert probe.calls == []
+
+
+def test_temporary_bar_marks_redis_unavailable_in_cache_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+  class FailingCache:
+    def get(self, key: str) -> None:
+      raise L2DataError("Redis 缓存不可用: Authentication required")
+
+    def set(self, key: str, value: dict[str, object], ttl_seconds: int) -> None:
+      raise L2DataError("Redis 缓存不可用: Authentication required")
+
+  provider = TemporaryQuoteBarProvider(
+    load_temporary_quote_profile(),
+    VersionedBarCache(FailingCache(), 60),
+    "tick_quote_session_v4",
+    "tick_quote_depth_v3",
+  )
+  monkeypatch.setattr(provider, "_aggregate_day", lambda *args: [_bar()])
+
+  provider._load_day("688981.SH", "2026-01-02", "1m")
+
+  day = provider.cache_snapshot()["days"][0]
+  assert day["cacheStatus"] == "miss_unavailable"
 
 
 def test_temporary_quote_mapping_uses_actual_depth_volume_columns() -> None:
@@ -547,6 +569,42 @@ def test_order_driven_runner_queries_quote_only_after_order(monkeypatch: pytest.
   assert performance["quoteRowsPrefetched"] == 1
 
 
+def test_order_driven_runner_uses_actual_last_quote_for_day_end(monkeypatch: pytest.MonkeyPatch) -> None:
+  class QuoteProvider:
+    def quotes_after(self, *args: Any, **kwargs: Any) -> list[QuoteSnapshot]:
+      return [_quote("2026-01-02 14:51:03")]
+
+    def last_quote_before(self, symbol: str, trade_date: str, before_time: str) -> QuoteSnapshot:
+      assert before_time == "2026-01-02 14:57:00"
+      return _quote("2026-01-02 14:56:57")
+
+  processed_quotes: list[str] = []
+  monkeypatch.setattr("backend.l2_runner.strategy_worker.begin_l2_day", lambda *args: None)
+  monkeypatch.setattr(
+    "backend.l2_runner.strategy_worker.process_l2_bars",
+    lambda *args: {
+      "processedBars": 1,
+      "quoteDemand": "waiting_quote",
+      "nextQuoteAfter": "2026-01-02 14:51:00",
+      "dayEndQuoteRequired": False,
+    },
+  )
+  monkeypatch.setattr(
+    "backend.l2_runner.strategy_worker.process_l2_quote",
+    lambda _session, payload: processed_quotes.append(payload["quote"]["time"]) or {
+      "quoteDemand": "idle", "dayEndQuoteRequired": True,
+    },
+  )
+  monkeypatch.setattr("backend.l2_runner.strategy_worker.finish_l2_day", lambda *args: None)
+  monkeypatch.setattr("backend.l2_runner.state_store.heartbeat_l2_backtest_job", lambda *args: True)
+
+  performance = _new_performance()
+  _replay_day("session", [_bar()], QuoteProvider(), "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
+
+  assert processed_quotes == ["2026-01-02 14:51:03", "2026-01-02 14:56:57"]
+  assert performance["quoteQueries"] == 2
+
+
 def test_order_driven_runner_reuses_future_quote_buffer_without_forward_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
   class QuoteProvider:
     def __init__(self) -> None:
@@ -621,6 +679,17 @@ def test_temporary_aggregation_does_not_require_fixed_snapshot_count() -> None:
   assert "max_gap_ms <=" not in query
   assert "14:57:00" in query
   assert "15:00:00" not in query
+  assert "cum_amount AS cum_amount" in query
+  assert "4294967296.0 AS uint32_modulus" in query
+  assert "if(cum_amount < 0, cum_amount + uint32_modulus, cum_amount) AS normalized_cum_amount" in query
+  assert "normalized_cum_amount + uint32_modulus - previous_cum_amount" in query
+  assert "countIf(volume < 0 OR amount_valid = 0)" in query
+
+
+def test_temporary_quote_profile_maps_cumulative_amount_for_wrap_repair() -> None:
+  profile = load_temporary_quote_profile()
+
+  assert profile.columns["cum_amount"] == "cum_amount"
 
 
 def test_continuous_quote_filter_excludes_closing_auction() -> None:

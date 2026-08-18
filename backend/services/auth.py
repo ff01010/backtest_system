@@ -147,11 +147,25 @@ def revoke_session(token: str | None) -> None:
       cur.execute("UPDATE auth_session SET revoked_at=now() WHERE token_hash=%s AND revoked_at IS NULL", (token_hash,))
 
 
-def list_users() -> list[dict[str, Any]]:
+def list_users(page: int, page_size: int) -> dict[str, Any]:
+  """按页返回人员，避免管理员页面一次加载全部账户。"""
   with _system_db() as conn:
     with conn.cursor() as cur:
-      cur.execute("SELECT * FROM app_user ORDER BY role DESC, username")
-      return [_normalize_user(row) for row in cur.fetchall()]
+      cur.execute("SELECT count(*) AS value FROM app_user")
+      total = int(cur.fetchone()["value"])
+      last_page = max(1, (total + page_size - 1) // page_size)
+      actual_page = min(page, last_page)
+      cur.execute("""
+        SELECT * FROM app_user
+        ORDER BY created_at DESC, username
+        LIMIT %s OFFSET %s
+      """, (page_size, (actual_page - 1) * page_size))
+      return {
+        "users": [_normalize_user(row) for row in cur.fetchall()],
+        "page": actual_page,
+        "pageSize": page_size,
+        "total": total,
+      }
 
 
 def create_user(username: str, display_name: str, password: str, role: str) -> dict[str, Any]:
@@ -194,3 +208,32 @@ def reset_password(user_id: str, password: str) -> None:
       if cur.rowcount == 0:
         raise KeyError(user_id)
       cur.execute("UPDATE auth_session SET revoked_at=now() WHERE user_id=%s AND revoked_at IS NULL", (user_id,))
+
+
+def delete_user(user_id: str, actor_user_id: str) -> dict[str, str]:
+  """删除无历史回测账号；保留历史的账号改为禁用，避免破坏审计链路。"""
+  if user_id == actor_user_id:
+    raise UserManagementError("不能删除当前登录账号")
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT id, role, status FROM app_user WHERE id=%s", (user_id,))
+      target = cur.fetchone()
+      if not target:
+        raise KeyError(user_id)
+      _ensure_deletable_admin(cur, target)
+      cur.execute("SELECT EXISTS(SELECT 1 FROM backtest_run WHERE owner_user_id=%s) AS value", (user_id,))
+      has_history = bool(cur.fetchone()["value"])
+      if has_history:
+        cur.execute("UPDATE app_user SET status='disabled', updated_at=now() WHERE id=%s", (user_id,))
+        cur.execute("UPDATE auth_session SET revoked_at=now() WHERE user_id=%s AND revoked_at IS NULL", (user_id,))
+        return {"action": "disabled", "message": "该用户存在历史回测记录，已禁用并保留历史归属。"}
+      cur.execute("DELETE FROM app_user WHERE id=%s", (user_id,))
+      return {"action": "deleted", "message": "用户已删除。"}
+
+
+def _ensure_deletable_admin(cur: psycopg.Cursor[Any], target: dict[str, Any]) -> None:
+  if target["role"] != "admin" or target["status"] != "active":
+    return
+  cur.execute("SELECT count(*) AS value FROM app_user WHERE role='admin' AND status='active'")
+  if int(cur.fetchone()["value"]) <= 1:
+    raise UserManagementError("至少保留一名启用的管理员")

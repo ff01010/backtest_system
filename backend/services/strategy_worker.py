@@ -112,7 +112,12 @@ def _request(path: str, method: str, payload: dict[str, Any] | None, timeout: in
       detail = response.get("detail") if isinstance(response, dict) else None
       error_detail = detail.get("errorDetail") if isinstance(detail, dict) else None
       if isinstance(error_detail, dict):
-        raise RemoteBacktestError.from_dict(error_detail) from error
+        diagnostic = detail.get("diagnostic")
+        diagnostic = {
+          key: value for key, value in diagnostic.items()
+          if isinstance(key, str) and isinstance(value, str)
+        } if isinstance(diagnostic, dict) else None
+        raise RemoteBacktestError.from_dict(error_detail, diagnostic) from error
     except json.JSONDecodeError:
       pass
     raise StrategyWorkerError("策略执行服务返回异常") from error

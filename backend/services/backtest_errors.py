@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from backend.services.system_error_catalog import classify_system_error
+
 
 @dataclass(frozen=True)
 class BacktestErrorDetail:
@@ -37,6 +39,16 @@ class BacktestErrorDetail:
     return BacktestErrorDetail(
       self.category, self.code, self.message, self.hint, self.callback,
       self.event_time, self.symbol, self.retryable, task_id,
+    )
+
+  def with_event_context(
+    self,
+    symbol: str | None,
+    event_time: str | None,
+  ) -> "BacktestErrorDetail":
+    return BacktestErrorDetail(
+      self.category, self.code, self.message, self.hint, self.callback,
+      self.event_time or event_time, self.symbol or symbol, self.retryable, self.task_id,
     )
 
 
@@ -75,8 +87,20 @@ class StrategyExecutionError(BacktestExecutionError, ValueError):
 class RemoteBacktestError(BacktestExecutionError):
   """保留 worker 已脱敏的结构化错误，避免 HTTP 传输时退化为字符串。"""
 
+  def __init__(
+    self,
+    detail: BacktestErrorDetail,
+    diagnostic: dict[str, str] | None = None,
+  ) -> None:
+    super().__init__(detail)
+    self.diagnostic = diagnostic or {}
+
   @classmethod
-  def from_dict(cls, value: dict[str, Any]) -> "RemoteBacktestError":
+  def from_dict(
+    cls,
+    value: dict[str, Any],
+    diagnostic: dict[str, str] | None = None,
+  ) -> "RemoteBacktestError":
     return cls(BacktestErrorDetail(
       category=str(value.get("category") or "system_error"),
       code=str(value.get("code") or "system.internal"),
@@ -87,21 +111,17 @@ class RemoteBacktestError(BacktestExecutionError):
       symbol=_optional_text(value.get("symbol")),
       retryable=bool(value.get("retryable", False)),
       task_id=_optional_text(value.get("taskId")),
-    ))
+    ), diagnostic)
 
 
 def error_detail(error: Exception, task_id: str | None = None) -> BacktestErrorDetail:
   """把任意异常降级为可公开的结构化错误。"""
   if isinstance(error, BacktestExecutionError):
     return error.detail.with_task_id(task_id or error.detail.task_id)
-  if isinstance(error, FileNotFoundError):
-    return BacktestErrorDetail(
-      "system_error", "data.unavailable", "所选区间没有可用行情数据。",
-      "请检查标的、日期和周期后重试。", retryable=False, task_id=task_id,
-    )
+  classified = classify_system_error(error)
   return BacktestErrorDetail(
-    "system_error", "system.internal", "回测执行异常，请稍后重试。",
-    "如持续出现，请提供任务编号给维护人员。", retryable=True, task_id=task_id,
+    "system_error", classified.code, classified.public_message,
+    classified.public_hint, retryable=classified.retryable, task_id=task_id,
   )
 
 

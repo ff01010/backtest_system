@@ -94,7 +94,7 @@ class L2Runner:
       status = "cancelled" if "租约丢失或已取消" in str(error) else "failed"
       system_error = None
       if status == "failed" and error_detail(error, job["runId"]).category == "system_error":
-        system_error = system_error_log_record(error, "l2_runner", stage)
+        system_error = system_error_log_record(error, "l2_runner", stage, job["runId"])
       state_store.finish_l2_backtest_job(
         job["runId"], job["attemptToken"], status, error_summary(error, job["runId"]),
         system_error=system_error.to_dict() if system_error else None,
@@ -192,54 +192,55 @@ def _replay_day(
   strategy_worker.begin_l2_day(session_id, {"tradeDate": trade_date})
   bar_index = 0
   quote_cursor: str | None = None
-  quote_buffer = _QuotePrefetchBuffer(quote_provider, symbol, trade_date, performance)
+  quote_reader = _QuotePrefetchBuffer(quote_provider, symbol, trade_date, performance)
   demand: dict[str, Any] = {"quoteDemand": "idle", "dayEndQuoteRequired": False}
-  while bar_index < len(bars):
-    next_bar = bars[bar_index]
-    if _waiting_quote(demand):
-      quote = quote_buffer.next(quote_cursor, demand, next_bar.end_time)
-      if quote is not None:
-        demand = _process_quote(session_id, quote, trade_date, job, performance)
-        quote_cursor = quote.time
-        continue
-    batch = bars[bar_index:] if not _waiting_quote(demand) else [next_bar]
-    started = time.perf_counter()
-    response = strategy_worker.process_l2_bars(session_id, {
-      "tradeDate": trade_date,
-      "bars": [asdict(bar) for bar in batch],
-    })
-    performance["workerMs"] += _elapsed_ms(started)
-    performance["workerCalls"] += 1
-    processed = int(response.get("processedBars", 0))
-    if processed <= 0 or processed > len(batch):
-      raise L2DataError("L2 worker 未返回有效的 Bar 处理数量")
-    performance["barCount"] += processed
-    bar_index += processed
-    demand = response
-    _heartbeat(job)
+  try:
+    while bar_index < len(bars):
+      next_bar = bars[bar_index]
+      if _waiting_quote(demand):
+        quote = quote_reader.next(quote_cursor, demand, next_bar.end_time)
+        if quote is not None:
+          demand = _process_quote(session_id, quote, trade_date, job, performance)
+          quote_cursor = quote.time
+          continue
+      batch = bars[bar_index:] if not _waiting_quote(demand) else [next_bar]
+      started = time.perf_counter()
+      response = strategy_worker.process_l2_bars(session_id, {
+        "tradeDate": trade_date,
+        "bars": [asdict(bar) for bar in batch],
+      })
+      performance["workerMs"] += _elapsed_ms(started)
+      performance["workerCalls"] += 1
+      processed = int(response.get("processedBars", 0))
+      if processed <= 0 or processed > len(batch):
+        raise L2DataError("L2 worker 未返回有效的 Bar 处理数量")
+      performance["barCount"] += processed
+      bar_index += processed
+      demand = response
+      _heartbeat(job)
 
-  session_end = f"{trade_date} 14:57:00"
-  while _waiting_quote(demand):
-    quote = quote_buffer.next(quote_cursor, demand, session_end)
-    if quote is None:
-      break
-    demand = _process_quote(session_id, quote, trade_date, job, performance)
-    quote_cursor = quote.time
+    session_end = f"{trade_date} 14:57:00"
+    while _waiting_quote(demand):
+      quote = quote_reader.next(quote_cursor, demand, session_end)
+      if quote is None:
+        break
+      demand = _process_quote(session_id, quote, trade_date, job, performance)
+      quote_cursor = quote.time
 
-  if bool(demand.get("dayEndQuoteRequired")):
-    final_quote = quote_buffer.last_before(session_end)
-    if final_quote is None:
+    if bool(demand.get("dayEndQuoteRequired")):
+      # 尾盘结算必须使用真实最后快照，不能使用任意预读窗口中的旧快照。
+      quote_reader.close()
       started = time.perf_counter()
       final_quote = quote_provider.last_quote_before(symbol, trade_date, session_end)
       performance["quoteQueries"] += 1
       performance["quoteBufferMisses"] += 1
       performance["sourceReadMs"] += _elapsed_ms(started)
-    else:
-      performance["quoteBufferHits"] += 1
-    if final_quote is not None and (quote_cursor is None or parse_timestamp(final_quote.time) > parse_timestamp(quote_cursor)):
-      demand = _process_quote(session_id, final_quote, trade_date, job, performance)
-      quote_cursor = final_quote.time
-  strategy_worker.finish_l2_day(session_id, trade_date)
+      if final_quote is not None and (quote_cursor is None or parse_timestamp(final_quote.time) > parse_timestamp(quote_cursor)):
+        demand = _process_quote(session_id, final_quote, trade_date, job, performance)
+        quote_cursor = final_quote.time
+    strategy_worker.finish_l2_day(session_id, trade_date)
+  finally:
+    quote_reader.close()
 
 
 def _replay_day_continuous(
@@ -320,11 +321,8 @@ class _QuotePrefetchBuffer:
       self._performance["quoteBufferHits"] += 1
     return self._quotes.popleft()
 
-  def last_before(self, before_time: str) -> QuoteSnapshot | None:
-    for quote in reversed(self._quotes):
-      if parse_timestamp(quote.time) < parse_timestamp(before_time):
-        return quote
-    return None
+  def close(self) -> None:
+    """预读缓冲不持有外部资源。"""
 
   def _discard_before(self, after_time: str) -> None:
     while self._quotes and parse_timestamp(self._quotes[0].time) <= parse_timestamp(after_time):
