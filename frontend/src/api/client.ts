@@ -72,6 +72,13 @@ export interface ManagedUser extends SessionUser {
   lastLoginAt: string | null;
 }
 
+export interface ManagedUserPage {
+  users: ManagedUser[];
+  page: number;
+  pageSize: number;
+  total: number;
+}
+
 export interface SystemErrorLogEntry {
   id: number;
   runId: string;
@@ -84,9 +91,12 @@ export interface SystemErrorLogEntry {
   source: string;
   stage: string;
   code: string;
+  category: string;
+  retryable: boolean;
   reason: string;
   exceptionType: string;
   context: Record<string, string>;
+  rawLogRef: string;
   occurredAt: string;
 }
 
@@ -105,8 +115,18 @@ export async function logout(): Promise<void> {
 }
 
 export async function fetchUsers(): Promise<ManagedUser[]> {
-  const data = await fetchJson<{ users: ManagedUser[] }>(`${BASE}/admin/users`);
-  return data.users;
+  const firstPage = await fetchUserPage(1, 100);
+  const pageCount = Math.ceil(firstPage.total / firstPage.pageSize);
+  if (pageCount <= 1) return firstPage.users;
+  const remainingPages = await Promise.all(
+    Array.from({ length: pageCount - 1 }, (_, index) => fetchUserPage(index + 2, firstPage.pageSize)),
+  );
+  return firstPage.users.concat(...remainingPages.map((item) => item.users));
+}
+
+export async function fetchUserPage(page: number, pageSize: number): Promise<ManagedUserPage> {
+  const search = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+  return fetchJson<ManagedUserPage>(`${BASE}/admin/users?${search}`);
 }
 
 export async function createUser(payload: { username: string; displayName: string; password: string; role: string }): Promise<ManagedUser> {
@@ -121,6 +141,14 @@ export async function updateUser(userId: string, payload: { displayName: string;
 
 export async function resetUserPassword(userId: string, password: string): Promise<void> {
   await sendJson<{ ok: boolean }>(`${BASE}/admin/users/${userId}/reset-password`, 'POST', { password });
+}
+
+export async function deleteUser(userId: string): Promise<{ action: 'deleted' | 'disabled'; message: string }> {
+  const res = await fetch(`${BASE}/admin/users/${userId}`, { method: 'DELETE', credentials: 'include' });
+  if (!res.ok) {
+    throw new Error(`API ${res.status}: ${await res.text()}`);
+  }
+  return res.json();
 }
 
 export async function fetchSystemErrorLogs(filters: {

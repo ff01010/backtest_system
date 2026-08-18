@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import socket
 from dataclasses import asdict
@@ -15,6 +16,7 @@ from backend.time_utils import now_shanghai_iso_datetime
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+logger = logging.getLogger(__name__)
 
 
 class L2DataError(RuntimeError):
@@ -43,7 +45,6 @@ class L2QuoteProvider(Protocol):
     self, symbol: str, trade_date: str, after_time: str, before_time: str | None, limit: int,
   ) -> list[QuoteSnapshot]:
     """返回严格晚于时间游标的有限条连续竞价快照。"""
-
 
 class L2EventProvider(Protocol):
   """逐笔成交的只读协议。"""
@@ -427,13 +428,21 @@ class VersionedBarCache:
   def __init__(self, cache: RedisJsonCache | None, ttl_seconds: int) -> None:
     self._cache = cache
     self._ttl = ttl_seconds
+    self._last_error: str | None = None
+    self._reported_errors: set[str] = set()
+
+  @property
+  def last_error(self) -> str | None:
+    return self._last_error
 
   def get(self, aggregation_version: str | None, mapping_version: str | None, symbol: str, trade_date: str, period: str) -> list[NormalizedBar] | None:
+    self._last_error = None
     if self._cache is None or not aggregation_version or not mapping_version:
       return None
     try:
       value = self._cache.get(self._key(aggregation_version, mapping_version, symbol, trade_date, period))
-    except L2DataError:
+    except L2DataError as error:
+      self._record_error("读取", error)
       return None
     if value is None:
       return None
@@ -448,17 +457,27 @@ class VersionedBarCache:
     period: str,
     bars: Sequence[NormalizedBar],
     metadata: dict[str, Any] | None = None,
-  ) -> None:
+  ) -> bool:
+    self._last_error = None
     if self._cache is None or not aggregation_version or not mapping_version:
-      return
+      return False
     try:
       self._cache.set(
         self._key(aggregation_version, mapping_version, symbol, trade_date, period),
         {"bars": [asdict(item) for item in bars], "metadata": metadata or {}},
         self._ttl,
       )
-    except L2DataError:
-      return
+    except L2DataError as error:
+      self._record_error("写入", error)
+      return False
+    return True
+
+  def _record_error(self, operation: str, error: L2DataError) -> None:
+    self._last_error = str(error)
+    message = f"{operation}:{self._last_error}"
+    if message not in self._reported_errors:
+      logger.warning("L2 Bar Redis 缓存%s失败，将降级为 ClickHouse 聚合：%s", operation, error)
+      self._reported_errors.add(message)
 
   @staticmethod
   def _key(aggregation_version: str, mapping_version: str, symbol: str, trade_date: str, period: str) -> str:
@@ -547,7 +566,7 @@ class TemporaryQuoteBarProvider:
     quality = _summarize_quality(bars)
     self._quality_by_day[trade_date] = quality
     if quality == "complete":
-      self._cache.set(
+      cached = self._cache.set(
         self._aggregation_version,
         self._mapping_version,
         symbol,
@@ -562,7 +581,7 @@ class TemporaryQuoteBarProvider:
           "sourcePolicy": "closed_day_append_only",
         },
       )
-      self._cache_status[trade_date] = "miss"
+      self._cache_status[trade_date] = "miss" if cached else "miss_unavailable"
     else:
       self._cache_status[trade_date] = "miss_unusable"
     return bars
@@ -602,10 +621,11 @@ class TemporaryQuoteBarProvider:
       f"{column['trade_date']}={ClickHouseL2Adapter._literal(trade_date)}"
     )
     return f"""
-WITH source AS (
+WITH 4294967296.0 AS uint32_modulus,
+source AS (
   SELECT {column['symbol']} AS symbol, {column['trade_date']} AS trade_date,
     {column['time']} AS event_time, {column['last_price']} AS last_price,
-    {column['volume']} AS volume, {column['amount']} AS amount,
+    {column['volume']} AS volume, {column['amount']} AS amount, {column['cum_amount']} AS cum_amount,
     multiIf(
       {column['time']} >= {morning_start} AND {column['time']} < {morning_end}, {morning_start},
       {column['time']} >= {afternoon_start} AND {column['time']} < {afternoon_end}, {afternoon_start},
@@ -620,13 +640,36 @@ WITH source AS (
   WHERE {source_where}
 ), session_rows AS (
   SELECT * FROM source WHERE session_start IS NOT NULL
+), normalized_source AS (
+  SELECT *, if(cum_amount < 0, cum_amount + uint32_modulus, cum_amount) AS normalized_cum_amount
+  FROM session_rows
 ), measured AS (
   SELECT *, {bucket} AS bucket_start,
     lagInFrame(event_time, 1, event_time) OVER (
       PARTITION BY symbol, trade_date, session_start ORDER BY event_time
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS previous_time
-  FROM session_rows
+    ) AS previous_time,
+    lagInFrame(normalized_cum_amount, 1, normalized_cum_amount) OVER (
+      PARTITION BY symbol, trade_date, session_start ORDER BY event_time
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS previous_cum_amount
+  FROM normalized_source
+), normalized AS (
+  SELECT *,
+    multiIf(
+      event_time = previous_time, amount,
+      normalized_cum_amount >= previous_cum_amount, normalized_cum_amount - previous_cum_amount,
+      previous_cum_amount >= uint32_modulus * 0.9 AND normalized_cum_amount <= uint32_modulus * 0.1,
+        normalized_cum_amount + uint32_modulus - previous_cum_amount,
+      0
+    ) AS amount_increment,
+    multiIf(
+      event_time = previous_time, amount >= 0,
+      normalized_cum_amount >= previous_cum_amount, 1,
+      previous_cum_amount >= uint32_modulus * 0.9 AND normalized_cum_amount <= uint32_modulus * 0.1, 1,
+      0
+    ) AS amount_valid
+  FROM measured
 ), bars AS (
   SELECT symbol, trade_date, bucket_start, {bar_end} AS bar_end,
     argMinIf(last_price, event_time, last_price > 0) AS open,
@@ -634,12 +677,12 @@ WITH source AS (
     minIf(last_price, last_price > 0) AS low,
     argMaxIf(last_price, event_time, last_price > 0) AS close,
     sumIf(volume, volume >= 0) AS aggregated_volume,
-    sumIf(amount, amount >= 0) AS aggregated_amount,
+    sumIf(amount_increment, amount_valid = 1) AS aggregated_amount,
     count() AS snapshot_count,
     max(dateDiff('millisecond', previous_time, event_time)) AS max_gap_ms,
     countIf(last_price > 0) AS valid_price_count,
-    countIf(volume < 0 OR amount < 0) AS invalid_increment_count
-  FROM measured
+    countIf(volume < 0 OR amount_valid = 0) AS invalid_increment_count
+  FROM normalized
   GROUP BY symbol, trade_date, bucket_start
 )
 SELECT symbol, toString(trade_date) AS trade_date,
@@ -665,7 +708,7 @@ ORDER BY trade_date, bucket_start
   def _validate_profile(self) -> None:
     if self._validated:
       return
-    required = {"symbol", "trade_date", "time", "last_price", "volume", "amount"}
+    required = {"symbol", "trade_date", "time", "last_price", "volume", "amount", "cum_amount"}
     if not _TABLE.fullmatch(self._profile.table_name) or not required <= self._profile.columns.keys():
       raise L2DataError("临时 L2 快照映射不完整")
     mapped = {self._profile.columns[item] for item in required}

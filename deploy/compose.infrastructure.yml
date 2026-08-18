@@ -130,7 +130,9 @@ services:
       timeout: 3s
       retries: 5
     networks:
-      - quant-backtest-l2-net
+      quant-backtest-l2-net:
+        aliases:
+          - l2-bar-cache
 
   l2-runner:
     build:
@@ -150,7 +152,7 @@ services:
       TREND_GRID_L2_BAR_MAPPING_JSON: ${TREND_GRID_L2_BAR_MAPPING_JSON:-}
       TREND_GRID_L2_QUOTE_MAPPING_JSON: ${TREND_GRID_L2_QUOTE_MAPPING_JSON:-}
       TREND_GRID_L2_EVENT_MAPPING_JSON: ${TREND_GRID_L2_EVENT_MAPPING_JSON:-}
-      TREND_GRID_L2_REDIS_HOST: redis
+      TREND_GRID_L2_REDIS_HOST: l2-bar-cache
       TREND_GRID_L2_REDIS_PORT: '6379'
     command: ['python', '-m', 'backend.l2_runner']
     depends_on:
