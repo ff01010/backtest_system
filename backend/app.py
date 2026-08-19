@@ -274,11 +274,11 @@ def _validate_backtest_request(request: dict) -> None:
     request["startDate"], request["endDate"] = normalize_date_range(request["startDate"], request["endDate"])
   except TradingDateError as error:
     raise HTTPException(422, str(error)) from error
-  fill_model = request.get("fillModel", "bar_close")
+  fill_model = request.get("fillModel", "bar_next_open")
   if fill_model == "l2_quote":
     if not settings.validate_l2_backtest_timeframe(request["timeframe"]):
       raise HTTPException(422, f"L2 回测不支持 {request['timeframe']}")
-  elif not settings.validate_backtest_timeframe(request["timeframe"]):
+  elif not settings.validate_l2_backtest_timeframe(request["timeframe"]):
     raise HTTPException(422, f"当前回测引擎不支持 {request['timeframe']}")
   if not strategy_adapters.has_strategy(request["strategy"]):
     raise HTTPException(422, f"不支持的策略: {request['strategy']}")
@@ -292,27 +292,16 @@ def _validate_backtest_request(request: dict) -> None:
 
   if fill_model == "l2_quote":
     request["fillModel"] = "l2_quote"
+    request["feeProfile"] = settings.default_fee_profile()
+    request["commissionRate"] = request["feeProfile"]["commissionRate"]
     return
 
-  try:
-    market_snapshots = {}
-    for symbol in {request["symbol"], request.get("benchmarkSymbol") or request["symbol"]}:
-      market_data.ensure_cached(
-        symbol, request["timeframe"], request["startDate"], request["endDate"],
-      )
-      market_snapshots[symbol] = market_data.snapshot(
-        symbol, request["timeframe"], request["startDate"], request["endDate"],
-      )
-    request["marketDataSnapshot"] = market_snapshots
-    data_repository.validate_backtest_coverage(
-      request["symbol"], request["timeframe"], request["startDate"], request["endDate"],
-    )
-    benchmark_symbol = request.get("benchmarkSymbol") or request["symbol"]
-    data_repository.validate_backtest_coverage(
-      benchmark_symbol, request["timeframe"], request["startDate"], request["endDate"],
-    )
-  except ValueError as error:
-    raise HTTPException(422, str(error)) from error
+  request["fillModel"] = "bar_close" if fill_model == "bar_close" else "bar_next_open"
+  request["feeProfile"] = settings.default_fee_profile()
+  request["commissionRate"] = request["feeProfile"]["commissionRate"]
+
+  # 标准 Bar 改由后台 Runner 加载并校验数据，避免长区间读取占用 HTTP 请求。
+  request["marketDataSnapshot"] = {}
 
 
 @app.on_event("startup")
@@ -801,50 +790,27 @@ def run_backtest(payload: schemas.BacktestRunRequest):
     except ValueError as error:
       raise HTTPException(422, str(error)) from error
 
-  run_id = None
   try:
-    run_id, display_no = state_store.create_backtest_run(request)
-    result = backtest_runner.run_backtest(request)
-    state_store.finish_backtest_run(
-      run_id,
-      "ok",
-      result["summary"],
-      result["outputDir"],
-      result,
-    )
+    run_id, display_no = state_store.create_bar_backtest_job(request)
     return {
       "runId": run_id,
       "displayNo": display_no,
       "configId": request.get("configId"),
       "configVersionId": request.get("configVersionId"),
       "scriptId": request.get("scriptId"),
-      **result,
+      "status": "queued",
+      "fillModel": request["fillModel"],
+      "message": "标准 Bar 回测已进入队列，等待 bar-runner 执行",
     }
-  except FileNotFoundError as e:
-    logger.exception("同步回测任务失败: %s", run_id)
-    if run_id is not None:
-      summary = _backtest_error_summary(e, run_id)
-      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e, run_id))
-    raise _backtest_failure_response(e, run_id)
-  except ValueError as e:
-    logger.exception("同步回测任务失败: %s", run_id)
-    if run_id is not None:
-      summary = _backtest_error_summary(e, run_id)
-      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e, run_id))
-    raise _backtest_failure_response(e, run_id)
-  except Exception as e:
-    logger.exception("同步回测任务失败: %s", run_id)
-    if run_id is not None:
-      summary = _backtest_error_summary(e, run_id)
-      state_store.finish_backtest_run(run_id, "error", summary, "", system_error=_sync_system_error_record(e, run_id))
-    raise _backtest_failure_response(e, run_id)
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
 
 
 @app.post("/api/backtest/runs/{run_id}/cancel")
-def cancel_l2_backtest_run(run_id: str):
-  """请求取消尚未结束的 L2 回测；Runner 在当前块结束后清理会话。"""
-  if not state_store.request_l2_backtest_cancel(run_id):
-    raise HTTPException(404, "未找到可取消的 L2 回测任务")
+def cancel_backtest_run(run_id: str):
+  """请求取消未结束的回测；Runner 会在当前可中断边界结束。"""
+  if not state_store.request_l2_backtest_cancel(run_id) and not state_store.request_bar_backtest_cancel(run_id):
+    raise HTTPException(404, "未找到可取消的回测任务")
   return {"runId": run_id, "status": "cancelling"}
 
 

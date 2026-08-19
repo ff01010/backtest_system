@@ -136,10 +136,6 @@ def _require_complete(symbol: str, timeframe: str, start_date: str, end_date: st
     raise MarketDataError(f"{symbol} {timeframe} QMT 行情不完整: {', '.join(invalid)}")
   if not statuses:
     raise MarketDataError(f"{symbol} {timeframe} 区间内未导入 QMT 行情")
-  if start_date < statuses[0]["date"] or end_date > statuses[-1]["date"]:
-    raise MarketDataError(
-      f"{symbol} {timeframe} QMT 覆盖仅到 {statuses[0]['date']}-{statuses[-1]['date']}"
-    )
 
 
 def _cached_timeframe_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:

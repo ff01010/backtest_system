@@ -23,6 +23,15 @@ class L2DataError(RuntimeError):
   """L2 数据契约、覆盖范围或缓存出现错误。"""
 
 
+class L2DataCoverageError(L2DataError):
+  """实际需要回放的交易日缺少连续竞价十档快照。"""
+
+  def __init__(self, symbol: str, missing_dates: Sequence[str]) -> None:
+    self.symbol = symbol
+    self.missing_dates = tuple(sorted({str(value) for value in missing_dates}))
+    super().__init__(f"{symbol} 缺少 L2 连续竞价十档快照: {', '.join(self.missing_dates)}")
+
+
 class L2BarProvider(Protocol):
   """已物化 L2 Bar 的只读协议。"""
 
@@ -225,6 +234,25 @@ class ClickHouseL2Adapter:
     )
     rows = clickhouse_client.query_rows(query)
     return int(rows[0]["total"])
+
+  def missing_quote_dates(self, symbol: str, trade_dates: Sequence[str]) -> list[str]:
+    """一次查询校验实际 Bar 日期是否都存在至少一条有效十档快照。"""
+    dates = sorted({str(value) for value in trade_dates})
+    if not dates:
+      return []
+    price_fields = {f"{side}_price_{index}" for side in ("bid", "ask") for index in range(1, 11)}
+    self._validate_profile({"symbol", "trade_date", "time", *price_fields})
+    valid_quote = " OR ".join(f"{self._profile.columns[name]}>0" for name in sorted(price_fields))
+    query = (
+      f"SELECT {self._profile.columns['trade_date']} AS trade_date "
+      f"FROM {self._profile.table_name} WHERE {self._profile.columns['symbol']}={self._literal(symbol)} "
+      f"AND {self._profile.columns['trade_date']} BETWEEN {self._literal(dates[0])} AND {self._literal(dates[-1])}"
+      f"{self._continuous_session_filter()} AND ({valid_quote}) "
+      f"GROUP BY {self._profile.columns['trade_date']}"
+    )
+    rows = clickhouse_client.query_rows(query)
+    available_dates = {str(row["trade_date"]) for row in rows}
+    return [trade_date for trade_date in dates if trade_date not in available_dates]
 
   def coverage(self, symbol: str, start_date: str, end_date: str) -> CoverageSnapshot:
     self._validate_profile({"symbol", "trade_date", "source_version"})
@@ -697,11 +725,20 @@ ORDER BY trade_date, bucket_start
 
   def _trading_days(self, symbol: str, start_date: str, end_date: str) -> list[str]:
     column = self._profile.columns
+    morning_start = "toDateTime(concat(toString(trade_date), ' 09:30:00'))"
+    morning_end = "toDateTime(concat(toString(trade_date), ' 11:30:00'))"
+    afternoon_start = "toDateTime(concat(toString(trade_date), ' 13:00:00'))"
+    afternoon_end = "toDateTime(concat(toString(trade_date), ' 14:57:00'))"
     query = (
-      f"SELECT DISTINCT toString({column['trade_date']}) AS trade_date FROM {self._profile.table_name} "
+      f"SELECT toString({column['trade_date']}) AS trade_date FROM {self._profile.table_name} "
       f"WHERE {column['symbol']}={ClickHouseL2Adapter._literal(symbol)} "
       f"AND {column['trade_date']} BETWEEN {ClickHouseL2Adapter._literal(start_date)} "
-      f"AND {ClickHouseL2Adapter._literal(end_date)} ORDER BY trade_date"
+      f"AND {ClickHouseL2Adapter._literal(end_date)} "
+      f"AND toDayOfWeek({column['trade_date']}) BETWEEN 1 AND 5 "
+      f"AND {column['last_price']} > 0 "
+      f"AND (({column['time']} >= {morning_start} AND {column['time']} < {morning_end}) "
+      f"OR ({column['time']} >= {afternoon_start} AND {column['time']} < {afternoon_end})) "
+      f"GROUP BY {column['trade_date']} ORDER BY trade_date"
     )
     return [str(row["trade_date"]) for row in clickhouse_client.query_rows(query)]
 

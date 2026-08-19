@@ -1,4 +1,4 @@
-"""可粘贴到自定义策略编辑器的 V6 分批建仓 L2 模板。
+"""可粘贴到自定义策略编辑器的 V6 分批建仓模板。
 
 该文件不直接由服务端导入；保存为 `on_bar` 脚本后由隔离 worker 执行。
 """
@@ -91,10 +91,6 @@ def on_quote(quote, state):
   if item['manualTakeover']:
     return []
   actions = []
-  if not item['openingSubmitted'] and quote['hhmm'] < FORCE_CLOSE_HHMM:
-    item['openingSubmitted'] = True
-    actions.append(_order('buy_open', OPENING_POSITION_QTY, 'V6 开盘 1% 建仓', 'opening'))
-    return actions
   if item['forwardQty'] > 0:
     take_profit = _forward_average(item) * 1.01
     stop_price = item['stageSignals'][3] if len(item['stageSignals']) >= 4 else 0.0
@@ -123,33 +119,38 @@ def on_bar(bar, state):
   """只使用已完成 1 分钟 Bar 确认顶底和反手收盘条件。"""
   item = _state(state)
   _reset_day(item, bar['tradeDate'])
+  actions = []
+  if not item['openingSubmitted'] and bar['hhmm'] < FORCE_CLOSE_HHMM:
+    item['openingSubmitted'] = True
+    actions.append(_order('buy_open', OPENING_POSITION_QTY, 'V6 首根 Bar 建仓', 'opening'))
   closes = item['closes']
   closes.append(float(bar['close']))
   if len(closes) > 3:
     closes.pop(0)
   if len(closes) < 3 or item['manualTakeover']:
-    return []
+    return actions
   a_close, b_close, c_close = closes
   is_peak = a_close <= b_close and b_close > c_close
   is_valley = a_close >= b_close and b_close < c_close
   if item['reverseTrigger'] and not item['reverseRequested']:
     if item['breachEnd'] == bar['time'][:12] and c_close <= item['reverseTrigger']:
       item['reverseRequested'] = True
-      return []
+      return actions
   if item['reverseRequested']:
     if is_valley and item['shortQty'] > 0 and not item['reverseExitRequested']:
       item['reverseExitRequested'] = True
-    return []
+    return actions
   if not is_valley or item['forwardQty'] <= 0 or len(item['stageSignals']) >= len(STAGE_QTYS):
-    return []
+    return actions
   if item['stageSignals'] and b_close >= item['stageSignals'][-1]:
-    return []
+    return actions
   stage_index = len(item['stageSignals'])
   key = f'stage-{stage_index + 1}'
   if _has_pending(item, key):
-    return []
+    return actions
   item['pendingSignal'] = b_close
-  return [_order('buy_open', STAGE_QTYS[stage_index], f'V6 第 {stage_index + 1} 阶段低点建仓', key)]
+  actions.append(_order('buy_open', STAGE_QTYS[stage_index], f'V6 第 {stage_index + 1} 阶段低点建仓', key))
+  return actions
 
 
 def on_order_event(event, state):

@@ -152,6 +152,7 @@ def test_worker_applies_slippage_to_script_trade_price() -> None:
     commissionRate=0,
     slippage=0.001,
     holdingPolicy="overnight",
+    fillModel="bar_close",
   ))
 
   assert round(result["trades"][0]["price"], 2) == 10.01

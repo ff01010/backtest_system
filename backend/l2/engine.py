@@ -9,6 +9,7 @@ from typing import Any, Sequence
 from uuid import uuid4
 
 from backend.backtesting.engine import PortfolioLedger
+from backend.backtesting.fees import FeeProfile
 from backend.backtesting.models import Bar, Fill, OrderIntent, OrderSide, PositionEffect
 from backend.l2.models import InstrumentRules, L2Order, NormalizedBar, QuoteLevel, QuoteSnapshot, TradeEvent, parse_timestamp
 
@@ -34,6 +35,7 @@ class L2ExecutionEngine:
     base_quantity: int = 0,
     base_cost_price: float = 0.0,
     t0_enabled: bool = False,
+    fee_profile: FeeProfile | None = None,
   ) -> None:
     if latency_ms < 0 or not 0 < passive_participation_rate <= 1:
       raise ValueError("L2 延迟或被动参与率无效")
@@ -46,6 +48,12 @@ class L2ExecutionEngine:
     self._strategy = strategy
     self._ledger = PortfolioLedger(initial_cash)
     self._commission_rate = commission_rate
+    self._fee_profile = fee_profile or FeeProfile(
+      commission_rate=commission_rate,
+      transfer_fee_rate=_TRANSFER_FEE_RATE,
+      stamp_duty_rate=_STAMP_DUTY_RATE,
+      minimum_commission=0.0,
+    )
     self._rules = rules
     self._latency = timedelta(milliseconds=latency_ms)
     self._participation = passive_participation_rate
@@ -65,6 +73,7 @@ class L2ExecutionEngine:
     self._sequence = 0
     self._base_initialized = False
     self._base_cost_price = base_cost_price
+    self._order_fee_state: dict[str, tuple[float, float]] = {}
 
   def initialize_base_position(self, symbol: str) -> None:
     """在首个交易日前将外部底仓登记到当前标的。"""
@@ -264,9 +273,15 @@ class L2ExecutionEngine:
   def _apply_fill(self, order: L2Order, quantity: int, price: float, time: str, source: str) -> None:
     if quantity <= 0 or not self._can_afford(order, quantity, price):
       return
-    fee = self._fee(order.side, price, quantity)
+    fee, breakdown = self._commit_fee(order, price, quantity)
     metadata = dict(order.intent.metadata)
-    metadata.update({"price_source": source, "order_id": order.order_id, "signal_time": metadata.get("signal_time", str(order.effective_at))})
+    metadata.update({
+      "price_source": source,
+      "order_id": order.order_id,
+      "signal_time": metadata.get("signal_time", str(order.effective_at)),
+      "fee_breakdown": breakdown,
+      "execution_mode": "l2_quote",
+    })
     fill = Fill(time, order.intent.symbol, order.side, quantity, price, fee, order.intent.reason, order.intent.position_effect, order.intent.position_key, metadata=metadata)
     self._ledger.apply_fill(fill)
     order.remaining_quantity -= quantity
@@ -388,9 +403,15 @@ class L2ExecutionEngine:
 
   def _apply_forced_fill(self, order: L2Order, price: float, source: str) -> None:
     quantity = order.remaining_quantity
-    fee = self._fee(order.side, price, quantity)
+    fee, breakdown = self._commit_fee(order, price, quantity)
     metadata = dict(order.intent.metadata)
-    metadata.update({"price_source": source, "order_id": order.order_id, "signal_time": self._last_quote.time})
+    metadata.update({
+      "price_source": source,
+      "order_id": order.order_id,
+      "signal_time": self._last_quote.time,
+      "fee_breakdown": breakdown,
+      "execution_mode": "l2_quote",
+    })
     fill = Fill(self._last_quote.time, order.intent.symbol, order.side, quantity, price, fee, order.intent.reason, order.intent.position_effect, order.intent.position_key, metadata=metadata)
     self._ledger.apply_fill(fill)
     order.filled_quantity += quantity
@@ -523,7 +544,8 @@ class L2ExecutionEngine:
   def _can_afford(self, order: L2Order, quantity: int, price: float) -> bool:
     if order.intent.position_effect != PositionEffect.OPEN_LONG:
       return True
-    return self._ledger.snapshot().cash + 1e-8 >= price * quantity + self._fee(order.side, price, quantity)
+    fee, _ = self._preview_fee(order, price, quantity)
+    return self._ledger.snapshot().cash + 1e-8 >= price * quantity + fee
 
   def _uses_t0_capacity(self, intent: OrderIntent) -> bool:
     return (
@@ -619,6 +641,21 @@ class L2ExecutionEngine:
       t0_available_quantity=self._t0_remaining() if self._t0_enabled else None,
     )
 
-  def _fee(self, side: OrderSide, price: float, quantity: int) -> float:
-    rate = self._commission_rate + _TRANSFER_FEE_RATE + (_STAMP_DUTY_RATE if side == OrderSide.SELL else 0)
-    return round(price * quantity * rate, 8)
+  def _preview_fee(self, order: L2Order, price: float, quantity: int) -> tuple[float, dict[str, float]]:
+    previous_notional, previous_commission = self._order_fee_state.get(order.order_id, (0.0, 0.0))
+    return self._fee_profile.fee_for_fill(
+      order.side,
+      price,
+      quantity,
+      previous_notional,
+      previous_commission,
+    )
+
+  def _commit_fee(self, order: L2Order, price: float, quantity: int) -> tuple[float, dict[str, float]]:
+    fee, breakdown = self._preview_fee(order, price, quantity)
+    previous_notional, previous_commission = self._order_fee_state.get(order.order_id, (0.0, 0.0))
+    self._order_fee_state[order.order_id] = (
+      previous_notional + price * quantity,
+      previous_commission + breakdown["commission"],
+    )
+    return fee, breakdown

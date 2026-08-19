@@ -40,6 +40,7 @@ def normalize_l2_result(raw_result: dict[str, Any], payload: dict[str, Any]) -> 
   trades = [_fill_to_trade(item) for item in _records(raw_result.get("fills"))]
   skipped_signals = _build_skipped_signals(raw_result)
   summary = _build_summary(initial_capital, trades, daily_holdings, initial_cash, base_quantity, base_cost_price, bool(payload.get("t0Enabled", False)))
+  summary.update(_execution_counts(raw_result.get("orders"), trades))
   warnings = [str(item) for item in raw_result.get("warnings", [])]
   benchmark_symbol = payload.get("benchmarkSymbol") or None
   if benchmark_symbol:
@@ -269,6 +270,21 @@ def _build_summary(
     "finalEquity": round(final_equity, 2),
     **_build_base_metrics(initial_cash, base_quantity, base_cost_price, t0_enabled, daily_holdings),
     **performance,
+  }
+
+
+def _execution_counts(raw_orders: object, trades: list[dict[str, Any]]) -> dict[str, int]:
+  """区分策略接受的委托数与盘口拆分后的成交笔数。"""
+  accepted_order_ids = {
+    str(item.get("orderId"))
+    for item in _records(raw_orders)
+    if item.get("type") == "accepted" and item.get("orderId")
+  }
+  fill_count = len(trades)
+  return {
+    "orderCount": len(accepted_order_ids) if accepted_order_ids else fill_count,
+    "fillCount": fill_count,
+    "tradeCount": fill_count,
   }
 
 

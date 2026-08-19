@@ -62,6 +62,22 @@ L2_PAGE_SIZE = int(os.getenv("TREND_GRID_L2_PAGE_SIZE", "2000"))
 L2_QUOTE_PREFETCH_SIZE = _read_bounded_int("TREND_GRID_L2_QUOTE_PREFETCH_SIZE", 128, 16, 512)
 L2_WORKER_SESSION_LIMIT = int(os.getenv("TREND_GRID_L2_WORKER_SESSION_LIMIT", "2"))
 
+# 全局默认 A 股费用。仅由部署环境配置，当前不向普通用户开放编辑。
+DEFAULT_COMMISSION_RATE = float(os.getenv("TREND_GRID_DEFAULT_COMMISSION_RATE", "0.00008"))
+DEFAULT_TRANSFER_FEE_RATE = float(os.getenv("TREND_GRID_DEFAULT_TRANSFER_FEE_RATE", "0.00001"))
+DEFAULT_STAMP_DUTY_RATE = float(os.getenv("TREND_GRID_DEFAULT_STAMP_DUTY_RATE", "0.0005"))
+DEFAULT_MINIMUM_COMMISSION = float(os.getenv("TREND_GRID_DEFAULT_MINIMUM_COMMISSION", "5"))
+
+
+def default_fee_profile() -> dict[str, float]:
+  """返回每个任务写入快照的默认 A 股费用。"""
+  return {
+    "commissionRate": DEFAULT_COMMISSION_RATE,
+    "transferFeeRate": DEFAULT_TRANSFER_FEE_RATE,
+    "stampDutyRate": DEFAULT_STAMP_DUTY_RATE,
+    "minimumCommission": DEFAULT_MINIMUM_COMMISSION,
+  }
+
 # 当前部署尚未配置 HTTPS，默认关闭 Secure 以保证同源 HTTP 登录可用。
 AUTH_COOKIE_SECURE = os.getenv("TREND_GRID_AUTH_COOKIE_SECURE", "false").lower() == "true"
 

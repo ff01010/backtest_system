@@ -43,6 +43,7 @@ def fill_to_api_trade(fill: Fill) -> dict[str, Any]:
     "time": str(fill.metadata.get("signal_time", fill.time)),
     "signalTime": str(fill.metadata.get("signal_time", fill.time)),
     "executionTime": str(fill.time),
+    "plannedExecutionTime": str(fill.metadata.get("planned_execution_time", fill.time)),
     "direction": str(fill.metadata.get("direction", fill.side.value)),
     "action": str(fill.metadata.get("direction", fill.side.value)),
     "side": fill.side.value,
@@ -58,6 +59,9 @@ def fill_to_api_trade(fill: Fill) -> dict[str, Any]:
       )
     ),
     "status": "filled",
+    "fee": float(fill.fee),
+    "feeBreakdown": dict(fill.metadata.get("fee_breakdown", {})),
+    "executionMode": str(fill.metadata.get("execution_mode", "bar_close")),
   }
   module = str(fill.metadata.get("strategy_module", ""))
   if module:

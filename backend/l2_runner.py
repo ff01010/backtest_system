@@ -16,10 +16,10 @@ from backend import settings
 from backend.date_codec import format_api_date
 from backend.l2.config import has_profile, load_profile, load_temporary_quote_profile
 from backend.l2.models import NormalizedBar, QuoteSnapshot, TradeEvent, parse_timestamp
-from backend.l2.providers import ClickHouseL2Adapter, L2DataError, RedisJsonCache, TemporaryQuoteBarProvider, VersionedBarCache
+from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError
 from backend.l2.result_adapter import normalize_l2_result
 from backend.services.backtest_errors import error_detail, error_summary
-from backend.services import state_store, strategy_worker
+from backend.services import bar_data, state_store, strategy_worker
 from backend.services.system_error_log import system_error_log_record
 from backend.strategies.scripted import quote_mode_for_script
 
@@ -56,11 +56,14 @@ class L2Runner:
     try:
       started_at = time.perf_counter()
       payload = dict(job["payload"])
-      bar_provider = self._bar_provider()
       quote_provider = ClickHouseL2Adapter(load_profile("quote") if has_profile("quote") else load_temporary_quote_profile())
       bar_read_started = time.perf_counter()
       stage = "l2.bar_load"
-      bars = bar_provider.load_bars(payload["symbol"], payload["timeframe"], payload["startDate"], payload["endDate"])
+      bars, bar_snapshot = bar_data.load_normalized_bars_with_snapshot(
+        payload["symbol"], payload["timeframe"], payload["startDate"], payload["endDate"],
+      )
+      stage = "l2.quote_coverage"
+      _validate_quote_coverage(quote_provider, payload["symbol"], bars)
       stage = "l2.strategy_session"
       session_id = strategy_worker.create_l2_session(self._session_payload(payload))
       quote_mode = _quote_mode(payload)
@@ -81,7 +84,7 @@ class L2Runner:
       stage = "l2.result_finalize"
       raw_result = strategy_worker.finish_l2_session(session_id)
       session_id = None
-      raw_result["dataSnapshot"] = _data_snapshot(bar_provider, quote_provider, payload, quote_mode)
+      raw_result["dataSnapshot"] = _data_snapshot(bar_snapshot, quote_provider, payload, quote_mode)
       performance["totalElapsedMs"] = _elapsed_ms(started_at)
       raw_result["performance"] = performance
       result = normalize_l2_result(raw_result, payload)
@@ -105,21 +108,6 @@ class L2Runner:
         strategy_worker.discard_l2_session(session_id)
 
   @staticmethod
-  def _bar_provider() -> ClickHouseL2Adapter | TemporaryQuoteBarProvider:
-    if has_profile("bar"):
-      return ClickHouseL2Adapter(load_profile("bar"))
-    cache = VersionedBarCache(
-      RedisJsonCache(settings.L2_REDIS_HOST, settings.L2_REDIS_PORT),
-      settings.L2_BAR_CACHE_TTL_SECONDS,
-    )
-    return TemporaryQuoteBarProvider(
-      load_temporary_quote_profile(),
-      cache,
-      settings.L2_TEMP_BAR_AGGREGATION_VERSION,
-      settings.L2_TEMP_MAPPING_VERSION,
-    )
-
-  @staticmethod
   def _session_payload(payload: dict[str, Any]) -> dict[str, Any]:
     script = payload.get("savedScriptSnapshot") or payload.get("versionScriptSnapshot")
     if not isinstance(script, dict) or not isinstance(script.get("code"), str):
@@ -136,6 +124,7 @@ class L2Runner:
       "params": {**params, "allowLong": payload.get("allowLong", True), "allowShort": payload.get("allowShort", False)},
       "initialCapital": float(payload["initialCapital"]),
       "commissionRate": float(payload["commissionRate"]),
+      "feeProfile": dict(payload.get("feeProfile") or {}),
       "latencyMs": int(params.get("l2LatencyMs", 0)),
       "passiveParticipationRate": float(params.get("l2PassiveParticipationRate", 0.1)),
       "holdingPolicy": _holding_policy(payload),
@@ -159,6 +148,16 @@ def _holding_policy(payload: dict[str, Any]) -> str:
   if payload.get("strategyCategory") not in {"core_position_overlay", "directional_holding"}:
     return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
   return "intraday" if _strategy_category(payload) == "core_position_overlay" else "overnight"
+
+
+def _validate_quote_coverage(
+  quote_provider: ClickHouseL2Adapter,
+  symbol: str,
+  bars: list[NormalizedBar],
+) -> None:
+  missing_dates = quote_provider.missing_quote_dates(symbol, [bar.trade_date for bar in bars])
+  if missing_dates:
+    raise L2DataCoverageError(symbol, missing_dates)
 
 
 def _quote_mode(payload: dict[str, Any]) -> str:
@@ -457,7 +456,7 @@ def _event_key(item: tuple[str, Any] | None) -> tuple[datetime, int, int]:
 
 
 def _data_snapshot(
-  bars: ClickHouseL2Adapter | TemporaryQuoteBarProvider,
+  bar_snapshot: dict[str, Any],
   quotes: ClickHouseL2Adapter,
   payload: dict[str, Any],
   quote_mode: str,
@@ -467,15 +466,15 @@ def _data_snapshot(
     "quoteMode": quote_mode,
     "quoteGranularitySeconds": 3,
     "eventProtocolVersion": "l2-script-events-v1",
-    "bar": asdict(bars.coverage(payload["symbol"], payload["startDate"], payload["endDate"])),
+    "bar": bar_snapshot,
     "quote": asdict(quotes.coverage(payload["symbol"], payload["startDate"], payload["endDate"])),
     "event": {
       "enabled": quote_mode == "continuous",
       "reason": "连续 3 秒盘口策略回放" if quote_mode == "continuous" else "基础 L2 主动盘口撮合不回放逐笔成交",
     },
   }
-  if isinstance(bars, TemporaryQuoteBarProvider):
-    snapshot["temporaryBarAggregation"] = bars.cache_snapshot()
+  if bar_snapshot.get("provider") == "temporary_tick_quote_aggregation":
+    snapshot["temporaryBarAggregation"] = bar_snapshot
   return snapshot
 
 
