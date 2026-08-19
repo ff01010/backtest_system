@@ -298,7 +298,7 @@ class ScriptedBarStrategy:
         reason=str(action.get("reason", "自定义策略信号")),
         time=signal_time,
         position_effect=effect,
-        position_key=self._position_key,
+        position_key=self._position_key_for(effect),
         metadata={
           "direction": action_name.upper(),
           "position_effect": effect.value,
@@ -309,6 +309,13 @@ class ScriptedBarStrategy:
         },
       ))
     return orders
+
+  def _position_key_for(self, effect: PositionEffect) -> str:
+    if not bool(self._params.get("corePositionOverlay", False)):
+      return self._position_key
+    if effect in {PositionEffect.OPEN_LONG, PositionEffect.CLOSE_LONG}:
+      return f"{self._position_key}:overlay_long"
+    return f"{self._position_key}:overlay_short"
 
   @property
   def skipped_signals(self) -> list[dict[str, Any]]:

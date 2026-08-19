@@ -697,11 +697,20 @@ ORDER BY trade_date, bucket_start
 
   def _trading_days(self, symbol: str, start_date: str, end_date: str) -> list[str]:
     column = self._profile.columns
+    morning_start = "toDateTime(concat(toString(trade_date), ' 09:30:00'))"
+    morning_end = "toDateTime(concat(toString(trade_date), ' 11:30:00'))"
+    afternoon_start = "toDateTime(concat(toString(trade_date), ' 13:00:00'))"
+    afternoon_end = "toDateTime(concat(toString(trade_date), ' 14:57:00'))"
     query = (
-      f"SELECT DISTINCT toString({column['trade_date']}) AS trade_date FROM {self._profile.table_name} "
+      f"SELECT toString({column['trade_date']}) AS trade_date FROM {self._profile.table_name} "
       f"WHERE {column['symbol']}={ClickHouseL2Adapter._literal(symbol)} "
       f"AND {column['trade_date']} BETWEEN {ClickHouseL2Adapter._literal(start_date)} "
-      f"AND {ClickHouseL2Adapter._literal(end_date)} ORDER BY trade_date"
+      f"AND {ClickHouseL2Adapter._literal(end_date)} "
+      f"AND toDayOfWeek({column['trade_date']}) BETWEEN 1 AND 5 "
+      f"AND {column['last_price']} > 0 "
+      f"AND (({column['time']} >= {morning_start} AND {column['time']} < {morning_end}) "
+      f"OR ({column['time']} >= {afternoon_start} AND {column['time']} < {afternoon_end})) "
+      f"GROUP BY {column['trade_date']} ORDER BY trade_date"
     )
     return [str(row["trade_date"]) for row in clickhouse_client.query_rows(query)]
 

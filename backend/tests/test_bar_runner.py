@@ -1,0 +1,48 @@
+"""标准 Bar 异步任务 Runner 测试。"""
+
+from typing import Any
+
+import pytest
+
+from backend import bar_runner
+
+
+def test_bar_runner_finishes_queued_job(monkeypatch: pytest.MonkeyPatch) -> None:
+  job = {
+    "runId": "run-1",
+    "ownerUserId": "owner-1",
+    "attemptToken": "attempt-1",
+    "payload": {"fillModel": "bar_next_open"},
+  }
+  finished: dict[str, Any] = {}
+  monkeypatch.setattr(bar_runner.state_store, "claim_bar_backtest_job", lambda *_: job)
+  monkeypatch.setattr(bar_runner.backtest_runner, "run_backtest", lambda _: {
+    "summary": {"tradeCount": 3}, "warnings": ["示例"], "outputDir": "", "trades": [],
+  })
+  monkeypatch.setattr(bar_runner.state_store, "heartbeat_bar_backtest_job", lambda *_: True)
+  monkeypatch.setattr(
+    bar_runner.state_store,
+    "finish_bar_backtest_job",
+    lambda *args, **kwargs: finished.update({"args": args, "kwargs": kwargs}) or True,
+  )
+
+  assert bar_runner.BarRunner("test-worker").run_once() is True
+  assert finished["args"][2] == "succeeded"
+  assert finished["args"][3]["fillModel"] == "bar_next_open"
+  assert finished["args"][3]["warningCount"] == 1
+
+
+def test_worker_summary_uses_cash_and_base_cost_as_initial_equity() -> None:
+  summary = bar_runner.backtest_runner._build_worker_summary(
+    1_000_000,
+    100_000,
+    20.0,
+    True,
+    [],
+    [{"date": "20260730", "close": 21.0, "totalEquity": 3_120_000.0, "dailyPnl": 120_000.0}],
+  )
+
+  assert summary["initialEquity"] == 3_000_000.0
+  assert summary["totalPnl"] == 120_000.0
+  assert summary["baseHoldingPnl"] == 100_000.0
+  assert summary["t0ExcessPnl"] == 20_000.0

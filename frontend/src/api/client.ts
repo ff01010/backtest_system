@@ -225,7 +225,7 @@ export interface BacktestRunPayload {
   allowShort: boolean;
   strategyCategory: 'core_position_overlay' | 'directional_holding';
   holdingPolicy: 'intraday' | 'overnight';
-  fillModel: 'bar_close' | 'l2_quote';
+  fillModel: 'bar_close' | 'bar_next_open' | 'l2_quote';
   baseQuantity: number;
   baseCostPrice: number;
   t0Enabled: boolean;
@@ -241,7 +241,7 @@ export interface QueuedBacktestResponse {
   configVersionId: string | null;
   scriptId: string | null;
   status: 'queued';
-  fillModel: 'l2_quote';
+  fillModel: 'bar_close' | 'bar_next_open' | 'l2_quote';
   message: string;
 }
 
@@ -296,7 +296,7 @@ export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistor
   return data.run;
 }
 
-export async function cancelL2BacktestRun(runId: string): Promise<{ runId: string; status: 'cancelling' }> {
+export async function cancelBacktestRun(runId: string): Promise<{ runId: string; status: 'cancelling' }> {
   const res = await fetch(`${BASE}/backtest/runs/${runId}/cancel`, {
     method: 'POST',
     credentials: 'include',

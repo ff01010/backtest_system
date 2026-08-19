@@ -10,7 +10,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from backend.backtesting import Bar, BarBacktestEngine, RecordedPriceExecutionModel
+from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel, RecordedPriceExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade
 from backend.date_codec import TradingDateError, format_api_date
 from backend.l2.engine import L2ExecutionEngine
@@ -26,8 +26,13 @@ class WorkerRunRequest(BaseModel):
   bars: list[dict[str, Any]]
   initialCapital: float = Field(gt=0)
   commissionRate: float = Field(ge=0)
+  feeProfile: dict[str, float] = Field(default_factory=dict)
+  fillModel: str = "bar_next_open"
   slippage: float = Field(default=0, ge=0, lt=1)
   holdingPolicy: str = "intraday"
+  baseQuantity: int = Field(default=0, ge=0)
+  baseCostPrice: float = Field(default=0, ge=0)
+  t0Enabled: bool = False
 
 
 class WorkerL2SessionCreateRequest(BaseModel):
@@ -36,6 +41,7 @@ class WorkerL2SessionCreateRequest(BaseModel):
   params: dict[str, Any] = Field(default_factory=dict)
   initialCapital: float = Field(gt=0)
   commissionRate: float = Field(ge=0)
+  feeProfile: dict[str, float] = Field(default_factory=dict)
   latencyMs: int = Field(default=0, ge=0)
   passiveParticipationRate: float = Field(default=0.1, gt=0, le=1)
   holdingPolicy: str = "intraday"
@@ -153,11 +159,17 @@ class L2WorkerSession:
 
   def __init__(self, payload: WorkerL2SessionCreateRequest) -> None:
     self.strategy = ScriptedBarStrategy(payload.scriptId, payload.code, payload.params, payload.quoteMode)
+    fee_profile = FeeProfile(
+      commission_rate=float(payload.feeProfile.get("commissionRate", payload.commissionRate)),
+      transfer_fee_rate=float(payload.feeProfile.get("transferFeeRate", 0.00001)),
+      stamp_duty_rate=float(payload.feeProfile.get("stampDutyRate", 0.0005)),
+      minimum_commission=float(payload.feeProfile.get("minimumCommission", 5)),
+    )
     self.engine = L2ExecutionEngine(
       self.strategy, payload.initialCapital, payload.commissionRate,
       InstrumentRules(**payload.instrumentRules), payload.latencyMs,
       payload.passiveParticipationRate, payload.holdingPolicy, payload.baseQuantity,
-      payload.baseCostPrice, payload.t0Enabled,
+      payload.baseCostPrice, payload.t0Enabled, fee_profile,
     )
     self.engine.initialize_base_position(payload.symbol)
     self.trade_date: str | None = None
@@ -254,11 +266,26 @@ def run(payload: WorkerRunRequest) -> dict[str, Any]:
       volume=float(item.get("volume", 0)),
     ) for item in payload.bars]
     strategy = ScriptedBarStrategy(payload.scriptId, payload.code, payload.params)
+    fee_profile = FeeProfile(
+      commission_rate=float(payload.feeProfile.get("commissionRate", payload.commissionRate)),
+      transfer_fee_rate=float(payload.feeProfile.get("transferFeeRate", 0.00001)),
+      stamp_duty_rate=float(payload.feeProfile.get("stampDutyRate", 0.0005)),
+      minimum_commission=float(payload.feeProfile.get("minimumCommission", 5)),
+    )
     engine = BarBacktestEngine(
       initial_cash=payload.initialCapital,
       commission_rate=payload.commissionRate,
-      execution_model=RecordedPriceExecutionModel(slippage=payload.slippage),
+      fee_profile=fee_profile,
+      execution_model=(
+        RecordedPriceExecutionModel(slippage=payload.slippage)
+        if payload.fillModel == "bar_close"
+        else NextOpenExecutionModel(slippage=payload.slippage)
+      ),
       holding_policy=payload.holdingPolicy,
+      execute_on_next_bar_open=payload.fillModel == "bar_next_open",
+      base_quantity=payload.baseQuantity,
+      base_cost_price=payload.baseCostPrice,
+      t0_enabled=payload.t0Enabled,
     )
     result = engine.run(strategy, bars)
   except ValueError as error:

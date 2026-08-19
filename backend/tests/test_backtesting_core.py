@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 
-from backend.backtesting.engine import BarBacktestEngine, PortfolioLedger, RecordedPriceExecutionModel
+from backend.backtesting.engine import BarBacktestEngine, NextOpenExecutionModel, PortfolioLedger, RecordedPriceExecutionModel
+from backend.backtesting.fees import FeeProfile
 from backend.backtesting.legacy import fill_to_api_trade, legacy_trades_to_fills
 from backend.backtesting.models import Bar, OrderIntent, OrderSide, PortfolioSnapshot, PositionEffect
 from backend.services.backtest_runner import _compute_performance_stats
@@ -101,6 +102,7 @@ def test_legacy_trade_bridge_preserves_frontend_shape() -> None:
     "time": "202607230930",
     "signalTime": "202607230930",
     "executionTime": "202607230930",
+    "plannedExecutionTime": "202607230930",
     "direction": "BUY_OPEN",
     "action": "BUY_OPEN",
     "side": "BUY",
@@ -111,7 +113,50 @@ def test_legacy_trade_bridge_preserves_frontend_shape() -> None:
     "note": "test",
     "priceSource": "成交模型价格",
     "status": "filled",
+    "fee": 0.0,
+    "feeBreakdown": {},
+    "executionMode": "bar_close",
   }
+
+
+def test_standard_bar_execution_fills_at_next_open_with_slippage() -> None:
+  class EntryStrategy:
+    def on_bar(self, bar: Bar, portfolio: PortfolioSnapshot) -> list[OrderIntent]:
+      return [OrderIntent(
+        bar.symbol,
+        OrderSide.BUY,
+        100,
+        "entry",
+        position_effect=PositionEffect.OPEN_LONG,
+        metadata={"signal_time": bar.time},
+      )] if bar.time.endswith("0930") else []
+
+  result = BarBacktestEngine(
+    initial_cash=10_000,
+    execution_model=NextOpenExecutionModel(slippage=0.001),
+    execute_on_next_bar_open=True,
+  ).run(EntryStrategy(), [
+    Bar("202607230930", "688981.SH", 10, 10, 10, 10),
+    Bar("202607230935", "688981.SH", 11, 11, 11, 11),
+  ])
+
+  assert len(result.fills) == 1
+  assert result.fills[0].time == "202607230935"
+  assert result.fills[0].price == 11.011
+
+
+def test_fee_profile_applies_minimum_commission_once_per_bar_order() -> None:
+  profile = FeeProfile()
+  result = BarBacktestEngine(
+    initial_cash=10_000,
+    fee_profile=profile,
+  ).run(RoundTripStrategy(), [
+    Bar("202607230930", "688981.SH", 10, 10, 10, 10),
+    Bar("202607230935", "688981.SH", 11, 11, 11, 11),
+  ])
+
+  assert result.fills[0].fee == 5.01
+  assert result.fills[1].fee == 5.561
 
 
 def test_batch_engine_replays_orders_on_their_recorded_bar() -> None:

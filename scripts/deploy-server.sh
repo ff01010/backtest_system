@@ -35,6 +35,18 @@ read_http_port() {
   echo "$port"
 }
 
+read_l2_runner_replicas() {
+  local replicas
+  replicas="$(grep -E '^TREND_GRID_L2_RUNNER_REPLICAS=' "$env_file" | tail -n 1 | cut -d= -f2- || true)"
+  replicas="${replicas//[[:space:]]/}"
+  if [[ -z "$replicas" ]]; then
+    echo "1"
+    return
+  fi
+  [[ "$replicas" =~ ^[1-8]$ ]] || fail "deploy/.env 中的 TREND_GRID_L2_RUNNER_REPLICAS 必须是 1 至 8 的整数"
+  echo "$replicas"
+}
+
 validate_clickhouse_network() {
   local clickhouse_url
   clickhouse_url="$(grep -E '^TREND_GRID_CLICKHOUSE_HTTP_URL=' "$env_file" | tail -n 1 | cut -d= -f2- || true)"
@@ -44,8 +56,10 @@ validate_clickhouse_network() {
 }
 
 verify_clickhouse_connectivity() {
-  docker exec quant-backtest-l2-runner python -c "import urllib.request; response = urllib.request.urlopen('http://quant-clickhouse:8123/ping', timeout=5); assert response.read().strip() == b'Ok.'" \
+  "${compose[@]}" exec -T l2-runner python -c "import urllib.request; response = urllib.request.urlopen('http://quant-clickhouse:8123/ping', timeout=5); assert response.read().strip() == b'Ok.'" \
     || fail "l2-runner 无法通过 quant-clickhouse:8123 连接 ClickHouse"
+  docker exec quant-backtest-bar-runner python -c "import urllib.request; response = urllib.request.urlopen('http://quant-clickhouse:8123/ping', timeout=5); assert response.read().strip() == b'Ok.'" \
+    || fail "quant-backtest-bar-runner 无法通过 quant-clickhouse:8123 连接 ClickHouse"
 }
 
 wait_for_application() {
@@ -80,7 +94,7 @@ validate_clickhouse_network
 "${compose[@]}" up -d postgres
 wait_for_postgres
 "${compose[@]}" --profile migration run --rm migrate
-"${compose[@]}" up -d --build strategy-worker backend l2-runner frontend
+"${compose[@]}" up -d --build --scale "l2-runner=$(read_l2_runner_replicas)" strategy-worker backend bar-runner l2-runner frontend
 verify_clickhouse_connectivity
 "${compose[@]}" ps
 wait_for_application "$(read_http_port)"

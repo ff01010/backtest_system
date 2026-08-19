@@ -665,6 +665,19 @@ def test_temporary_quote_provider_normalizes_frontend_date(value: str, expected:
   assert TemporaryQuoteBarProvider._parse_date(value).isoformat() == expected
 
 
+def test_temporary_quote_provider_excludes_zero_price_non_trading_days(monkeypatch: pytest.MonkeyPatch) -> None:
+  provider = TemporaryQuoteBarProvider(
+    load_temporary_quote_profile(), VersionedBarCache(None, 60), "tick_quote_session_v5", "tick_quote_depth_v3",
+  )
+  queries: list[str] = []
+  monkeypatch.setattr(clickhouse_client, "query_rows", lambda query: queries.append(query) or [{"trade_date": "2025-03-10"}])
+
+  assert provider._trading_days("688126.SH", "2025-03-07", "2025-03-10") == ["2025-03-10"]
+  assert "last_price > 0" in queries[0]
+  assert "toDayOfWeek(trade_date) BETWEEN 1 AND 5" in queries[0]
+  assert "09:30:00" in queries[0]
+
+
 def test_temporary_aggregation_does_not_require_fixed_snapshot_count() -> None:
   provider = TemporaryQuoteBarProvider(
     load_temporary_quote_profile(),

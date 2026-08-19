@@ -30,6 +30,18 @@ function Get-HttpPort {
   return [int]$port
 }
 
+function Get-L2RunnerReplicas {
+  $line = Get-Content $envFile | Where-Object { $_ -match '^TREND_GRID_L2_RUNNER_REPLICAS=' } | Select-Object -Last 1
+  if ($null -eq $line) {
+    return 1
+  }
+  $replicas = $line.Split('=', 2)[1].Trim()
+  if ($replicas -notmatch '^[1-8]$') {
+    throw 'TREND_GRID_L2_RUNNER_REPLICAS in deploy/.env must be an integer from 1 to 8'
+  }
+  return [int]$replicas
+}
+
 function Wait-PostgresHealthy {
   for ($attempt = 1; $attempt -le 30; $attempt += 1) {
     $health = (& docker inspect --format '{{.State.Health.Status}}' quant-backtest-postgres 2>$null).Trim()
@@ -66,6 +78,7 @@ if (-not (Test-Path $envFile)) {
 
 Get-Command docker -ErrorAction Stop | Out-Null
 $httpPort = Get-HttpPort
+$l2RunnerReplicas = Get-L2RunnerReplicas
 
 Push-Location $projectRoot
 try {
@@ -73,11 +86,11 @@ try {
   Wait-PostgresHealthy
   Invoke-Compose @('--profile', 'migration', 'run', '--rm', 'migrate')
 
-  $upArguments = @('up', '-d')
+  $upArguments = @('up', '-d', '--scale', "l2-runner=$l2RunnerReplicas")
   if (-not $SkipBuild) {
     $upArguments += '--build'
   }
-  $upArguments += 'redis', 'strategy-worker', 'l2-runner', 'backend', 'frontend'
+  $upArguments += 'redis', 'strategy-worker', 'bar-runner', 'l2-runner', 'backend', 'frontend'
   Invoke-Compose $upArguments
   Invoke-Compose @('ps')
   Wait-ApplicationHealthy $httpPort

@@ -17,11 +17,11 @@ from typing import Any, Sequence
 import pandas as pd
 import yaml
 
-from backend.backtesting import Bar, BarBacktestEngine, RecordedPriceExecutionModel
+from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel, RecordedPriceExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade
 from backend.strategies.catalog import create_bar_strategy, get_strategy_source_snapshot
 from backend.strategies.external_engine import load_external_engine
-from backend.services import market_data, state_store, strategy_worker
+from backend.services import bar_data, market_data, state_store, strategy_worker
 
 _BACKTEST_SYSTEM_ROOT = os.path.dirname(
   os.path.dirname(os.path.dirname(__file__))
@@ -154,6 +154,7 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
       **payload.get("strategyParams", {}),
       "allowLong": payload.get("allowLong", True),
       "allowShort": payload.get("allowShort", True),
+      "corePositionOverlay": _strategy_category(payload) == "core_position_overlay",
     },
     "bars": [
       {"time": str(row.time), "symbol": payload["symbol"], "open": float(row.open),
@@ -163,13 +164,25 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     ],
     "initialCapital": float(payload["initialCapital"]),
     "commissionRate": float(payload["commissionRate"]),
+    "feeProfile": dict(payload.get("feeProfile") or {}),
     "slippage": float(payload["slippage"]),
     "holdingPolicy": _holding_policy(payload),
+    "fillModel": str(payload.get("fillModel", "bar_next_open")),
+    "baseQuantity": int(payload.get("baseQuantity", 0)),
+    "baseCostPrice": float(payload.get("baseCostPrice", 0)),
+    "t0Enabled": bool(payload.get("t0Enabled", False)),
   })
+  initial_cash = float(payload["initialCapital"])
+  base_quantity = int(payload.get("baseQuantity", 0))
+  base_cost_price = float(payload.get("baseCostPrice", 0))
+  initial_equity = _initial_total_equity(initial_cash, base_quantity, base_cost_price)
   daily_holdings = _build_worker_daily_holdings(
-    bars, worker_result["portfolioSnapshots"], payload["symbol"], float(payload["initialCapital"]),
+    bars, worker_result["portfolioSnapshots"], payload["symbol"], initial_equity,
   )
-  summary = _build_worker_summary(float(payload["initialCapital"]), worker_result["trades"], daily_holdings)
+  summary = _build_worker_summary(
+    initial_cash, base_quantity, base_cost_price, bool(payload.get("t0Enabled", False)),
+    worker_result["trades"], daily_holdings,
+  )
   benchmark_symbol = payload.get("benchmarkSymbol") or payload["symbol"]
   benchmark_equity, benchmark_warnings = _build_benchmark_equity(
     benchmark_symbol, payload.get("timeframe", "5m"), payload["startDate"], payload["endDate"],
@@ -202,12 +215,13 @@ def _script_output_dir(payload: dict[str, Any]) -> str:
 
 def _build_script_experiment_manifest(
   payload: dict[str, Any], bars: pd.DataFrame, script_id: str, script_name: str, code_hash: str,
+  data_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
   timeframe = str(payload.get("timeframe", "5m"))
   holding_policy = _holding_policy(payload)
-  data_snapshot = market_data.snapshot(
+  data_snapshot = data_snapshot or dict(payload.get("marketDataSnapshot", {}).get(payload["symbol"]) or market_data.snapshot(
     payload["symbol"], timeframe, payload["startDate"], payload["endDate"],
-  )
+  ))
   config_hash = _stable_hash({
     "scriptId": script_id,
     "strategyParams": payload.get("strategyParams", {}),
@@ -218,6 +232,8 @@ def _build_script_experiment_manifest(
     "initialCapital": payload["initialCapital"],
     "commissionRate": payload["commissionRate"],
     "slippage": payload["slippage"],
+    "fillModel": payload.get("fillModel", "bar_next_open"),
+    "feeProfile": payload.get("feeProfile", {}),
     "allowLong": payload.get("allowLong", True),
     "allowShort": payload.get("allowShort", True),
     "holdingPolicy": holding_policy,
@@ -234,7 +250,7 @@ def _build_script_experiment_manifest(
     "experimentHash": experiment_hash,
     "engineVersion": "isolated-script-worker-v1",
     "signalModel": "on_bar_script",
-    "fillModel": "recorded_price_fill",
+    "fillModel": str(payload.get("fillModel", "bar_next_open")),
     "randomSeed": 0,
     "strategyCodeHash": code_hash,
     "configHash": config_hash,
@@ -250,6 +266,7 @@ def _build_script_experiment_manifest(
     "costModel": {
       "commissionRate": float(payload["commissionRate"]),
       "slippage": float(payload["slippage"]),
+      **dict(payload.get("feeProfile") or {}),
     },
     "holdingPolicy": holding_policy,
     "strategyCategory": _strategy_category(payload),
@@ -259,12 +276,12 @@ def _build_script_experiment_manifest(
 
 
 def _build_worker_daily_holdings(
-  bars: pd.DataFrame, snapshots: list[dict[str, Any]], symbol: str, initial_capital: float,
+  bars: pd.DataFrame, snapshots: list[dict[str, Any]], symbol: str, initial_equity: float,
 ) -> list[dict[str, Any]]:
   if len(bars) != len(snapshots):
     raise ValueError("策略执行容器返回的账本快照数量异常")
   items: list[dict[str, Any]] = []
-  previous_total = initial_capital
+  previous_total = initial_equity
   for index, row in enumerate(bars.itertuples(index=False)):
     date = str(row.time)[:8]
     if index + 1 < len(bars) and str(bars.iloc[index + 1]["time"])[:8] == date:
@@ -287,17 +304,25 @@ def _build_worker_daily_holdings(
 
 
 def _build_worker_summary(
-  initial_capital: float, trades: list[dict[str, Any]], daily_holdings: list[dict[str, Any]],
+  initial_cash: float,
+  base_quantity: int,
+  base_cost_price: float,
+  t0_enabled: bool,
+  trades: list[dict[str, Any]],
+  daily_holdings: list[dict[str, Any]],
 ) -> dict[str, Any]:
+  initial_equity = _initial_total_equity(initial_cash, base_quantity, base_cost_price)
   realized_pnl = [float(item.get("pnl", 0)) for item in trades if abs(float(item.get("pnl", 0))) > 1e-8]
   wins = [value for value in realized_pnl if value > 0]
   losses = [value for value in realized_pnl if value < 0]
   daily_pnl = {item["date"]: float(item["dailyPnl"]) for item in daily_holdings}
-  performance = _compute_performance_stats(initial_capital, daily_pnl)
-  final_equity = daily_holdings[-1]["totalEquity"] if daily_holdings else initial_capital
+  performance = _compute_performance_stats(initial_equity, daily_pnl)
+  final_equity = daily_holdings[-1]["totalEquity"] if daily_holdings else initial_equity
   return {
-    "totalPnl": round(final_equity - initial_capital, 2), "totalReturn": round(final_equity / initial_capital - 1, 6),
-    "maxDrawdown": round(_max_drawdown_amount(initial_capital, daily_holdings), 2), **performance,
+    "initialEquity": round(initial_equity, 2),
+    "totalPnl": round(final_equity - initial_equity, 2),
+    "totalReturn": round(final_equity / initial_equity - 1, 6) if initial_equity > 0 else 0.0,
+    "maxDrawdown": round(_max_drawdown_amount(initial_equity, daily_holdings), 2), **performance,
     "winRate": round(len(wins) / len(realized_pnl), 4) if realized_pnl else 0.0,
     "dailyWinRate": round(sum(value > 0 for value in daily_pnl.values()) / len(daily_pnl), 4) if daily_pnl else 0.0,
     "tradeCount": len(trades), "winningTrades": len(wins), "losingTrades": len(losses),
@@ -305,6 +330,34 @@ def _build_worker_summary(
     "avgLoss": round(sum(losses) / len(losses), 2) if losses else None,
     "profitLossRatio": round(abs(sum(wins) / sum(losses)), 4) if wins and losses else None,
     "finalEquity": round(final_equity, 2),
+    **_build_worker_base_metrics(initial_cash, base_quantity, base_cost_price, t0_enabled, daily_holdings),
+  }
+
+
+def _initial_total_equity(initial_cash: float, base_quantity: int, base_cost_price: float) -> float:
+  return initial_cash + max(0, base_quantity) * max(0.0, base_cost_price)
+
+
+def _build_worker_base_metrics(
+  initial_cash: float,
+  base_quantity: int,
+  base_cost_price: float,
+  t0_enabled: bool,
+  daily_holdings: list[dict[str, Any]],
+) -> dict[str, float | None]:
+  if base_quantity <= 0 or base_cost_price <= 0:
+    return {"baseHoldingPnl": None, "baseHoldingReturn": None, "t0ExcessPnl": None, "t0ExcessReturn": None}
+  initial_equity = _initial_total_equity(initial_cash, base_quantity, base_cost_price)
+  final_equity = float(daily_holdings[-1]["totalEquity"]) if daily_holdings else initial_equity
+  final_close = float(daily_holdings[-1]["close"]) if daily_holdings else base_cost_price
+  base_final_equity = initial_cash + base_quantity * final_close
+  base_pnl = base_final_equity - initial_equity
+  excess_pnl = final_equity - base_final_equity
+  return {
+    "baseHoldingPnl": round(base_pnl, 2),
+    "baseHoldingReturn": round(base_pnl / initial_equity, 6) if initial_equity > 0 else None,
+    "t0ExcessPnl": round(excess_pnl, 2) if t0_enabled else None,
+    "t0ExcessReturn": round(excess_pnl / (base_quantity * base_cost_price), 6) if t0_enabled else None,
   }
 
 
@@ -614,7 +667,7 @@ def _apply_position_params(strategy: dict[str, Any], payload: dict[str, Any]) ->
 
 
 def _load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
-  df = market_data.load_bars(symbol, timeframe, start_date, end_date)
+  df, _ = bar_data.load_bars_with_snapshot(symbol, timeframe, start_date, end_date)
   df["hhmm"] = df["time"].str[8:12].astype(int)
   df = df[df["hhmm"].apply(is_trading_time)]
   return df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)

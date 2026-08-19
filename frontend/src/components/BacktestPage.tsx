@@ -14,7 +14,7 @@ import type { ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createAccount,
-  cancelL2BacktestRun,
+  cancelBacktestRun,
   createStrategyConfig,
   createStrategyScript,
   deleteStrategyConfig,
@@ -96,13 +96,13 @@ const DEFAULT_PARAMS = {
   startDate: '2026-06-01',
   endDate: '2026-06-26',
   initialCapital: '1000000',
-  commissionRate: '0.0003',
-  slippage: '0',
+  commissionRate: '0.00008',
+  slippage: '0.0001',
   allowLong: true,
   allowShort: true,
   strategyCategory: 'directional_holding',
   holdingPolicy: 'overnight',
-  fillModel: 'bar_close',
+  fillModel: 'bar_next_open',
   baseQuantity: '0',
   baseCostPrice: '0',
   t0Enabled: false,
@@ -365,9 +365,6 @@ function validateParams(params: BacktestParams) {
   if (isCorePositionOverlay && (baseQuantity <= 0 || baseCostPrice <= 0)) {
     errors.push('底仓增强策略必须填写有效的底仓数量和成本价');
   }
-  if (isCorePositionOverlay && params.fillModel !== 'l2_quote') {
-    errors.push('底仓增强策略仅支持基础 L2 十档盘口回测');
-  }
   if (isCorePositionOverlay && !params.t0Enabled) {
     errors.push('底仓增强策略必须启用底仓做 T');
   }
@@ -376,9 +373,6 @@ function validateParams(params: BacktestParams) {
   }
   if (params.t0Enabled && baseQuantity <= 0) {
     errors.push('启用底仓做 T 时底仓数量必须大于 0');
-  }
-  if (params.fillModel !== 'l2_quote' && (baseQuantity > 0 || params.t0Enabled)) {
-    errors.push('底仓做 T 仅支持基础 L2 十档盘口回测');
   }
   if (!Number.isFinite(commissionRate) || commissionRate < 0) {
     errors.push('手续费率不能小于 0');
@@ -874,9 +868,9 @@ export default function BacktestPage({
   const [error, setError] = useState('');
   const [backtestErrorDetail, setBacktestErrorDetail] = useState<BacktestErrorDetail | null>(null);
   const [running, setRunning] = useState(false);
-  const [cancellingL2Run, setCancellingL2Run] = useState(false);
+  const [cancellingRun, setCancellingRun] = useState(false);
   const [result, setResult] = useState<BacktestRunResponse | null>(null);
-  const [pendingL2Run, setPendingL2Run] = useState<{ runId: string; displayNo: number } | null>(null);
+  const [pendingRun, setPendingRun] = useState<{ runId: string; displayNo: number } | null>(null);
   const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
   const [benchmarkDataStatus, setBenchmarkDataStatus] = useState<DataStatus | null>(null);
   const [dataStatusError, setDataStatusError] = useState('');
@@ -978,11 +972,11 @@ export default function BacktestPage({
   }, []);
 
   useEffect(() => {
-    if (!pendingL2Run) return undefined;
+    if (!pendingRun) return undefined;
     let disposed = false;
     const poll = async () => {
       try {
-        const run = await fetchBacktestRun(pendingL2Run.runId);
+        const run = await fetchBacktestRun(pendingRun.runId);
         if (disposed) return;
         if (run.status === 'ok' && run.resultJson) {
           setResult({
@@ -996,14 +990,14 @@ export default function BacktestPage({
           setHoldingStartDate('');
           setHoldingEndDate('');
           setHoldingStatusFilter('all');
-          setPendingL2Run(null);
+          setPendingRun(null);
           setActivePanel('overview');
-          setStatus(`L2 回测 ${formatRunReference(run.displayNo)} 已完成，交易 ${run.resultJson.summary.tradeCount} 笔`);
+          setStatus(`回测 ${formatRunReference(run.displayNo)} 已完成，交易 ${run.resultJson.summary.tradeCount} 笔`);
           refreshBacktestRuns();
           return;
         }
         if (run.status === 'error' || run.status === 'cancelled') {
-          setPendingL2Run(null);
+          setPendingRun(null);
           setBacktestErrorDetail(getRunErrorDetail(run));
           setSelectedHistoryRunId(run.id);
           setActivePanel('history');
@@ -1012,7 +1006,7 @@ export default function BacktestPage({
           refreshBacktestRuns();
         }
       } catch {
-        // 网络瞬时失败不应中断正在运行的 L2 回测轮询。
+        // 网络瞬时失败不应中断正在运行的回测轮询。
       }
     };
     void poll();
@@ -1021,7 +1015,7 @@ export default function BacktestPage({
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [pendingL2Run]);
+  }, [pendingRun]);
 
   useEffect(() => {
     if (!hasSelectedConfig || !publishedFingerprint) return;
@@ -1287,7 +1281,7 @@ export default function BacktestPage({
 
   const setStrategyCategory = (strategyCategory: 'core_position_overlay' | 'directional_holding') => {
     setParams((prev) => strategyCategory === 'core_position_overlay'
-      ? { ...prev, strategyCategory, fillModel: 'l2_quote', holdingPolicy: 'intraday', t0Enabled: true }
+      ? { ...prev, strategyCategory, holdingPolicy: 'intraday', t0Enabled: true }
       : {
         ...prev,
         strategyCategory,
@@ -1316,7 +1310,7 @@ export default function BacktestPage({
     setSelectedTimeframe(timeframe);
   };
 
-  const setFillModel = (fillModel: 'bar_close' | 'l2_quote') => {
+  const setFillModel = (fillModel: 'bar_close' | 'bar_next_open' | 'l2_quote') => {
     setParam('fillModel', fillModel);
     if (fillModel === 'l2_quote' && !L2_TIMEFRAMES.includes(selectedTimeframe)) {
       setSelectedTimeframe('1m');
@@ -1710,7 +1704,7 @@ export default function BacktestPage({
         allowShort: params.allowShort,
         strategyCategory: params.strategyCategory === 'core_position_overlay' ? 'core_position_overlay' : 'directional_holding',
         holdingPolicy: params.strategyCategory === 'core_position_overlay' ? 'intraday' : 'overnight',
-        fillModel: params.fillModel === 'l2_quote' ? 'l2_quote' : 'bar_close',
+        fillModel: params.fillModel === 'l2_quote' ? 'l2_quote' : params.fillModel === 'bar_close' ? 'bar_close' : 'bar_next_open',
         baseQuantity: Number(params.baseQuantity),
         baseCostPrice: Number(params.baseCostPrice),
         t0Enabled: params.t0Enabled,
@@ -1721,9 +1715,9 @@ export default function BacktestPage({
       const data = await runBacktest(payload);
       if (!('summary' in data)) {
         await refreshBacktestRuns();
-        setPendingL2Run({ runId: data.runId, displayNo: data.displayNo });
+        setPendingRun({ runId: data.runId, displayNo: data.displayNo });
         setActivePanel('overview');
-        setStatus(`L2 回测 ${formatRunReference(data.displayNo)} 已进入队列，完成后将自动展示概览和信号明细`);
+        setStatus(`回测 ${formatRunReference(data.displayNo)} 已进入队列，完成后将自动展示概览和信号明细`);
         return;
       }
       setResult(data);
@@ -1861,26 +1855,26 @@ export default function BacktestPage({
     return 'flat';
   };
 
-  const activeL2Run = useMemo(() => {
-    const pending = pendingL2Run ? backtestRuns.find((run) => run.id === pendingL2Run.runId) : null;
+  const activeRun = useMemo(() => {
+    const pending = pendingRun ? backtestRuns.find((run) => run.id === pendingRun.runId) : null;
     if (pending && (pending.status === 'queued' || pending.status === 'running')) return pending;
-    return backtestRuns.find((run) => run.fillModel === 'l2_quote' && run.status === 'running')
-      || backtestRuns.find((run) => run.fillModel === 'l2_quote' && run.status === 'queued')
+    return backtestRuns.find((run) => run.status === 'running')
+      || backtestRuns.find((run) => run.status === 'queued')
       || null;
-  }, [backtestRuns, pendingL2Run]);
+  }, [backtestRuns, pendingRun]);
 
-  const handleCancelL2Run = async () => {
-    if (!activeL2Run) return;
-    setCancellingL2Run(true);
+  const handleCancelRun = async () => {
+    if (!activeRun) return;
+    setCancellingRun(true);
     setError('');
     try {
-      await cancelL2BacktestRun(activeL2Run.id);
-      setStatus(`L2 回测 ${formatRunReference(activeL2Run.displayNo)} 正在取消，当前处理块结束后停止`);
+      await cancelBacktestRun(activeRun.id);
+      setStatus(`回测 ${formatRunReference(activeRun.displayNo)} 正在取消，当前处理块结束后停止`);
       await refreshBacktestRuns();
     } catch (e) {
       setError(e instanceof Error ? e.message : '取消回测失败');
     } finally {
-      setCancellingL2Run(false);
+      setCancellingRun(false);
     }
   };
   const filteredDailyHoldings = dailyHoldings.filter((holding) => {
@@ -2020,11 +2014,34 @@ export default function BacktestPage({
   ];
   const visibleTradeColumns = tradeColumnDefs.filter((column) => tradeColumns[column.key]);
   const tradeGridColumns = visibleTradeColumns.map((column) => column.width).join(' ') || '1fr';
+  const overlaySummary = useMemo(() => {
+    if (!result || !isOverlayResult) return result?.summary || null;
+    if (typeof result.summary.t0ExcessPnl === 'number') return result.summary;
+    const lastHolding = dailyHoldings[dailyHoldings.length - 1];
+    if (resultBaseQuantity <= 0 || resultBaseCostPrice <= 0 || !lastHolding) return result.summary;
+    const initialEquity = resultInitialCash + resultBaseQuantity * resultBaseCostPrice;
+    const finalEquity = Number(lastHolding.totalEquity);
+    const finalClose = Number(lastHolding.close);
+    if (!Number.isFinite(initialEquity) || !Number.isFinite(finalEquity) || !Number.isFinite(finalClose)) return result.summary;
+    const baseFinalEquity = resultInitialCash + resultBaseQuantity * finalClose;
+    const baseHoldingPnl = baseFinalEquity - initialEquity;
+    const t0ExcessPnl = finalEquity - baseFinalEquity;
+    return {
+      ...result.summary,
+      initialEquity,
+      totalPnl: finalEquity - initialEquity,
+      totalReturn: initialEquity > 0 ? (finalEquity / initialEquity) - 1 : 0,
+      baseHoldingPnl,
+      baseHoldingReturn: initialEquity > 0 ? baseHoldingPnl / initialEquity : null,
+      t0ExcessPnl,
+      t0ExcessReturn: t0ExcessPnl / (resultBaseQuantity * resultBaseCostPrice),
+    };
+  }, [dailyHoldings, isOverlayResult, result, resultBaseCostPrice, resultBaseQuantity, resultInitialCash]);
   const coreMetrics = isOverlayResult ? [
-    ['做T超额收益', result ? formatMoney(result.summary.t0ExcessPnl) : '--'],
-    ['做T超额收益率', result ? formatPct(result.summary.t0ExcessReturn) : '--'],
-    ['底仓持有收益率', result ? formatPct(result.summary.baseHoldingReturn) : '--'],
-    ['总账户收益率', result ? formatPct(result.summary.totalReturn) : '--'],
+    ['做T超额收益', overlaySummary ? formatMoney(overlaySummary.t0ExcessPnl) : '--'],
+    ['做T超额收益率', overlaySummary ? formatPct(overlaySummary.t0ExcessReturn) : '--'],
+    ['底仓持有收益率', overlaySummary ? formatPct(overlaySummary.baseHoldingReturn) : '--'],
+    ['总账户收益率', overlaySummary ? formatPct(overlaySummary.totalReturn) : '--'],
     ['最大回撤', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
     ['交易 / 胜率', result ? `${result.summary.tradeCount} / ${formatPct(result.summary.winRate)}` : '--'],
   ] : [
@@ -2039,12 +2056,12 @@ export default function BacktestPage({
     {
       title: '收益',
       rows: isOverlayResult ? [
-        ['总收益', result ? formatMoney(result.summary.totalPnl) : '--'],
-        ['最终权益', result ? formatMoney(result.summary.finalEquity) : '--'],
-        ['总收益率', result ? formatPct(result.summary.totalReturn) : '--'],
-        ['底仓持有收益率', result ? formatPct(result.summary.baseHoldingReturn) : '--'],
-        ['做T超额收益', result ? formatMoney(result.summary.t0ExcessPnl) : '--'],
-        ['做T超额收益率', result ? formatPct(result.summary.t0ExcessReturn) : '--'],
+        ['总收益', overlaySummary ? formatMoney(overlaySummary.totalPnl) : '--'],
+        ['最终权益', overlaySummary ? formatMoney(overlaySummary.finalEquity) : '--'],
+        ['总收益率', overlaySummary ? formatPct(overlaySummary.totalReturn) : '--'],
+        ['底仓持有收益率', overlaySummary ? formatPct(overlaySummary.baseHoldingReturn) : '--'],
+        ['做T超额收益', overlaySummary ? formatMoney(overlaySummary.t0ExcessPnl) : '--'],
+        ['做T超额收益率', overlaySummary ? formatPct(overlaySummary.t0ExcessReturn) : '--'],
         ['年化收益', result ? formatPct(result.summary.annualReturn) : '--'],
       ] : [
         ['总收益', result ? formatMoney(result.summary.totalPnl) : '--'],
@@ -2140,7 +2157,7 @@ export default function BacktestPage({
   const historyRangeEnd = Math.min(historyPageStart + historyPageSize, filteredHistoryRuns.length);
   const historyGridColumns = 'minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 74px';
   const activePanelLabel = resultTabs.find((item) => item.id === activePanel)?.label || '概览';
-  const runDisabled = running || activeL2Run != null || !hasSelectedConfig || versionDirty;
+  const runDisabled = running || activeRun != null || !hasSelectedConfig || versionDirty;
   const statusMessage = error || status || (versionDirty
     ? '策略内容已修改，请先保存策略后运行回测。'
     : activeConfig ? `当前策略：${activeConfig.name}` : '请先新建并保存策略');
@@ -2268,7 +2285,7 @@ export default function BacktestPage({
         allowShort: saved.allowShort !== false,
         strategyCategory: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'core_position_overlay' : 'directional_holding',
         holdingPolicy: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'intraday' : 'overnight',
-        fillModel: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'l2_quote' : (run.fillModel === 'l2_quote' ? 'l2_quote' : 'bar_close'),
+        fillModel: run.fillModel === 'l2_quote' ? 'l2_quote' : run.fillModel === 'bar_close' ? 'bar_close' : 'bar_next_open',
         baseQuantity: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseQuantity ?? 0 : 0),
         baseCostPrice: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseCostPrice ?? 0 : 0),
         t0Enabled: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true,
@@ -2277,9 +2294,9 @@ export default function BacktestPage({
       });
       if (!('summary' in data)) {
         await refreshBacktestRuns();
-        setPendingL2Run({ runId: data.runId, displayNo: data.displayNo });
+        setPendingRun({ runId: data.runId, displayNo: data.displayNo });
         setActivePanel('overview');
-        setStatus(`L2 回测 ${formatRunReference(data.displayNo)} 已重新进入队列，完成后将自动展示结果`);
+        setStatus(`回测 ${formatRunReference(data.displayNo)} 已重新进入队列，完成后将自动展示结果`);
         return;
       }
       setResult(data);
@@ -2380,17 +2397,17 @@ export default function BacktestPage({
           </div>
         </div>
 
-        {activeL2Run ? (
+        {activeRun ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ color: '#a16207', fontSize: 12 }}>
-              L2 回测 {formatRunReference(activeL2Run.displayNo)} {activeL2Run.status === 'queued' ? '排队中' : '运行中'}
+              {activeRun.fillModel === 'l2_quote' ? 'L2 盘口回放' : '标准 Bar 回放'} {formatRunReference(activeRun.displayNo)} {activeRun.status === 'queued' ? '排队中' : '运行中'}
             </span>
             <button
-              onClick={handleCancelL2Run}
-              disabled={cancellingL2Run}
-              style={{ height: 36, borderRadius: 4, border: '1px solid #dc2626', background: '#fef2f2', color: '#b91c1c', padding: '0 14px', cursor: cancellingL2Run ? 'wait' : 'pointer', fontWeight: 700, fontSize: 14 }}
+              onClick={handleCancelRun}
+              disabled={cancellingRun}
+              style={{ height: 36, borderRadius: 4, border: '1px solid #dc2626', background: '#fef2f2', color: '#b91c1c', padding: '0 14px', cursor: cancellingRun ? 'wait' : 'pointer', fontWeight: 700, fontSize: 14 }}
             >
-              {cancellingL2Run ? '正在取消...' : '取消回测'}
+              {cancellingRun ? '正在取消...' : '取消回测'}
             </button>
           </div>
         ) : (
@@ -2530,10 +2547,10 @@ export default function BacktestPage({
                   <div style={labelStyle}>初始资金</div>
                   <input value={params.initialCapital} onChange={(e) => setParam('initialCapital', e.target.value)} style={fieldStyle} />
                 </label>
-                <label>
-                  <div style={labelStyle}>手续费率</div>
-                  <input value={params.commissionRate} onChange={(e) => setParam('commissionRate', e.target.value)} style={fieldStyle} />
-                </label>
+                <div>
+                  <div style={labelStyle}>默认 A 股费用</div>
+                  <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.55 }}>佣金万分之 0.8（单笔最低 5 元）· 过户费万分之 0.1 · 卖出印花税万分之 5</div>
+                </div>
                 <label>
                   <div style={labelStyle}>滑点</div>
                   <input value={params.slippage} onChange={(e) => setParam('slippage', e.target.value)} style={fieldStyle} />
@@ -2917,16 +2934,20 @@ export default function BacktestPage({
                     <div style={labelStyle}>成交模式</div>
                     <select
                       value={params.fillModel}
-                      onChange={(e) => setFillModel(e.target.value === 'l2_quote' ? 'l2_quote' : 'bar_close')}
+                      onChange={(e) => setFillModel(e.target.value === 'l2_quote' ? 'l2_quote' : e.target.value === 'bar_close' ? 'bar_close' : 'bar_next_open')}
                       style={fieldStyle}
-                      disabled={isCorePositionOverlay}
                     >
-                      <option value="bar_close">Bar 收盘价快速回测</option>
-                      <option value="l2_quote">基础 L2 十档盘口回测（异步）</option>
+                      <option value="bar_next_open">标准 Bar 回放（快速）</option>
+                      <option value="l2_quote">L2 盘口回放（真实）</option>
                     </select>
                     {isL2Quote && (
                       <div style={{ color: '#1d4ed8', fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
                         on_bar 在 Bar 结束时触发；定义 on_quote 的脚本会连续接收 3 秒盘口，新委托只使用严格晚于当前事件的盘口成交。纯 on_bar 脚本仍按订单驱动读取盘口。
+                      </div>
+                    )}
+                    {params.fillModel === 'bar_next_open' && (
+                      <div style={{ color: '#1d4ed8', fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
+                        on_bar 在已完成 Bar 的收盘时触发；信号在下一根可交易 Bar 的开盘价加固定滑点成交。
                       </div>
                     )}
                   </label>
@@ -2985,10 +3006,10 @@ export default function BacktestPage({
                     <div style={labelStyle}>初始资金</div>
                     <input value={params.initialCapital} onChange={(e) => setParam('initialCapital', e.target.value)} style={fieldStyle} />
                   </label>
-                  <label>
-                    <div style={labelStyle}>手续费率</div>
-                    <input value={params.commissionRate} onChange={(e) => setParam('commissionRate', e.target.value)} style={fieldStyle} />
-                  </label>
+                  <div>
+                    <div style={labelStyle}>默认 A 股费用</div>
+                    <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.45 }}>佣金万分之 0.8（单笔最低 5 元）· 过户费万分之 0.1 · 卖出印花税万分之 5</div>
+                  </div>
                   <label>
                     <div style={labelStyle}>滑点</div>
                     <input value={params.slippage} onChange={(e) => setParam('slippage', e.target.value)} style={fieldStyle} />
@@ -4353,17 +4374,10 @@ export default function BacktestPage({
           </label>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <label>
-              <div style={labelStyle}>手续费率</div>
-              <input
-                value={params.commissionRate}
-                onChange={(e) => setParam('commissionRate', e.target.value)}
-                style={fieldStyle}
-              />
-              <div style={{ color: '#b45309', fontSize: 11, marginTop: 5 }}>
-                当前仅保存到记录，尚未影响引擎成本
-              </div>
-            </label>
+            <div>
+              <div style={labelStyle}>默认 A 股费用</div>
+              <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.45 }}>佣金万分之 0.8（单笔最低 5 元）· 过户费万分之 0.1 · 卖出印花税万分之 5</div>
+            </div>
             <label>
               <div style={labelStyle}>滑点</div>
               <input

@@ -175,6 +175,8 @@ def test_backtest_requires_saved_strategy_params(monkeypatch: pytest.MonkeyPatch
   })
   monkeypatch.setattr(api_app.market_data, "ensure_cached", lambda *_: {"status": "cache_hit", "rowCount": 0, "fetchedDates": []})
   monkeypatch.setattr(api_app.market_data, "snapshot", lambda *args: {"hash": args[0]})
+  from backend.services import bar_data
+  monkeypatch.setattr(bar_data, "ensure_available", lambda *args: {"hash": args[0], "provider": "qmt_kline"})
   monkeypatch.setattr(api_app.data_repository, "validate_backtest_coverage", lambda *args: None)
   request = {
     "configId": "00000000-0000-0000-0000-000000000003",
@@ -205,6 +207,20 @@ def test_backtest_requires_saved_strategy_params(monkeypatch: pytest.MonkeyPatch
   request["strategyParams"]["window"] = "10"
   with pytest.raises(HTTPException, match="window"):
     api_app._validate_backtest_request(request)
+
+
+def test_bar_source_error_is_exposed_as_request_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+  from backend.l2.providers import L2DataError
+  from backend.services import bar_data
+
+  monkeypatch.setattr(
+    bar_data,
+    "load_bars_with_snapshot",
+    lambda *_: (_ for _ in ()).throw(L2DataError("临时 L2 Bar 无有效价格: 2025-03-07")),
+  )
+
+  with pytest.raises(ValueError, match="Bar 数据不可用于回测: 临时 L2 Bar 无有效价格"):
+    bar_data.ensure_available("688981.SH", "5m", "20250307", "20250307")
 
 
 def test_trend_grid_direction_flags_block_opening_orders(tmp_path: Any) -> None:
