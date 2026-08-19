@@ -77,6 +77,22 @@ def test_qmt_normalized_bar_uses_completed_bar_time() -> None:
   assert bars[0].end_time == "2026-07-30 09:30:00"
 
 
+def test_qmt_normalized_bar_accepts_minute_time_without_seconds() -> None:
+  frame = pd.DataFrame([
+    {"time": "202607300930", "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 100},
+    {"time": "202607300959", "open": 10.1, "high": 10.3, "low": 10.0, "close": 10.2, "volume": 100},
+    {"time": "202607301000", "open": 10.2, "high": 10.4, "low": 10.1, "close": 10.3, "volume": 100},
+  ])
+
+  bars = bar_data._qmt_normalized_bars("688981.SH", "1m", frame)
+
+  assert [bar.end_time for bar in bars] == [
+    "2026-07-30 09:30:00",
+    "2026-07-30 09:59:00",
+    "2026-07-30 10:00:00",
+  ]
+
+
 def test_15m_aggregation_uses_qmt_right_closed_opening_window() -> None:
   start = datetime(2026, 7, 30, 9, 30, tzinfo=_TIMEZONE)
   rows = []

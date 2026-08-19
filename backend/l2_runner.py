@@ -16,7 +16,7 @@ from backend import settings
 from backend.date_codec import format_api_date
 from backend.l2.config import has_profile, load_profile, load_temporary_quote_profile
 from backend.l2.models import NormalizedBar, QuoteSnapshot, TradeEvent, parse_timestamp
-from backend.l2.providers import ClickHouseL2Adapter, L2DataError
+from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError
 from backend.l2.result_adapter import normalize_l2_result
 from backend.services.backtest_errors import error_detail, error_summary
 from backend.services import bar_data, state_store, strategy_worker
@@ -62,6 +62,8 @@ class L2Runner:
       bars, bar_snapshot = bar_data.load_normalized_bars_with_snapshot(
         payload["symbol"], payload["timeframe"], payload["startDate"], payload["endDate"],
       )
+      stage = "l2.quote_coverage"
+      _validate_quote_coverage(quote_provider, payload["symbol"], bars)
       stage = "l2.strategy_session"
       session_id = strategy_worker.create_l2_session(self._session_payload(payload))
       quote_mode = _quote_mode(payload)
@@ -146,6 +148,16 @@ def _holding_policy(payload: dict[str, Any]) -> str:
   if payload.get("strategyCategory") not in {"core_position_overlay", "directional_holding"}:
     return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
   return "intraday" if _strategy_category(payload) == "core_position_overlay" else "overnight"
+
+
+def _validate_quote_coverage(
+  quote_provider: ClickHouseL2Adapter,
+  symbol: str,
+  bars: list[NormalizedBar],
+) -> None:
+  missing_dates = quote_provider.missing_quote_dates(symbol, [bar.trade_date for bar in bars])
+  if missing_dates:
+    raise L2DataCoverageError(symbol, missing_dates)
 
 
 def _quote_mode(payload: dict[str, Any]) -> str:

@@ -119,7 +119,7 @@ def _snapshot(provider: str, symbol: str, timeframe: str, start_date: str, end_d
 def _qmt_normalized_bars(symbol: str, period: str, frame: pd.DataFrame) -> list[NormalizedBar]:
   bars: list[NormalizedBar] = []
   for row in frame.itertuples(index=False):
-    end_time = datetime.strptime(str(row.time), "%Y%m%d%H%M%S")
+    end_time = _parse_qmt_bar_time(row.time)
     if not _is_a_share_session(end_time):
       continue
     start_time = end_time - _period_duration(period)
@@ -139,6 +139,16 @@ def _qmt_normalized_bars(symbol: str, period: str, frame: pd.DataFrame) -> list[
       source_version="qmt_kline",
     ))
   return bars
+
+
+def _parse_qmt_bar_time(value: object) -> datetime:
+  """兼容 QMT 分钟线的 12 位时间与带秒的 14 位时间。"""
+  text = str(value).strip()
+  if len(text) == 12:
+    text = f"{text}00"
+  if len(text) != 14 or not text.isdigit():
+    raise ValueError(f"QMT Bar 时间格式无效: {value}")
+  return datetime.strptime(text, "%Y%m%d%H%M%S")
 
 
 def _period_duration(period: str) -> timedelta:

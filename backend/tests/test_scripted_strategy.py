@@ -6,7 +6,8 @@ import pytest
 
 from backend.backtesting.engine import BarBacktestEngine
 from backend.backtesting.models import Bar, PortfolioSnapshot, PositionSnapshot
-from backend.l2.models import QuoteLevel, QuoteSnapshot
+from backend.l2.engine import L2ExecutionEngine
+from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot
 from backend.services.backtest_errors import StrategyExecutionError, error_summary
 from backend.strategies.scripted import ScriptedBarStrategy, quote_mode_for_script, validate_script_code
 
@@ -101,18 +102,56 @@ def test_continuous_mode_requires_quote_callback() -> None:
 
 
 @pytest.mark.parametrize("symbol", ["600584.SH", "688981.SH"])
-def test_v6_template_requests_opening_position_from_first_quote(symbol: str) -> None:
+def test_v6_template_requests_opening_position_from_first_completed_bar(symbol: str) -> None:
   code = Path("backend/strategies/staged_entry_long_v6_l2.py").read_text(encoding="utf-8")
   strategy = ScriptedBarStrategy("v6", code, {"allowLong": True, "allowShort": True})
+  portfolio = PortfolioSnapshot(cash=1_000_000, equity=1_000_000, positions={})
+  orders = strategy.on_bar(Bar("20260727093000", symbol, 10, 10, 10, 10), portfolio)
   quote = QuoteSnapshot(
     symbol, "20260727", "2026-07-27 09:30:03", 1,
     (QuoteLevel(10, 1_000),), (QuoteLevel(10.01, 1_000),), 10,
   )
 
-  orders = strategy.on_quote(quote, PortfolioSnapshot(cash=1_000_000, equity=1_000_000, positions={}))
-
   assert strategy.quote_mode == "continuous"
   assert [(item.quantity, item.metadata["client_order_key"]) for item in orders] == [(200, "opening")]
+  assert strategy.on_quote(quote, portfolio) == []
+
+
+def test_v6_template_runs_in_standard_bar_mode() -> None:
+  code = Path("backend/strategies/staged_entry_long_v6_l2.py").read_text(encoding="utf-8")
+  strategy = ScriptedBarStrategy("v6-standard", code, {"allowLong": True, "allowShort": True})
+
+  result = BarBacktestEngine(
+    initial_cash=1_000_000,
+    execute_on_next_bar_open=True,
+  ).run(strategy, [
+    Bar("20260727093000", "688981.SH", 10, 10, 10, 10),
+    Bar("20260727093100", "688981.SH", 10, 10, 10, 10),
+  ])
+
+  assert [(item.quantity, item.metadata["client_order_key"]) for item in result.fills] == [(200, "opening")]
+
+
+def test_v6_template_opening_signal_uses_later_l2_quote_for_fill() -> None:
+  code = Path("backend/strategies/staged_entry_long_v6_l2.py").read_text(encoding="utf-8")
+  strategy = ScriptedBarStrategy("v6-l2", code, {"allowLong": True, "allowShort": True})
+  engine = L2ExecutionEngine(strategy, 1_000_000, 0.00008, InstrumentRules())
+  bar = NormalizedBar(
+    symbol="688981.SH", trade_date="20260727", period="1m",
+    start_time="2026-07-27 09:30:00", end_time="2026-07-27 09:31:00",
+    open=10, high=10, low=10, close=10, volume=1_000, amount=10_000,
+    quality="complete", source_version="test",
+  )
+  quote = QuoteSnapshot(
+    "688981.SH", "20260727", "2026-07-27 09:31:03", 1,
+    (QuoteLevel(9.99, 1_000),), (QuoteLevel(10.01, 1_000),), 10, "test",
+  )
+
+  engine.begin_day("20260727")
+  engine.process_chunk([bar], [quote], [])
+
+  fills = engine.result()["fills"]
+  assert [(item["time"], item["quantity"]) for item in fills] == [("2026-07-27 09:31:03", 200)]
 
 
 def test_script_context_unifies_compact_and_l2_iso_time() -> None:

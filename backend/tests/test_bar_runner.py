@@ -46,3 +46,5 @@ def test_worker_summary_uses_cash_and_base_cost_as_initial_equity() -> None:
   assert summary["totalPnl"] == 120_000.0
   assert summary["baseHoldingPnl"] == 100_000.0
   assert summary["t0ExcessPnl"] == 20_000.0
+  assert summary["orderCount"] == 0
+  assert summary["fillCount"] == 0

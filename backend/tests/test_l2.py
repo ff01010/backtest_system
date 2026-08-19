@@ -11,9 +11,11 @@ from backend.backtesting.models import OrderIntent, OrderSide, PositionEffect
 from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot, SourceMappingProfile, TradeEvent, parse_timestamp
 from backend.l2.config import load_temporary_quote_profile
-from backend.l2.providers import ClickHouseL2Adapter, L2DataError, TemporaryQuoteBarProvider, VersionedBarCache
+from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError, TemporaryQuoteBarProvider, VersionedBarCache
 from backend.l2.result_adapter import normalize_l2_result
-from backend.l2_runner import L2Runner, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day
+from backend.l2_runner import L2Runner, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day, _validate_quote_coverage
+from backend.services.backtest_errors import error_detail
+from backend.services.system_error_catalog import classify_system_error
 from backend.services import clickhouse_client
 from backend.worker_app import (
   L2WorkerSession,
@@ -163,6 +165,8 @@ def test_l2_result_adapter_builds_overview_and_signal_details() -> None:
   assert result["summary"]["totalReturn"] == 0.1
   assert result["summary"]["maxDrawdownRate"] == 0.1
   assert result["summary"]["tradeCount"] == 2
+  assert result["summary"]["orderCount"] == 1
+  assert result["summary"]["fillCount"] == 2
   assert result["trades"][0]["action"] == "BUY_OPEN"
   assert result["dailyHoldings"][0]["longQty"] == 100
   assert len(result["skippedSignals"]) == 2
@@ -251,6 +255,51 @@ def test_temporary_quote_mapping_uses_actual_depth_volume_columns() -> None:
   assert profile.table_name == "quant.tick_quote"
   assert profile.columns["bid_volume_1"] == "bid_vol_1"
   assert profile.columns["ask_volume_10"] == "ask_vol_10"
+
+
+def test_quote_coverage_uses_actual_bar_dates(monkeypatch: pytest.MonkeyPatch) -> None:
+  profile = load_temporary_quote_profile()
+  adapter = ClickHouseL2Adapter(profile)
+  queries: list[str] = []
+
+  def query_rows(query: str) -> list[dict[str, str]]:
+    queries.append(query)
+    if query.startswith("DESCRIBE TABLE"):
+      return [{"name": column} for column in profile.columns.values()]
+    return [{"trade_date": "2026-01-02"}]
+
+  monkeypatch.setattr(clickhouse_client, "query_rows", query_rows)
+
+  missing_dates = adapter.missing_quote_dates("688981.SH", ["2026-01-02", "2026-01-03"])
+
+  assert missing_dates == ["2026-01-03"]
+  assert "GROUP BY trade_date" in queries[-1]
+  assert "09:30:00" in queries[-1]
+  assert "14:57:00" in queries[-1]
+
+
+def test_l2_quote_coverage_fails_before_strategy_session() -> None:
+  class CoverageProbe:
+    def missing_quote_dates(self, symbol: str, dates: list[str]) -> list[str]:
+      assert symbol == "688981.SH"
+      assert dates == ["20260102"]
+      return ["20260102"]
+
+  with pytest.raises(L2DataCoverageError, match="20260102"):
+    _validate_quote_coverage(CoverageProbe(), "688981.SH", [_bar()])  # type: ignore[arg-type]
+
+
+def test_l2_quote_coverage_error_has_safe_data_message() -> None:
+  error = L2DataCoverageError("688126.SH", ["2025-04-10"])
+  detail = error_detail(error)
+  classification = classify_system_error(error)
+
+  assert detail.category == "system_error"
+  assert detail.code == "l2.quote_coverage_missing"
+  assert detail.retryable is False
+  assert detail.message == "688126.SH 缺少 L2 盘口数据：2025-04-10。"
+  assert classification.category == "data"
+  assert classification.retryable is False
 
 
 def test_temporary_quote_profile_scales_only_depth_prices() -> None:

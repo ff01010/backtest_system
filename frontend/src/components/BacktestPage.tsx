@@ -40,6 +40,7 @@ import type {
   BacktestErrorDetail,
   BacktestRunHistory,
   BacktestRunResponse,
+  BacktestSummary,
   BenchmarkPoint,
   DataStatus,
   EquityPoint,
@@ -147,6 +148,16 @@ function getPnlColor(value: number): string {
   if (value > 0) return '#dc2626';
   if (value < 0) return '#16a34a';
   return '#64748b';
+}
+
+function getOrderCount(summary: Partial<BacktestSummary> | null | undefined): number | null {
+  if (!summary) return null;
+  return typeof summary.orderCount === 'number' ? summary.orderCount : summary.tradeCount ?? null;
+}
+
+function getFillCount(summary: Partial<BacktestSummary> | null | undefined): number | null {
+  if (!summary) return null;
+  return typeof summary.fillCount === 'number' ? summary.fillCount : summary.tradeCount ?? null;
 }
 
 type BacktestParamValue = string | boolean;
@@ -939,6 +950,8 @@ export default function BacktestPage({
       .map((source) => `# ${source.path}\n\n${source.code}`)
       .join('\n\n# ----------------------------------------------------------------\n\n') || ''
   ), [strategySource]);
+  const activeStrategyCode = selectedStrategy === 'user_script' ? scriptForm.code : strategySourceCode;
+  const hasQuoteCallback = /\bdef\s+on_quote\s*\(/.test(activeStrategyCode);
   const draftFingerprint = useMemo(() => buildStrategyDraftFingerprint({
     strategy: selectedStrategy,
     mode: 'backtest',
@@ -992,7 +1005,7 @@ export default function BacktestPage({
           setHoldingStatusFilter('all');
           setPendingRun(null);
           setActivePanel('overview');
-          setStatus(`回测 ${formatRunReference(run.displayNo)} 已完成，交易 ${run.resultJson.summary.tradeCount} 笔`);
+          setStatus(`回测 ${formatRunReference(run.displayNo)} 已完成，成交 ${getFillCount(run.resultJson.summary) ?? 0} 笔`);
           refreshBacktestRuns();
           return;
         }
@@ -1728,7 +1741,7 @@ export default function BacktestPage({
         refreshDataStatus(selectedSymbol, selectedTimeframe);
       }
       refreshBacktestRuns();
-      setStatus(`回测完成 ${formatRunReference(data.displayNo)}，交易 ${data.summary.tradeCount} 笔`);
+      setStatus(`回测完成 ${formatRunReference(data.displayNo)}，成交 ${getFillCount(data.summary) ?? 0} 笔`);
     } catch (e) {
       if (e instanceof BacktestRequestError) {
         setBacktestErrorDetail(e.detail);
@@ -2043,14 +2056,14 @@ export default function BacktestPage({
     ['底仓持有收益率', overlaySummary ? formatPct(overlaySummary.baseHoldingReturn) : '--'],
     ['总账户收益率', overlaySummary ? formatPct(overlaySummary.totalReturn) : '--'],
     ['最大回撤', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
-    ['交易 / 胜率', result ? `${result.summary.tradeCount} / ${formatPct(result.summary.winRate)}` : '--'],
+    ['成交 / 胜率', result ? `${formatNumber(getFillCount(result.summary))} / ${formatPct(result.summary.winRate)}` : '--'],
   ] : [
     ['总收益', result ? formatPct(result.summary.totalReturn) : '--'],
     ['年化收益', result ? formatPct(result.summary.annualReturn) : '--'],
     ['超额收益', result ? formatPct(result.excessReturn) : '--'],
     ['最大回撤', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
     ['Sharpe', result ? formatNumber(result.summary.annualSharpe) : '--'],
-    ['交易 / 胜率', result ? `${result.summary.tradeCount} / ${formatPct(result.summary.winRate)}` : '--'],
+    ['成交 / 胜率', result ? `${formatNumber(getFillCount(result.summary))} / ${formatPct(result.summary.winRate)}` : '--'],
   ];
   const metricGroups = [
     {
@@ -2088,7 +2101,7 @@ export default function BacktestPage({
         ['胜率', result ? formatPct(result.summary.winRate) : '--'],
         ['日胜率', result ? formatPct(result.summary.dailyWinRate) : '--'],
         ['盈亏比', result ? formatNumber(result.summary.profitLossRatio) : '--'],
-        ['交易次数', result ? String(result.summary.tradeCount) : '--'],
+        ['成交笔数', result ? formatNumber(getFillCount(result.summary)) : '--'],
         ['盈利次数', result ? String(result.summary.winningTrades) : '--'],
         ['亏损次数', result ? String(result.summary.losingTrades) : '--'],
         ['平均盈利', result ? formatMoney(result.summary.avgWin) : '--'],
@@ -2880,7 +2893,7 @@ export default function BacktestPage({
                       />
                       <div className="strategy-editor-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
                         <span style={{ color: '#64748b', fontSize: 12 }}>
-                          接口：on_bar(bar, state)；L2 脚本可选 on_quote(quote, state) 与 on_order_event(event, state)。time 为 YYYYMMDDHHMMSS，tradeDate 为 YYYY-MM-DD，hhmm 例如 931；{params.fillModel === 'l2_quote' ? '定义 on_quote 时连续回放 3 秒快照，新订单仅可用后续快照撮合。' : '按收盘价成交。'}支持导入后端已安装模块。
+                          接口：on_bar(bar, state)；可选 on_quote(quote, state) 与 on_order_event(event, state)。time 为 YYYYMMDDHHMMSS，tradeDate 为 YYYY-MM-DD，hhmm 例如 931；{params.fillModel === 'l2_quote' ? '定义 on_quote 时连续回放 3 秒快照，新订单仅可用后续快照撮合。' : '标准 Bar 执行 on_bar 与成交回报，不执行 on_quote；信号按下一根可交易 Bar 开盘价加滑点成交。'}支持导入后端已安装模块。
                         </span>
                         <span style={{ color: '#64748b', fontSize: 12 }}>代码将随“保存策略”一并保存。</span>
                       </div>
@@ -2947,7 +2960,12 @@ export default function BacktestPage({
                     )}
                     {params.fillModel === 'bar_next_open' && (
                       <div style={{ color: '#1d4ed8', fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
-                        on_bar 在已完成 Bar 的收盘时触发；信号在下一根可交易 Bar 的开盘价加固定滑点成交。
+                        on_bar 在已完成 Bar 的收盘时触发；信号在下一根可交易 Bar 的开盘价加固定滑点成交，虚拟成交后会调用 on_order_event。
+                      </div>
+                    )}
+                    {params.fillModel === 'bar_next_open' && hasQuoteCallback && (
+                      <div style={{ color: '#b45309', fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
+                        当前策略定义了 on_quote：标准 Bar 回放仍会执行 on_bar，但不会执行盘口止损、止盈等实时快照逻辑。
                       </div>
                     )}
                   </label>
@@ -3145,6 +3163,7 @@ export default function BacktestPage({
                   <div className="trade-filter-layout" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'end', gap: 10 }}>
                     <div className="trade-filter-summary" aria-label="信号执行摘要">
                       <div><span>信号</span><strong>{allSignals.length}</strong></div>
+                      <div><span>有效委托</span><strong>{result ? formatNumber(getOrderCount(result.summary)) : '--'}</strong></div>
                       <div><span>已成交</span><strong className="is-filled">{filledSignalCount}</strong></div>
                       <div><span>已跳过</span><strong className="is-skipped">{skippedSignalCount}</strong></div>
                       <div><span>胜率</span><strong>{result ? formatPct(result.summary.winRate) : '--'}</strong></div>
@@ -3746,7 +3765,7 @@ export default function BacktestPage({
                               <div style={{ color: '#b45309' }}>该记录的实验清单不完整，无法完整复现。</div>
                             )}
                             <HistoryRunSnapshot run={selectedHistoryRun} />
-                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8, marginTop: 4 }}>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))', gap: 8, marginTop: 4 }}>
                               <div style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: 8 }}>
                                 <div style={{ color: '#64748b', fontSize: 11 }}>总收益率</div>
                                 <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalPct(selectedHistoryRun.summaryJson.totalReturn)}</div>
@@ -3760,8 +3779,12 @@ export default function BacktestPage({
                                 <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalNumber(selectedHistoryRun.summaryJson.annualSharpe)}</div>
                               </div>
                               <div style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: 8 }}>
-                                <div style={{ color: '#64748b', fontSize: 11 }}>交易次数</div>
-                                <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalNumber(selectedHistoryRun.summaryJson.tradeCount)}</div>
+                                <div style={{ color: '#64748b', fontSize: 11 }}>有效委托数</div>
+                                <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalNumber(getOrderCount(selectedHistoryRun.summaryJson))}</div>
+                              </div>
+                              <div style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: 8 }}>
+                                <div style={{ color: '#64748b', fontSize: 11 }}>成交笔数</div>
+                                <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalNumber(getFillCount(selectedHistoryRun.summaryJson))}</div>
                               </div>
                             </div>
                             <label>
@@ -3878,15 +3901,16 @@ export default function BacktestPage({
                               <div style={{ overflow: 'auto', border: '1px solid #e2e8f0', borderRadius: 6 }}>
                                 <div style={{ display: 'grid', gridTemplateColumns: '130px 1fr 1fr 1fr', gap: 8, padding: '8px 10px', background: '#f8fafc', color: '#64748b', fontSize: 11, fontWeight: 700 }}>
                                   <span>结果指标</span>
-                                  <span>回测 #{selectedHistoryRun.id}</span>
-                                  <span>回测 #{compareHistoryRun.id}</span>
+                                  <span title={selectedHistoryRun.id}>回测 {formatRunReference(selectedHistoryRun.displayNo)}</span>
+                                  <span title={compareHistoryRun.id}>回测 {formatRunReference(compareHistoryRun.displayNo)}</span>
                                   <span>差异</span>
                                 </div>
                                 {[
                                   ['总收益率', selectedHistoryRun.summaryJson.totalReturn, compareHistoryRun.summaryJson.totalReturn, formatOptionalPct],
                                   ['最大回撤', selectedHistoryRun.summaryJson.maxDrawdownRate, compareHistoryRun.summaryJson.maxDrawdownRate, formatOptionalPct],
                                   ['Sharpe', selectedHistoryRun.summaryJson.annualSharpe, compareHistoryRun.summaryJson.annualSharpe, formatOptionalNumber],
-                                  ['信号次数', selectedHistoryRun.summaryJson.tradeCount, compareHistoryRun.summaryJson.tradeCount, formatOptionalNumber],
+                                  ['有效委托数', getOrderCount(selectedHistoryRun.summaryJson), getOrderCount(compareHistoryRun.summaryJson), formatOptionalNumber],
+                                  ['成交笔数', getFillCount(selectedHistoryRun.summaryJson), getFillCount(compareHistoryRun.summaryJson), formatOptionalNumber],
                                 ].map(([label, current, compared, formatter]) => {
                                   const difference = Number(current ?? 0) - Number(compared ?? 0);
                                   return (

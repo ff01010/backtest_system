@@ -191,6 +191,8 @@ class BacktestSummary(BaseModel):
   winRate: float | None
   dailyWinRate: float | None
   tradeCount: int
+  orderCount: int | None = None
+  fillCount: int | None = None
   winningTrades: int
   losingTrades: int
   avgWin: float | None

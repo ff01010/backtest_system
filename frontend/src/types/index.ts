@@ -146,6 +146,8 @@ export interface BacktestSummary {
   winRate: NullableMetric;
   dailyWinRate: NullableMetric;
   tradeCount: number;
+  orderCount?: number;
+  fillCount?: number;
   winningTrades: number;
   losingTrades: number;
   avgWin: NullableMetric;

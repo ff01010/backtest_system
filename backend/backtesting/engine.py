@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import Callable, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 from backend.backtesting.fees import FeeProfile
 from backend.backtesting.models import (
@@ -82,6 +82,14 @@ class StreamingStrategy(Protocol):
   ) -> None:
     """驱动策略状态机，并为每根 K 线调用一次 emit。"""
     ...
+
+
+@dataclass(frozen=True)
+class _AcceptedBarOrder:
+  """标准 Bar 模式待成交订单及其回调关联标识。"""
+
+  order_id: str
+  intent: OrderIntent
 
 
 @dataclass
@@ -549,26 +557,29 @@ class BarBacktestEngine:
     self._t0_enabled = t0_enabled
     self._t0_remaining = base_quantity if t0_enabled else 0
     self._t0_date: str | None = None
+    self._order_event_sequence = 0
 
   def run(self, strategy: BarStrategy, bars: Sequence[Bar]) -> BacktestResult:
     equity_curve: list[EquityPoint] = []
     portfolio_snapshots: list[PortfolioSnapshot] = []
     if bars and self._base_quantity > 0:
       self._ledger.initialize_long_position(bars[0].symbol, self._base_quantity, self._base_cost_price, "base_position")
-    pending_orders: list[OrderIntent] = []
+    self._order_event_sequence = 0
+    pending_orders: list[_AcceptedBarOrder] = []
     for index, bar in enumerate(bars):
       self._begin_day_if_needed(bar)
       if pending_orders:
-        self._execute_orders(bar, pending_orders, False)
+        self._execute_accepted_orders(strategy, bar, pending_orders, False)
         pending_orders = []
       self._ledger.mark(bar.symbol, bar.close)
       orders = strategy.on_bar(bar, self._ledger.snapshot())
       is_day_end = self._is_day_end(bars, index)
+      accepted_orders = self._accept_orders(strategy, orders, is_day_end, bar.time)
       if self._execute_on_next_bar_open:
-        pending_orders = self._eligible_orders(orders, is_day_end)
-        snapshot = self._close_day_if_needed(bar, is_day_end)
+        pending_orders = accepted_orders
+        snapshot = self._close_day_if_needed_with_events(strategy, bar, is_day_end)
       else:
-        snapshot = self._execute_orders(bar, orders, is_day_end)
+        snapshot = self._execute_accepted_orders(strategy, bar, accepted_orders, is_day_end)
       equity_curve.append(EquityPoint(bar.time, snapshot.equity, snapshot.cash))
       portfolio_snapshots.append(snapshot)
     return BacktestResult(
@@ -577,6 +588,99 @@ class BarBacktestEngine:
       self._ledger.snapshot(),
       portfolio_snapshots,
     )
+
+  def _accept_orders(
+    self,
+    strategy: BarStrategy,
+    orders: Sequence[OrderIntent],
+    is_day_end: bool,
+    event_time: str,
+  ) -> list[_AcceptedBarOrder]:
+    accepted: list[_AcceptedBarOrder] = []
+    for order in self._eligible_orders(orders, is_day_end):
+      self._order_event_sequence += 1
+      item = _AcceptedBarOrder(f"bar-{self._order_event_sequence}", order)
+      accepted.append(item)
+      self._notify_order_event(strategy, self._order_event(item, "accepted", event_time))
+    return accepted
+
+  def _execute_accepted_orders(
+    self,
+    strategy: BarStrategy,
+    bar: Bar,
+    orders: Sequence[_AcceptedBarOrder],
+    is_day_end: bool,
+  ) -> PortfolioSnapshot:
+    for item in orders:
+      fill = self._execution_model.create_fill(item.intent, bar, self._commission_rate, self._fee_profile)
+      if fill is None:
+        self._notify_order_event(strategy, self._order_event(
+          item, "rejected", bar.time, rejection_reason="标准 Bar 成交模型未产生有效成交",
+        ))
+        continue
+      applied_fill = self._ledger.apply_fill(fill)
+      if self._uses_t0_capacity(item.intent):
+        self._t0_remaining = max(0, self._t0_remaining - applied_fill.quantity)
+      self._notify_order_event(strategy, self._order_event(item, "filled", applied_fill.time, applied_fill))
+    return self._close_day_if_needed_with_events(strategy, bar, is_day_end)
+
+  def _close_day_if_needed_with_events(
+    self,
+    strategy: BarStrategy,
+    bar: Bar,
+    is_day_end: bool,
+  ) -> PortfolioSnapshot:
+    if self._holding_policy == "intraday" and is_day_end:
+      orders = self._ledger.force_close_orders(bar, {"base_position"} if self._base_quantity > 0 else None)
+      accepted = self._accept_orders(strategy, orders, False, bar.time)
+      self._execute_accepted_orders(strategy, bar, accepted, False)
+    return self._ledger.snapshot()
+
+  @staticmethod
+  def _notify_order_event(strategy: BarStrategy, event: dict[str, Any]) -> None:
+    callback = getattr(strategy, "on_order_event", None)
+    if callable(callback):
+      callback(event)
+
+  @staticmethod
+  def _order_event(
+    item: _AcceptedBarOrder,
+    event_type: str,
+    event_time: str,
+    fill: Fill | None = None,
+    rejection_reason: str | None = None,
+  ) -> dict[str, Any]:
+    order = item.intent
+    metadata = order.metadata
+    direction = str(metadata.get("direction") or order.side.value)
+    event: dict[str, Any] = {
+      "type": event_type,
+      "orderId": item.order_id,
+      "symbol": order.symbol,
+      "side": order.side.value,
+      "direction": direction,
+      "action": direction,
+      "quantity": fill.quantity if fill is not None else order.quantity,
+      "reason": order.reason,
+      "signalTime": str(metadata.get("signal_time") or order.time or event_time),
+      "clientOrderKey": metadata.get("client_order_key"),
+      "positionEffect": order.position_effect.value if order.position_effect else None,
+      "source": str(metadata.get("source") or "strategy"),
+    }
+    if event_type == "accepted":
+      event["effectiveAt"] = event_time
+    if fill is not None:
+      event.update({
+        "time": fill.time,
+        "executionTime": fill.time,
+        "price": fill.price,
+        "commission": fill.fee,
+        "cumulativeQuantity": fill.quantity,
+        "remaining": 0,
+      })
+    if rejection_reason:
+      event["rejectionReason"] = rejection_reason
+    return event
 
   def run_batch(
     self,
