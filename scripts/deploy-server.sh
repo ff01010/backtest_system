@@ -56,8 +56,14 @@ validate_clickhouse_network() {
 }
 
 verify_clickhouse_connectivity() {
-  "${compose[@]}" exec -T l2-runner python -c "import urllib.request; response = urllib.request.urlopen('http://quant-clickhouse:8123/ping', timeout=5); assert response.read().strip() == b'Ok.'" \
-    || fail "l2-runner 无法通过 quant-clickhouse:8123 连接 ClickHouse"
+  local runner_id runner_ids
+  runner_ids="$("${compose[@]}" ps -q l2-runner)"
+  [[ -n "$runner_ids" ]] || fail "l2-runner 未启动，无法检查 ClickHouse 连通性"
+  while IFS= read -r runner_id; do
+    [[ -n "$runner_id" ]] || continue
+    docker exec "$runner_id" python -c "import urllib.request; response = urllib.request.urlopen('http://quant-clickhouse:8123/ping', timeout=5); assert response.read().strip() == b'Ok.'" \
+      || fail "l2-runner 无法通过 quant-clickhouse:8123 连接 ClickHouse"
+  done <<< "$runner_ids"
   docker exec quant-backtest-bar-runner python -c "import urllib.request; response = urllib.request.urlopen('http://quant-clickhouse:8123/ping', timeout=5); assert response.read().strip() == b'Ok.'" \
     || fail "quant-backtest-bar-runner 无法通过 quant-clickhouse:8123 连接 ClickHouse"
 }

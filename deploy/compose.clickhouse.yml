@@ -7,6 +7,9 @@ services:
   l2-runner:
     networks:
       - quant-platform-net
+  bar-runner:
+    networks:
+      - quant-platform-net
 
 networks:
   quant-platform-net:

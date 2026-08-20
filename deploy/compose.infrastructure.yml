@@ -152,7 +152,6 @@ services:
     environment:
       TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
       TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
-      TREND_GRID_STRATEGY_WORKER_URL: http://strategy-worker:8001
       TREND_GRID_CLICKHOUSE_HTTP_URL: ${TREND_GRID_CLICKHOUSE_HTTP_URL:-}
       TREND_GRID_CLICKHOUSE_USER: ${TREND_GRID_CLICKHOUSE_USER:-default}
       TREND_GRID_CLICKHOUSE_PASSWORD: ${TREND_GRID_CLICKHOUSE_PASSWORD:-}
@@ -165,16 +164,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      strategy-worker:
-        condition: service_healthy
       redis:
         condition: service_healthy
-    cpus: 2.0
-    mem_limit: 3g
+    cpus: 4.0
+    mem_limit: 6g
     pids_limit: 256
     networks:
       - quant-backtest-net
-      - quant-backtest-worker-net
       - quant-backtest-l2-net
 
   bar-runner:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import threading
 import time
 from collections import deque
 from dataclasses import asdict
@@ -18,8 +19,9 @@ from backend.l2.config import has_profile, load_profile, load_temporary_quote_pr
 from backend.l2.models import NormalizedBar, QuoteSnapshot, TradeEvent, parse_timestamp
 from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError
 from backend.l2.result_adapter import normalize_l2_result
+from backend.l2.strategy_session import L2StrategySession
 from backend.services.backtest_errors import error_detail, error_summary
-from backend.services import bar_data, state_store, strategy_worker
+from backend.services import bar_data, state_store
 from backend.services.system_error_log import system_error_log_record
 from backend.strategies.scripted import quote_mode_for_script
 
@@ -50,10 +52,12 @@ class L2Runner:
     return True
 
   def _run_job(self, job: dict[str, Any]) -> None:
-    session_id: str | None = None
+    session: L2StrategySession | None = None
+    lease = _JobLeaseKeeper(job)
     completed = False
     stage = "l2.initialize"
     try:
+      lease.start()
       started_at = time.perf_counter()
       payload = dict(job["payload"])
       quote_provider = ClickHouseL2Adapter(load_profile("quote") if has_profile("quote") else load_temporary_quote_profile())
@@ -65,7 +69,7 @@ class L2Runner:
       stage = "l2.quote_coverage"
       _validate_quote_coverage(quote_provider, payload["symbol"], bars)
       stage = "l2.strategy_session"
-      session_id = strategy_worker.create_l2_session(self._session_payload(payload))
+      session = L2StrategySession(self._session_payload(payload), lease.ensure_active)
       quote_mode = _quote_mode(payload)
       performance = _new_performance(quote_mode)
       performance["barReadMs"] = _elapsed_ms(bar_read_started)
@@ -73,22 +77,24 @@ class L2Runner:
       for trade_date, day_bars in _bars_by_day(bars).items():
         if quote_mode == "continuous":
           _replay_day_continuous(
-            session_id, day_bars, quote_provider, payload["symbol"], trade_date,
+            session, day_bars, quote_provider, payload["symbol"], trade_date,
             job, performance,
           )
         else:
           _replay_day(
-            session_id, day_bars, quote_provider, payload["symbol"], trade_date,
+            session, day_bars, quote_provider, payload["symbol"], trade_date,
             job, performance,
           )
       stage = "l2.result_finalize"
-      raw_result = strategy_worker.finish_l2_session(session_id)
-      session_id = None
+      raw_result = session.result()
+      session.close()
+      session = None
       raw_result["dataSnapshot"] = _data_snapshot(bar_snapshot, quote_provider, payload, quote_mode)
       performance["totalElapsedMs"] = _elapsed_ms(started_at)
       raw_result["performance"] = performance
       result = normalize_l2_result(raw_result, payload)
       summary = _summary(result)
+      lease.ensure_active()
       completed = state_store.finish_l2_backtest_job(job["runId"], job["attemptToken"], "succeeded", summary, result)
       if not completed:
         logger.warning("L2 任务 %s 已由新的执行尝试接管", job["runId"])
@@ -104,8 +110,9 @@ class L2Runner:
         owner_user_id=job["ownerUserId"],
       )
     finally:
-      if session_id is not None:
-        strategy_worker.discard_l2_session(session_id)
+      if session is not None:
+        session.close()
+      lease.stop()
 
   @staticmethod
   def _session_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -178,7 +185,7 @@ def _bars_by_day(bars: list[NormalizedBar]) -> dict[str, list[NormalizedBar]]:
 
 
 def _replay_day(
-  session_id: str,
+  session: L2StrategySession,
   bars: list[NormalizedBar],
   quote_provider: ClickHouseL2Adapter,
   symbol: str,
@@ -188,7 +195,7 @@ def _replay_day(
 ) -> None:
   """以 Bar 为主时钟，只有待成交订单才按时间游标读取盘口。"""
   trade_date = format_api_date(trade_date)
-  strategy_worker.begin_l2_day(session_id, {"tradeDate": trade_date})
+  session.begin_day(trade_date)
   bar_index = 0
   quote_cursor: str | None = None
   quote_reader = _QuotePrefetchBuffer(quote_provider, symbol, trade_date, performance)
@@ -199,20 +206,16 @@ def _replay_day(
       if _waiting_quote(demand):
         quote = quote_reader.next(quote_cursor, demand, next_bar.end_time)
         if quote is not None:
-          demand = _process_quote(session_id, quote, trade_date, job, performance)
+          demand = _process_quote(session, quote, job, performance)
           quote_cursor = quote.time
           continue
       batch = bars[bar_index:] if not _waiting_quote(demand) else [next_bar]
       started = time.perf_counter()
-      response = strategy_worker.process_l2_bars(session_id, {
-        "tradeDate": trade_date,
-        "bars": [asdict(bar) for bar in batch],
-      })
+      response = session.process_bars(batch)
       performance["workerMs"] += _elapsed_ms(started)
-      performance["workerCalls"] += 1
       processed = int(response.get("processedBars", 0))
       if processed <= 0 or processed > len(batch):
-        raise L2DataError("L2 worker 未返回有效的 Bar 处理数量")
+        raise L2DataError("L2 策略会话未返回有效的 Bar 处理数量")
       performance["barCount"] += processed
       bar_index += processed
       demand = response
@@ -223,7 +226,7 @@ def _replay_day(
       quote = quote_reader.next(quote_cursor, demand, session_end)
       if quote is None:
         break
-      demand = _process_quote(session_id, quote, trade_date, job, performance)
+      demand = _process_quote(session, quote, job, performance)
       quote_cursor = quote.time
 
     if bool(demand.get("dayEndQuoteRequired")):
@@ -235,15 +238,16 @@ def _replay_day(
       performance["quoteBufferMisses"] += 1
       performance["sourceReadMs"] += _elapsed_ms(started)
       if final_quote is not None and (quote_cursor is None or parse_timestamp(final_quote.time) > parse_timestamp(quote_cursor)):
-        demand = _process_quote(session_id, final_quote, trade_date, job, performance)
+        demand = _process_quote(session, final_quote, job, performance)
         quote_cursor = final_quote.time
-    strategy_worker.finish_l2_day(session_id, trade_date)
+    session.finish_day(trade_date)
+    _record_session_performance(session, performance)
   finally:
     quote_reader.close()
 
 
 def _replay_day_continuous(
-  session_id: str,
+  session: L2StrategySession,
   bars: list[NormalizedBar],
   quote_provider: ClickHouseL2Adapter,
   symbol: str,
@@ -253,20 +257,13 @@ def _replay_day_continuous(
 ) -> None:
   """连续模式只为声明 on_quote 的策略回放完整 3 秒快照。"""
   trade_date = format_api_date(trade_date)
-  strategy_worker.begin_l2_day(session_id, {"tradeDate": trade_date})
-  source_read_started_ms = performance["sourceReadMs"]
-  stream_started = time.perf_counter()
-  response = strategy_worker.stream_l2_day(
-    session_id,
-    _continuous_stream_chunks(bars, quote_provider, symbol, trade_date, job, performance),
-  )
-  stream_elapsed_ms = _elapsed_ms(stream_started)
-  worker_processing_ms = float(response.get("workerProcessingMs", 0.0))
-  performance["workerMs"] += worker_processing_ms
-  source_read_ms = performance["sourceReadMs"] - source_read_started_ms
-  performance["transportMs"] += max(0.0, stream_elapsed_ms - source_read_ms - worker_processing_ms)
-  performance["workerCalls"] += 1
-  strategy_worker.finish_l2_day(session_id, trade_date)
+  session.begin_day(trade_date)
+  started = time.perf_counter()
+  for chunk in _continuous_stream_chunks(bars, quote_provider, symbol, trade_date, job, performance):
+    session.process_chunk_payload(chunk)
+  performance["workerMs"] += _elapsed_ms(started)
+  session.finish_day(trade_date)
+  _record_session_performance(session, performance)
 
 
 def _continuous_stream_chunks(
@@ -341,19 +338,21 @@ class _QuotePrefetchBuffer:
 
 
 def _process_quote(
-  session_id: str,
+  session: L2StrategySession,
   quote: QuoteSnapshot,
-  trade_date: str,
   job: dict[str, Any],
   performance: dict[str, Any],
 ) -> dict[str, Any]:
   started = time.perf_counter()
-  response = strategy_worker.process_l2_quote(session_id, {"tradeDate": trade_date, "quote": asdict(quote)})
+  response = session.process_quote(quote)
   performance["workerMs"] += _elapsed_ms(started)
-  performance["workerCalls"] += 1
   performance["quotesFetched"] += 1
   _heartbeat(job)
   return response
+
+
+def _record_session_performance(session: L2StrategySession, performance: dict[str, Any]) -> None:
+  performance["workerCalls"] = int(getattr(session, "callback_calls", performance["workerCalls"]))
 
 
 def _waiting_quote(demand: dict[str, Any]) -> bool:
@@ -376,6 +375,40 @@ def _later_timestamp(left: str | None, right: str) -> str:
 def _heartbeat(job: dict[str, Any]) -> None:
   if not state_store.heartbeat_l2_backtest_job(job["runId"], job["attemptToken"], settings.L2_JOB_LEASE_SECONDS):
     raise L2DataError("L2 任务租约丢失或已取消")
+
+
+class _JobLeaseKeeper:
+  """在策略回调阻塞时仍由父 runner 持续续租。"""
+
+  def __init__(self, job: dict[str, Any]) -> None:
+    self._job = job
+    self._stop_event = threading.Event()
+    self._lock = threading.Lock()
+    self._failure: Exception | None = None
+    self._thread = threading.Thread(target=self._run, name="l2-job-lease", daemon=True)
+
+  def start(self) -> None:
+    self._thread.start()
+
+  def stop(self) -> None:
+    self._stop_event.set()
+    self._thread.join(timeout=2)
+
+  def ensure_active(self) -> None:
+    with self._lock:
+      failure = self._failure
+    if failure is not None:
+      raise failure
+
+  def _run(self) -> None:
+    interval = max(1.0, min(10.0, settings.L2_JOB_LEASE_SECONDS / 3))
+    while not self._stop_event.wait(interval):
+      try:
+        _heartbeat(self._job)
+      except Exception as error:
+        with self._lock:
+          self._failure = error
+        return
 
 
 def _new_performance(quote_mode: str = "order_driven") -> dict[str, Any]:
