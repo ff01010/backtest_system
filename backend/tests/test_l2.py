@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 from dataclasses import asdict, replace
 from typing import Any
 
@@ -13,7 +14,9 @@ from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteS
 from backend.l2.config import load_temporary_quote_profile
 from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError, TemporaryQuoteBarProvider, VersionedBarCache
 from backend.l2.result_adapter import normalize_l2_result
-from backend.l2_runner import L2Runner, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day, _validate_quote_coverage
+from backend.l2.strategy_session import L2StrategySession
+from backend import settings
+from backend.l2_runner import L2Runner, _JobLeaseKeeper, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day, _validate_quote_coverage
 from backend.services.backtest_errors import error_detail
 from backend.services.system_error_catalog import classify_system_error
 from backend.services import clickhouse_client
@@ -564,16 +567,20 @@ def test_order_driven_runner_does_not_query_quotes_without_orders(monkeypatch: p
     def last_quote_before(self, *args, **kwargs):
       raise AssertionError("无仓位时不应查询收盘盘口")
 
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.begin_l2_day", lambda *args: None)
-  monkeypatch.setattr(
-    "backend.l2_runner.strategy_worker.process_l2_bars",
-    lambda session_id, payload: {"processedBars": len(payload["bars"]), "quoteDemand": "idle", "dayEndQuoteRequired": False},
-  )
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.finish_l2_day", lambda *args: None)
+  class ReplaySession:
+    def begin_day(self, trade_date: str) -> None:
+      assert trade_date == "2026-01-02"
+
+    def process_bars(self, bars: list[NormalizedBar]) -> dict[str, Any]:
+      return {"processedBars": len(bars), "quoteDemand": "idle", "dayEndQuoteRequired": False}
+
+    def finish_day(self, trade_date: str) -> None:
+      assert trade_date == "2026-01-02"
+
   monkeypatch.setattr("backend.l2_runner.state_store.heartbeat_l2_backtest_job", lambda *args: True)
 
   performance = _new_performance()
-  _replay_day("session", [_bar()], QuoteProvider(), "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
+  _replay_day(ReplaySession(), [_bar()], QuoteProvider(), "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
 
   assert performance["quotesFetched"] == 0
   assert performance["quoteQueries"] == 0
@@ -594,24 +601,28 @@ def test_order_driven_runner_queries_quote_only_after_order(monkeypatch: pytest.
   provider = QuoteProvider()
   bar_calls = 0
 
-  def process_bars(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    nonlocal bar_calls
-    bar_calls += 1
-    if bar_calls == 1:
-      return {"processedBars": 1, "quoteDemand": "waiting_quote", "nextQuoteAfter": "2026-01-02 09:31:00", "dayEndQuoteRequired": False}
-    return {"processedBars": len(payload["bars"]), "quoteDemand": "idle", "dayEndQuoteRequired": False}
+  class ReplaySession:
+    def begin_day(self, trade_date: str) -> None:
+      assert trade_date == "2026-01-02"
 
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.begin_l2_day", lambda *args: None)
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.process_l2_bars", process_bars)
-  monkeypatch.setattr(
-    "backend.l2_runner.strategy_worker.process_l2_quote",
-    lambda *args: {"quoteDemand": "idle", "dayEndQuoteRequired": False},
-  )
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.finish_l2_day", lambda *args: None)
+    def process_bars(self, bars: list[NormalizedBar]) -> dict[str, Any]:
+      nonlocal bar_calls
+      bar_calls += 1
+      if bar_calls == 1:
+        return {"processedBars": 1, "quoteDemand": "waiting_quote", "nextQuoteAfter": "2026-01-02 09:31:00", "dayEndQuoteRequired": False}
+      return {"processedBars": len(bars), "quoteDemand": "idle", "dayEndQuoteRequired": False}
+
+    def process_quote(self, quote: QuoteSnapshot) -> dict[str, Any]:
+      assert quote.time == "2026-01-02 09:31:03"
+      return {"quoteDemand": "idle", "dayEndQuoteRequired": False}
+
+    def finish_day(self, trade_date: str) -> None:
+      assert trade_date == "2026-01-02"
+
   monkeypatch.setattr("backend.l2_runner.state_store.heartbeat_l2_backtest_job", lambda *args: True)
 
   performance = _new_performance()
-  _replay_day("session", [_bar()], provider, "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
+  _replay_day(ReplaySession(), [_bar()], provider, "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
 
   assert provider.calls == [("2026-01-02 09:31:00", None, 128)]
   assert performance["quotesFetched"] == 1
@@ -628,27 +639,31 @@ def test_order_driven_runner_uses_actual_last_quote_for_day_end(monkeypatch: pyt
       return _quote("2026-01-02 14:56:57")
 
   processed_quotes: list[str] = []
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.begin_l2_day", lambda *args: None)
-  monkeypatch.setattr(
-    "backend.l2_runner.strategy_worker.process_l2_bars",
-    lambda *args: {
-      "processedBars": 1,
-      "quoteDemand": "waiting_quote",
-      "nextQuoteAfter": "2026-01-02 14:51:00",
-      "dayEndQuoteRequired": False,
-    },
-  )
-  monkeypatch.setattr(
-    "backend.l2_runner.strategy_worker.process_l2_quote",
-    lambda _session, payload: processed_quotes.append(payload["quote"]["time"]) or {
-      "quoteDemand": "idle", "dayEndQuoteRequired": True,
-    },
-  )
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.finish_l2_day", lambda *args: None)
+
+  class ReplaySession:
+    def begin_day(self, trade_date: str) -> None:
+      assert trade_date == "2026-01-02"
+
+    def process_bars(self, bars: list[NormalizedBar]) -> dict[str, Any]:
+      assert len(bars) == 1
+      return {
+        "processedBars": 1,
+        "quoteDemand": "waiting_quote",
+        "nextQuoteAfter": "2026-01-02 14:51:00",
+        "dayEndQuoteRequired": False,
+      }
+
+    def process_quote(self, quote: QuoteSnapshot) -> dict[str, Any]:
+      processed_quotes.append(quote.time)
+      return {"quoteDemand": "idle", "dayEndQuoteRequired": True}
+
+    def finish_day(self, trade_date: str) -> None:
+      assert trade_date == "2026-01-02"
+
   monkeypatch.setattr("backend.l2_runner.state_store.heartbeat_l2_backtest_job", lambda *args: True)
 
   performance = _new_performance()
-  _replay_day("session", [_bar()], QuoteProvider(), "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
+  _replay_day(ReplaySession(), [_bar()], QuoteProvider(), "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
 
   assert processed_quotes == ["2026-01-02 14:51:03", "2026-01-02 14:56:57"]
   assert performance["quoteQueries"] == 2
@@ -671,30 +686,33 @@ def test_order_driven_runner_reuses_future_quote_buffer_without_forward_delivery
   events: list[str] = []
   bar_calls = 0
 
-  def process_bars(_: str, payload: dict[str, Any]) -> dict[str, Any]:
-    nonlocal bar_calls
-    bar = payload["bars"][0]
-    events.append(f"bar:{bar['end_time']}")
-    bar_calls += 1
-    return {
-      "processedBars": 1,
-      "quoteDemand": "waiting_quote",
-      "nextQuoteAfter": bar["end_time"],
-      "dayEndQuoteRequired": False,
-    }
+  class ReplaySession:
+    def begin_day(self, trade_date: str) -> None:
+      assert trade_date == "2026-01-02"
 
-  def process_quote(_: str, payload: dict[str, Any]) -> dict[str, Any]:
-    events.append(f"quote:{payload['quote']['time']}")
-    return {"quoteDemand": "idle", "dayEndQuoteRequired": False}
+    def process_bars(self, bars: list[NormalizedBar]) -> dict[str, Any]:
+      nonlocal bar_calls
+      bar = bars[0]
+      events.append(f"bar:{bar.end_time}")
+      bar_calls += 1
+      return {
+        "processedBars": 1,
+        "quoteDemand": "waiting_quote",
+        "nextQuoteAfter": bar.end_time,
+        "dayEndQuoteRequired": False,
+      }
 
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.begin_l2_day", lambda *args: None)
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.process_l2_bars", process_bars)
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.process_l2_quote", process_quote)
-  monkeypatch.setattr("backend.l2_runner.strategy_worker.finish_l2_day", lambda *args: None)
+    def process_quote(self, quote: QuoteSnapshot) -> dict[str, Any]:
+      events.append(f"quote:{quote.time}")
+      return {"quoteDemand": "idle", "dayEndQuoteRequired": False}
+
+    def finish_day(self, trade_date: str) -> None:
+      assert trade_date == "2026-01-02"
+
   monkeypatch.setattr("backend.l2_runner.state_store.heartbeat_l2_backtest_job", lambda *args: True)
 
   performance = _new_performance()
-  _replay_day("session", [_bar(), second_bar], provider, "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
+  _replay_day(ReplaySession(), [_bar(), second_bar], provider, "688981.SH", "20260102", {"runId": "run", "attemptToken": "token"}, performance)
 
   assert bar_calls == 2
   assert events == [
@@ -1043,6 +1061,165 @@ def on_order_event(event, state):
 
   assert len(session.result()["fills"]) == 1
   assert session.strategy._state["fillSeen"] == "quote-entry"
+
+
+def test_local_strategy_session_keeps_l2_engine_in_runner_process() -> None:
+  session = L2StrategySession({
+    "scriptId": "local-session",
+    "code": "def on_bar(bar, state):\n  return [{'action': 'buy_open', 'quantity': 100, 'reason': '测试'}]",
+    "params": {},
+    "initialCapital": 100_000,
+    "commissionRate": 0,
+    "feeProfile": {},
+    "latencyMs": 0,
+    "passiveParticipationRate": 0.1,
+    "holdingPolicy": "overnight",
+    "symbol": "688981.SH",
+    "baseQuantity": 0,
+    "baseCostPrice": 0,
+    "t0Enabled": False,
+    "quoteMode": "order_driven",
+    "instrumentRules": {},
+  })
+  try:
+    session.begin_day("2026-01-02")
+    demand = session.process_bars([_bar()])
+    assert demand["quoteDemand"] == "waiting_quote"
+
+    session.process_quote(_quote("2026-01-02 09:31:03"))
+    session.finish_day("2026-01-02")
+    result = session.result()
+
+    assert len(result["fills"]) == 1
+    assert result["fills"][0]["time"] == "2026-01-02 09:31:03"
+    assert session.callback_calls >= 2
+  finally:
+    session.close()
+
+
+def test_local_strategy_session_returns_strategy_error() -> None:
+  session = L2StrategySession({
+    "scriptId": "local-error",
+    "code": "def on_bar(bar, state):\n  raise ValueError('策略错误')",
+    "params": {},
+    "initialCapital": 100_000,
+    "commissionRate": 0,
+    "feeProfile": {},
+    "latencyMs": 0,
+    "passiveParticipationRate": 0.1,
+    "holdingPolicy": "overnight",
+    "symbol": "688981.SH",
+    "baseQuantity": 0,
+    "baseCostPrice": 0,
+    "t0Enabled": False,
+    "quoteMode": "order_driven",
+    "instrumentRules": {},
+  })
+  try:
+    session.begin_day("2026-01-02")
+    with pytest.raises(Exception) as error:
+      session.process_bars([_bar()])
+    assert error_detail(error.value).category == "strategy_error"
+  finally:
+    session.close()
+
+
+def test_local_strategy_session_preserves_quote_and_order_event_callbacks() -> None:
+  session = L2StrategySession({
+    "scriptId": "local-quote",
+    "code": """
+def on_bar(bar, state):
+  return []
+
+def on_quote(quote, state):
+  if not state.get('submitted'):
+    state['submitted'] = True
+    return [{'action': 'buy_open', 'quantity': 100, 'clientOrderKey': 'entry'}]
+  return []
+
+def on_order_event(event, state):
+  if event['type'] == 'filled':
+    state['filled'] = event['clientOrderKey']
+""",
+    "params": {},
+    "initialCapital": 100_000,
+    "commissionRate": 0,
+    "feeProfile": {},
+    "latencyMs": 0,
+    "passiveParticipationRate": 0.1,
+    "holdingPolicy": "overnight",
+    "symbol": "688981.SH",
+    "baseQuantity": 0,
+    "baseCostPrice": 0,
+    "t0Enabled": False,
+    "quoteMode": "continuous",
+    "instrumentRules": {},
+  })
+  try:
+    session.begin_day("2026-01-02")
+    first = session.process_quote(_quote("2026-01-02 09:30:03"))
+    second = session.process_quote(_quote("2026-01-02 09:30:06"))
+    session.finish_day("2026-01-02")
+    result = session.result()
+
+    assert first["quoteDemand"] == "waiting_quote"
+    assert second["quoteDemand"] == "idle"
+    assert len(result["fills"]) == 1
+    assert session.callback_calls >= 4
+  finally:
+    session.close()
+
+
+def test_local_strategy_session_accepts_dataclass_quote_chunk() -> None:
+  session = L2StrategySession({
+    "scriptId": "local-chunk",
+    "code": "def on_bar(bar, state):\n  return []\n\ndef on_quote(quote, state):\n  return []",
+    "params": {},
+    "initialCapital": 100_000,
+    "commissionRate": 0,
+    "feeProfile": {},
+    "latencyMs": 0,
+    "passiveParticipationRate": 0.1,
+    "holdingPolicy": "overnight",
+    "symbol": "688981.SH",
+    "baseQuantity": 0,
+    "baseCostPrice": 0,
+    "t0Enabled": False,
+    "quoteMode": "continuous",
+    "instrumentRules": {},
+  })
+  try:
+    session.begin_day("2026-01-02")
+    session.process_chunk_payload({
+      "bars": [],
+      "quotes": [asdict(_quote("2026-01-02 09:30:03"))],
+      "trades": [],
+    })
+    session.finish_day("2026-01-02")
+    session.result()
+
+    assert session.callback_calls >= 1
+  finally:
+    session.close()
+
+
+def test_job_lease_keeper_detects_lost_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+  observed = threading.Event()
+
+  def lose_lease(_: dict[str, Any]) -> None:
+    observed.set()
+    raise L2DataError("L2 任务租约丢失或已取消")
+
+  monkeypatch.setattr(settings, "L2_JOB_LEASE_SECONDS", 3)
+  monkeypatch.setattr("backend.l2_runner._heartbeat", lose_lease)
+  keeper = _JobLeaseKeeper({"runId": "run", "attemptToken": "token"})
+  keeper.start()
+  try:
+    assert observed.wait(timeout=2)
+    with pytest.raises(L2DataError, match="租约丢失"):
+      keeper.ensure_active()
+  finally:
+    keeper.stop()
 
 
 def test_event_adapter_only_queries_trade_rows(monkeypatch: pytest.MonkeyPatch) -> None:
