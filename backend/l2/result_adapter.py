@@ -17,6 +17,8 @@ def normalize_l2_result(raw_result: dict[str, Any], payload: dict[str, Any]) -> 
     daily_holdings = _normalize_daily_holdings(_records(result.get("dailyHoldings")))
     result["dailyHoldings"] = daily_holdings
     result["equity"] = _normalize_equity_dates(_records(result.get("equity")))
+    result["trades"] = [_normalize_trade(item) for item in _records(result.get("trades"))]
+    result["skippedSignals"] = [_normalize_skipped_signal(item) for item in _records(result.get("skippedSignals"))]
     result["strategyCategory"] = _strategy_category(payload)
     result["resultSchemaVersion"] = int(result.get("resultSchemaVersion") or 1)
     result["summary"] = {
@@ -149,7 +151,7 @@ def _market_values(
 
 def _fill_to_trade(fill: dict[str, Any]) -> dict[str, Any]:
   metadata = _mapping(fill.get("metadata"))
-  side = str(fill.get("side") or "")
+  side = _normalize_side(fill.get("side"))
   direction = str(metadata.get("direction") or side)
   trade = {
     "time": str(metadata.get("signal_time") or fill.get("time") or ""),
@@ -169,6 +171,12 @@ def _fill_to_trade(fill: dict[str, Any]) -> dict[str, Any]:
   if metadata.get("strategy_module"):
     trade["strategyModule"] = str(metadata["strategy_module"])
   return trade
+
+
+def _normalize_trade(trade: dict[str, Any]) -> dict[str, Any]:
+  normalized = dict(trade)
+  normalized["side"] = _normalize_side(trade.get("side"))
+  return normalized
 
 
 def _build_skipped_signals(raw_result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -196,7 +204,7 @@ def _build_skipped_signals(raw_result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _normalize_skipped_signal(signal: dict[str, Any]) -> dict[str, Any]:
-  side = str(signal.get("side") or "")
+  side = _normalize_side(signal.get("side"))
   direction = str(signal.get("direction") or signal.get("action") or side)
   return {
     "time": str(signal.get("time") or signal.get("signalTime") or ""),
@@ -216,7 +224,7 @@ def _normalize_skipped_signal(signal: dict[str, Any]) -> dict[str, Any]:
 
 
 def _event_to_skipped_signal(event: dict[str, Any], note: str, quantity: int | None = None) -> dict[str, Any]:
-  side = str(event.get("side") or "")
+  side = _normalize_side(event.get("side"))
   direction = str(event.get("direction") or side)
   signal = {
     "time": str(event.get("signalTime") or ""),
@@ -380,6 +388,14 @@ def _records(value: object) -> list[dict[str, Any]]:
   if not isinstance(value, list):
     return []
   return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _normalize_side(value: object) -> str:
+  """兼容 HTTP JSON 与 Pipe 传输后的订单方向表示。"""
+  side = str(value or "").upper()
+  if side.startswith("ORDERSIDE."):
+    side = side.rsplit(".", 1)[-1]
+  return side
 
 
 def _mapping(value: object) -> dict[str, Any]:

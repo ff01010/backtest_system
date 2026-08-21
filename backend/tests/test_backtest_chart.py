@@ -111,3 +111,23 @@ def test_backtest_chart_trades_does_not_guess_missing_price() -> None:
 
   assert trades == []
   assert unsupported_count == 1
+
+
+def test_backtest_chart_trades_reports_enum_side_value_as_unsupported() -> None:
+  run = {
+    "id": "run-enum-side",
+    "resultJson": {
+      "trades": [{
+        "time": "2026-07-30 09:35:00",
+        "action": "BUY_OPEN",
+        "side": "OrderSide.BUY",
+        "price": 12.34,
+        "quantity": 100,
+      }],
+    },
+  }
+
+  trades, unsupported_count = _backtest_chart_trades(run, "2026-07-30")
+
+  assert trades == []
+  assert unsupported_count == 1
