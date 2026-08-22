@@ -136,7 +136,7 @@ class BacktestRunRequest(BaseModel):
   allowShort: bool = True
   strategyCategory: Literal["core_position_overlay", "directional_holding"] | None = None
   holdingPolicy: Literal["intraday", "overnight"] = "intraday"
-  fillModel: Literal["bar_close", "bar_next_open", "l2_quote"] = "bar_next_open"
+  fillModel: Literal["bar_next_open", "l2_quote"] = "bar_next_open"
   baseQuantity: int = Field(default=0, ge=0)
   baseCostPrice: float = Field(default=0, ge=0)
   t0Enabled: bool = False

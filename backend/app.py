@@ -296,7 +296,7 @@ def _validate_backtest_request(request: dict) -> None:
     request["commissionRate"] = request["feeProfile"]["commissionRate"]
     return
 
-  request["fillModel"] = "bar_close" if fill_model == "bar_close" else "bar_next_open"
+  request["fillModel"] = "bar_next_open"
   request["feeProfile"] = settings.default_fee_profile()
   request["commissionRate"] = request["feeProfile"]["commissionRate"]
 
@@ -628,7 +628,10 @@ def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
   """策略方案按保存的成交模式使用对应的周期白名单。"""
   params_json = request.get("paramsJson")
   params = params_json.get("params", {}) if isinstance(params_json, dict) else {}
-  fill_model = params.get("fillModel", "bar_close") if isinstance(params, dict) else "bar_close"
+  if isinstance(params, dict) and params.get("fillModel") == "bar_close":
+    # 已废止的配置在再次保存时统一迁移为标准 Bar 回放，不能重新创建同 Bar 收盘成交任务。
+    params["fillModel"] = "bar_next_open"
+  fill_model = params.get("fillModel", "bar_next_open") if isinstance(params, dict) else "bar_next_open"
   timeframe = str(request["timeframe"])
   supported = (
     settings.validate_l2_backtest_timeframe(timeframe)

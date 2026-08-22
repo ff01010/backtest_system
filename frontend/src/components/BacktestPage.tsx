@@ -234,7 +234,7 @@ interface NetSeries {
 
 function getDefaultScriptCode(timeframe: string): string {
   return `# on_bar(bar, state) 会在每根已完成的 ${timeframe} K 线调用一次。
-# 当前规则：本 Bar 收盘产生信号，并按本 Bar 收盘价虚拟成交。
+# 当前规则：本 Bar 收盘产生信号，并按下一根可交易 Bar 开盘价加滑点虚拟成交。
 # 时间：time 为 YYYYMMDDHHMMSS；tradeDate 为 YYYY-MM-DD；hhmm 例如 931。
 # bar 可读：time/datetime/tradeDate/hhmm/open/high/low/close/volume/cash/equity/position/params。
 # action 支持 buy_open、sell_open、sell_close、buy_close。
@@ -258,6 +258,10 @@ function createEmptyScriptForm(timeframe = '5m') {
 
 function isValidDate(value: string) {
   return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+}
+
+function normalizeFillModel(value: unknown): 'bar_next_open' | 'l2_quote' {
+  return value === 'l2_quote' ? 'l2_quote' : 'bar_next_open';
 }
 
 export function normalizeApiDate(value: string) {
@@ -1323,7 +1327,7 @@ export default function BacktestPage({
     setSelectedTimeframe(timeframe);
   };
 
-  const setFillModel = (fillModel: 'bar_close' | 'bar_next_open' | 'l2_quote') => {
+  const setFillModel = (fillModel: 'bar_next_open' | 'l2_quote') => {
     setParam('fillModel', fillModel);
     if (fillModel === 'l2_quote' && !L2_TIMEFRAMES.includes(selectedTimeframe)) {
       setSelectedTimeframe('1m');
@@ -1717,7 +1721,7 @@ export default function BacktestPage({
         allowShort: params.allowShort,
         strategyCategory: params.strategyCategory === 'core_position_overlay' ? 'core_position_overlay' : 'directional_holding',
         holdingPolicy: params.strategyCategory === 'core_position_overlay' ? 'intraday' : 'overnight',
-        fillModel: params.fillModel === 'l2_quote' ? 'l2_quote' : params.fillModel === 'bar_close' ? 'bar_close' : 'bar_next_open',
+        fillModel: normalizeFillModel(params.fillModel),
         baseQuantity: Number(params.baseQuantity),
         baseCostPrice: Number(params.baseCostPrice),
         t0Enabled: params.t0Enabled,
@@ -1737,9 +1741,6 @@ export default function BacktestPage({
       setHoldingStartDate('');
       setHoldingEndDate('');
       setHoldingStatusFilter('all');
-      if (payload.fillModel === 'bar_close') {
-        refreshDataStatus(selectedSymbol, selectedTimeframe);
-      }
       refreshBacktestRuns();
       setStatus(`回测完成 ${formatRunReference(data.displayNo)}，成交 ${getFillCount(data.summary) ?? 0} 笔`);
     } catch (e) {
@@ -2242,7 +2243,7 @@ export default function BacktestPage({
       allowShort: boolValue('allowShort', DEFAULT_PARAMS.allowShort),
       strategyCategory: textValue('strategyCategory', run.strategyCategory || (Number(saved.baseQuantity || 0) > 0 || saved.t0Enabled === true ? 'core_position_overlay' : 'directional_holding')),
       holdingPolicy: run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity || 0) > 0 || saved.t0Enabled === true ? 'intraday' : 'overnight',
-      fillModel: textValue('fillModel', run.fillModel || DEFAULT_PARAMS.fillModel),
+      fillModel: normalizeFillModel(savedStrategyParams.fillModel || run.fillModel),
       baseQuantity: textValue('baseQuantity', DEFAULT_PARAMS.baseQuantity),
       baseCostPrice: textValue('baseCostPrice', DEFAULT_PARAMS.baseCostPrice),
       t0Enabled: boolValue('t0Enabled', DEFAULT_PARAMS.t0Enabled),
@@ -2298,7 +2299,7 @@ export default function BacktestPage({
         allowShort: saved.allowShort !== false,
         strategyCategory: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'core_position_overlay' : 'directional_holding',
         holdingPolicy: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'intraday' : 'overnight',
-        fillModel: run.fillModel === 'l2_quote' ? 'l2_quote' : run.fillModel === 'bar_close' ? 'bar_close' : 'bar_next_open',
+        fillModel: normalizeFillModel(run.fillModel),
         baseQuantity: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseQuantity ?? 0 : 0),
         baseCostPrice: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseCostPrice ?? 0 : 0),
         t0Enabled: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true,
@@ -2947,7 +2948,7 @@ export default function BacktestPage({
                     <div style={labelStyle}>成交模式</div>
                     <select
                       value={params.fillModel}
-                      onChange={(e) => setFillModel(e.target.value === 'l2_quote' ? 'l2_quote' : e.target.value === 'bar_close' ? 'bar_close' : 'bar_next_open')}
+                      onChange={(e) => setFillModel(e.target.value === 'l2_quote' ? 'l2_quote' : 'bar_next_open')}
                       style={fieldStyle}
                     >
                       <option value="bar_next_open">标准 Bar 回放（快速）</option>

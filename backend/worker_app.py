@@ -4,13 +4,13 @@
 import json
 import os
 import time
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel, RecordedPriceExecutionModel
+from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade
 from backend.date_codec import TradingDateError, format_api_date
 from backend.l2.engine import L2ExecutionEngine
@@ -27,7 +27,7 @@ class WorkerRunRequest(BaseModel):
   initialCapital: float = Field(gt=0)
   commissionRate: float = Field(ge=0)
   feeProfile: dict[str, float] = Field(default_factory=dict)
-  fillModel: str = "bar_next_open"
+  fillModel: Literal["bar_next_open"] = "bar_next_open"
   slippage: float = Field(default=0, ge=0, lt=1)
   holdingPolicy: str = "intraday"
   baseQuantity: int = Field(default=0, ge=0)
@@ -276,13 +276,9 @@ def run(payload: WorkerRunRequest) -> dict[str, Any]:
       initial_cash=payload.initialCapital,
       commission_rate=payload.commissionRate,
       fee_profile=fee_profile,
-      execution_model=(
-        RecordedPriceExecutionModel(slippage=payload.slippage)
-        if payload.fillModel == "bar_close"
-        else NextOpenExecutionModel(slippage=payload.slippage)
-      ),
+      execution_model=NextOpenExecutionModel(slippage=payload.slippage),
       holding_policy=payload.holdingPolicy,
-      execute_on_next_bar_open=payload.fillModel == "bar_next_open",
+      execute_on_next_bar_open=True,
       base_quantity=payload.baseQuantity,
       base_cost_price=payload.baseCostPrice,
       t0_enabled=payload.t0Enabled,
