@@ -1375,6 +1375,34 @@ button, input, select, textarea {
   font-size: 13px;
 }
 
+.strategy-guide-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.strategy-guide-header-actions a,
+.strategy-guide-header-actions > button:not(.strategy-guide-close) {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  color: #334155;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 9px;
+  text-decoration: none;
+}
+
+.strategy-guide-header-actions a:hover,
+.strategy-guide-header-actions > button:not(.strategy-guide-close):hover {
+  border-color: #0f766e;
+  color: #0f766e;
+}
+
 .strategy-guide-close {
   display: inline-grid;
   width: 32px;
@@ -1619,6 +1647,23 @@ button, input, select, textarea {
 
   .strategy-guide-drawer-header {
     padding: 18px 18px 14px;
+  }
+
+  .strategy-guide-header-actions {
+    gap: 5px;
+  }
+
+  .strategy-guide-header-actions a,
+  .strategy-guide-header-actions > button:not(.strategy-guide-close) {
+    font-size: 0;
+    min-width: 32px;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .strategy-guide-header-actions a svg,
+  .strategy-guide-header-actions > button:not(.strategy-guide-close) svg {
+    font-size: initial;
   }
 
   .strategy-guide-layout {

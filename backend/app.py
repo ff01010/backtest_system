@@ -328,6 +328,12 @@ def strategy_guide():
   return {"title": "策略编写指南", "content": _load_strategy_guide()}
 
 
+@app.get("/strategy-guide.md", include_in_schema=False)
+def public_strategy_guide() -> Response:
+  """提供固定的公开 Markdown 策略指南，不开放任意文件读取。"""
+  return Response(content=_load_strategy_guide(), media_type="text/markdown")
+
+
 @app.post("/api/auth/login")
 def login(payload: schemas.LoginRequest, request: Request, response: Response):
   """校验用户名密码并签发仅浏览器可见的 HttpOnly 会话 Cookie。"""
