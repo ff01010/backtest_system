@@ -67,6 +67,7 @@ def normalize_l2_result(raw_result: dict[str, Any], payload: dict[str, Any]) -> 
     "trades": trades,
     "skippedSignals": skipped_signals,
     "orderEvents": _records(raw_result.get("orders")),
+    "executionPlans": _records(raw_result.get("executionPlans")),
     "dataSnapshot": raw_result.get("dataSnapshot") or {},
     "performance": _mapping(raw_result.get("performance")),
     "experimentManifest": _build_manifest(raw_result, payload),
@@ -167,6 +168,9 @@ def _fill_to_trade(fill: dict[str, Any]) -> dict[str, Any]:
     "note": str(fill.get("reason") or ""),
     "priceSource": str(metadata.get("price_source") or "L2 成交模型价格"),
     "status": "filled",
+    "parentOrderId": metadata.get("parent_order_id"),
+    "childIndex": metadata.get("child_index"),
+    "executionAlgorithm": metadata.get("execution_algorithm"),
   }
   if metadata.get("strategy_module"):
     trade["strategyModule"] = str(metadata["strategy_module"])
@@ -380,6 +384,8 @@ def _build_manifest(raw_result: dict[str, Any], payload: dict[str, Any]) -> dict
     "baseCostPrice": _number(payload.get("baseCostPrice"), 0.0),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
     "executionEnvironment": "l2-runner",
+    "executionAlgorithm": str(payload.get("executionAlgorithm") or "immediate"),
+    "executionParameters": _mapping(payload.get("executionParameters")),
     "orderEventCount": len(_records(raw_result.get("orders"))),
   }
 

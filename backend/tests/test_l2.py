@@ -14,10 +14,10 @@ from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteS
 from backend.l2.config import load_temporary_quote_profile
 from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError, TemporaryQuoteBarProvider, VersionedBarCache
 from backend.l2.result_adapter import normalize_l2_result
-from backend.l2.strategy_session import L2StrategySession
+from backend.l2.strategy_session import L2StrategySession, _redact_diagnostic_text
 from backend import settings
 from backend.l2_runner import L2Runner, _JobLeaseKeeper, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day, _validate_quote_coverage
-from backend.services.backtest_errors import error_detail
+from backend.services.backtest_errors import RemoteBacktestError, error_detail
 from backend.services.system_error_catalog import classify_system_error
 from backend.services import clickhouse_client
 from backend.worker_app import (
@@ -1155,8 +1155,20 @@ def test_local_strategy_session_returns_strategy_error() -> None:
     with pytest.raises(Exception) as error:
       session.process_bars([_bar()])
     assert error_detail(error.value).category == "strategy_error"
+    assert isinstance(error.value, RemoteBacktestError)
+    assert error.value.diagnostic["exceptionType"] == "ValueError"
+    assert error.value.diagnostic["trace"]
+    assert error.value.diagnostic["__internal_raw_message"]
+    assert error.value.diagnostic["__internal_raw_traceback"]
   finally:
     session.close()
+
+
+def test_strategy_session_diagnostic_redacts_credentials() -> None:
+  value = _redact_diagnostic_text("http://user:password@host/path token=secret-value")
+
+  assert "password@" not in value
+  assert "secret-value" not in value
 
 
 def test_local_strategy_session_preserves_quote_and_order_event_callbacks() -> None:

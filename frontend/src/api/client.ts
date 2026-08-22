@@ -226,6 +226,8 @@ export interface BacktestRunPayload {
   strategyCategory: 'core_position_overlay' | 'directional_holding';
   holdingPolicy: 'intraday' | 'overnight';
   fillModel: 'bar_next_open' | 'l2_quote';
+  executionAlgorithm: 'immediate' | 'twap';
+  executionParameters: Record<string, number | string>;
   baseQuantity: number;
   baseCostPrice: number;
   t0Enabled: boolean;

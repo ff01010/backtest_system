@@ -1095,7 +1095,15 @@ def _normalize_system_error(row: dict[str, Any]) -> dict[str, Any]:
     "retryable": bool(row.get("retryable")),
     "reason": row["reason"],
     "exceptionType": row["exception_type"],
-    "context": _json(row.get("context_json"), {}),
+    "context": _public_system_error_context(_json(row.get("context_json"), {})),
     "rawLogRef": row.get("raw_log_ref") or "",
     "occurredAt": _format_time(row["occurred_at"]),
+  }
+
+
+def _public_system_error_context(context: dict[str, Any]) -> dict[str, Any]:
+  return {
+    key: value
+    for key, value in context.items()
+    if not key.startswith("__internal_")
   }

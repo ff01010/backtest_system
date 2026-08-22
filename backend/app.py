@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend import settings
+from backend.execution import execution_algorithm_snapshot, validate_execution_request
 from backend.date_codec import TradingDateError, format_legacy_date, normalize_date_range
 from backend import schemas
 from backend.time_utils import format_epoch_as_shanghai
@@ -261,6 +262,9 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "benchmarkSymbol": config.get("benchmarkSymbol"), "accountId": config.get("accountId"),
     "params": config.get("paramsJson", {}).get("params", {}),
     "description": script["description"], "runParams": request.get("strategyParams", {}),
+    "execution": execution_algorithm_snapshot(
+      str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
+    ),
   }
 
 
@@ -275,6 +279,12 @@ def _validate_backtest_request(request: dict) -> None:
   except TradingDateError as error:
     raise HTTPException(422, str(error)) from error
   fill_model = request.get("fillModel", "bar_next_open")
+  try:
+    request.update(validate_execution_request(
+      str(fill_model), request.get("executionAlgorithm"), request.get("executionParameters"),
+    ))
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
   if fill_model == "l2_quote":
     if not settings.validate_l2_backtest_timeframe(request["timeframe"]):
       raise HTTPException(422, f"L2 回测不支持 {request['timeframe']}")

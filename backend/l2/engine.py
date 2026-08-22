@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Sequence
 from uuid import uuid4
 
 from backend.backtesting.engine import PortfolioLedger
 from backend.backtesting.fees import FeeProfile
 from backend.backtesting.models import Bar, Fill, OrderIntent, OrderSide, PositionEffect
+from backend.execution.contract import ChildOrder, ExecutionContext
+from backend.execution.runtime import ExecutionRuntime
 from backend.l2.models import InstrumentRules, L2Order, NormalizedBar, QuoteLevel, QuoteSnapshot, TradeEvent, parse_timestamp
 
 _STAMP_DUTY_RATE = 0.0005
@@ -36,6 +38,8 @@ class L2ExecutionEngine:
     base_cost_price: float = 0.0,
     t0_enabled: bool = False,
     fee_profile: FeeProfile | None = None,
+    execution_algorithm: str = "immediate",
+    execution_parameters: dict[str, Any] | None = None,
   ) -> None:
     if latency_ms < 0 or not 0 < passive_participation_rate <= 1:
       raise ValueError("L2 延迟或被动参与率无效")
@@ -55,6 +59,13 @@ class L2ExecutionEngine:
       minimum_commission=0.0,
     )
     self._rules = rules
+    self._execution_algorithm = execution_algorithm
+    self._execution_parameters = dict(execution_parameters or {})
+    self._execution_runtime = ExecutionRuntime(
+      execution_algorithm,
+      self._execution_parameters,
+      ExecutionContext("l2_quote", rules, datetime.max),
+    )
     self._latency = timedelta(milliseconds=latency_ms)
     self._participation = passive_participation_rate
     self._holding_policy = holding_policy
@@ -96,6 +107,7 @@ class L2ExecutionEngine:
     self._sellable_reserved = {}
     self._last_quote = None
     self._last_bar = None
+    self._execution_runtime.begin_day(parse_timestamp(f"{trade_date} 14:57:00"))
     self._order_events.append({"type": "day_started", "tradeDate": trade_date})
 
   def process_chunk(
@@ -124,11 +136,14 @@ class L2ExecutionEngine:
 
   def has_pending_orders(self) -> bool:
     """返回是否仍需后续盘口完成当前订单。"""
-    return any(order.status == "pending" for order in self._orders)
+    return any(order.status == "pending" for order in self._orders) or self._execution_runtime.has_pending_work()
 
   def next_quote_after(self) -> str | None:
     """返回下一条可能影响待成交订单的严格排他时间边界。"""
     effective_times = [order.effective_at for order in self._orders if order.status == "pending"]
+    next_execution_event = self._execution_runtime.next_event_after()
+    if next_execution_event is not None:
+      effective_times.append(next_execution_event)
     return min(effective_times).isoformat(sep=" ") if effective_times else None
 
   def requires_day_end_quote(self) -> bool:
@@ -141,6 +156,7 @@ class L2ExecutionEngine:
   def finish_day(self, trade_date: str) -> None:
     """收盘撤单并在日内模式用最后有效盘口尝试平仓。"""
     self._cancel_open_orders("日终撤单")
+    self._execution_runtime.cancel_all("日终撤单")
     if self._holding_policy == "intraday":
       self._force_close_at_last_quote(trade_date)
     if self._last_bar is not None:
@@ -154,6 +170,7 @@ class L2ExecutionEngine:
       "fills": [asdict(item) for item in self._ledger.fills],
       "equity": self._equity,
       "orders": self._order_events,
+      "executionPlans": self._execution_runtime.result(),
       "finalPortfolio": asdict(snapshot),
       "warnings": self._warnings,
     }
@@ -190,9 +207,15 @@ class L2ExecutionEngine:
       self._record_rejection(intent, signal_time, "底仓做 T 剩余额度不足")
       return
     for item in intents:
-      self._submit_one(item, signal_time)
+      if not self._valid_execution_intent(item, signal_time):
+        continue
+      for child in self._execution_runtime.submit(item, signal_time):
+        self._submit_child(child, signal_time)
 
-  def _submit_one(self, intent: OrderIntent, signal_time: Any) -> None:
+  def _submit_child(self, child: ChildOrder, signal_time: Any) -> None:
+    self._submit_one(child.intent, child.scheduled_at, signal_time)
+
+  def _submit_one(self, intent: OrderIntent, effective_at: Any, signal_time: Any | None = None) -> None:
     if self._rules.halted:
       self._record_rejection(intent, signal_time, "标的停牌")
       return
@@ -213,13 +236,13 @@ class L2ExecutionEngine:
       self._record_rejection(intent, signal_time, "clientOrderKey 存在未终结订单")
       return
     self._sequence += 1
-    order = L2Order(str(uuid4()), intent, signal_time + self._latency, intent.quantity, self._sequence)
+    order = L2Order(str(uuid4()), intent, effective_at + self._latency, intent.quantity, self._sequence)
     self._orders.append(order)
     if self._uses_t0_capacity(intent):
       self._t0_reserved[order.order_id] = intent.quantity
     if intent.position_effect == PositionEffect.CLOSE_LONG:
       self._sellable_reserved[order.order_id] = (intent.symbol, intent.position_key, intent.quantity)
-    self._record_acceptance(order, signal_time)
+    self._record_acceptance(order, signal_time or effective_at)
 
   def _on_quote(self, quote: QuoteSnapshot) -> None:
     self._last_quote = quote
@@ -228,6 +251,9 @@ class L2ExecutionEngine:
     for order in self._eligible_orders(quote_time):
       if self._is_active(order, quote):
         self._fill_against_depth(order, quote, budget)
+    for child in self._execution_runtime.on_quote(quote_time):
+      self._submit_child(child, child.intent.metadata.get("parent_signal_time", quote_time))
+    self._cancel_expired_execution_orders()
     callback = getattr(self._strategy, "on_quote", None)
     if callable(callback):
       for intent in callback(quote, self._snapshot()):
@@ -284,6 +310,7 @@ class L2ExecutionEngine:
     })
     fill = Fill(time, order.intent.symbol, order.side, quantity, price, fee, order.intent.reason, order.intent.position_effect, order.intent.position_key, metadata=metadata)
     self._ledger.apply_fill(fill)
+    self._execution_runtime.on_fill(order.intent.metadata.get("parent_order_id"), quantity)
     order.remaining_quantity -= quantity
     order.filled_quantity += quantity
     if order.intent.position_effect == PositionEffect.CLOSE_LONG:
@@ -438,6 +465,7 @@ class L2ExecutionEngine:
         order.status = "cancelled"
         self._release_t0_reservation(order)
         self._release_sellable_reservation(order)
+        self._execution_runtime.cancel_open(order.intent.metadata.get("parent_order_id"), order.remaining_quantity, reason)
         event = {"type": "cancelled", "orderId": order.order_id, "remaining": order.remaining_quantity, "reason": reason}
         self._order_events.append(event)
         self._notify_strategy_event({
@@ -445,6 +473,30 @@ class L2ExecutionEngine:
           "clientOrderKey": order.intent.metadata.get("client_order_key"),
           "positionEffect": order.intent.position_effect.value if order.intent.position_effect else None,
         })
+
+  def _cancel_expired_execution_orders(self) -> None:
+    parent_order_ids = self._execution_runtime.consume_cancelled_parent_ids()
+    if not parent_order_ids:
+      return
+    reason = "执行窗口结束，取消剩余数量"
+    for order in self._orders:
+      if order.status != "pending" or order.intent.metadata.get("parent_order_id") not in parent_order_ids:
+        continue
+      order.status = "cancelled"
+      self._release_t0_reservation(order)
+      self._release_sellable_reservation(order)
+      self._order_events.append({
+        "type": "cancelled",
+        "orderId": order.order_id,
+        "remaining": order.remaining_quantity,
+        "reason": reason,
+      })
+      self._notify_strategy_event({
+        "type": "cancelled",
+        "time": order.effective_at,
+        "orderId": order.order_id,
+        "reason": reason,
+      })
 
   def _record_equity(self, bar: NormalizedBar) -> None:
     snapshot = self._snapshot()
@@ -482,6 +534,7 @@ class L2ExecutionEngine:
     })
 
   def _record_rejection(self, intent: OrderIntent, signal_time: Any, reason: str) -> None:
+    self._execution_runtime.on_rejection(intent.metadata.get("parent_order_id"), intent.quantity, reason)
     event = {
       "type": "rejected",
       "signalTime": str(signal_time),
@@ -509,6 +562,9 @@ class L2ExecutionEngine:
       "limitPrice": intent.limit_price,
       "strategyModule": metadata.get("strategy_module"),
       "clientOrderKey": metadata.get("client_order_key"),
+      "parentOrderId": metadata.get("parent_order_id"),
+      "childIndex": metadata.get("child_index"),
+      "executionAlgorithm": metadata.get("execution_algorithm", "immediate"),
     }
 
   def _notify_strategy_event(self, event: dict[str, Any]) -> None:
@@ -516,6 +572,18 @@ class L2ExecutionEngine:
     callback = getattr(self._strategy, "on_order_event", None)
     if callable(callback):
       callback(event)
+
+  def _valid_execution_intent(self, intent: OrderIntent, signal_time: Any) -> bool:
+    if self._execution_algorithm != "twap":
+      return True
+    minimum = int(self._execution_parameters.get("minChildQuantity", 0))
+    if minimum <= 0 or minimum > intent.quantity:
+      self._record_rejection(intent, signal_time, "TWAP 最小子单数量超过母单数量")
+      return False
+    if intent.position_effect in {PositionEffect.OPEN_LONG, PositionEffect.OPEN_SHORT} and not self._rules.is_valid_open_quantity(minimum):
+      self._record_rejection(intent, signal_time, "TWAP 最小子单数量不符合标的交易单位")
+      return False
+    return True
 
   def _valid_limit(self, price: float) -> bool:
     if self._rules.lower_limit is not None and price < self._rules.lower_limit:
