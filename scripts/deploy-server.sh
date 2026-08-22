@@ -40,7 +40,7 @@ read_l2_runner_replicas() {
   replicas="$(grep -E '^TREND_GRID_L2_RUNNER_REPLICAS=' "$env_file" | tail -n 1 | cut -d= -f2- || true)"
   replicas="${replicas//[[:space:]]/}"
   if [[ -z "$replicas" ]]; then
-    echo "1"
+    echo "8"
     return
   fi
   [[ "$replicas" =~ ^[1-8]$ ]] || fail "deploy/.env 中的 TREND_GRID_L2_RUNNER_REPLICAS 必须是 1 至 8 的整数"
