@@ -365,10 +365,10 @@ button, input, select, textarea {
 
 .trade-filter-summary {
   display: grid;
-  grid-template-columns: repeat(4, minmax(78px, 1fr));
+  grid-template-columns: repeat(5, minmax(78px, 1fr));
   overflow: hidden;
-  flex: 1 1 360px;
-  max-width: 500px;
+  flex: 1 1 460px;
+  max-width: 620px;
   border: 1px solid #d9e4db;
   border-radius: var(--radius-sm);
   background: rgba(246, 249, 245, 0.82);
@@ -623,6 +623,25 @@ button, input, select, textarea {
 .trade-side-label,
 .trade-pnl-value {
   font-variant-numeric: tabular-nums;
+}
+
+.trade-price-cell {
+  min-width: 0;
+}
+
+.trade-price-value {
+  display: block;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.trade-price-source {
+  display: block;
+  margin-top: 2px;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .trade-day-group {

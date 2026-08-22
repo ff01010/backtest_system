@@ -2002,12 +2002,12 @@ export default function BacktestPage({
     {
       key: 'price',
       label: '成交价/数量',
-      width: 'minmax(100px, 1fr)',
+      width: 'minmax(132px, 1.35fr)',
       align: 'right',
       render: (trade) => (
         <span>
-          <span>{`${trade.price.toFixed(2)} ×${trade.quantity}`}</span>
-          <span style={{ display: 'block', color: '#64748b', fontSize: 11, marginTop: 2 }}>
+          <span className="trade-price-value">{`${trade.price.toFixed(2)} ×${trade.quantity}`}</span>
+          <span className="trade-price-source">
             {trade.priceSource || '成交模型价格'}
           </span>
         </span>
@@ -3539,12 +3539,12 @@ export default function BacktestPage({
                         )}
                         <div className={`trade-ledger-row ${trade.status === 'skipped' ? 'is-skipped' : 'is-filled'}`} style={{ display: 'grid', gridTemplateColumns: `${tradeGridColumns} 68px`, gap: 8, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '8px 0', alignItems: 'center' }}>
                           {visibleTradeColumns.map((column) => (
-                            <span key={column.key} style={{
+                            <span key={column.key} className={column.key === 'price' ? 'trade-price-cell' : undefined} style={{
                               textAlign: column.align || 'left',
-                              overflow: 'hidden',
-                              textOverflow: 'ellipsis',
-                              whiteSpace: column.key === 'note' ? 'normal' : 'nowrap',
-                              lineHeight: column.key === 'note' ? 1.5 : undefined,
+                              overflow: column.key === 'price' ? 'visible' : 'hidden',
+                              textOverflow: column.key === 'price' ? 'clip' : 'ellipsis',
+                              whiteSpace: column.key === 'note' || column.key === 'price' ? 'normal' : 'nowrap',
+                              lineHeight: column.key === 'note' || column.key === 'price' ? 1.5 : undefined,
                             }}>
                               {column.render(trade)}
                             </span>

@@ -516,6 +516,41 @@ def test_l2_result_adapter_reports_base_holding_and_t0_excess() -> None:
   assert result["strategyMetrics"]["t0Metrics"]["t0ExcessPnl"] == 50
 
 
+def test_l2_result_adapter_normalizes_pipe_enum_side_values() -> None:
+  raw_result = {
+    "fills": [{
+      "time": "2026-01-02 09:31:03",
+      "side": "OrderSide.BUY",
+      "quantity": 100,
+      "price": 10.0,
+      "reason": "开多",
+      "metadata": {"direction": "BUY_OPEN"},
+    }],
+    "equity": [],
+    "orders": [],
+    "warnings": [],
+  }
+
+  result = normalize_l2_result(raw_result, {"initialCapital": 1_000})
+
+  assert result["trades"][0]["side"] == "BUY"
+
+
+def test_l2_result_adapter_normalizes_saved_l2_result_side_values() -> None:
+  saved_result = {
+    "summary": {"totalReturn": 0.01},
+    "equity": [],
+    "dailyHoldings": [],
+    "trades": [{"side": "OrderSide.SELL", "action": "SELL_CLOSE"}],
+    "skippedSignals": [{"side": "OrderSide.BUY", "action": "BUY_OPEN"}],
+  }
+
+  result = normalize_l2_result(saved_result, {"initialCapital": 1_000})
+
+  assert result["trades"][0]["side"] == "SELL"
+  assert result["skippedSignals"][0]["side"] == "BUY"
+
+
 def test_l2_normalized_history_result_converts_compact_holding_dates() -> None:
   result = normalize_l2_result({
     "summary": {"totalReturn": 0.01},

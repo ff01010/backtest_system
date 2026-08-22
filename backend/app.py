@@ -144,7 +144,7 @@ def _backtest_chart_trades(
       or not isinstance(price, (int, float))
       or not isinstance(quantity, int)
     ):
-      if execution_time[:8] == date:
+      if execution_time[:8] == trade_date_key:
         unsupported_count += 1
       continue
     trades.append({

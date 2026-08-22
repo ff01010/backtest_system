@@ -100,7 +100,9 @@ validate_clickhouse_network
 "${compose[@]}" up -d postgres
 wait_for_postgres
 "${compose[@]}" --profile migration run --rm migrate
-"${compose[@]}" up -d --build --scale "l2-runner=$(read_l2_runner_replicas)" strategy-worker backend bar-runner l2-runner frontend
+"${compose[@]}" up -d --build --scale "l2-runner=$(read_l2_runner_replicas)" strategy-worker backend bar-runner l2-runner
+# Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。
+"${compose[@]}" up -d --build --force-recreate frontend
 verify_clickhouse_connectivity
 "${compose[@]}" ps
 wait_for_application "$(read_http_port)"
