@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -11,7 +12,7 @@ from backend.services.system_error_catalog import classify_system_error, root_ca
 
 @dataclass(frozen=True)
 class SystemErrorLogRecord:
-  """可供管理员查看、但不包含秘密信息的系统错误记录。"""
+  """管理员可见的安全摘要与仅数据库保留的原始诊断。"""
 
   source: str
   stage: str
@@ -33,14 +34,18 @@ def system_error_log_record(
   stage: str,
   task_id: str | None = None,
 ) -> SystemErrorLogRecord | None:
-  """仅将系统错误转换为管理员日志；策略错误继续由原有页面展示。"""
-  if error_detail(error).category != "system_error":
-    return None
+  """记录系统错误及 worker 拒绝任务时返回的原始诊断。"""
   if isinstance(error, RemoteBacktestError) and error.diagnostic:
     return _remote_worker_record(error, source, stage, task_id)
+  if error_detail(error).category != "system_error":
+    return None
 
   cause = root_cause(error)
   classified = classify_system_error(error)
+  context = {
+    **classified.context,
+    **_internal_error_context(error),
+  }
   return SystemErrorLogRecord(
     source=source,
     stage=stage,
@@ -49,7 +54,7 @@ def system_error_log_record(
     retryable=classified.retryable,
     reason=classified.admin_reason,
     exception_type=type(cause).__name__,
-    context=classified.context,
+    context=context,
     raw_log_ref=_raw_log_ref(source, stage, task_id),
   )
 
@@ -67,6 +72,9 @@ def _remote_worker_record(
     context["symbol"] = error.detail.symbol
   if error.detail.event_time:
     context["eventTime"] = error.detail.event_time
+  if diagnostic.get("trace"):
+    context["trace"] = diagnostic["trace"][:1_500]
+  context.update(_remote_internal_context(diagnostic))
   return SystemErrorLogRecord(
     source=source,
     stage=stage,
@@ -81,6 +89,21 @@ def _remote_worker_record(
 
 
 def _raw_log_ref(source: str, stage: str, task_id: str | None) -> str:
-  container = {"l2_runner": "quant-backtest-l2-runner", "sync_runner": "quant-backtest-backend"}.get(source, source)
+  container = {"l2_runner": "quant-backtest-platform-l2-runner-*", "sync_runner": "quant-backtest-backend"}.get(source, source)
   task = task_id or "unknown"
   return f"container={container}; taskId={task}; stage={stage}"
+
+
+def _internal_error_context(error: Exception) -> dict[str, str]:
+  return {
+    "__internal_raw_message": str(error),
+    "__internal_raw_traceback": "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+  }
+
+
+def _remote_internal_context(diagnostic: dict[str, str]) -> dict[str, str]:
+  return {
+    key: diagnostic[key]
+    for key in ("__internal_raw_message", "__internal_raw_traceback")
+    if diagnostic.get(key)
+  }

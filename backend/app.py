@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend import settings
+from backend.execution import execution_algorithm_snapshot, validate_execution_request
 from backend.date_codec import TradingDateError, format_legacy_date, normalize_date_range
 from backend import schemas
 from backend.time_utils import format_epoch_as_shanghai
@@ -261,6 +262,9 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "benchmarkSymbol": config.get("benchmarkSymbol"), "accountId": config.get("accountId"),
     "params": config.get("paramsJson", {}).get("params", {}),
     "description": script["description"], "runParams": request.get("strategyParams", {}),
+    "execution": execution_algorithm_snapshot(
+      str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
+    ),
   }
 
 
@@ -275,6 +279,12 @@ def _validate_backtest_request(request: dict) -> None:
   except TradingDateError as error:
     raise HTTPException(422, str(error)) from error
   fill_model = request.get("fillModel", "bar_next_open")
+  try:
+    request.update(validate_execution_request(
+      str(fill_model), request.get("executionAlgorithm"), request.get("executionParameters"),
+    ))
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
   if fill_model == "l2_quote":
     if not settings.validate_l2_backtest_timeframe(request["timeframe"]):
       raise HTTPException(422, f"L2 回测不支持 {request['timeframe']}")
@@ -296,7 +306,7 @@ def _validate_backtest_request(request: dict) -> None:
     request["commissionRate"] = request["feeProfile"]["commissionRate"]
     return
 
-  request["fillModel"] = "bar_close" if fill_model == "bar_close" else "bar_next_open"
+  request["fillModel"] = "bar_next_open"
   request["feeProfile"] = settings.default_fee_profile()
   request["commissionRate"] = request["feeProfile"]["commissionRate"]
 
@@ -326,6 +336,12 @@ def _load_strategy_guide() -> str:
 @app.get("/api/strategy-guide")
 def strategy_guide():
   return {"title": "策略编写指南", "content": _load_strategy_guide()}
+
+
+@app.get("/strategy-guide.md", include_in_schema=False)
+def public_strategy_guide() -> Response:
+  """提供固定的公开 Markdown 策略指南，不开放任意文件读取。"""
+  return Response(content=_load_strategy_guide(), media_type="text/markdown")
 
 
 @app.post("/api/auth/login")
@@ -628,7 +644,10 @@ def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
   """策略方案按保存的成交模式使用对应的周期白名单。"""
   params_json = request.get("paramsJson")
   params = params_json.get("params", {}) if isinstance(params_json, dict) else {}
-  fill_model = params.get("fillModel", "bar_close") if isinstance(params, dict) else "bar_close"
+  if isinstance(params, dict) and params.get("fillModel") == "bar_close":
+    # 已废止的配置在再次保存时统一迁移为标准 Bar 回放，不能重新创建同 Bar 收盘成交任务。
+    params["fillModel"] = "bar_next_open"
+  fill_model = params.get("fillModel", "bar_next_open") if isinstance(params, dict) else "bar_next_open"
   timeframe = str(request["timeframe"])
   supported = (
     settings.validate_l2_backtest_timeframe(timeframe)

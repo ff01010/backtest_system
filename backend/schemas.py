@@ -136,7 +136,9 @@ class BacktestRunRequest(BaseModel):
   allowShort: bool = True
   strategyCategory: Literal["core_position_overlay", "directional_holding"] | None = None
   holdingPolicy: Literal["intraday", "overnight"] = "intraday"
-  fillModel: Literal["bar_close", "bar_next_open", "l2_quote"] = "bar_next_open"
+  fillModel: Literal["bar_next_open", "l2_quote"] = "bar_next_open"
+  executionAlgorithm: Literal["immediate", "twap"] = "immediate"
+  executionParameters: dict[str, Any] = Field(default_factory=dict)
   baseQuantity: int = Field(default=0, ge=0)
   baseCostPrice: float = Field(default=0, ge=0)
   t0Enabled: bool = False
@@ -175,6 +177,8 @@ class BacktestRunRequest(BaseModel):
       raise ValueError("底仓数量大于 0 时必须填写底仓成本价")
     if self.t0Enabled and self.baseQuantity <= 0:
       raise ValueError("启用底仓做 T 时底仓数量必须大于 0")
+    if self.executionAlgorithm == "twap" and self.fillModel != "l2_quote":
+      raise ValueError("TWAP 仅支持 L2 盘口回放")
     return self
 
 

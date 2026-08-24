@@ -176,6 +176,9 @@ export interface BacktestTrade {
   time: string;
   signalTime?: string;
   executionTime?: string;
+  parentOrderId?: string;
+  childIndex?: number;
+  executionAlgorithm?: string;
   priceSource?: string;
   action?: string;
   status?: 'filled' | 'skipped' | string;
@@ -187,6 +190,21 @@ export interface BacktestTrade {
   pnl: number;
   note: string;
   strategyModule?: string;
+}
+
+export interface ExecutionPlan {
+  parentOrderId: string;
+  algorithm: string;
+  signalTime: string;
+  action: string;
+  requestedQuantity: number;
+  filledQuantity: number;
+  cancelledQuantity: number;
+  rejectedQuantity: number;
+  remainingQuantity: number;
+  status: string;
+  reason: string;
+  plannedChildCount: number;
 }
 
 export interface DailyHoldingPoint {
@@ -223,6 +241,7 @@ export interface BacktestRunResponse {
   benchmarkReturn: NullableMetric;
   excessReturn: NullableMetric;
   trades: BacktestTrade[];
+  executionPlans?: ExecutionPlan[];
   skippedSignals?: BacktestTrade[];
   experimentManifest?: ExperimentManifest;
   dataSnapshot?: Record<string, unknown>;

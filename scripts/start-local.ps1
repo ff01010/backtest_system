@@ -33,7 +33,7 @@ function Get-HttpPort {
 function Get-L2RunnerReplicas {
   $line = Get-Content $envFile | Where-Object { $_ -match '^TREND_GRID_L2_RUNNER_REPLICAS=' } | Select-Object -Last 1
   if ($null -eq $line) {
-    return 1
+    return 8
   }
   $replicas = $line.Split('=', 2)[1].Trim()
   if ($replicas -notmatch '^[1-8]$') {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 from typing import Any, Sequence
 
 from backend.backtesting.models import (
@@ -28,15 +29,24 @@ _SAFE_BUILTINS = {
   "any": any,
   "bool": bool,
   "dict": dict,
+  "ImportError": ImportError,
+  "isinstance": isinstance,
+  "list": list,
   "float": float,
   "int": int,
   "len": len,
   "max": max,
   "min": min,
+  "object": object,
   "range": range,
   "round": round,
+  "set": set,
+  "sorted": sorted,
+  "str": str,
   "sum": sum,
+  "TypeError": TypeError,
   "ValueError": ValueError,
+  "__build_class__": builtins.__build_class__,
   "__import__": __import__,
 }
 
@@ -139,7 +149,10 @@ class ScriptedBarStrategy:
       self._quote_mode = quote_mode_for_script(code, quote_mode)
     except ValueError as error:
       raise StrategyExecutionError.from_exception(error) from error
-    namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
+    namespace: dict[str, Any] = {
+      "__builtins__": _SAFE_BUILTINS,
+      "__name__": f"strategy_script_{script_id}",
+    }
     try:
       exec(compile(code, f"strategy_script_{script_id}.py", "exec"), namespace)
     except Exception as error:
@@ -147,9 +160,14 @@ class ScriptedBarStrategy:
     self._callback = namespace["on_bar"]
     self._quote_callback = namespace.get("on_quote")
     self._order_event_callback = namespace.get("on_order_event")
-    self._params = dict(params)
+    self._execution_params = dict(params)
+    self._script_params = {
+      key: value
+      for key, value in self._execution_params.items()
+      if key not in {"allowLong", "allowShort"}
+    }
     self._position_key = f"script:{script_id}"
-    self._state: dict[str, Any] = {"params": self._params}
+    self._state: dict[str, Any] = {"params": dict(self._script_params)}
     self._skipped_signals: list[dict[str, Any]] = []
 
   def on_bar(
@@ -224,7 +242,7 @@ class ScriptedBarStrategy:
       "basePosition": portfolio.base_position,
       "sellableQuantity": portfolio.sellable_quantity,
       "t0AvailableQuantity": portfolio.t0_available_quantity,
-      "params": self._params,
+      "params": self._script_params,
     }
 
   def _quote_context(
@@ -251,7 +269,7 @@ class ScriptedBarStrategy:
       "basePosition": portfolio.base_position,
       "sellableQuantity": portfolio.sellable_quantity,
       "t0AvailableQuantity": portfolio.t0_available_quantity,
-      "params": self._params,
+      "params": self._script_params,
     }
 
   def _strategy_position(self, positions: dict[str, Any], overlay_suffix: str) -> int:
@@ -311,7 +329,7 @@ class ScriptedBarStrategy:
     return orders
 
   def _position_key_for(self, effect: PositionEffect) -> str:
-    if not bool(self._params.get("corePositionOverlay", False)):
+    if not bool(self._execution_params.get("corePositionOverlay", False)):
       return self._position_key
     if effect in {PositionEffect.OPEN_LONG, PositionEffect.CLOSE_LONG}:
       return f"{self._position_key}:overlay_long"
@@ -336,9 +354,9 @@ class ScriptedBarStrategy:
   def _is_direction_permitted(self, action_name: str) -> bool:
     """方向设置是统一执行权限，策略代码无需自行读取该参数。"""
     if action_name == "buy_open":
-      return bool(self._params.get("allowLong", True))
+      return bool(self._execution_params.get("allowLong", True))
     if action_name == "sell_open":
-      return bool(self._params.get("allowShort", True))
+      return bool(self._execution_params.get("allowShort", True))
     return True
 
   def _record_skipped_signal(

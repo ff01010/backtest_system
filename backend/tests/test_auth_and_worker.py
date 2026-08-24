@@ -140,6 +140,28 @@ def test_worker_runs_script_without_database_access() -> None:
   assert len(result["portfolioSnapshots"]) == 1
 
 
+def test_worker_keeps_raw_script_exception_for_administrator() -> None:
+  request = WorkerRunRequest(
+    scriptId="diagnostic-script",
+    code="def on_bar(bar, state):\n  return missing_variable\n",
+    bars=[{
+      "time": "202601010930", "symbol": "000001.SZ", "open": 10,
+      "high": 10, "low": 10, "close": 10, "volume": 100,
+    }],
+    initialCapital=100_000,
+    commissionRate=0.0003,
+  )
+
+  with pytest.raises(HTTPException) as raised:
+    run(request)
+
+  diagnostic = raised.value.detail["diagnostic"]
+  assert diagnostic["exceptionType"] == "NameError"
+  assert "missing_variable" in diagnostic["reason"]
+  assert "missing_variable" in diagnostic["__internal_raw_message"]
+  assert "strategy_script_diagnostic-script.py" in diagnostic["__internal_raw_traceback"]
+
+
 def test_worker_applies_slippage_to_script_trade_price() -> None:
   result = run(WorkerRunRequest(
     scriptId="slippage-script",
@@ -147,16 +169,19 @@ def test_worker_applies_slippage_to_script_trade_price() -> None:
     bars=[{
       "time": "202601010930", "symbol": "000001.SZ", "open": 10,
       "high": 10, "low": 10, "close": 10, "volume": 100,
+    }, {
+      "time": "202601010931", "symbol": "000001.SZ", "open": 11,
+      "high": 11, "low": 11, "close": 11, "volume": 100,
     }],
     initialCapital=100_000,
     commissionRate=0,
     slippage=0.001,
     holdingPolicy="overnight",
-    fillModel="bar_close",
+    fillModel="bar_next_open",
   ))
 
-  assert round(result["trades"][0]["price"], 2) == 10.01
-  assert result["trades"][0]["priceSource"] == "当前 Bar 收盘价 + 固定滑点 10.00 bp"
+  assert round(result["trades"][0]["price"], 2) == 11.01
+  assert result["trades"][0]["priceSource"] == "下一根 Bar 开盘价 + 固定滑点 10.00 bp"
 
 
 def test_l2_quote_error_has_diagnostic_and_quote_context(monkeypatch) -> None:

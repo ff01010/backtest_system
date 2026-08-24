@@ -104,6 +104,10 @@ const DEFAULT_PARAMS = {
   strategyCategory: 'directional_holding',
   holdingPolicy: 'overnight',
   fillModel: 'bar_next_open',
+  executionAlgorithm: 'immediate',
+  twapDurationSeconds: '300',
+  twapIntervalSeconds: '30',
+  twapMinChildQuantity: '100',
   baseQuantity: '0',
   baseCostPrice: '0',
   t0Enabled: false,
@@ -129,6 +133,17 @@ const EXPERIMENT_PARAM_KEYS = new Set([
   'initialCapital',
   'commissionRate',
   'slippage',
+  'executionAlgorithm',
+  'twapDurationSeconds',
+  'twapIntervalSeconds',
+  'twapMinChildQuantity',
+]);
+
+const EXECUTION_PARAM_KEYS = new Set([
+  'executionAlgorithm',
+  'twapDurationSeconds',
+  'twapIntervalSeconds',
+  'twapMinChildQuantity',
 ]);
 
 const STRATEGY_LABELS: Record<string, string> = {
@@ -188,6 +203,7 @@ type HistoryParamKey =
   | 'strategyCategory'
   | 'holdingPolicy'
   | 'fillModel'
+  | 'executionAlgorithm'
   | 'baseQuantity'
   | 'baseCostPrice'
   | 't0Enabled';
@@ -211,6 +227,7 @@ const HISTORY_PARAM_LABELS: Record<HistoryParamKey, string> = {
   strategyCategory: '策略类别',
   holdingPolicy: '持仓规则',
   fillModel: '成交模式',
+  executionAlgorithm: '执行方式',
   baseQuantity: '底仓数量',
   baseCostPrice: '底仓成本价',
   t0Enabled: '启用底仓做T',
@@ -234,7 +251,7 @@ interface NetSeries {
 
 function getDefaultScriptCode(timeframe: string): string {
   return `# on_bar(bar, state) 会在每根已完成的 ${timeframe} K 线调用一次。
-# 当前规则：本 Bar 收盘产生信号，并按本 Bar 收盘价虚拟成交。
+# 当前规则：本 Bar 收盘产生信号，并按下一根可交易 Bar 开盘价加滑点虚拟成交。
 # 时间：time 为 YYYYMMDDHHMMSS；tradeDate 为 YYYY-MM-DD；hhmm 例如 931。
 # bar 可读：time/datetime/tradeDate/hhmm/open/high/low/close/volume/cash/equity/position/params。
 # action 支持 buy_open、sell_open、sell_close、buy_close。
@@ -258,6 +275,10 @@ function createEmptyScriptForm(timeframe = '5m') {
 
 function isValidDate(value: string) {
   return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+}
+
+function normalizeFillModel(value: unknown): 'bar_next_open' | 'l2_quote' {
+  return value === 'l2_quote' ? 'l2_quote' : 'bar_next_open';
 }
 
 export function normalizeApiDate(value: string) {
@@ -390,6 +411,23 @@ function validateParams(params: BacktestParams) {
   }
   if (!Number.isFinite(slippage) || slippage < 0 || slippage >= 1) {
     errors.push('滑点应大于等于 0 且小于 1');
+  }
+  if (params.executionAlgorithm === 'twap') {
+    const durationSeconds = Number(params.twapDurationSeconds);
+    const intervalSeconds = Number(params.twapIntervalSeconds);
+    const minChildQuantity = Number(params.twapMinChildQuantity);
+    if (params.fillModel !== 'l2_quote') {
+      errors.push('TWAP 仅支持 L2 盘口回放');
+    }
+    if (!Number.isInteger(durationSeconds) || durationSeconds < 3) {
+      errors.push('TWAP 执行时长必须是不少于 3 秒的整数');
+    }
+    if (!Number.isInteger(intervalSeconds) || intervalSeconds < 3 || intervalSeconds % 3 !== 0 || intervalSeconds > durationSeconds) {
+      errors.push('TWAP 间隔必须是 3 秒倍数，且不大于执行时长');
+    }
+    if (!Number.isInteger(minChildQuantity) || minChildQuantity <= 0) {
+      errors.push('TWAP 最小子单数量必须为正整数');
+    }
   }
   if (!hasEnabledTradeDirection(params.allowLong, params.allowShort)) {
     errors.push('至少选择一个交易方向');
@@ -690,6 +728,7 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
             { label: '交易方向', value: getHistoryDirectionLabel(run) },
             { label: '持仓规则', value: getHistoryRunParam(run, 'holdingPolicy') },
             { label: '成交规则', value: run.fillModel || manifest?.fillModel },
+            { label: '执行方式', value: run.paramsJson.executionAlgorithm === 'twap' ? 'TWAP（L2）' : '立即成交' },
             { label: '代码指纹', value: shortenHistoryHash(scriptSnapshot.codeHash ?? manifest?.strategyCodeHash) },
           ]}
         />
@@ -1323,10 +1362,20 @@ export default function BacktestPage({
     setSelectedTimeframe(timeframe);
   };
 
-  const setFillModel = (fillModel: 'bar_close' | 'bar_next_open' | 'l2_quote') => {
+  const setFillModel = (fillModel: 'bar_next_open' | 'l2_quote') => {
     setParam('fillModel', fillModel);
+    if (fillModel !== 'l2_quote') {
+      setParam('executionAlgorithm', 'immediate');
+    }
     if (fillModel === 'l2_quote' && !L2_TIMEFRAMES.includes(selectedTimeframe)) {
       setSelectedTimeframe('1m');
+    }
+  };
+
+  const setExecutionAlgorithm = (algorithm: 'immediate' | 'twap') => {
+    setParam('executionAlgorithm', algorithm);
+    if (algorithm === 'twap') {
+      setFillModel('l2_quote');
     }
   };
 
@@ -1717,12 +1766,21 @@ export default function BacktestPage({
         allowShort: params.allowShort,
         strategyCategory: params.strategyCategory === 'core_position_overlay' ? 'core_position_overlay' : 'directional_holding',
         holdingPolicy: params.strategyCategory === 'core_position_overlay' ? 'intraday' : 'overnight',
-        fillModel: params.fillModel === 'l2_quote' ? 'l2_quote' : params.fillModel === 'bar_close' ? 'bar_close' : 'bar_next_open',
+        fillModel: normalizeFillModel(params.fillModel),
+        executionAlgorithm: params.executionAlgorithm === 'twap' ? 'twap' : 'immediate',
+        executionParameters: params.executionAlgorithm === 'twap'
+          ? {
+              durationSeconds: Number(params.twapDurationSeconds),
+              intervalSeconds: Number(params.twapIntervalSeconds),
+              minChildQuantity: Number(params.twapMinChildQuantity),
+              completionPolicy: 'cancel_remaining',
+            }
+          : {},
         baseQuantity: Number(params.baseQuantity),
         baseCostPrice: Number(params.baseCostPrice),
         t0Enabled: params.t0Enabled,
         isDefault: false,
-        strategyParams: params,
+        strategyParams: Object.fromEntries(Object.entries(params).filter(([key]) => !EXECUTION_PARAM_KEYS.has(key))),
         runDraft: false,
       };
       const data = await runBacktest(payload);
@@ -1737,9 +1795,6 @@ export default function BacktestPage({
       setHoldingStartDate('');
       setHoldingEndDate('');
       setHoldingStatusFilter('all');
-      if (payload.fillModel === 'bar_close') {
-        refreshDataStatus(selectedSymbol, selectedTimeframe);
-      }
       refreshBacktestRuns();
       setStatus(`回测完成 ${formatRunReference(data.displayNo)}，成交 ${getFillCount(data.summary) ?? 0} 笔`);
     } catch (e) {
@@ -2242,7 +2297,11 @@ export default function BacktestPage({
       allowShort: boolValue('allowShort', DEFAULT_PARAMS.allowShort),
       strategyCategory: textValue('strategyCategory', run.strategyCategory || (Number(saved.baseQuantity || 0) > 0 || saved.t0Enabled === true ? 'core_position_overlay' : 'directional_holding')),
       holdingPolicy: run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity || 0) > 0 || saved.t0Enabled === true ? 'intraday' : 'overnight',
-      fillModel: textValue('fillModel', run.fillModel || DEFAULT_PARAMS.fillModel),
+      fillModel: normalizeFillModel(savedStrategyParams.fillModel || run.fillModel),
+      executionAlgorithm: run.paramsJson.executionAlgorithm === 'twap' ? 'twap' : 'immediate',
+      twapDurationSeconds: String(asHistoryRecord(run.paramsJson.executionParameters).durationSeconds ?? DEFAULT_PARAMS.twapDurationSeconds),
+      twapIntervalSeconds: String(asHistoryRecord(run.paramsJson.executionParameters).intervalSeconds ?? DEFAULT_PARAMS.twapIntervalSeconds),
+      twapMinChildQuantity: String(asHistoryRecord(run.paramsJson.executionParameters).minChildQuantity ?? DEFAULT_PARAMS.twapMinChildQuantity),
       baseQuantity: textValue('baseQuantity', DEFAULT_PARAMS.baseQuantity),
       baseCostPrice: textValue('baseCostPrice', DEFAULT_PARAMS.baseCostPrice),
       t0Enabled: boolValue('t0Enabled', DEFAULT_PARAMS.t0Enabled),
@@ -2298,7 +2357,9 @@ export default function BacktestPage({
         allowShort: saved.allowShort !== false,
         strategyCategory: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'core_position_overlay' : 'directional_holding',
         holdingPolicy: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'intraday' : 'overnight',
-        fillModel: run.fillModel === 'l2_quote' ? 'l2_quote' : run.fillModel === 'bar_close' ? 'bar_close' : 'bar_next_open',
+        fillModel: normalizeFillModel(run.fillModel),
+        executionAlgorithm: run.paramsJson.executionAlgorithm === 'twap' ? 'twap' : 'immediate',
+        executionParameters: asHistoryRecord(run.paramsJson.executionParameters) as Record<string, number | string>,
         baseQuantity: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseQuantity ?? 0 : 0),
         baseCostPrice: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseCostPrice ?? 0 : 0),
         t0Enabled: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true,
@@ -2947,7 +3008,7 @@ export default function BacktestPage({
                     <div style={labelStyle}>成交模式</div>
                     <select
                       value={params.fillModel}
-                      onChange={(e) => setFillModel(e.target.value === 'l2_quote' ? 'l2_quote' : e.target.value === 'bar_close' ? 'bar_close' : 'bar_next_open')}
+                      onChange={(e) => setFillModel(e.target.value === 'l2_quote' ? 'l2_quote' : 'bar_next_open')}
                       style={fieldStyle}
                     >
                       <option value="bar_next_open">标准 Bar 回放（快速）</option>
@@ -2966,6 +3027,36 @@ export default function BacktestPage({
                     {params.fillModel === 'bar_next_open' && hasQuoteCallback && (
                       <div style={{ color: '#b45309', fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
                         当前策略定义了 on_quote：标准 Bar 回放仍会执行 on_bar，但不会执行盘口止损、止盈等实时快照逻辑。
+                      </div>
+                    )}
+                    <div style={{ display: 'block', marginTop: 10 }}>
+                      <div style={labelStyle}>执行方式</div>
+                      <select
+                        value={params.executionAlgorithm}
+                        onChange={(e) => setExecutionAlgorithm(e.target.value === 'twap' ? 'twap' : 'immediate')}
+                        style={fieldStyle}
+                      >
+                        <option value="immediate">立即成交</option>
+                        <option value="twap" disabled={!isL2Quote}>TWAP（L2）</option>
+                      </select>
+                    </div>
+                    {params.executionAlgorithm === 'twap' && (
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+                        <div>
+                          <div style={labelStyle}>执行时长（秒）</div>
+                          <input value={params.twapDurationSeconds} onChange={(e) => setParam('twapDurationSeconds', e.target.value)} style={fieldStyle} />
+                        </div>
+                        <div>
+                          <div style={labelStyle}>子单间隔（秒）</div>
+                          <input value={params.twapIntervalSeconds} onChange={(e) => setParam('twapIntervalSeconds', e.target.value)} style={fieldStyle} />
+                        </div>
+                        <div>
+                          <div style={labelStyle}>最小子单数量</div>
+                          <input value={params.twapMinChildQuantity} onChange={(e) => setParam('twapMinChildQuantity', e.target.value)} style={fieldStyle} />
+                        </div>
+                        <div style={{ gridColumn: '1 / -1', color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>
+                          仅使用信号之后的 3 秒快照；执行窗口结束仍未成交的数量将自动撤销。
+                        </div>
                       </div>
                     )}
                   </label>
@@ -3159,6 +3250,25 @@ export default function BacktestPage({
               )}
 
               {activePanel === 'trades' && (
+                <>
+                {result && (result.executionPlans || []).length > 0 && (
+                  <details style={{ ...panelStyle, padding: '10px 12px', background: '#ffffff', color: '#475569', fontSize: 12 }}>
+                    <summary style={{ color: '#0f766e', cursor: 'pointer', width: 'fit-content' }}>
+                      执行追溯（{result.executionPlans?.length} 个母单）
+                    </summary>
+                    <div style={{ display: 'grid', gap: 6, marginTop: 10 }}>
+                      {result.executionPlans?.map((plan) => (
+                        <div key={plan.parentOrderId} style={{ display: 'grid', gridTemplateColumns: 'minmax(120px, 1.4fr) repeat(4, minmax(80px, 1fr))', gap: 10, alignItems: 'center', borderTop: '1px solid #e2e8f0', paddingTop: 6 }}>
+                          <span title={plan.parentOrderId}>{plan.algorithm === 'twap' ? 'TWAP' : '立即成交'} · {formatSignalTime(plan.signalTime)}</span>
+                          <span>申请 {plan.requestedQuantity}</span>
+                          <span>成交 {plan.filledQuantity}</span>
+                          <span>撤销 {plan.cancelledQuantity}</span>
+                          <span>{plan.status === 'filled' ? '已完成' : plan.reason || plan.status}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
                 <section className="trade-filter-panel" style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
                   <div className="trade-filter-layout" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'end', gap: 10 }}>
                     <div className="trade-filter-summary" aria-label="信号执行摘要">
@@ -3231,6 +3341,7 @@ export default function BacktestPage({
                     </div>
                   </details>
                 </section>
+                </>
               )}
 
               {activePanel === 'overview' && (

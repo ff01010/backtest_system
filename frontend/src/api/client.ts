@@ -225,7 +225,9 @@ export interface BacktestRunPayload {
   allowShort: boolean;
   strategyCategory: 'core_position_overlay' | 'directional_holding';
   holdingPolicy: 'intraday' | 'overnight';
-  fillModel: 'bar_close' | 'bar_next_open' | 'l2_quote';
+  fillModel: 'bar_next_open' | 'l2_quote';
+  executionAlgorithm: 'immediate' | 'twap';
+  executionParameters: Record<string, number | string>;
   baseQuantity: number;
   baseCostPrice: number;
   t0Enabled: boolean;
@@ -241,7 +243,7 @@ export interface QueuedBacktestResponse {
   configVersionId: string | null;
   scriptId: string | null;
   status: 'queued';
-  fillModel: 'bar_close' | 'bar_next_open' | 'l2_quote';
+  fillModel: 'bar_next_open' | 'l2_quote';
   message: string;
 }
 

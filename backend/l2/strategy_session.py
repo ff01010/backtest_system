@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import re
 import time
+import traceback
 from collections.abc import Callable, Sequence
 from multiprocessing.connection import Connection
+from pathlib import Path
 from typing import Any
 
 from backend.backtesting.fees import FeeProfile
@@ -158,7 +161,12 @@ class _EngineProcessProxy:
     if message.get("status") == "error":
       detail = message.get("detail")
       if isinstance(detail, dict):
-        raise RemoteBacktestError.from_dict(detail)
+        diagnostic = message.get("diagnostic")
+        safe_diagnostic = {
+          key: value for key, value in diagnostic.items()
+          if isinstance(key, str) and isinstance(value, str)
+        } if isinstance(diagnostic, dict) else None
+        raise RemoteBacktestError.from_dict(detail, safe_diagnostic)
       raise StrategySessionProcessError("策略会话未返回结构化错误")
     if message.get("status") != "ok":
       raise StrategySessionProcessError("策略会话返回了未知状态")
@@ -284,9 +292,46 @@ def _response(value: Any) -> dict[str, Any]:
 
 def _send_error(connection: Connection, error: Exception) -> None:
   try:
-    connection.send({"status": "error", "detail": error_detail(error).to_dict()})
+    connection.send({
+      "status": "error",
+      "detail": error_detail(error).to_dict(),
+      "diagnostic": _error_diagnostic(error),
+    })
   except (BrokenPipeError, EOFError, OSError):
     return
+
+
+def _error_diagnostic(error: Exception) -> dict[str, str]:
+  cause = _root_error(error)
+  return {
+    "exceptionType": type(cause).__name__,
+    "reason": _redact_diagnostic_text(str(cause))[:500],
+    "trace": _trace_summary(cause),
+    "__internal_raw_message": str(cause),
+    "__internal_raw_traceback": "".join(traceback.format_exception(type(cause), cause, cause.__traceback__)),
+  }
+
+
+def _root_error(error: Exception) -> Exception:
+  current = error
+  visited: set[int] = set()
+  while id(current) not in visited:
+    visited.add(id(current))
+    next_error = current.__cause__ or current.__context__
+    if not isinstance(next_error, Exception):
+      return current
+    current = next_error
+  return current
+
+
+def _trace_summary(error: Exception) -> str:
+  frames = traceback.extract_tb(error.__traceback__)[-8:]
+  return " > ".join(f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in frames)
+
+
+def _redact_diagnostic_text(value: str) -> str:
+  without_credentials = re.sub(r"([a-z]+://[^\s:/]+:)[^@\s]+@", r"\1***@", value, flags=re.IGNORECASE)
+  return re.sub(r"(?i)\b(password|token|secret|authorization)\b\s*[:=]\s*\S+", r"\1=***", without_credentials)
 
 
 def _session_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -306,6 +351,8 @@ def _session_payload(payload: dict[str, Any]) -> dict[str, Any]:
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
     "feeProfile": dict(payload.get("feeProfile") or {}),
+    "executionAlgorithm": str(payload.get("executionAlgorithm") or "immediate"),
+    "executionParameters": dict(payload.get("executionParameters") or {}),
   }
 
 
@@ -373,4 +420,6 @@ def _build_engine(payload: dict[str, Any], strategy: ScriptedBarStrategy) -> L2E
       stamp_duty_rate=float(fee_profile.get("stampDutyRate", 0.0005)),
       minimum_commission=float(fee_profile.get("minimumCommission", 5)),
     ),
+    str(payload.get("executionAlgorithm") or "immediate"),
+    dict(payload.get("executionParameters") or {}),
   )

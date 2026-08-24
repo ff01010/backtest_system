@@ -16,6 +16,7 @@ frontend/coverage/
 *.pid
 storage/
 artifacts/
+backend/strategies/
 
 # Secrets and local configuration
 .env

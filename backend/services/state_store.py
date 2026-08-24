@@ -26,6 +26,9 @@ class ConflictError(DatabaseError):
   """违反唯一约束等写入冲突。"""
 
 
+_L2_FAIR_CLAIM_LOCK_KEY = 314159265
+
+
 def _translate_error(error: Exception) -> DatabaseError:
   if isinstance(error, IntegrityError):
     return ConflictError(str(error))
@@ -735,31 +738,43 @@ def create_bar_backtest_job(payload: dict[str, Any]) -> tuple[str, int]:
   return run_id, display_no
 
 
+def _claim_fair_l2_job_row(cur: Any, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
+  """在短事务调度锁内按用户运行数领取一条 L2 任务。"""
+  cur.execute("SELECT pg_advisory_xact_lock(%s)", (_L2_FAIR_CLAIM_LOCK_KEY,))
+  cur.execute("""
+    WITH candidate AS (
+      SELECT job.run_id
+      FROM l2_backtest_job AS job
+      WHERE (job.status='queued' AND NOT job.cancel_requested)
+         OR (job.status='running' AND job.lease_expires_at < now() AND NOT job.cancel_requested)
+      ORDER BY (
+        SELECT count(*)
+        FROM l2_backtest_job AS active
+        WHERE active.owner_user_id=job.owner_user_id
+          AND active.status='running'
+          AND active.lease_expires_at >= now()
+      ), job.created_at, job.run_id
+      FOR UPDATE OF job SKIP LOCKED
+      LIMIT 1
+    )
+    UPDATE l2_backtest_job AS job
+    SET status='running', attempt_no=attempt_no + 1, attempt_token=gen_random_uuid(),
+      lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
+      started_at=COALESCE(started_at, now()), updated_at=now()
+    FROM candidate
+    WHERE job.run_id=candidate.run_id
+    RETURNING job.run_id, job.owner_user_id, job.payload, job.attempt_no, job.attempt_token
+  """, (lease_seconds, worker_id))
+  return cur.fetchone()
+
+
 def claim_l2_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
-  """原子领取一个任务，并为本次尝试生成不可复用令牌。"""
+  """原子公平领取一个任务，并为本次尝试生成不可复用令牌。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("L2 runner 标识和租约时长必须有效")
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        WITH candidate AS (
-          SELECT run_id
-          FROM l2_backtest_job
-          WHERE (status='queued' AND NOT cancel_requested)
-             OR (status='running' AND lease_expires_at < now() AND NOT cancel_requested)
-          ORDER BY created_at
-          FOR UPDATE SKIP LOCKED
-          LIMIT 1
-        )
-        UPDATE l2_backtest_job AS job
-        SET status='running', attempt_no=attempt_no + 1, attempt_token=gen_random_uuid(),
-          lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
-          started_at=COALESCE(started_at, now()), updated_at=now()
-        FROM candidate
-        WHERE job.run_id=candidate.run_id
-        RETURNING job.run_id, job.owner_user_id, job.payload, job.attempt_no, job.attempt_token
-      """, (lease_seconds, worker_id))
-      row = cur.fetchone()
+      row = _claim_fair_l2_job_row(cur, worker_id, lease_seconds)
       if not row:
         return None
       cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
@@ -1080,7 +1095,15 @@ def _normalize_system_error(row: dict[str, Any]) -> dict[str, Any]:
     "retryable": bool(row.get("retryable")),
     "reason": row["reason"],
     "exceptionType": row["exception_type"],
-    "context": _json(row.get("context_json"), {}),
+    "context": _public_system_error_context(_json(row.get("context_json"), {})),
     "rawLogRef": row.get("raw_log_ref") or "",
     "occurredAt": _format_time(row["occurred_at"]),
+  }
+
+
+def _public_system_error_context(context: dict[str, Any]) -> dict[str, Any]:
+  return {
+    key: value
+    for key, value in context.items()
+    if not key.startswith("__internal_")
   }

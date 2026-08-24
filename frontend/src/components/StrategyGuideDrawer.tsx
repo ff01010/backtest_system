@@ -1,4 +1,4 @@
-import { Check, ChevronRight, Clipboard, FileText, LoaderCircle, X } from 'lucide-react';
+import { Check, ChevronRight, Clipboard, FileText, Link2, LoaderCircle, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { fetchStrategyGuide } from '../api/client';
 
@@ -143,6 +143,7 @@ export default function StrategyGuideDrawer({ open, onClose, onUseExample }: Pro
   const [error, setError] = useState('');
   const [hasLoaded, setHasLoaded] = useState(false);
   const [loadAttempt, setLoadAttempt] = useState(0);
+  const [copiedPublicLink, setCopiedPublicLink] = useState(false);
   const scrollContainerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
@@ -183,12 +184,26 @@ export default function StrategyGuideDrawer({ open, onClose, onUseExample }: Pro
     container.scrollTo({ top: Math.max(0, targetTop - 18), behavior: 'smooth' });
   };
 
+  const copyPublicLink = async () => {
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}/strategy-guide.md`);
+      setCopiedPublicLink(true);
+      window.setTimeout(() => setCopiedPublicLink(false), 1600);
+    } catch {
+      setError('复制公开链接失败，请手动复制浏览器地址。');
+    }
+  };
+
   if (!open) return null;
   return <div className="strategy-guide-backdrop" role="presentation" onMouseDown={onClose}>
     <aside aria-label="策略编写指南" className="strategy-guide-drawer" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
       <header className="strategy-guide-drawer-header">
         <div><span className="strategy-guide-eyebrow"><FileText size={14} />策略代码参考</span><h2>{guide?.title || '策略编写指南'}</h2><p>读取当前系统契约；示例可复制或写入编辑器。</p></div>
-        <button aria-label="关闭策略编写指南" className="strategy-guide-close" type="button" onClick={onClose}><X size={18} /></button>
+        <div className="strategy-guide-header-actions">
+          <a href="/strategy-guide.md" rel="noreferrer" target="_blank"><Link2 size={14} />打开 Markdown</a>
+          <button type="button" onClick={() => void copyPublicLink()}>{copiedPublicLink ? <Check size={14} /> : <Clipboard size={14} />}{copiedPublicLink ? '已复制' : '复制公开链接'}</button>
+          <button aria-label="关闭策略编写指南" className="strategy-guide-close" type="button" onClick={onClose}><X size={18} /></button>
+        </div>
       </header>
       {guide ? <div className="strategy-guide-layout">
         <nav aria-label="指南目录" className="strategy-guide-toc">{sections.map((section) => <button type="button" onClick={() => scrollToSection(section.id)} key={section.id}><ChevronRight size={13} />{section.text}</button>)}</nav>

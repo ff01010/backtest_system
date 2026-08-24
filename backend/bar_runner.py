@@ -10,7 +10,7 @@ from typing import Any
 
 from backend import settings
 from backend.services import backtest_runner, state_store
-from backend.services.backtest_errors import error_detail, error_summary
+from backend.services.backtest_errors import error_summary
 from backend.services.system_error_log import system_error_log_record
 
 logger = logging.getLogger(__name__)
@@ -53,7 +53,7 @@ class BarRunner:
       logger.exception("标准 Bar 回测任务失败: %s", job["runId"])
       status = "cancelled" if "已取消或租约丢失" in str(error) else "failed"
       system_error = None
-      if status == "failed" and error_detail(error, job["runId"]).category == "system_error":
+      if status == "failed":
         system_error = system_error_log_record(error, "bar_runner", stage, job["runId"])
       state_store.finish_bar_backtest_job(
         job["runId"], job["attemptToken"], status, error_summary(error, job["runId"]),

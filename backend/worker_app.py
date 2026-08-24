@@ -4,18 +4,20 @@
 import json
 import os
 import time
-from typing import Any
+import traceback
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel, RecordedPriceExecutionModel
+from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade
 from backend.date_codec import TradingDateError, format_api_date
 from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot, TradeEvent
 from backend.services.backtest_errors import error_detail
+from backend.services.system_error_catalog import root_cause
 from backend.strategies.scripted import ScriptedBarStrategy
 
 
@@ -27,7 +29,7 @@ class WorkerRunRequest(BaseModel):
   initialCapital: float = Field(gt=0)
   commissionRate: float = Field(ge=0)
   feeProfile: dict[str, float] = Field(default_factory=dict)
-  fillModel: str = "bar_next_open"
+  fillModel: Literal["bar_next_open"] = "bar_next_open"
   slippage: float = Field(default=0, ge=0, lt=1)
   holdingPolicy: str = "intraday"
   baseQuantity: int = Field(default=0, ge=0)
@@ -143,13 +145,18 @@ def _worker_http_error(
   symbol: str | None = None,
   event_time: str | None = None,
 ) -> HTTPException:
-  """worker 只向调度端返回已脱敏的结构化错误。"""
+  """向调度端返回公开错误和仅供管理员留存的原始诊断。"""
   detail = error_detail(error).with_event_context(symbol, event_time)
+  cause = root_cause(error)
   return HTTPException(422, {
     "errorDetail": detail.to_dict(),
     "diagnostic": {
-      "exceptionType": type(error).__name__,
-      "reason": str(error)[:500],
+      "exceptionType": type(cause).__name__,
+      "reason": str(cause)[:500],
+      "__internal_raw_message": str(cause)[:2_000],
+      "__internal_raw_traceback": "".join(
+        traceback.format_exception(type(error), error, error.__traceback__),
+      )[:8_000],
     },
   })
 
@@ -276,13 +283,9 @@ def run(payload: WorkerRunRequest) -> dict[str, Any]:
       initial_cash=payload.initialCapital,
       commission_rate=payload.commissionRate,
       fee_profile=fee_profile,
-      execution_model=(
-        RecordedPriceExecutionModel(slippage=payload.slippage)
-        if payload.fillModel == "bar_close"
-        else NextOpenExecutionModel(slippage=payload.slippage)
-      ),
+      execution_model=NextOpenExecutionModel(slippage=payload.slippage),
       holding_policy=payload.holdingPolicy,
-      execute_on_next_bar_open=payload.fillModel == "bar_next_open",
+      execute_on_next_bar_open=True,
       base_quantity=payload.baseQuantity,
       base_cost_price=payload.baseCostPrice,
       t0_enabled=payload.t0Enabled,
