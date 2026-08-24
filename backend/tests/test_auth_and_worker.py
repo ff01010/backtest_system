@@ -140,6 +140,28 @@ def test_worker_runs_script_without_database_access() -> None:
   assert len(result["portfolioSnapshots"]) == 1
 
 
+def test_worker_keeps_raw_script_exception_for_administrator() -> None:
+  request = WorkerRunRequest(
+    scriptId="diagnostic-script",
+    code="def on_bar(bar, state):\n  return missing_variable\n",
+    bars=[{
+      "time": "202601010930", "symbol": "000001.SZ", "open": 10,
+      "high": 10, "low": 10, "close": 10, "volume": 100,
+    }],
+    initialCapital=100_000,
+    commissionRate=0.0003,
+  )
+
+  with pytest.raises(HTTPException) as raised:
+    run(request)
+
+  diagnostic = raised.value.detail["diagnostic"]
+  assert diagnostic["exceptionType"] == "NameError"
+  assert "missing_variable" in diagnostic["reason"]
+  assert "missing_variable" in diagnostic["__internal_raw_message"]
+  assert "strategy_script_diagnostic-script.py" in diagnostic["__internal_raw_traceback"]
+
+
 def test_worker_applies_slippage_to_script_trade_price() -> None:
   result = run(WorkerRunRequest(
     scriptId="slippage-script",

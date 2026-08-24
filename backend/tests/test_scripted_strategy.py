@@ -50,6 +50,27 @@ def on_bar(bar, state):
 """)
 
 
+def test_script_supports_classes_and_common_pure_builtins() -> None:
+  strategy = ScriptedBarStrategy("class-script", """
+class Counter(object):
+  def normalize(self, values):
+    return sorted(set(values))
+
+def on_bar(bar, state):
+  counter = state.setdefault('counter', Counter())
+  state['values'] = counter.normalize([2, 1, 2])
+  state['closeText'] = str(bar['close'])
+  if not isinstance(state['values'], list):
+    raise TypeError('invalid values')
+  return []
+""", {})
+  portfolio = PortfolioSnapshot(cash=100_000, equity=100_000, positions={})
+
+  assert strategy.on_bar(Bar("20260727093000", "688981.SH", 10, 10, 10, 10), portfolio) == []
+  assert strategy._state["values"] == [1, 2]
+  assert strategy._state["closeText"] == "10"
+
+
 def test_script_allows_installed_module_imports() -> None:
   strategy = ScriptedBarStrategy(9, """
 import math

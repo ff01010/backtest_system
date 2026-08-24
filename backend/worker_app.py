@@ -4,6 +4,7 @@
 import json
 import os
 import time
+import traceback
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from backend.date_codec import TradingDateError, format_api_date
 from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot, TradeEvent
 from backend.services.backtest_errors import error_detail
+from backend.services.system_error_catalog import root_cause
 from backend.strategies.scripted import ScriptedBarStrategy
 
 
@@ -143,13 +145,18 @@ def _worker_http_error(
   symbol: str | None = None,
   event_time: str | None = None,
 ) -> HTTPException:
-  """worker 只向调度端返回已脱敏的结构化错误。"""
+  """向调度端返回公开错误和仅供管理员留存的原始诊断。"""
   detail = error_detail(error).with_event_context(symbol, event_time)
+  cause = root_cause(error)
   return HTTPException(422, {
     "errorDetail": detail.to_dict(),
     "diagnostic": {
-      "exceptionType": type(error).__name__,
-      "reason": str(error)[:500],
+      "exceptionType": type(cause).__name__,
+      "reason": str(cause)[:500],
+      "__internal_raw_message": str(cause)[:2_000],
+      "__internal_raw_traceback": "".join(
+        traceback.format_exception(type(error), error, error.__traceback__),
+      )[:8_000],
     },
   })
 

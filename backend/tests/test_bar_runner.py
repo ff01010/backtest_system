@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from backend import bar_runner
+from backend.services.backtest_errors import RemoteBacktestError
 
 
 def test_bar_runner_finishes_queued_job(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -30,6 +31,39 @@ def test_bar_runner_finishes_queued_job(monkeypatch: pytest.MonkeyPatch) -> None
   assert finished["args"][2] == "succeeded"
   assert finished["args"][3]["fillModel"] == "bar_next_open"
   assert finished["args"][3]["warningCount"] == 1
+
+
+def test_bar_runner_persists_remote_strategy_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
+  job = {
+    "runId": "run-2",
+    "ownerUserId": "owner-2",
+    "attemptToken": "attempt-2",
+    "payload": {"fillModel": "bar_next_open"},
+  }
+  error = RemoteBacktestError.from_dict(
+    {
+      "category": "strategy_error",
+      "code": "strategy.runtime_error",
+      "message": "策略引用了未定义的变量或函数。",
+    },
+    {"exceptionType": "NameError", "reason": "missing_variable"},
+  )
+  finished: dict[str, Any] = {}
+
+  def fail_backtest(_: dict[str, Any]) -> dict[str, Any]:
+    raise error
+
+  monkeypatch.setattr(bar_runner.state_store, "claim_bar_backtest_job", lambda *_: job)
+  monkeypatch.setattr(bar_runner.backtest_runner, "run_backtest", fail_backtest)
+  monkeypatch.setattr(
+    bar_runner.state_store,
+    "finish_bar_backtest_job",
+    lambda *args, **kwargs: finished.update({"args": args, "kwargs": kwargs}) or True,
+  )
+
+  assert bar_runner.BarRunner("test-worker").run_once() is True
+  assert finished["kwargs"]["system_error"]["reason"] == "missing_variable"
+  assert finished["kwargs"]["system_error"]["exception_type"] == "NameError"
 
 
 def test_worker_summary_uses_cash_and_base_cost_as_initial_equity() -> None:

@@ -102,3 +102,27 @@ def test_remote_worker_diagnostic_is_saved_for_administrator() -> None:
     "__internal_raw_message": "原始异常正文",
     "__internal_raw_traceback": "完整调用栈",
   }
+
+
+def test_remote_strategy_diagnostic_is_saved_for_administrator() -> None:
+  error = RemoteBacktestError.from_dict(
+    {
+      "category": "strategy_error",
+      "code": "strategy.runtime_error",
+      "message": "策略引用了未定义的变量或函数。",
+    },
+    {
+      "exceptionType": "NameError",
+      "reason": "name '__build_class__' is not defined",
+      "__internal_raw_message": "name '__build_class__' is not defined",
+      "__internal_raw_traceback": "strategy_script_1.py:1",
+    },
+  )
+
+  record = system_error_log_record(error, "bar_runner", "bar.backtest", "run-1")
+
+  assert record is not None
+  assert record.code == "worker.execution_rejected"
+  assert record.reason == "name '__build_class__' is not defined"
+  assert record.exception_type == "NameError"
+  assert record.context["__internal_raw_message"] == "name '__build_class__' is not defined"

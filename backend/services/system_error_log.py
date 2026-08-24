@@ -34,11 +34,11 @@ def system_error_log_record(
   stage: str,
   task_id: str | None = None,
 ) -> SystemErrorLogRecord | None:
-  """仅将系统错误转换为管理员日志；策略错误继续由原有页面展示。"""
-  if error_detail(error).category != "system_error":
-    return None
+  """记录系统错误及 worker 拒绝任务时返回的原始诊断。"""
   if isinstance(error, RemoteBacktestError) and error.diagnostic:
     return _remote_worker_record(error, source, stage, task_id)
+  if error_detail(error).category != "system_error":
+    return None
 
   cause = root_cause(error)
   classified = classify_system_error(error)

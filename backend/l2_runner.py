@@ -20,7 +20,7 @@ from backend.l2.models import NormalizedBar, QuoteSnapshot, TradeEvent, parse_ti
 from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError
 from backend.l2.result_adapter import normalize_l2_result
 from backend.l2.strategy_session import L2StrategySession
-from backend.services.backtest_errors import RemoteBacktestError, error_detail, error_summary
+from backend.services.backtest_errors import RemoteBacktestError, error_summary
 from backend.services import bar_data, state_store
 from backend.services.system_error_log import system_error_log_record
 from backend.strategies.scripted import quote_mode_for_script
@@ -110,7 +110,7 @@ class L2Runner:
         )
       status = "cancelled" if "租约丢失或已取消" in str(error) else "failed"
       system_error = None
-      if status == "failed" and error_detail(error, job["runId"]).category == "system_error":
+      if status == "failed":
         system_error = system_error_log_record(error, "l2_runner", stage, job["runId"])
       state_store.finish_l2_backtest_job(
         job["runId"], job["attemptToken"], status, error_summary(error, job["runId"]),

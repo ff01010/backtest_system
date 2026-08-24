@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 from typing import Any, Sequence
 
 from backend.backtesting.models import (
@@ -28,15 +29,24 @@ _SAFE_BUILTINS = {
   "any": any,
   "bool": bool,
   "dict": dict,
+  "ImportError": ImportError,
+  "isinstance": isinstance,
+  "list": list,
   "float": float,
   "int": int,
   "len": len,
   "max": max,
   "min": min,
+  "object": object,
   "range": range,
   "round": round,
+  "set": set,
+  "sorted": sorted,
+  "str": str,
   "sum": sum,
+  "TypeError": TypeError,
   "ValueError": ValueError,
+  "__build_class__": builtins.__build_class__,
   "__import__": __import__,
 }
 
@@ -139,7 +149,10 @@ class ScriptedBarStrategy:
       self._quote_mode = quote_mode_for_script(code, quote_mode)
     except ValueError as error:
       raise StrategyExecutionError.from_exception(error) from error
-    namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
+    namespace: dict[str, Any] = {
+      "__builtins__": _SAFE_BUILTINS,
+      "__name__": f"strategy_script_{script_id}",
+    }
     try:
       exec(compile(code, f"strategy_script_{script_id}.py", "exec"), namespace)
     except Exception as error:
