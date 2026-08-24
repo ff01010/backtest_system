@@ -282,6 +282,46 @@ def on_bar(bar, state):
   }]
 
 
+def test_script_cannot_preempt_direction_permission_from_params() -> None:
+  strategy = ScriptedBarStrategy(9, """
+def on_bar(bar, state):
+  if bar['params'].get('allowShort') is False:
+    return []
+  return [{'action': 'sell_open', 'quantity': 100, 'reason': '空头信号'}]
+""", {"allowLong": True, "allowShort": False, "window": 20})
+  bar = Bar("20260727093000", "688981.SH", 10, 10, 10, 10)
+  portfolio = PortfolioSnapshot(cash=1_000_000, equity=1_000_000, positions={})
+
+  orders = strategy.on_bar(bar, portfolio)
+
+  assert orders == []
+  assert "allowLong" not in strategy._state["params"]
+  assert "allowShort" not in strategy._state["params"]
+  assert strategy._state["params"]["window"] == 20
+  assert strategy.skipped_signals[0]["action"] == "SELL_OPEN"
+  assert strategy.skipped_signals[0]["status"] == "skipped"
+
+
+def test_quote_context_hides_direction_execution_permissions() -> None:
+  strategy = ScriptedBarStrategy(10, """
+def on_bar(bar, state):
+  return []
+
+def on_quote(quote, state):
+  state['quoteParams'] = quote['params']
+  return []
+""", {"allowLong": False, "allowShort": True, "window": 20})
+  portfolio = PortfolioSnapshot(cash=1_000_000, equity=1_000_000, positions={})
+  level = QuoteLevel(10, 1_000)
+  quote = QuoteSnapshot(
+    "688981.SH", "20260727", "20260727093003", 1, (level,), (level,), 10,
+  )
+
+  strategy.on_quote(quote, portfolio)
+
+  assert strategy._state["quoteParams"] == {"window": 20}
+
+
 def test_qmt_trend_follow_script_opens_and_stops_short_position() -> None:
   strategy = _qmt_script_strategy(2)
   bars = _qmt_entry_bars() + [
