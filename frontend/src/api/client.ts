@@ -262,9 +262,28 @@ export async function runBacktest(payload: BacktestRunPayload): Promise<Backtest
     if (detail && (detail.category === 'strategy_error' || detail.category === 'system_error')) {
       throw new BacktestRequestError(detail);
     }
+    if (res.status === 422) {
+      const message = getValidationErrorMessage(response);
+      if (message) {
+        throw new Error(`回测参数校验失败：${message}`);
+      }
+    }
     throw new Error(`API ${res.status}: 回测请求失败`);
   }
   return res.json();
+}
+
+function getValidationErrorMessage(response: unknown): string | null {
+  if (!response || typeof response !== 'object') return null;
+  const detail = (response as { detail?: unknown }).detail;
+  if (typeof detail === 'string' && detail.trim()) return detail.trim();
+  if (!Array.isArray(detail)) return null;
+  const messages = detail.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const message = (item as { msg?: unknown }).msg;
+    return typeof message === 'string' && message.trim() ? [message.trim()] : [];
+  });
+  return messages.length > 0 ? Array.from(new Set(messages)).join('；') : null;
 }
 
 export interface LiveStrategyResponse {
