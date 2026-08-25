@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Pydantic 响应模型"""
 
+from datetime import datetime
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -180,6 +181,35 @@ class BacktestRunRequest(BaseModel):
     if self.executionAlgorithm == "twap" and self.fillModel != "l2_quote":
       raise ValueError("TWAP 仅支持 L2 盘口回放")
     return self
+
+
+class ApiKeyCreateRequest(BaseModel):
+  name: str = Field(min_length=1, max_length=80)
+  scopes: list[Literal["backtest:submit", "backtest:read", "backtest:cancel"]]
+  expiresAt: datetime | None = None
+
+
+class PublicBacktestOverrides(BaseModel):
+  start_date: str | None = None
+  end_date: str | None = None
+  initial_capital: float | None = Field(default=None, gt=0)
+  commission_rate: float | None = Field(default=None, ge=0)
+  slippage: float | None = Field(default=None, ge=0)
+
+  @field_validator("start_date", "end_date", mode="before")
+  @classmethod
+  def normalize_optional_date(cls, value: object) -> str | None:
+    if value is None:
+      return None
+    try:
+      return format_api_date(value)  # type: ignore[arg-type]
+    except TradingDateError as error:
+      raise ValueError(str(error)) from error
+
+
+class PublicBacktestCreateRequest(BaseModel):
+  config_id: str = Field(min_length=1, max_length=64)
+  overrides: PublicBacktestOverrides = Field(default_factory=PublicBacktestOverrides)
 
 
 class BacktestSummary(BaseModel):

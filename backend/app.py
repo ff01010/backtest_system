@@ -9,9 +9,11 @@ import sys
 import os
 import ast
 import hashlib
+import json
 import logging
 import re
 from typing import Any
+from uuid import uuid4
 
 _viewer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _viewer_dir not in sys.path:
@@ -20,6 +22,7 @@ if _viewer_dir not in sys.path:
 _STRATEGY_GUIDE_PATH = os.path.join(_viewer_dir, "docs", "玄龄回测系统使用手册.md")
 
 from fastapi import FastAPI, Query, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -89,7 +92,23 @@ app.add_middleware(
 
 @app.middleware("http")
 async def authenticate_api_request(request: Request, call_next):
-  """所有业务 API 必须携带有效会话，用户身份由上下文供仓储层使用。"""
+  """按 Cookie 或 API Key 认证业务接口，并将用户写入当前请求上下文。"""
+  if request.url.path.startswith("/api/v1/"):
+    request.state.request_id = f"req_{uuid4().hex}"
+    if not settings.PUBLIC_API_ENABLED:
+      return _public_api_error(request, 404, "api.disabled", "开放 API 未启用")
+    authorization = request.headers.get("authorization", "")
+    token_value = authorization[7:] if authorization.lower().startswith("bearer ") else None
+    principal = auth.get_api_key_principal(token_value)
+    if principal is None:
+      return _public_api_error(request, 401, "api_key_invalid", "API Key 无效、已撤销或已过期")
+    user, api_key = principal
+    request.state.api_key = api_key
+    token = set_current_user(user)
+    try:
+      return await call_next(request)
+    finally:
+      reset_current_user(token)
   path = request.url.path
   if request.method == "OPTIONS" or not path.startswith("/api/") or path in {
     "/api/health",
@@ -105,6 +124,58 @@ async def authenticate_api_request(request: Request, call_next):
     return await call_next(request)
   finally:
     reset_current_user(token)
+
+
+def _public_api_error(
+  request: Request,
+  status_code: int,
+  code: str,
+  message: str,
+  retryable: bool = False,
+) -> JSONResponse:
+  return JSONResponse(
+    status_code=status_code,
+    content={
+      "error": {
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "request_id": getattr(request.state, "request_id", None),
+      },
+    },
+  )
+
+
+@app.exception_handler(HTTPException)
+async def handle_http_exception(request: Request, error: HTTPException) -> JSONResponse:
+  if request.url.path.startswith("/api/v1/"):
+    detail = error.detail if isinstance(error.detail, str) else "请求无法完成"
+    code = "backtest.validation_failed" if error.status_code == 422 else "request.failed"
+    if error.status_code == 403:
+      code = "api_scope_denied"
+    elif error.status_code == 404:
+      code = "resource.not_found"
+    elif error.status_code == 409:
+      code = "idempotency.conflict"
+    elif error.status_code == 429:
+      code = "rate_limit.exceeded"
+    return _public_api_error(request, error.status_code, code, detail, error.status_code >= 500)
+  return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(request: Request, error: RequestValidationError) -> JSONResponse:
+  if request.url.path.startswith("/api/v1/"):
+    return _public_api_error(request, 422, "backtest.validation_failed", "请求参数不符合接口约束")
+  return JSONResponse(status_code=422, content={"detail": error.errors()})
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_exception(request: Request, error: Exception) -> JSONResponse:
+  logger.exception("未处理接口异常: %s", request.url.path, exc_info=error)
+  if request.url.path.startswith("/api/v1/"):
+    return _public_api_error(request, 503, "backtest.unavailable", "服务暂时不可用，请稍后重试", True)
+  return JSONResponse(status_code=500, content={"detail": "服务器内部错误"})
 
 
 def _model_dump(model):
@@ -318,8 +389,120 @@ def _validate_backtest_request(request: dict) -> None:
   request["marketDataSnapshot"] = {}
 
 
+_PUBLIC_OVERRIDE_MAP = {
+  "start_date": "startDate",
+  "end_date": "endDate",
+  "initial_capital": "initialCapital",
+  "commission_rate": "commissionRate",
+  "slippage": "slippage",
+}
+
+
+def _require_public_scope(request: Request, scope: str) -> auth.ApiKeyPrincipal:
+  api_key = getattr(request.state, "api_key", None)
+  if not isinstance(api_key, auth.ApiKeyPrincipal):
+    raise HTTPException(401, "API Key 无效")
+  if scope not in api_key.scopes:
+    raise HTTPException(403, "当前 API Key 不具备所需权限")
+  return api_key
+
+
+def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest) -> dict[str, Any]:
+  """仅从已保存方案生成请求，开放接口只能覆盖少量运行参数。"""
+  try:
+    config = state_store.get_strategy_config(payload.config_id)
+  except KeyError as error:
+    raise HTTPException(404, "策略方案不存在") from error
+  if not config.get("enabled") or not config.get("published", True):
+    raise HTTPException(409, "策略方案未启用或尚未发布")
+  params_json = config.get("paramsJson")
+  saved_params = params_json.get("params", {}) if isinstance(params_json, dict) else {}
+  if not isinstance(saved_params, dict):
+    raise HTTPException(422, "策略方案缺少可运行参数")
+
+  values = dict(saved_params)
+  overrides = _model_dump(payload.overrides)
+  for source_key, target_key in _PUBLIC_OVERRIDE_MAP.items():
+    value = overrides.get(source_key)
+    if value is not None:
+      values[target_key] = value
+  required_keys = {"startDate", "endDate", "initialCapital", "commissionRate", "slippage"}
+  missing = sorted(key for key in required_keys if values.get(key) is None)
+  if missing:
+    raise HTTPException(422, f"策略方案缺少运行参数：{', '.join(missing)}")
+
+  execution_algorithm = str(values.get("executionAlgorithm", "immediate"))
+  execution_parameters: dict[str, Any] = {}
+  if execution_algorithm == "twap":
+    execution_parameters = {
+      "durationSeconds": values.get("twapDurationSeconds"),
+      "intervalSeconds": values.get("twapIntervalSeconds"),
+      "minChildQuantity": values.get("twapMinChildQuantity"),
+      "completionPolicy": "cancel_remaining",
+    }
+  request_model = schemas.BacktestRunRequest(
+    configId=config["id"],
+    scriptId=config.get("scriptId"),
+    accountId=config.get("accountId"),
+    account="default",
+    mode="backtest",
+    symbol=config["symbol"],
+    benchmarkSymbol=config.get("benchmarkSymbol") or config["symbol"],
+    strategy=config["strategy"],
+    timeframe=config["timeframe"],
+    startDate=values["startDate"],
+    endDate=values["endDate"],
+    initialCapital=values["initialCapital"],
+    commissionRate=values["commissionRate"],
+    slippage=values["slippage"],
+    positionMode=str(values.get("positionMode", "full_available")),
+    orderCash=values.get("orderCash"),
+    orderPct=values.get("orderPct"),
+    allowLong=values.get("allowLong", True),
+    allowShort=values.get("allowShort", True),
+    strategyCategory=values.get("strategyCategory"),
+    holdingPolicy=values.get("holdingPolicy", "intraday"),
+    fillModel=values.get("fillModel", "bar_next_open"),
+    executionAlgorithm=execution_algorithm,
+    executionParameters=execution_parameters,
+    baseQuantity=values.get("baseQuantity", 0),
+    baseCostPrice=values.get("baseCostPrice", 0),
+    t0Enabled=values.get("t0Enabled", False),
+    strategyParams={
+      key: value for key, value in saved_params.items()
+      if key not in _EXPERIMENT_PARAM_KEYS
+    },
+  )
+  request = _model_dump(request_model)
+  _validate_backtest_request(request)
+  return request
+
+
+def _public_request_hash(payload: schemas.PublicBacktestCreateRequest) -> str:
+  canonical = json.dumps(_model_dump(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+  return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "run_id": run["id"],
+    "display_no": run["displayNo"],
+    "config_id": run.get("configId"),
+    "symbol": run["symbol"],
+    "timeframe": run["timeframe"],
+    "fill_model": run["fillModel"],
+    "status": run["status"],
+    "start_date": run["startDate"],
+    "end_date": run["endDate"],
+    "summary": run.get("summaryJson") or {},
+    "created_at": run["createdAt"],
+    "finished_at": run["finishedAt"],
+  }
+
+
 @app.on_event("startup")
 def startup():
+  settings.validate_public_api_configuration()
   state_store.ensure_schema()
 
 
@@ -396,6 +579,32 @@ def current_user(request: Request):
     "displayName": user.display_name,
     "role": user.role,
   }}
+
+
+@app.get("/api/api-keys")
+def api_keys():
+  return {"keys": auth.list_api_keys(get_current_user().id)}
+
+
+@app.post("/api/api-keys")
+def create_api_key(payload: schemas.ApiKeyCreateRequest):
+  try:
+    key, plain_text_key = auth.create_api_key(
+      get_current_user().id,
+      payload.name,
+      list(payload.scopes),
+      payload.expiresAt,
+    )
+  except auth.ApiKeyError as error:
+    raise HTTPException(422, str(error)) from error
+  return {"key": key, "plainTextKey": plain_text_key}
+
+
+@app.delete("/api/api-keys/{key_id}")
+def revoke_api_key(key_id: str):
+  if not auth.revoke_api_key(get_current_user().id, key_id):
+    raise HTTPException(404, "API Key 不存在")
+  return {"revoked": True}
 
 
 def _require_admin(request: Request) -> CurrentUser:
@@ -790,6 +999,104 @@ def backtest_timeframes_batch(
       for item in requested
     },
   }
+
+
+@app.post("/api/v1/backtests")
+def public_create_backtest(payload: schemas.PublicBacktestCreateRequest, request: Request):
+  api_key = _require_public_scope(request, "backtest:submit")
+  idempotency_key = request.headers.get("idempotency-key", "").strip()
+  if not 8 <= len(idempotency_key) <= 128:
+    raise HTTPException(422, "Idempotency-Key 必须为 8 至 128 个字符")
+  try:
+    backtest_request = _build_public_backtest_request(payload)
+    run_id, display_no, replayed, run_status, fill_model = state_store.create_api_backtest_job(
+      backtest_request,
+      api_key.id,
+      idempotency_key,
+      _public_request_hash(payload),
+    )
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
+  except ValueError as error:
+    raise HTTPException(429, str(error)) from error
+  return {
+    "run_id": run_id,
+    "display_no": display_no,
+    "status": {"succeeded": "ok", "failed": "error"}.get(run_status, run_status),
+    "fill_model": fill_model,
+    "replayed": replayed,
+    "request_id": request.state.request_id,
+  }
+
+
+@app.get("/api/v1/backtests")
+def public_backtest_runs(
+  request: Request,
+  limit: int = Query(20, ge=1, le=100),
+  cursor: int = Query(0, ge=0),
+):
+  _require_public_scope(request, "backtest:read")
+  runs = state_store.list_backtest_runs(limit + 1, offset=cursor)
+  page = runs[:limit]
+  return {
+    "items": [_public_run_payload(run) for run in page],
+    "next_cursor": str(cursor + len(page)) if len(runs) > limit else None,
+  }
+
+
+@app.get("/api/v1/backtests/{run_id}")
+def public_backtest_detail(run_id: str, request: Request):
+  _require_public_scope(request, "backtest:read")
+  try:
+    return {"run": _public_run_payload(state_store.get_backtest_run(run_id))}
+  except KeyError as error:
+    raise HTTPException(404, "回测记录不存在") from error
+
+
+@app.get("/api/v1/backtests/{run_id}/signals")
+def public_backtest_signals(
+  run_id: str,
+  request: Request,
+  cursor: int = Query(0, ge=0),
+  limit: int = Query(100, ge=1, le=200),
+):
+  _require_public_scope(request, "backtest:read")
+  try:
+    page = state_store.get_backtest_result_page(run_id, "signals", cursor, limit)
+    return {
+      "items": page["items"],
+      "next_cursor": page["nextCursor"],
+      "total": page["total"],
+    }
+  except KeyError as error:
+    raise HTTPException(404, "回测记录不存在") from error
+
+
+@app.get("/api/v1/backtests/{run_id}/trades")
+def public_backtest_trades(
+  run_id: str,
+  request: Request,
+  cursor: int = Query(0, ge=0),
+  limit: int = Query(100, ge=1, le=200),
+):
+  _require_public_scope(request, "backtest:read")
+  try:
+    page = state_store.get_backtest_result_page(run_id, "trades", cursor, limit)
+    return {
+      "items": page["items"],
+      "next_cursor": page["nextCursor"],
+      "total": page["total"],
+    }
+  except KeyError as error:
+    raise HTTPException(404, "回测记录不存在") from error
+
+
+@app.post("/api/v1/backtests/{run_id}/cancel")
+def public_cancel_backtest(run_id: str, request: Request):
+  _require_public_scope(request, "backtest:cancel")
+  if not state_store.request_l2_backtest_cancel(run_id) and not state_store.request_bar_backtest_cancel(run_id):
+    raise HTTPException(404, "未找到可取消的回测任务")
+  return {"run_id": run_id, "status": "cancelling", "request_id": request.state.request_id}
 
 
 @app.post("/api/backtest/run")

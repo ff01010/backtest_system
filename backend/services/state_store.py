@@ -678,64 +678,154 @@ def _next_backtest_display_no(cur: Any, owner_user_id: str) -> int:
   return int(row["display_no"])
 
 
-def create_backtest_run(payload: dict[str, Any], status: str = "running") -> tuple[str, int]:
+def _create_backtest_run_row(
+  cur: Any,
+  payload: dict[str, Any],
+  status: str,
+  owner_user_id: str,
+) -> tuple[str, int]:
   config_id = payload.get("configId")
+  display_no = _next_backtest_display_no(cur, owner_user_id)
+  instrument_id = _instrument_id(cur, payload["symbol"])
+  benchmark_id = _instrument_id(cur, payload["benchmarkSymbol"]) if payload.get("benchmarkSymbol") else None
+  script_snapshot = payload.get("savedScriptSnapshot")
+  params_snapshot = payload.get("savedConfigSnapshot", {})
+  db_status = "running" if status == "running" else "queued"
+  cur.execute("""
+    INSERT INTO backtest_run (
+      id, owner_user_id, display_no, strategy_version_id, status, requested_params, market_data_snapshot,
+      started_at, config_id, config_version_id, account_id, instrument_id,
+      benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot, execution_kind
+    ) VALUES (
+      gen_random_uuid(), %s, %s, %s, %s, %s, %s,
+      CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+    ) RETURNING id, display_no
+  """, (owner_user_id, display_no, None, db_status, Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
+         config_id, None, payload.get("accountId"), instrument_id, benchmark_id,
+         payload.get("timeframe", "5m"), "bar_close_signal_fill", Jsonb(script_snapshot) if script_snapshot else None,
+         Jsonb(params_snapshot), payload.get("executionKind", "published")))
+  row = cur.fetchone()
+  return _uuid(row["id"]) or "", int(row["display_no"])
+
+
+def create_backtest_run(payload: dict[str, Any], status: str = "running") -> tuple[str, int]:
   owner_user_id = current_user_id()
   with _db() as conn:
     with conn.cursor() as cur:
-      display_no = _next_backtest_display_no(cur, owner_user_id)
-      instrument_id = _instrument_id(cur, payload["symbol"])
-      benchmark_id = _instrument_id(cur, payload["benchmarkSymbol"]) if payload.get("benchmarkSymbol") else None
-      script_snapshot = payload.get("savedScriptSnapshot")
-      params_snapshot = payload.get("savedConfigSnapshot", {})
-      db_status = "running" if status == "running" else "queued"
-      cur.execute("""
-        INSERT INTO backtest_run (
-          id, owner_user_id, display_no, strategy_version_id, status, requested_params, market_data_snapshot,
-          started_at, config_id, config_version_id, account_id, instrument_id,
-          benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot, execution_kind
-        ) VALUES (
-          gen_random_uuid(), %s, %s, %s, %s, %s, %s,
-          CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-        ) RETURNING id, display_no
-      """, (owner_user_id, display_no, None, db_status, Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
-             config_id, None, payload.get("accountId"), instrument_id, benchmark_id,
-             payload.get("timeframe", "5m"), "bar_close_signal_fill", Jsonb(script_snapshot) if script_snapshot else None,
-             Jsonb(params_snapshot), payload.get("executionKind", "published")))
-      row = cur.fetchone()
-      return _uuid(row["id"]) or "", int(row["display_no"])
+      return _create_backtest_run_row(cur, payload, status, owner_user_id)
+
+
+def _create_queued_backtest_job(
+  cur: Any,
+  payload: dict[str, Any],
+  owner_user_id: str,
+  job_table: str,
+  fill_model: str,
+) -> tuple[str, int]:
+  run_id, display_no = _create_backtest_run_row(cur, payload, "queued", owner_user_id)
+  cur.execute("UPDATE backtest_run SET fill_model=%s WHERE id=%s AND owner_user_id=%s", (
+    fill_model, run_id, owner_user_id,
+  ))
+  cur.execute(f"""
+    INSERT INTO {job_table} (run_id, owner_user_id, payload)
+    VALUES (%s, %s, %s)
+  """, (run_id, owner_user_id, Jsonb(payload)))
+  return run_id, display_no
 
 
 def create_l2_backtest_job(payload: dict[str, Any]) -> tuple[str, int]:
   """创建异步 L2 回测任务；PostgreSQL 是其唯一状态真源。"""
-  run_id, display_no = create_backtest_run(payload, status="queued")
   owner_user_id = current_user_id()
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("UPDATE backtest_run SET fill_model=%s WHERE id=%s AND owner_user_id=%s", (
-        "l2_quote", run_id, owner_user_id,
-      ))
-      cur.execute("""
-        INSERT INTO l2_backtest_job (run_id, owner_user_id, payload)
-        VALUES (%s, %s, %s)
-      """, (run_id, owner_user_id, Jsonb(payload)))
-  return run_id, display_no
+      return _create_queued_backtest_job(cur, payload, owner_user_id, "l2_backtest_job", "l2_quote")
 
 
 def create_bar_backtest_job(payload: dict[str, Any]) -> tuple[str, int]:
   """创建异步标准 Bar 回测任务；任务状态由 PostgreSQL 持久化。"""
-  run_id, display_no = create_backtest_run(payload, status="queued")
   owner_user_id = current_user_id()
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("UPDATE backtest_run SET fill_model=%s WHERE id=%s AND owner_user_id=%s", (
-        payload.get("fillModel", "bar_next_open"), run_id, owner_user_id,
-      ))
+      return _create_queued_backtest_job(
+        cur, payload, owner_user_id, "bar_backtest_job", payload.get("fillModel", "bar_next_open"),
+      )
+
+
+def create_api_backtest_job(
+  payload: dict[str, Any],
+  api_key_id: str,
+  idempotency_key: str,
+  request_hash: str,
+) -> tuple[str, int, bool, str, str]:
+  """在同一事务内处理 API 限额、幂等记录和回测任务创建。"""
+  owner_user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
       cur.execute("""
-        INSERT INTO bar_backtest_job (run_id, owner_user_id, payload)
-        VALUES (%s, %s, %s)
-      """, (run_id, owner_user_id, Jsonb(payload)))
-  return run_id, display_no
+        SELECT id FROM api_access_key
+        WHERE id=%s AND owner_user_id=%s AND revoked_at IS NULL
+          AND (expires_at IS NULL OR expires_at > now())
+        FOR UPDATE
+      """, (api_key_id, owner_user_id))
+      if cur.fetchone() is None:
+        raise KeyError("api_key")
+      cur.execute("""
+        SELECT request_hash, run_id FROM api_idempotency_record
+        WHERE api_key_id=%s AND idempotency_key=%s
+      """, (api_key_id, idempotency_key))
+      existing = cur.fetchone()
+      if existing:
+        if existing["request_hash"] != request_hash:
+          raise ConflictError("同一幂等键不能用于不同请求")
+        if existing["run_id"] is None:
+          raise DatabaseError("幂等请求尚未完成，请重试")
+        cur.execute("SELECT display_no, status, fill_model FROM backtest_run WHERE id=%s", (existing["run_id"],))
+        run = cur.fetchone()
+        if run is None:
+          raise DatabaseError("幂等请求关联的回测记录不存在")
+        return (
+          str(existing["run_id"]),
+          int(run["display_no"]),
+          True,
+          str(run["status"]),
+          str(run["fill_model"] or payload.get("fillModel", "bar_next_open")),
+        )
+      cur.execute("""
+        SELECT count(*) AS value
+        FROM api_idempotency_record record
+        JOIN backtest_run run ON run.id=record.run_id
+        WHERE record.api_key_id=%s AND run.status IN ('queued', 'running')
+      """, (api_key_id,))
+      if int(cur.fetchone()["value"]) >= settings.PUBLIC_API_MAX_INFLIGHT:
+        raise ValueError("API Key 正在排队或运行的回测已达上限")
+      cur.execute("""
+        SELECT count(*) AS value FROM api_idempotency_record
+        WHERE api_key_id=%s AND created_at >= current_date
+      """, (api_key_id,))
+      if int(cur.fetchone()["value"]) >= settings.PUBLIC_API_DAILY_SUBMIT_LIMIT:
+        raise ValueError("API Key 今日回测提交次数已达上限")
+      cur.execute("""
+        INSERT INTO api_idempotency_record (
+          api_key_id, owner_user_id, idempotency_key, request_hash
+        ) VALUES (%s, %s, %s, %s)
+      """, (api_key_id, owner_user_id, idempotency_key, request_hash))
+      if payload.get("fillModel") == "l2_quote":
+        run_id, display_no = _create_queued_backtest_job(
+          cur, payload, owner_user_id, "l2_backtest_job", "l2_quote",
+        )
+      else:
+        run_id, display_no = _create_queued_backtest_job(
+          cur, payload, owner_user_id, "bar_backtest_job", payload.get("fillModel", "bar_next_open"),
+        )
+      cur.execute("""
+        UPDATE api_idempotency_record SET run_id=%s
+        WHERE api_key_id=%s AND idempotency_key=%s
+      """, (run_id, api_key_id, idempotency_key))
+      cur.execute("""
+        INSERT INTO api_access_audit (api_key_id, owner_user_id, event_type, detail)
+        VALUES (%s, %s, 'backtest_submitted', %s)
+      """, (api_key_id, owner_user_id, Jsonb({"runId": run_id, "fillModel": payload.get("fillModel")})))
+      return run_id, display_no, False, "queued", str(payload.get("fillModel", "bar_next_open"))
 
 
 def _claim_fair_l2_job_row(cur: Any, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
@@ -970,11 +1060,25 @@ def _run_query(where: str = "") -> str:
   """
 
 
-def list_backtest_runs(limit: int = 30, config_id: str | None = None) -> list[dict[str, Any]]:
+def list_backtest_runs(
+  limit: int = 30,
+  config_id: str | None = None,
+  offset: int = 0,
+) -> list[dict[str, Any]]:
+  if offset < 0:
+    raise ValueError("分页偏移量无效")
   with _db() as conn:
     with conn.cursor() as cur:
-      query = _run_query("AND r.config_id=%s ORDER BY r.created_at DESC LIMIT %s") if config_id else _run_query("ORDER BY r.created_at DESC LIMIT %s")
-      params = (current_user_id(), config_id, limit) if config_id else (current_user_id(), limit)
+      query = (
+        _run_query("AND r.config_id=%s ORDER BY r.created_at DESC LIMIT %s OFFSET %s")
+        if config_id
+        else _run_query("ORDER BY r.created_at DESC LIMIT %s OFFSET %s")
+      )
+      params = (
+        (current_user_id(), config_id, limit, offset)
+        if config_id
+        else (current_user_id(), limit, offset)
+      )
       cur.execute(query, params)
       return [_normalize_run(row) for row in cur.fetchall()]
 
@@ -987,6 +1091,47 @@ def get_backtest_run(run_id: str) -> dict[str, Any]:
       if not row:
         raise KeyError(run_id)
       return _normalize_run(row)
+
+
+def get_backtest_result_page(
+  run_id: str,
+  result_key: str,
+  cursor: int,
+  limit: int,
+) -> dict[str, Any]:
+  """分页读取已完成任务的不可变结果快照，避免开放 API 返回超大 JSON。"""
+  if cursor < 0 or limit < 1 or limit > 200:
+    raise ValueError("分页参数无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT result_json FROM backtest_run
+        WHERE id=%s AND owner_user_id=%s
+      """, (run_id, current_user_id()))
+      row = cur.fetchone()
+      if not row:
+        raise KeyError(run_id)
+      result = _json(row["result_json"], {})
+      if not isinstance(result, dict):
+        result = {}
+      if result_key == "signals":
+        items = [
+          {"type": "execution_plan", **item}
+          for item in result.get("executionPlans", []) if isinstance(item, dict)
+        ] + [
+          {"type": "skipped_signal", **item}
+          for item in result.get("skippedSignals", []) if isinstance(item, dict)
+        ]
+        items.sort(key=lambda item: str(item.get("signalTime") or item.get("time") or ""))
+      else:
+        items = [item for item in result.get("trades", []) if isinstance(item, dict)]
+      page = items[cursor:cursor + limit]
+      next_cursor = cursor + len(page)
+      return {
+        "items": page,
+        "nextCursor": str(next_cursor) if next_cursor < len(items) else None,
+        "total": len(items),
+      }
 
 
 def list_system_error_logs(
