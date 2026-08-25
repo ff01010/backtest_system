@@ -3,6 +3,7 @@
 
 import base64
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
@@ -12,6 +13,7 @@ from typing import Any, Iterator
 import psycopg
 from psycopg.errors import IntegrityError
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from backend import settings
 from backend.services import state_store
@@ -22,6 +24,7 @@ from backend.time_utils import format_shanghai_datetime
 SESSION_COOKIE = "quant_backtest_session"
 SESSION_LIFETIME = timedelta(hours=12)
 PASSWORD_ITERATIONS = 210_000
+API_KEY_SCOPES = {"backtest:submit", "backtest:read", "backtest:cancel"}
 
 
 class AuthenticationError(RuntimeError):
@@ -30,6 +33,19 @@ class AuthenticationError(RuntimeError):
 
 class UserManagementError(RuntimeError):
   """人员管理操作不满足约束。"""
+
+
+class ApiKeyError(RuntimeError):
+  """API Key 创建或校验不满足约束。"""
+
+
+@dataclass(frozen=True)
+class ApiKeyPrincipal:
+  """已验证 API Key 的最小调用主体。"""
+
+  id: str
+  owner_user_id: str
+  scopes: frozenset[str]
 
 
 def _b64encode(value: bytes) -> str:
@@ -97,6 +113,161 @@ def _to_current_user(row: dict[str, Any]) -> CurrentUser:
     display_name=row["display_name"],
     role=row["role"],
   )
+
+
+def _api_key_hash(secret: str) -> str:
+  if len(settings.API_KEY_PEPPER) < 32:
+    raise ApiKeyError("开放 API 尚未配置密钥保护")
+  return hmac.new(
+    settings.API_KEY_PEPPER.encode("utf-8"), secret.encode("utf-8"), hashlib.sha256,
+  ).hexdigest()
+
+
+def _parse_api_key(value: str | None) -> tuple[str, str] | None:
+  if not value or not value.startswith("qbk_"):
+    return None
+  parts = value.split("_", 2)
+  if len(parts) != 3 or len(parts[1]) != 12 or len(parts[2]) < 40:
+    return None
+  return parts[1], parts[2]
+
+
+def _normalize_api_key(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "id": str(row["id"]),
+    "name": row["name"],
+    "prefix": f"qbk_{row['key_prefix']}",
+    "scopes": list(_json_scopes(row["scopes"])),
+    "expiresAt": format_shanghai_datetime(row["expires_at"]) or None,
+    "revokedAt": format_shanghai_datetime(row["revoked_at"]) or None,
+    "lastUsedAt": format_shanghai_datetime(row["last_used_at"]) or None,
+    "createdAt": format_shanghai_datetime(row["created_at"]),
+  }
+
+
+def _json_scopes(value: Any) -> tuple[str, ...]:
+  if not isinstance(value, list):
+    return ()
+  return tuple(item for item in value if isinstance(item, str) and item in API_KEY_SCOPES)
+
+
+def _audit_api_key(
+  cur: psycopg.Cursor[Any],
+  key_id: str | None,
+  owner_user_id: str,
+  event_type: str,
+  detail: dict[str, Any] | None = None,
+) -> None:
+  cur.execute("""
+    INSERT INTO api_access_audit (api_key_id, owner_user_id, event_type, detail)
+    VALUES (%s, %s, %s, %s)
+  """, (key_id, owner_user_id, event_type, Jsonb(detail or {})))
+
+
+def create_api_key(
+  owner_user_id: str,
+  name: str,
+  scopes: list[str],
+  expires_at: datetime | None,
+) -> tuple[dict[str, Any], str]:
+  """创建仅展示一次的 API Key，数据库只保存随机 secret 的 HMAC 摘要。"""
+  normalized_name = name.strip()
+  normalized_scopes = sorted(set(scopes))
+  if not normalized_name or len(normalized_name) > 80:
+    raise ApiKeyError("API Key 名称长度必须在 1 至 80 之间")
+  if not normalized_scopes or any(scope not in API_KEY_SCOPES for scope in normalized_scopes):
+    raise ApiKeyError("API Key 权限范围无效")
+  if expires_at and expires_at <= datetime.now(timezone.utc):
+    raise ApiKeyError("API Key 过期时间必须晚于当前时间")
+  secret = secrets.token_urlsafe(36)
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      for _ in range(3):
+        prefix = secrets.token_hex(6)
+        try:
+          cur.execute("""
+            INSERT INTO api_access_key (
+              owner_user_id, name, key_prefix, secret_hash, scopes, expires_at
+            ) VALUES (%s, %s, %s, %s, %s, %s) RETURNING *
+          """, (owner_user_id, normalized_name, prefix, _api_key_hash(secret),
+                Jsonb(normalized_scopes), expires_at))
+          row = cur.fetchone()
+          _audit_api_key(cur, str(row["id"]), owner_user_id, "created", {"scopes": normalized_scopes})
+          return _normalize_api_key(row), f"qbk_{prefix}_{secret}"
+        except IntegrityError:
+          continue
+  raise ApiKeyError("API Key 创建冲突，请重试")
+
+
+def list_api_keys(owner_user_id: str) -> list[dict[str, Any]]:
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT * FROM api_access_key WHERE owner_user_id=%s
+        ORDER BY created_at DESC, id DESC
+      """, (owner_user_id,))
+      return [_normalize_api_key(row) for row in cur.fetchall()]
+
+
+def revoke_api_key(owner_user_id: str, key_id: str) -> bool:
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE api_access_key SET revoked_at=COALESCE(revoked_at, now()), updated_at=now()
+        WHERE id=%s AND owner_user_id=%s RETURNING id
+      """, (key_id, owner_user_id))
+      row = cur.fetchone()
+      if not row:
+        return False
+      _audit_api_key(cur, str(row["id"]), owner_user_id, "revoked")
+      return True
+
+
+def get_api_key_principal(value: str | None) -> tuple[CurrentUser, ApiKeyPrincipal] | None:
+  """解析 Bearer Key；调用方只得到所属用户与固定权限，不继承管理员权限。"""
+  parsed = _parse_api_key(value)
+  if not parsed:
+    return None
+  prefix, secret = parsed
+  try:
+    secret_hash = _api_key_hash(secret)
+  except ApiKeyError:
+    return None
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT
+          key.id AS api_key_id,
+          key.owner_user_id,
+          key.scopes,
+          u.id AS user_id,
+          u.username,
+          u.display_name,
+          u.role
+        FROM api_access_key key
+        JOIN app_user u ON u.id=key.owner_user_id
+        WHERE key.key_prefix=%s AND key.secret_hash=%s
+          AND key.revoked_at IS NULL
+          AND (key.expires_at IS NULL OR key.expires_at > now())
+          AND u.status='active'
+      """, (prefix, secret_hash))
+      row = cur.fetchone()
+      if not row:
+        return None
+      cur.execute("""
+        UPDATE api_access_key SET last_used_at=now(), updated_at=now()
+        WHERE id=%s AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
+      """, (row["api_key_id"],))
+      scopes = frozenset(_json_scopes(row["scopes"]))
+      user = CurrentUser(
+        id=str(row["user_id"]),
+        username=row["username"],
+        display_name=row["display_name"],
+        role=row["role"],
+      )
+      return user, ApiKeyPrincipal(
+        id=str(row["api_key_id"]), owner_user_id=str(row["owner_user_id"]), scopes=scopes,
+      )
 
 
 def authenticate(username: str, password: str, client_ip: str | None, user_agent: str | None) -> tuple[str, CurrentUser]:

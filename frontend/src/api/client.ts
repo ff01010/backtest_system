@@ -66,6 +66,17 @@ export interface SessionUser {
   role: 'admin' | 'user';
 }
 
+export interface ApiAccessKey {
+  id: string;
+  name: string;
+  prefix: string;
+  scopes: Array<'backtest:submit' | 'backtest:read' | 'backtest:cancel'>;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  lastUsedAt: string | null;
+  createdAt: string;
+}
+
 export interface ManagedUser extends SessionUser {
   status: 'active' | 'disabled';
   createdAt: string;
@@ -112,6 +123,27 @@ export async function fetchCurrentUser(): Promise<SessionUser> {
 
 export async function logout(): Promise<void> {
   await sendJson<{ ok: boolean }>(`${BASE}/auth/logout`, 'POST', {});
+}
+
+export async function fetchApiKeys(): Promise<ApiAccessKey[]> {
+  const data = await fetchJson<{ keys: ApiAccessKey[] }>(`${BASE}/api-keys`);
+  return data.keys;
+}
+
+export async function createApiKey(payload: {
+  name: string;
+  scopes: ApiAccessKey['scopes'];
+  expiresAt: string | null;
+}): Promise<{ key: ApiAccessKey; plainTextKey: string }> {
+  return sendJson<{ key: ApiAccessKey; plainTextKey: string }>(`${BASE}/api-keys`, 'POST', payload);
+}
+
+export async function revokeApiKey(keyId: string): Promise<void> {
+  const response = await fetch(`${BASE}/api-keys/${encodeURIComponent(keyId)}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  if (!response.ok) throw new Error(`API ${response.status}: ${await response.text()}`);
 }
 
 export async function fetchUsers(): Promise<ManagedUser[]> {

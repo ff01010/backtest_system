@@ -81,6 +81,18 @@ def default_fee_profile() -> dict[str, float]:
 # 当前部署尚未配置 HTTPS，默认关闭 Secure 以保证同源 HTTP 登录可用。
 AUTH_COOKIE_SECURE = os.getenv("TREND_GRID_AUTH_COOKIE_SECURE", "false").lower() == "true"
 
+# 对外回测 API 默认关闭。启用后必须配置私有 pepper，避免仅用数据库摘要保护 API Key。
+PUBLIC_API_ENABLED = os.getenv("TREND_GRID_PUBLIC_API_ENABLED", "false").lower() == "true"
+API_KEY_PEPPER = os.getenv("TREND_GRID_API_KEY_PEPPER", "")
+PUBLIC_API_MAX_INFLIGHT = _read_bounded_int("TREND_GRID_PUBLIC_API_MAX_INFLIGHT", 2, 1, 20)
+PUBLIC_API_DAILY_SUBMIT_LIMIT = _read_bounded_int("TREND_GRID_PUBLIC_API_DAILY_SUBMIT_LIMIT", 100, 1, 10_000)
+
+
+def validate_public_api_configuration() -> None:
+  """开放 API 启用时，拒绝在缺少密钥摘要 pepper 的环境中启动。"""
+  if PUBLIC_API_ENABLED and len(API_KEY_PEPPER) < 32:
+    raise ValueError("启用开放 API 时必须设置长度不少于 32 的 TREND_GRID_API_KEY_PEPPER")
+
 
 def resolve_kline_path(symbol: str, timeframe: str, date: str | None = None) -> str | None:
   """根据标的和周期解析 K 线文件路径, 不存在返回 None
