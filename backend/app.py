@@ -200,6 +200,10 @@ _EXPERIMENT_PARAM_KEYS = {
   "initialCapital",
   "commissionRate",
   "slippage",
+  "executionAlgorithm",
+  "twapDurationSeconds",
+  "twapIntervalSeconds",
+  "twapMinChildQuantity",
 }
 
 
