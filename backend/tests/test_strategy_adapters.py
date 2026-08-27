@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from backend import app as api_app
 from backend import schemas
-from backend.services import backtest_runner
+from backend.services import backtest_preflight, backtest_runner
 from backend.services import state_store
 from backend.services import strategy_adapters
 from shared.cost import buy_net, sell_net
@@ -182,6 +182,7 @@ def test_backtest_requires_saved_strategy_params(monkeypatch: pytest.MonkeyPatch
   from backend.services import bar_data
   monkeypatch.setattr(bar_data, "ensure_available", lambda *args: {"hash": args[0], "provider": "qmt_kline"})
   monkeypatch.setattr(api_app.data_repository, "validate_backtest_coverage", lambda *args: None)
+  monkeypatch.setattr(backtest_preflight, "require_available", lambda *_: {"barSnapshot": {"provider": "qmt_kline"}})
   request = {
     "configId": "00000000-0000-0000-0000-000000000003",
     "configVersionId": None,

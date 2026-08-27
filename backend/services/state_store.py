@@ -2,7 +2,7 @@
 """PostgreSQL 状态仓储：仅访问规范表，不在应用启动时建表。"""
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
@@ -74,12 +74,112 @@ def ensure_schema() -> None:
         raise DatabaseError("数据库迁移尚未执行，请先运行 deploy 的 migrate 服务")
 
 
+def replace_trade_calendar(
+  exchange: str, start_date: str, end_date: str, open_dates: list[str], source: str,
+) -> None:
+  """按自然日覆盖写入交易日历，确保区间内开市和休市状态都可判定。"""
+  start = date.fromisoformat(start_date)
+  end = date.fromisoformat(end_date)
+  all_dates = [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
+  open_set = set(open_dates)
+  rows = [(exchange, value, value.isoformat() in open_set, source) for value in all_dates]
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.executemany("""
+        INSERT INTO market_trade_calendar (exchange, trade_date, is_open, source)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (exchange, trade_date) DO UPDATE SET
+          is_open=EXCLUDED.is_open, source=EXCLUDED.source, updated_at=now()
+      """, rows)
+
+
+def list_open_trade_dates(start_date: str, end_date: str, exchange: str = "SSE") -> list[str]:
+  """返回指定交易所的开市日期。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT trade_date
+        FROM market_trade_calendar
+        WHERE exchange=%s AND trade_date BETWEEN %s AND %s AND is_open=true
+        ORDER BY trade_date
+      """, (exchange, start_date, end_date))
+      return [str(row["trade_date"]) for row in cur.fetchall()]
+
+
+def is_trade_calendar_range_covered(start_date: str, end_date: str, exchange: str = "SSE") -> bool:
+  """仅当每个自然日都有日历记录时才允许预检使用该区间。"""
+  start = date.fromisoformat(start_date)
+  end = date.fromisoformat(end_date)
+  expected_count = (end - start).days + 1
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT count(*) AS date_count
+        FROM market_trade_calendar
+        WHERE exchange=%s AND trade_date BETWEEN %s AND %s
+      """, (exchange, start_date, end_date))
+      row = cur.fetchone()
+      return int(row["date_count"] or 0) == expected_count
+
+
 def _to_float(value: Any) -> float | None:
   if value is None:
     return None
   if isinstance(value, Decimal):
     return float(value)
   return float(value)
+
+def list_l2_quote_daily_availability(
+  source_key: str, symbol: str, trade_dates: list[str],
+) -> dict[str, dict[str, Any]]:
+  """读取日级十档可用性摘要；未命中日期由调用方补齐。"""
+  dates = sorted(set(trade_dates))
+  if not dates:
+    return {}
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT trade_date, status, snapshot_count, first_quote_time, last_quote_time
+        FROM l2_quote_daily_availability
+        WHERE source_key=%s AND symbol=%s AND trade_date = ANY(%s::date[])
+      """, (source_key, symbol, dates))
+      return {
+        str(row["trade_date"]): {
+          "status": str(row["status"]),
+          "snapshotCount": int(row["snapshot_count"]),
+          "firstQuoteTime": str(row["first_quote_time"] or ""),
+          "lastQuoteTime": str(row["last_quote_time"] or ""),
+        }
+        for row in cur.fetchall()
+      }
+
+
+def upsert_l2_quote_daily_availability(
+  source_key: str, symbol: str, records: list[dict[str, Any]],
+) -> None:
+  """写入按标的、交易日和数据源版本隔离的十档摘要。"""
+  if not records:
+    return
+  rows = [
+    (
+      source_key, symbol, item["tradeDate"], item["status"], int(item.get("snapshotCount") or 0),
+      str(item.get("firstQuoteTime") or "") or None, str(item.get("lastQuoteTime") or "") or None,
+    )
+    for item in records
+  ]
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.executemany("""
+        INSERT INTO l2_quote_daily_availability (
+          source_key, symbol, trade_date, status, snapshot_count, first_quote_time, last_quote_time
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (source_key, symbol, trade_date) DO UPDATE SET
+          status=EXCLUDED.status,
+          snapshot_count=EXCLUDED.snapshot_count,
+          first_quote_time=EXCLUDED.first_quote_time,
+          last_quote_time=EXCLUDED.last_quote_time,
+          checked_at=now()
+      """, rows)
 
 
 def _format_time(value: Any) -> str:
@@ -433,39 +533,47 @@ def _insert_script_version(cur: Any, script_id: str, version_no: int, payload: d
          current_user_id()))
 
 
+def _write_strategy_script(cur: Any, script_id: str | None, payload: dict[str, Any]) -> str:
+  if script_id is None:
+    cur.execute("""
+      INSERT INTO user_strategy (id, owner_user_id, name, description, strategy_type, status)
+      VALUES (gen_random_uuid(), %s, %s, %s, 'python', 'active') RETURNING id
+    """, (current_user_id(), payload["name"], payload.get("description", "")))
+    saved_id = _uuid(cur.fetchone()["id"]) or ""
+    _insert_script_version(cur, saved_id, 1, payload)
+    return saved_id
+  cur.execute("SELECT current_version_no FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, current_user_id()))
+  row = cur.fetchone()
+  if not row:
+    raise KeyError(script_id)
+  cur.execute("""
+    UPDATE user_strategy SET name=%s, description=%s, updated_at=now()
+    WHERE id=%s AND owner_user_id=%s
+  """, (payload["name"], payload.get("description", ""), script_id, current_user_id()))
+  cur.execute("""
+    UPDATE user_strategy_version SET source_code=%s, source_checksum=%s, runtime_config=%s
+    WHERE strategy_id=%s AND version_no=%s
+  """, (
+    payload["code"], hashlib.sha256(payload["code"].encode("utf-8")).hexdigest(),
+    Jsonb({"entryType": payload.get("entryType", "on_bar"), "status": "active"}),
+    script_id, int(row["current_version_no"]),
+  ))
+  if cur.rowcount == 0:
+    _insert_script_version(cur, script_id, int(row["current_version_no"]), payload)
+  return script_id
+
+
 def create_strategy_script(payload: dict[str, Any]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        INSERT INTO user_strategy (id, owner_user_id, name, description, strategy_type, status)
-        VALUES (gen_random_uuid(), %s, %s, %s, 'python', 'active') RETURNING id
-      """, (current_user_id(), payload["name"], payload.get("description", "")))
-      script_id = _uuid(cur.fetchone()["id"])
-      _insert_script_version(cur, script_id or "", 1, payload)
-  return get_strategy_script(script_id or "")
+      script_id = _write_strategy_script(cur, None, payload)
+  return get_strategy_script(script_id)
 
 
 def update_strategy_script(script_id: str, payload: dict[str, Any]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("SELECT current_version_no FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, current_user_id()))
-      row = cur.fetchone()
-      if not row:
-        raise KeyError(script_id)
-      cur.execute("""
-        UPDATE user_strategy SET name=%s, description=%s, updated_at=now()
-        WHERE id=%s AND owner_user_id=%s
-      """, (payload["name"], payload.get("description", ""), script_id, current_user_id()))
-      cur.execute("""
-        UPDATE user_strategy_version SET source_code=%s, source_checksum=%s, runtime_config=%s
-        WHERE strategy_id=%s AND version_no=%s
-      """, (
-        payload["code"], hashlib.sha256(payload["code"].encode("utf-8")).hexdigest(),
-        Jsonb({"entryType": payload.get("entryType", "on_bar"), "status": "active"}),
-        script_id, int(row["current_version_no"]),
-      ))
-      if cur.rowcount == 0:
-        _insert_script_version(cur, script_id, int(row["current_version_no"]), payload)
+      _write_strategy_script(cur, script_id, payload)
   return get_strategy_script(script_id)
 
 
@@ -572,6 +680,20 @@ def update_strategy_config(config_id: str, payload: dict[str, Any]) -> dict[str,
   return get_strategy_config(config_id)
 
 
+
+def save_complete_strategy(
+  script_payload: dict[str, Any], config_payload: dict[str, Any], script_id: str | None, config_id: str | None,
+) -> dict[str, dict[str, Any]]:
+  """在同一事务中保存脚本与完整回测策略，避免预检通过后出现半完成数据。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      saved_script_id = _write_strategy_script(cur, script_id, script_payload)
+      config = {**config_payload, "scriptId": saved_script_id}
+      saved_config_id = _write_config(cur, config_id, config)
+  return {
+    "script": get_strategy_script(saved_script_id),
+    "config": get_strategy_config(saved_config_id),
+  }
 def _version_fingerprint(snapshot: dict[str, Any]) -> str:
   return hashlib.sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 

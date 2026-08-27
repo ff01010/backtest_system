@@ -51,16 +51,9 @@ def test_quote_prefetch_size_has_safe_bounds(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_l2_strategy_config_accepts_derived_l2_timeframe() -> None:
-  app._validate_strategy_config_timeframe({
-    "timeframe": "3m",
-    "paramsJson": {"params": {"fillModel": "l2_quote"}},
-  })
-
-  with pytest.raises(app.HTTPException, match="当前回测引擎不支持 3m"):
-    app._validate_strategy_config_timeframe({
-      "timeframe": "3m",
-      "paramsJson": {"params": {"fillModel": "bar_close"}},
-    })
+  assert settings.validate_l2_backtest_timeframe("3m")
+  assert settings.validate_backtest_timeframe("3m")
+  assert not settings.validate_l2_backtest_timeframe("2m")
 
 
 def test_backtest_timeframe_availability_uses_database_cache(monkeypatch: pytest.MonkeyPatch) -> None:

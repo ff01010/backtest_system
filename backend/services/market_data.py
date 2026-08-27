@@ -59,6 +59,11 @@ def timeframe_status(symbol: str, start_date: str | None, end_date: str | None) 
   return items
 
 
+def coverage_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> list[dict[str, str]]:
+  """公开给回测预检服务的轻量覆盖记录查询。"""
+  return _coverage_status(symbol, timeframe, start_date, end_date)
+
+
 def list_dates(symbol: str, timeframe: str) -> list[dict[str, Any]]:
   """返回已经导入且覆盖完整的 QMT 交易日。"""
   _validate_symbol(symbol)

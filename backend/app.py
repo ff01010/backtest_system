@@ -34,6 +34,7 @@ from backend.time_utils import format_epoch_as_shanghai
 from backend.strategies.catalog import get_strategy_source_snapshot
 from backend.strategies.scripted import validate_script_code
 from backend.services import (
+  backtest_preflight,
   backtest_runner,
   market_data,
   qmt_instrument_directory,
@@ -379,14 +380,32 @@ def _validate_backtest_request(request: dict) -> None:
     request["fillModel"] = "l2_quote"
     request["feeProfile"] = settings.default_fee_profile()
     request["commissionRate"] = request["feeProfile"]["commissionRate"]
+    _require_preflight(request)
     return
 
   request["fillModel"] = "bar_next_open"
   request["feeProfile"] = settings.default_fee_profile()
   request["commissionRate"] = request["feeProfile"]["commissionRate"]
+  _require_preflight(request)
 
-  # 标准 Bar 改由后台 Runner 加载并校验数据，避免长区间读取占用 HTTP 请求。
-  request["marketDataSnapshot"] = {}
+
+def _require_preflight(request: dict[str, Any]) -> None:
+  try:
+    snapshot = backtest_preflight.require_available(
+      str(request["symbol"]), str(request["timeframe"]), str(request["startDate"]),
+      str(request["endDate"]), str(request.get("fillModel", "bar_next_open")),
+    )
+  except backtest_preflight.PreflightError as error:
+    raise HTTPException(422, {"errorDetail": _preflight_error_detail(error.result)}) from error
+  request["marketDataSnapshot"] = snapshot
+
+
+def _preflight_error_detail(result: dict[str, Any]) -> dict[str, Any]:
+  codes = list(result.get("missingDataTypes") or [])
+  return {"category": "data", "code": codes[0] if codes else "data.unavailable",
+          "message": result.get("message") or "当前日期范围数据不完整。",
+          "hint": "请调整日期范围或补齐数据后重试。", "retryable": False,
+          "taskId": None, "missingDates": result.get("missingDates") or []}
 
 
 _PUBLIC_OVERRIDE_MAP = {
@@ -853,6 +872,28 @@ def update_strategy_config(config_id: str, payload: schemas.StrategyConfigUpdate
     raise HTTPException(500, f"PostgreSQL 更新策略配置失败: {e}")
 
 
+@app.post("/api/complete-strategies")
+def save_complete_strategy(payload: schemas.CompleteStrategySave):
+  script_request = _model_dump(payload.script)
+  config_request = _model_dump(payload.config)
+  _validate_strategy_script(script_request)
+  if not settings.validate_symbol(config_request["symbol"]):
+    raise HTTPException(422, f"非法标的: {config_request['symbol']}")
+  if config_request.get("benchmarkSymbol") and not settings.validate_symbol(config_request["benchmarkSymbol"]):
+    raise HTTPException(422, f"非法买入持有基准: {config_request['benchmarkSymbol']}")
+  _validate_strategy_config_timeframe(config_request)
+  try:
+    return state_store.save_complete_strategy(
+      script_request, config_request, payload.scriptId, payload.configId,
+    )
+  except KeyError as error:
+    raise HTTPException(404, "策略脚本或策略配置不存在") from error
+  except state_store.ConflictError:
+    raise HTTPException(409, f"策略名称已存在: {payload.script.name}")
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"PostgreSQL 保存完整策略失败: {error}") from error
+
+
 def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
   """策略方案按保存的成交模式使用对应的周期白名单。"""
   params_json = request.get("paramsJson")
@@ -870,6 +911,14 @@ def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
   if not supported:
     engine_name = "L2 回测" if fill_model == "l2_quote" else "当前回测引擎"
     raise HTTPException(422, f"{engine_name}不支持 {timeframe}")
+  if not isinstance(params, dict) or not params.get("startDate") or not params.get("endDate"):
+    raise HTTPException(422, "完整策略必须包含回测开始日期和结束日期")
+  try:
+    backtest_preflight.require_available(
+      str(request["symbol"]), timeframe, str(params["startDate"]), str(params["endDate"]), str(fill_model),
+    )
+  except backtest_preflight.PreflightError as error:
+    raise HTTPException(422, {"errorDetail": _preflight_error_detail(error.result)}) from error
 
 
 @app.post("/api/strategy-configs/{config_id}/publish")
@@ -976,6 +1025,21 @@ def backtest_timeframes(
     except TradingDateError as error:
       raise HTTPException(422, str(error)) from error
   return {"timeframes": data_repository.get_backtest_timeframes(symbol, start_date, end_date)}
+
+
+@app.get("/api/backtest/preflight")
+def backtest_preflight_check(
+  symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
+  timeframe: str = Query(...),
+  start_date: str = Query(..., alias="startDate"),
+  end_date: str = Query(..., alias="endDate"),
+  fill_model: str = Query("bar_next_open", alias="fillModel"),
+):
+  try:
+    start_date, end_date = normalize_date_range(start_date, end_date)
+    return backtest_preflight.preview(symbol, start_date, end_date, fill_model, timeframe)
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
 
 
 @app.get("/api/backtest/timeframes/batch")

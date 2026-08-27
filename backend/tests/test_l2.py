@@ -297,10 +297,10 @@ def test_l2_quote_coverage_error_has_safe_data_message() -> None:
   detail = error_detail(error)
   classification = classify_system_error(error)
 
-  assert detail.category == "system_error"
+  assert detail.category == "data"
   assert detail.code == "l2.quote_coverage_missing"
   assert detail.retryable is False
-  assert detail.message == "688126.SH 缺少 L2 盘口数据：2025-04-10。"
+  assert detail.message == "当前日期范围缺少 L2 十档快照。"
   assert classification.category == "data"
   assert classification.retryable is False
 

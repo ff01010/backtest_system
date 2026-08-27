@@ -87,6 +87,11 @@ def _temporary_provider() -> TemporaryQuoteBarProvider:
   )
 
 
+def derived_bar_available_dates(symbol: str, timeframe: str, trade_dates: list[str]) -> list[str]:
+  """按日判断 Redis 聚合缓存或原始 L2 快照是否可生成 Bar。"""
+  return _temporary_provider().available_bar_dates(symbol, trade_dates, timeframe)
+
+
 def _normalized_frame(bars: list[Any]) -> pd.DataFrame:
   rows = [{
     "time": _bar_time(item.end_time),
