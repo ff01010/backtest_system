@@ -120,7 +120,7 @@ def error_detail(error: Exception, task_id: str | None = None) -> BacktestErrorD
     return error.detail.with_task_id(task_id or error.detail.task_id)
   classified = classify_system_error(error)
   return BacktestErrorDetail(
-    "system_error", classified.code, classified.public_message,
+    "data" if classified.category == "data" else "system_error", classified.code, classified.public_message,
     classified.public_hint, retryable=classified.retryable, task_id=task_id,
   )
 

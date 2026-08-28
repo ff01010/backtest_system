@@ -291,7 +291,7 @@ export async function runBacktest(payload: BacktestRunPayload): Promise<Backtest
     const detail = response && typeof response === 'object'
       ? (response as { detail?: { errorDetail?: BacktestErrorDetail } }).detail?.errorDetail
       : undefined;
-    if (detail && (detail.category === 'strategy_error' || detail.category === 'system_error')) {
+    if (detail && (detail.category === 'strategy_error' || detail.category === 'system_error' || detail.category === 'data')) {
       throw new BacktestRequestError(detail);
     }
     if (res.status === 422) {
@@ -394,6 +394,29 @@ export interface BacktestTimeframeAvailability {
   reason: string;
   dataStart: string | null;
   dataEnd: string | null;
+}
+
+export interface BacktestPreflightResponse {
+  symbol: string;
+  startDate: string;
+  endDate: string;
+  fillModel: 'bar_next_open' | 'l2_quote';
+  calendarDays: Array<{
+    date: string;
+    tradingDay: boolean;
+    status: 'available' | 'incomplete' | 'future' | 'non_trading' | 'unknown';
+    missingDataTypes: string[];
+  }>;
+  missingDates: string[];
+  timeframes: Array<BacktestTimeframeAvailability & {
+    missingDataTypes: string[];
+    missingDates: string[];
+  }>;
+}
+
+export async function fetchBacktestPreflight(symbol: string, timeframe: string, startDate: string, endDate: string, fillModel: 'bar_next_open' | 'l2_quote'): Promise<BacktestPreflightResponse> {
+  const search = new URLSearchParams({ symbol, timeframe, startDate, endDate, fillModel });
+  return fetchJson<BacktestPreflightResponse>(`${BASE}/backtest/preflight?${search.toString()}`);
 }
 
 export async function fetchBacktestTimeframes(
@@ -505,6 +528,19 @@ export async function updateStrategyConfig(
     payload
   );
   return data.config;
+}
+
+export async function saveCompleteStrategy(
+  script: StrategyScriptPayload,
+  config: StrategyConfigPayload,
+  scriptId: string | null,
+  configId: string | null,
+): Promise<{ script: StrategyScript; config: StrategyConfig }> {
+  return sendJson<{ script: StrategyScript; config: StrategyConfig }>(
+    `${BASE}/complete-strategies`,
+    'POST',
+    { script, config, scriptId, configId },
+  );
 }
 
 export async function publishStrategyConfig(

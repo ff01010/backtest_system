@@ -52,6 +52,9 @@ def test_public_request_only_overrides_allowed_runtime_fields(monkeypatch: pytes
     "code": "def on_bar(bar, state):\n  return []\n",
     "entryType": "on_bar",
   })
+  monkeypatch.setattr(
+    api_app.backtest_preflight, "require_available", lambda *_: {"barSnapshot": {"provider": "test"}},
+  )
   payload = schemas.PublicBacktestCreateRequest(
     config_id=str(config["id"]),
     overrides={"start_date": "2026-06-02", "initial_capital": 200_000},

@@ -15,7 +15,6 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createAccount,
   cancelBacktestRun,
-  createStrategyConfig,
   createStrategyScript,
   deleteStrategyConfig,
   deleteStrategyScript,
@@ -23,6 +22,7 @@ import {
   fetchBacktestRuns,
   fetchBacktestRun,
   fetchBacktestTimeframes,
+  fetchBacktestPreflight,
   fetchDataStatus,
   fetchStrategyParameterSchema,
   fetchStrategySource,
@@ -30,8 +30,8 @@ import {
   fetchStrategyScripts,
   BacktestRequestError,
   runBacktest,
+  saveCompleteStrategy,
   updateBacktestRunMeta,
-  updateStrategyConfig,
   updateStrategyScript,
 } from '../api/client';
 import type { BacktestRunPayload, BacktestTimeframeAvailability } from '../api/client';
@@ -56,6 +56,7 @@ import BacktestTabs from './BacktestTabs';
 import InstrumentSearchField from './InstrumentSearchField';
 import StrategyGuideDrawer from './StrategyGuideDrawer';
 
+import BacktestDateRangePicker from './BacktestDateRangePicker';
 interface Props {
   symbol: string;
   strategy: string;
@@ -280,6 +281,14 @@ function isValidDate(value: string) {
 function normalizeFillModel(value: unknown): 'bar_next_open' | 'l2_quote' {
   return value === 'l2_quote' ? 'l2_quote' : 'bar_next_open';
 }
+
+function calendarMonthRange(month: string): { startDate: string; endDate: string } {
+  const start = new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)) - 1, 1);
+  const end = new Date(start.getFullYear(), start.getMonth() + 1, 0);
+  const format = (value: Date): string => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+  return { startDate: format(start), endDate: format(end) };
+}
+
 
 export function normalizeApiDate(value: string) {
   return /^\d{8}$/.test(value) ? `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}` : value;
@@ -911,6 +920,8 @@ export default function BacktestPage({
   const [selectedTimeframe, setSelectedTimeframe] = useState('5m');
   const [backtestTimeframes, setBacktestTimeframes] = useState<BacktestTimeframeAvailability[]>([]);
   const [selectedBenchmarkSymbol, setSelectedBenchmarkSymbol] = useState(symbol);
+  const [preflight, setPreflight] = useState<Awaited<ReturnType<typeof fetchBacktestPreflight>> | null>(null);
+  const [preflightNotice, setPreflightNotice] = useState('');
   const [selectedStrategy, setSelectedStrategy] = useState('user_script');
   const [selectedAccountId, setSelectedAccountId] = useState<number | ''>('');
   const [newAccountName, setNewAccountName] = useState('');
@@ -928,6 +939,8 @@ export default function BacktestPage({
   const [loadingDataStatus, setLoadingDataStatus] = useState(false);
   const [loadingBenchmarkDataStatus, setLoadingBenchmarkDataStatus] = useState(false);
   const [params, setParams] = useState<BacktestParams>(DEFAULT_PARAMS);
+  const [calendarMonth, setCalendarMonth] = useState(DEFAULT_PARAMS.startDate.slice(0, 7));
+  const [calendarPreflight, setCalendarPreflight] = useState<Awaited<ReturnType<typeof fetchBacktestPreflight>> | null>(null);
   const [strategyParameterSchema, setStrategyParameterSchema] = useState<StrategyParameterSchema | null>(null);
   const [strategySchemaError, setStrategySchemaError] = useState('');
   const [loadingStrategySchema, setLoadingStrategySchema] = useState(false);
@@ -1115,8 +1128,34 @@ export default function BacktestPage({
   }, [params.startDate, params.endDate, selectedSymbol]);
 
   useEffect(() => {
-    refreshStrategyParameterSchema(selectedStrategy);
-  }, [selectedStrategy]);
+    if (!shouldFetchBacktestTimeframes(params.startDate, params.endDate)) {
+      setPreflight(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      fetchBacktestPreflight(selectedSymbol, selectedTimeframe, params.startDate, params.endDate, normalizeFillModel(params.fillModel))
+        .then((value) => {
+          if (!cancelled) setPreflight(value);
+        })
+        .catch(() => {
+          if (!cancelled) setPreflight(null);
+        });
+    }, 280);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [selectedSymbol, selectedTimeframe, params.startDate, params.endDate, params.fillModel]);
+  useEffect(() => {
+    const range = calendarMonthRange(calendarMonth);
+    let cancelled = false;
+    fetchBacktestPreflight(selectedSymbol, selectedTimeframe, range.startDate, range.endDate, normalizeFillModel(params.fillModel))
+      .then((value) => { if (!cancelled) setCalendarPreflight(value); })
+      .catch(() => { if (!cancelled) setCalendarPreflight(null); });
+    return () => { cancelled = true; };
+  }, [calendarMonth, params.fillModel, selectedSymbol, selectedTimeframe]);
+
 
   useEffect(() => {
     if (isCustomScriptStrategy(selectedStrategy)) {
@@ -1261,6 +1300,10 @@ export default function BacktestPage({
       setLoadingStrategySchema(false);
     }
   };
+  useEffect(() => {
+    refreshStrategyParameterSchema(selectedStrategy);
+  }, [selectedStrategy]);
+
 
   const applyStrategyConfig = (config: StrategyConfig) => {
     const savedParams = config.paramsJson.params as Partial<BacktestParams> | undefined;
@@ -1600,7 +1643,13 @@ export default function BacktestPage({
     }
   };
 
+  const showPreflightNotice = (message: string): void => {
+    setPreflightNotice(message);
+    window.setTimeout(() => setPreflightNotice(''), 4000);
+  };
+
   const handleSaveConfig = async (): Promise<string | null> => {
+
     setError('');
     setStatus('');
     const strategyName = configName.trim() || scriptForm.name.trim();
@@ -1617,6 +1666,11 @@ export default function BacktestPage({
       setError('自定义脚本策略必须选择或新建一个 on_bar 策略代码');
       return null;
     }
+    const selectedPreflight = preflight?.timeframes.find((item) => item.timeframe === selectedTimeframe);
+    if (!selectedPreflight?.available) {
+      showPreflightNotice(selectedPreflight?.reason || '正在检查当前策略的数据可用性');
+      return null;
+    }
     try {
       const isCustomScript = isCustomScriptStrategy(selectedStrategy);
       const sourceCode = isCustomScript ? scriptForm.code : (strategySourceCode || scriptForm.code);
@@ -1630,15 +1684,12 @@ export default function BacktestPage({
           ? 'on_bar'
           : (strategySource ? `catalog:${strategySource.id}` : scriptForm.entryType),
       };
-      const savedScript = hasSelectedScript
-        ? await updateStrategyScript(selectedScriptId, scriptPayload)
-        : await createStrategyScript(scriptPayload);
       const strategyId = isCustomScript ? 'user_script' : selectedStrategy;
-      const payload = {
+      const configPayload = {
         ...buildStrategyConfigPayload(
-        savedScript.id,
-        strategyName,
-        strategyId,
+          '',
+          strategyName,
+          strategyId,
         ),
         publish: false,
       };
@@ -1646,9 +1697,9 @@ export default function BacktestPage({
       const targetConfigId = hasSelectedConfig
         ? selectedConfigId
         : existingConfig?.id;
-      const config = targetConfigId
-        ? await updateStrategyConfig(targetConfigId, payload)
-        : await createStrategyConfig(payload);
+      const { script: savedScript, config } = await saveCompleteStrategy(
+        scriptPayload, configPayload, hasSelectedScript ? selectedScriptId : null, targetConfigId || null,
+      );
       await refreshStrategyAssets();
       setSelectedConfigId(config.id);
       setSelectedScriptId(savedScript.id);
@@ -1736,6 +1787,11 @@ export default function BacktestPage({
     }
     if (versionDirty) {
       setError('策略内容已修改，请先保存策略');
+      return;
+    }
+    const selectedPreflight = preflight?.timeframes.find((item) => item.timeframe === selectedTimeframe);
+    if (!selectedPreflight?.available) {
+      showPreflightNotice(selectedPreflight?.reason || '正在检查当前策略的数据可用性');
       return;
     }
     const validationErrors = validateParams(params);
@@ -1878,12 +1934,22 @@ export default function BacktestPage({
   );
   const isCorePositionOverlay = params.strategyCategory === 'core_position_overlay';
   const isL2Quote = params.fillModel === 'l2_quote';
-  const timeframeOptions = isL2Quote
-    ? L2_TIMEFRAMES.map((timeframe) => ({ timeframe, available: true }))
-    : backtestTimeframes;
-  const dataCoverage = isL2Quote
-    ? { tone: 'info', text: 'L2 任务将由 Runner 校验上游 Bar、十档快照与逐笔成交的完整交集。' }
-    : buildDataCoverage('运行标的', dataStatus, loadingDataStatus, dataStatusError);
+  const preflightTimeframes = preflight?.timeframes || [];
+  const selectedPreflight = preflightTimeframes.find((item) => item.timeframe === selectedTimeframe);
+  const timeframeOptions = preflightTimeframes.length > 0
+    ? preflightTimeframes
+    : (isL2Quote
+      ? L2_TIMEFRAMES.map((timeframe) => ({ timeframe, available: false, reason: '正在检查数据可用性' }))
+      : backtestTimeframes.map((item) => ({
+        ...item,
+        reason: item.available ? '数据完整' : 'Bar 数据不完整',
+      })));
+  const dataCoverage = selectedPreflight
+    ? {
+      tone: selectedPreflight.available ? 'ok' : 'warning',
+      text: selectedPreflight.reason,
+    }
+    : { tone: 'warning', text: '正在检查当前日期范围的数据可用性。' };
   const benchmarkCoverage = isL2Quote
     ? { tone: 'info', text: 'L2 模式不使用 QMT 基准覆盖；结果会保存 L2 数据来源版本。' }
     : buildDataCoverage(
@@ -1892,7 +1958,7 @@ export default function BacktestPage({
       loadingBenchmarkDataStatus,
       benchmarkDataStatusError,
     );
-  const runPreflightReady = isL2Quote || (dataCoverage.tone === 'ok' && benchmarkCoverage.tone === 'ok');
+  const runPreflightReady = selectedPreflight?.available === true && (isL2Quote || benchmarkCoverage.tone === 'ok');
   const dataCoverageColor = dataCoverage.tone === 'ok' ? '#0f766e' : dataCoverage.tone === 'info' ? '#1d4ed8' : '#b45309';
   const resultHistoryRun = result?.runId ? backtestRuns.find((item) => item.id === result.runId) || null : null;
   const resultStrategyCategory = result?.strategyCategory || result?.experimentManifest?.strategyCategory || resultHistoryRun?.strategyCategory || params.strategyCategory;
@@ -2421,6 +2487,16 @@ export default function BacktestPage({
       gridTemplateRows: activePanel === 'overview' ? '52px minmax(0, 1fr)' : 'minmax(0, 1fr)',
       overflow: 'hidden',
     }}>
+      {preflightNotice && (
+        <div role="status" style={{
+          position: 'fixed', right: 24, bottom: 24, zIndex: 40, maxWidth: 360,
+          padding: '10px 12px', borderRadius: 6, border: '1px solid #f59e0b', background: '#fffbeb',
+          color: '#92400e', boxShadow: '0 8px 24px rgba(15, 23, 42, 0.16)', fontSize: 13, lineHeight: 1.5,
+        }}>
+          {preflightNotice}
+        </div>
+      )}
+
       {activePanel === 'overview' && <header className="workbench-header" style={{
         display: 'grid',
         gridTemplateColumns: 'minmax(260px, 1fr) auto auto',
@@ -2494,14 +2570,14 @@ export default function BacktestPage({
               : versionDirty
                 ? '请先保存策略'
                 : !runPreflightReady
-                  ? '请等待运行前检查通过'
+                  ? '当前日期范围数据不完整'
                   : undefined}
             style={{
               height: 36,
               borderRadius: 4,
-              border: `1px solid ${runDisabled ? '#cbd5e1' : '#0f766e'}`,
-              background: runDisabled ? '#f1f5f9' : '#ccfbf1',
-              color: runDisabled ? '#94a3b8' : '#0f766e',
+              border: `1px solid ${runDisabled ? '#cbd5e1' : !runPreflightReady ? '#f59e0b' : '#0f766e'}`,
+              background: runDisabled ? '#f1f5f9' : !runPreflightReady ? '#fffbeb' : '#ccfbf1',
+              color: runDisabled ? '#94a3b8' : !runPreflightReady ? '#92400e' : '#0f766e',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -2593,16 +2669,10 @@ export default function BacktestPage({
 
               <section style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700 }}>回测区间</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                  <label>
-                    <div style={labelStyle}>开始日期</div>
-                    <input type="date" value={params.startDate} onChange={(e) => setParam('startDate', e.target.value)} style={fieldStyle} />
-                  </label>
-                  <label>
-                    <div style={labelStyle}>结束日期</div>
-                    <input type="date" value={params.endDate} onChange={(e) => setParam('endDate', e.target.value)} style={fieldStyle} />
-                  </label>
-                </div>
+                <BacktestDateRangePicker
+                  startDate={params.startDate} endDate={params.endDate} days={calendarPreflight?.calendarDays || []}
+                  onChange={(key, value) => setParam(key, value)} onMonthChange={setCalendarMonth}
+                />
               </section>
 
               <section style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -2641,6 +2711,7 @@ export default function BacktestPage({
                 <div style={{ color: dataCoverageColor, fontSize: 12, lineHeight: 1.65 }}>
                   {dataCoverage.text}
                 </div>
+
                 <div style={{ color: benchmarkCoverage.tone === 'ok' ? '#0f766e' : '#b45309', fontSize: 12, lineHeight: 1.65, marginTop: 6 }}>
                   {benchmarkCoverage.text}
                 </div>
@@ -3069,7 +3140,7 @@ export default function BacktestPage({
                     >
                       {timeframeOptions.map((item) => (
                         <option key={item.timeframe} value={item.timeframe}>
-                          {item.timeframe}{isL2Quote ? '（L2 固定周期）' : item.available ? '（QMT 数据已导入）' : '（QMT 数据未覆盖）'}
+                          {item.timeframe}（{item.available ? '数据完整' : item.reason || '数据不完整'}）
                         </option>
                       ))}
                     </select>
@@ -3101,15 +3172,12 @@ export default function BacktestPage({
                       {renderStrategyParameterForm()}
                     </div>
                   )}
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                    <label>
-                      <div style={labelStyle}>开始日期</div>
-                      <input type="date" value={params.startDate} onChange={(e) => setParam('startDate', e.target.value)} style={fieldStyle} />
-                    </label>
-                    <label>
-                      <div style={labelStyle}>结束日期</div>
-                      <input type="date" value={params.endDate} onChange={(e) => setParam('endDate', e.target.value)} style={fieldStyle} />
-                    </label>
+                  <div>
+                    <div style={labelStyle}>回测区间</div>
+                    <BacktestDateRangePicker
+                      startDate={params.startDate} endDate={params.endDate} days={calendarPreflight?.calendarDays || []}
+                      onChange={(key, value) => setParam(key, value)} onMonthChange={setCalendarMonth}
+                    />
                   </div>
                   <label>
                     <div style={labelStyle}>初始资金</div>
@@ -3195,7 +3263,7 @@ export default function BacktestPage({
                       gap: 6,
                       cursor: runDisabled ? 'not-allowed' : 'pointer',
                       opacity: runDisabled ? 0.7 : 1,
-                    }} onClick={handleRunBacktest} disabled={runDisabled} title={versionDirty ? '请先保存策略' : !hasSelectedConfig ? '请先保存策略' : !runPreflightReady ? '请等待运行前检查通过' : undefined}>
+                    }} onClick={handleRunBacktest} disabled={runDisabled} title={versionDirty ? '请先保存策略' : !hasSelectedConfig ? '请先保存策略' : !runPreflightReady ? '当前日期范围数据不完整' : undefined}>
                       <Play size={14} />
                       {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : '运行回测'}
                     </button>
@@ -4478,25 +4546,12 @@ export default function BacktestPage({
               )}
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <label>
-              <div style={labelStyle}>开始日期</div>
-              <input
-                type="date"
-                value={params.startDate}
-                onChange={(e) => setParam('startDate', e.target.value)}
-                style={fieldStyle}
-              />
-            </label>
-            <label>
-              <div style={labelStyle}>结束日期</div>
-              <input
-                type="date"
-                value={params.endDate}
-                onChange={(e) => setParam('endDate', e.target.value)}
-                style={fieldStyle}
-              />
-            </label>
+          <div>
+            <div style={labelStyle}>回测区间</div>
+            <BacktestDateRangePicker
+              startDate={params.startDate} endDate={params.endDate} days={calendarPreflight?.calendarDays || []}
+              onChange={(key, value) => setParam(key, value)} onMonthChange={setCalendarMonth}
+            />
           </div>
 
           <label>

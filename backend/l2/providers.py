@@ -235,6 +235,32 @@ class ClickHouseL2Adapter:
     rows = clickhouse_client.query_rows(query)
     return int(rows[0]["total"])
 
+  def quote_daily_availability(self, symbol: str, trade_dates: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """按日汇总有效十档快照，供预检摘要缓存和回填使用。"""
+    dates = sorted({str(value) for value in trade_dates})
+    if not dates:
+      return {}
+    price_fields = {f"{side}_price_{index}" for side in ("bid", "ask") for index in range(1, 11)}
+    self._validate_profile({"symbol", "trade_date", "time", *price_fields})
+    valid_quote = " OR ".join(f"{self._profile.columns[name]}>0" for name in sorted(price_fields))
+    date_literals = ", ".join(self._literal(value) for value in dates)
+    query = (
+      f"SELECT toString({self._profile.columns['trade_date']}) AS trade_date, count() AS snapshot_count, "
+      f"min({self._profile.columns['time']}) AS first_quote_time, max({self._profile.columns['time']}) AS last_quote_time "
+      f"FROM {self._profile.table_name} WHERE {self._profile.columns['symbol']}={self._literal(symbol)} "
+      f"AND {self._profile.columns['trade_date']} IN ({date_literals})"
+      f"{self._continuous_session_filter()} AND ({valid_quote}) "
+      f"GROUP BY {self._profile.columns['trade_date']}"
+    )
+    rows = clickhouse_client.query_rows(query)
+    return {
+      str(row["trade_date"]): {
+        "snapshotCount": int(row["snapshot_count"]),
+        "firstQuoteTime": str(row.get("first_quote_time") or ""),
+        "lastQuoteTime": str(row.get("last_quote_time") or ""),
+      }
+      for row in rows
+    }
   def missing_quote_dates(self, symbol: str, trade_dates: Sequence[str]) -> list[str]:
     """一次查询校验实际 Bar 日期是否都存在至少一条有效十档快照。"""
     dates = sorted({str(value) for value in trade_dates})
@@ -581,6 +607,25 @@ class TemporaryQuoteBarProvider:
         for day in sorted(self._cache_status)
       ],
     }
+
+  def available_bar_dates(self, symbol: str, trade_dates: Sequence[str], period: str) -> list[str]:
+    """预检派生 Bar：缓存命中或原始快照可聚合的日期均视为可用。"""
+    if period not in self._PERIOD_SECONDS:
+      raise L2DataError(f"临时 L2 聚合不支持周期: {period}")
+    dates = sorted({str(value) for value in trade_dates})
+    if not dates:
+      return []
+    self._validate_profile()
+    cached_dates = {
+      trade_date
+      for trade_date in dates
+      if self._cache.get(self._aggregation_version, self._mapping_version, symbol, trade_date, period) is not None
+    }
+    uncached = [trade_date for trade_date in dates if trade_date not in cached_dates]
+    if not uncached:
+      return sorted(cached_dates)
+    raw_dates = set(self._trading_days(symbol, uncached[0], uncached[-1]))
+    return sorted(cached_dates | (raw_dates & set(uncached)))
 
   def _load_day(self, symbol: str, trade_date: str, period: str) -> list[NormalizedBar]:
     key = self._cache.key(self._aggregation_version, self._mapping_version, symbol, trade_date, period)

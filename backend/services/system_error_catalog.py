@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 from backend import settings
-from backend.l2.providers import L2DataCoverageError
+from backend.l2.providers import L2DataCoverageError, L2DataError
 from backend.services.clickhouse_client import ClickHouseError
 
 
@@ -33,13 +33,22 @@ def classify_system_error(error: Exception) -> SystemErrorClassification:
     missing_dates = ", ".join(cause.missing_dates)
     return SystemErrorClassification(
       "l2.quote_coverage_missing", "data", False,
-      f"{cause.symbol} 缺少 L2 盘口数据：{missing_dates}。",
+      "当前日期范围缺少 L2 十档快照。",
       "请在数据补齐后重新发起回测。",
       str(cause),
       {"symbol": cause.symbol, "missingDates": missing_dates},
     )
   if isinstance(cause, socket.gaierror):
     return _clickhouse("host_unresolved", False, "数据源地址不可用。", "请联系管理员检查数据源配置。", f"ClickHouse 主机名无法解析：{host or '未配置主机'}", host)
+  if isinstance(cause, L2DataError):
+    return SystemErrorClassification(
+      "data.unavailable", "data", False,
+      "当前日期范围的回测数据不完整。",
+      "请调整日期范围或在数据补齐后重新发起回测。",
+      str(cause),
+      {},
+    )
+
   if isinstance(cause, ConnectionRefusedError):
     return _clickhouse("connection_refused", True, "数据源暂时无法连接。", "请稍后重试。", f"ClickHouse 拒绝连接：{host or '未配置主机'}", host)
   if isinstance(cause, ResponseNotReady):

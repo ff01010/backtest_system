@@ -447,6 +447,13 @@ class DateItem(BaseModel):
   hasKline: bool
   hasSignal: bool
 
+class CompleteStrategySave(BaseModel):
+  script: StrategyScriptCreate
+  config: StrategyConfigCreate
+  scriptId: str | None = None
+  configId: str | None = None
+
+
 
 class ErrorResponse(BaseModel):
   error: str

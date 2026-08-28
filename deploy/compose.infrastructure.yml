@@ -57,6 +57,24 @@ services:
     networks:
       - quant-backtest-net
 
+  calendar-sync:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    profiles: ['calendar-sync']
+    restart: 'no'
+    env_file:
+      - .env
+    environment:
+      TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
+      TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ['python', '-m', 'backend.trade_calendar_sync']
+    networks:
+      - quant-backtest-net
+
   backend:
     build:
       context: ..

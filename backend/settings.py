@@ -24,9 +24,10 @@ SIGNAL_ROOT = os.getenv("TREND_GRID_SIGNAL_ROOT", "./runtime/signals")
 # 支持的 K 线周期：部分周期由 1m/5m 拟合生成。
 TIMEFRAMES = ["1m", "2m", "3m", "4m", "5m", "10m", "15m", "30m", "45m", "60m", "1d"]
 
-# 回测引擎已验证的运行周期。图表和数据管理可继续使用 TIMEFRAMES 中的其它周期。
-BACKTEST_TIMEFRAMES = ("1m", "5m")
-L2_BACKTEST_TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "45m", "60m", "1d")
+# 两种回测模式共用统一 Bar 周期；L2 模式额外校验十档快照和必要的逐笔成交。
+BAR_RUN_TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "45m", "60m", "1d")
+BACKTEST_TIMEFRAMES = BAR_RUN_TIMEFRAMES
+L2_BACKTEST_TIMEFRAMES = BAR_RUN_TIMEFRAMES
 
 # 信号文件命名模板
 SIGNAL_FILENAME = "signal_{strategy}_{date}.csv"
