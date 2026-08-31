@@ -267,8 +267,8 @@ class L2ExecutionEngine:
         break
       if not order.is_market and self._passive_price_reached(order, trade.price):
         filled = min(order.remaining_quantity, available)
-        self._apply_fill(order, filled, trade.price, trade.time, "逐笔保守成交确认")
-        available -= filled
+        actual_filled = self._apply_fill(order, filled, trade.price, trade.time, "逐笔保守成交确认")
+        available -= actual_filled
 
   def _eligible_orders(self, event_time: Any) -> list[L2Order]:
     return sorted(
@@ -291,14 +291,45 @@ class L2ExecutionEngine:
       if order.remaining_quantity <= 0 or not self._price_permitted(order, level):
         break
       key = ("ask" if order.side == OrderSide.BUY else "bid", index)
-      quantity = min(order.remaining_quantity, budget[key])
-      if quantity > 0:
-        self._apply_fill(order, quantity, level.price, quote.time, "十档盘口主动成交")
-        budget[key] -= quantity
+      candidate_quantity = min(order.remaining_quantity, budget[key])
+      if candidate_quantity <= 0:
+        continue
+      affordable_quantity = self._affordable_quantity(order, level.price, candidate_quantity)
+      if affordable_quantity <= 0:
+        self._record_funds_insufficient(order, quote.time, level.price)
+        break
+      fill_quantity = min(candidate_quantity, affordable_quantity)
+      filled_quantity = self._apply_fill(
+        order,
+        fill_quantity,
+        level.price,
+        quote.time,
+        "十档盘口主动成交",
+        depth_quantity=level.volume,
+        affordable_quantity=affordable_quantity,
+        funding_limited=fill_quantity < candidate_quantity,
+      )
+      budget[key] -= filled_quantity
+      if fill_quantity < candidate_quantity:
+        self._record_funds_insufficient(order, quote.time, level.price)
+      if filled_quantity < fill_quantity:
+        break
 
-  def _apply_fill(self, order: L2Order, quantity: int, price: float, time: str, source: str) -> None:
+  def _apply_fill(
+    self,
+    order: L2Order,
+    quantity: int,
+    price: float,
+    time: str,
+    source: str,
+    *,
+    depth_quantity: int | None = None,
+    affordable_quantity: int | None = None,
+    funding_limited: bool = False,
+  ) -> int:
     if quantity <= 0 or not self._can_afford(order, quantity, price):
-      return
+      return 0
+    available_cash_before = self._ledger.snapshot().cash
     fee, breakdown = self._commit_fee(order, price, quantity)
     metadata = dict(order.intent.metadata)
     metadata.update({
@@ -308,6 +339,15 @@ class L2ExecutionEngine:
       "fee_breakdown": breakdown,
       "execution_mode": "l2_quote",
     })
+    if funding_limited:
+      order.metadata["funding_limited"] = True
+      metadata.update({
+        "fundingLimited": True,
+        "depthQuantity": depth_quantity if depth_quantity is not None else quantity,
+        "affordableQuantity": affordable_quantity if affordable_quantity is not None else quantity,
+        "remainingQuantity": order.remaining_quantity - quantity,
+        "availableCashBefore": round(available_cash_before, 8),
+      })
     fill = Fill(time, order.intent.symbol, order.side, quantity, price, fee, order.intent.reason, order.intent.position_effect, order.intent.position_key, metadata=metadata)
     self._ledger.apply_fill(fill)
     self._execution_runtime.on_fill(order.intent.metadata.get("parent_order_id"), quantity)
@@ -337,6 +377,7 @@ class L2ExecutionEngine:
       "clientOrderKey": order.intent.metadata.get("client_order_key"),
       "positionEffect": order.intent.position_effect.value if order.intent.position_effect else None,
     })
+    return quantity
 
   def _force_close_at_last_quote(self, trade_date: str) -> None:
     portfolio = self._ledger.snapshot()
@@ -465,8 +506,9 @@ class L2ExecutionEngine:
         order.status = "cancelled"
         self._release_t0_reservation(order)
         self._release_sellable_reservation(order)
-        self._execution_runtime.cancel_open(order.intent.metadata.get("parent_order_id"), order.remaining_quantity, reason)
-        event = {"type": "cancelled", "orderId": order.order_id, "remaining": order.remaining_quantity, "reason": reason}
+        cancel_reason = self._cancel_reason(order, reason)
+        self._execution_runtime.cancel_open(order.intent.metadata.get("parent_order_id"), order.remaining_quantity, cancel_reason)
+        event = {"type": "cancelled", "orderId": order.order_id, "remaining": order.remaining_quantity, "reason": cancel_reason}
         self._order_events.append(event)
         self._notify_strategy_event({
           **event,
@@ -614,6 +656,54 @@ class L2ExecutionEngine:
       return True
     fee, _ = self._preview_fee(order, price, quantity)
     return self._ledger.snapshot().cash + 1e-8 >= price * quantity + fee
+
+  def _affordable_quantity(self, order: L2Order, price: float, candidate_quantity: int) -> int:
+    if candidate_quantity <= 0 or order.intent.position_effect != PositionEffect.OPEN_LONG:
+      return candidate_quantity
+    if self._can_afford(order, candidate_quantity, price):
+      return candidate_quantity
+    affordable_raw_quantity = self._maximum_affordable_quantity(order, price, candidate_quantity)
+    return self._round_down_open_quantity(affordable_raw_quantity)
+
+  def _maximum_affordable_quantity(self, order: L2Order, price: float, upper_bound: int) -> int:
+    lower_bound = 0
+    while lower_bound < upper_bound:
+      midpoint = (lower_bound + upper_bound + 1) // 2
+      if self._can_afford(order, midpoint, price):
+        lower_bound = midpoint
+      else:
+        upper_bound = midpoint - 1
+    return lower_bound
+
+  def _round_down_open_quantity(self, quantity: int) -> int:
+    minimum = self._rules.minimum_order_quantity
+    step = self._rules.order_quantity_step
+    if quantity < minimum:
+      return 0
+    return minimum + (quantity - minimum) // step * step
+
+  def _record_funds_insufficient(self, order: L2Order, time: str, price: float) -> None:
+    order.metadata["funding_limited"] = True
+    if order.metadata.get("funds_insufficient_reported"):
+      return
+    order.metadata["funds_insufficient_reported"] = True
+    event = {
+      "type": "funds_insufficient",
+      "orderId": order.order_id,
+      "time": time,
+      "price": price,
+      "remaining": order.remaining_quantity,
+      **self._signal_fields(order.intent),
+      "strategyReason": order.intent.reason,
+      "reason": "可用资金不足，暂无法成交",
+    }
+    self._order_events.append(event)
+
+  @staticmethod
+  def _cancel_reason(order: L2Order, reason: str) -> str:
+    if reason == "日终撤单" and order.metadata.get("funding_limited"):
+      return "日终撤单；期间受可用资金限制"
+    return reason
 
   def _uses_t0_capacity(self, intent: OrderIntent) -> bool:
     return (

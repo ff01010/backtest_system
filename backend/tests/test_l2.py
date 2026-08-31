@@ -48,6 +48,15 @@ class BuyStrategy:
     ) for _ in range(self._count)]
 
 
+class EventRecordingBuyStrategy(BuyStrategy):
+  def __init__(self, quantity: int = 100) -> None:
+    super().__init__(quantity=quantity)
+    self.order_events: list[dict[str, Any]] = []
+
+  def on_order_event(self, event: dict[str, Any]) -> None:
+    self.order_events.append(event)
+
+
 def _bar() -> NormalizedBar:
   return NormalizedBar(
     symbol="688981.SH", trade_date="20260102", period="1m",
@@ -101,6 +110,64 @@ def test_l2_snapshot_depth_is_shared_by_orders() -> None:
   fills = engine.result()["fills"]
 
   assert sum(item["quantity"] for item in fills) == 100
+
+
+def test_l2_open_long_uses_affordable_lot_quantity_and_records_metadata() -> None:
+  engine = L2ExecutionEngine(BuyStrategy(quantity=1_200), 1_999, 0, InstrumentRules())
+  engine.begin_day("20260102")
+  engine.process_bar(_bar())
+  engine.process_quote(_quote("2026-01-02 09:31:03", ask_volume=1_200))
+  engine.finish_day("20260102")
+
+  result = engine.result()
+  fill = result["fills"][0]
+  cancelled = next(item for item in result["orders"] if item["type"] == "cancelled")
+  diagnostic = next(item for item in result["orders"] if item["type"] == "funds_insufficient")
+
+  assert fill["quantity"] == 100
+  assert fill["metadata"]["fundingLimited"] is True
+  assert fill["metadata"]["affordableQuantity"] == 100
+  assert fill["metadata"]["availableCashBefore"] == 1_999
+  assert diagnostic["remaining"] == 1_100
+  assert cancelled["reason"] == "日终撤单；期间受可用资金限制"
+
+
+def test_l2_funds_insufficient_keeps_order_pending_without_strategy_callback() -> None:
+  strategy = EventRecordingBuyStrategy()
+  engine = L2ExecutionEngine(strategy, 999, 0, InstrumentRules())
+  engine.begin_day("20260102")
+  engine.process_bar(_bar())
+  engine.process_quote(_quote("2026-01-02 09:31:03"))
+
+  result = engine.result()
+  diagnostic = next(item for item in result["orders"] if item["type"] == "funds_insufficient")
+
+  assert result["fills"] == []
+  assert diagnostic["remaining"] == 100
+  assert diagnostic["reason"] == "可用资金不足，暂无法成交"
+  assert [item["type"] for item in strategy.order_events] == ["accepted"]
+  assert engine._orders[0].status == "pending"
+
+
+def test_l2_unaffordable_order_does_not_consume_depth_budget() -> None:
+  engine = L2ExecutionEngine(BuyStrategy(), 999, 0, InstrumentRules())
+  engine.begin_day("20260102")
+  engine.process_bar(_bar())
+  quote = _quote("2026-01-02 09:31:03")
+  budget = engine._depth_budget(quote)
+
+  engine._fill_against_depth(engine._orders[0], quote, budget)
+
+  assert budget[("ask", 0)] == 100
+
+
+def test_l2_depth_odd_lot_can_fill_when_cash_covers_full_depth() -> None:
+  engine = L2ExecutionEngine(BuyStrategy(quantity=200), 1_371, 0, InstrumentRules())
+  engine.begin_day("20260102")
+  engine.process_bar(_bar())
+  engine.process_quote(_quote("2026-01-02 09:31:03", ask_volume=137))
+
+  assert engine.result()["fills"][0]["quantity"] == 137
 
 
 def test_l2_allows_one_sided_limit_up_quote_for_long_day_end_close() -> None:
@@ -171,10 +238,31 @@ def test_l2_result_adapter_builds_overview_and_signal_details() -> None:
   assert result["summary"]["orderCount"] == 1
   assert result["summary"]["fillCount"] == 2
   assert result["trades"][0]["action"] == "BUY_OPEN"
+  assert result["trades"][0].get("fundingLimited") is None
   assert result["dailyHoldings"][0]["longQty"] == 100
   assert len(result["skippedSignals"]) == 2
   assert "日终撤单" in result["skippedSignals"][0]["note"]
   assert "标的不允许卖空" in result["skippedSignals"][1]["note"]
+
+
+def test_l2_result_adapter_exposes_funding_limit_detail() -> None:
+  raw_result = {
+    "fills": [{
+      "time": "2026-01-02 09:31:03", "side": "BUY", "quantity": 100, "price": 10,
+      "reason": "开多", "position_effect": "open_long",
+      "metadata": {
+        "fundingLimited": True, "depthQuantity": 1_200, "affordableQuantity": 100,
+        "remainingQuantity": 1_100, "availableCashBefore": 1_999,
+      },
+    }],
+    "equity": [], "orders": [], "warnings": [],
+  }
+
+  result = normalize_l2_result(raw_result, {"initialCapital": 1_999})
+
+  assert result["trades"][0]["fundingLimited"] is True
+  assert result["trades"][0]["affordableQuantity"] == 100
+  assert result["trades"][0]["availableCashBefore"] == 1_999
 
 
 def test_l2_order_events_keep_signal_fields_for_unfilled_orders() -> None:

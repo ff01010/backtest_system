@@ -12,4 +12,8 @@ describe('trade display', () => {
     expect(formatTradeNote('BUY_CLOSE', 'stop')).toBe('触及止损价，买入平空');
     expect(formatTradeNote('BUY_COVER', 'CLOSE_LINE')).toBe('触及平仓线');
   });
+
+  it('对资金受限成交保留策略说明并追加原因', () => {
+    expect(formatTradeNote('BUY_OPEN', '开多', true)).toBe('开多；资金不足限制，已成交可负担部分');
+  });
 });
