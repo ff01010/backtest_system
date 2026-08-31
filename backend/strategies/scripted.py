@@ -51,6 +51,34 @@ _SAFE_BUILTINS = {
 }
 
 
+def warmup_trading_days_for_script(code: str) -> int:
+  """静态读取策略声明的预热交易日数，不执行用户代码。"""
+  try:
+    tree = ast.parse(code)
+  except SyntaxError as error:
+    raise ValueError(f"Python 语法错误: 第 {error.lineno} 行 {error.msg}") from error
+  declarations = [
+    node
+    for node in tree.body
+    if isinstance(node, ast.Assign)
+    and len(node.targets) == 1
+    and isinstance(node.targets[0], ast.Name)
+    and node.targets[0].id == "WARMUP_TRADING_DAYS"
+  ]
+  if not declarations:
+    return 0
+  if len(declarations) > 1:
+    raise ValueError("WARMUP_TRADING_DAYS 只能声明一次")
+  value = declarations[0].value
+  if isinstance(value, ast.Constant) and not isinstance(value.value, bool) and isinstance(value.value, int):
+    warmup_days = value.value
+  else:
+    raise ValueError("WARMUP_TRADING_DAYS 必须是模块顶层整数常量")
+  if not 0 <= warmup_days <= 250:
+    raise ValueError("WARMUP_TRADING_DAYS 必须为 0 到 250 的整数")
+  return warmup_days
+
+
 class _ScriptValidator(ast.NodeVisitor):
   """校验脚本接口与订单契约，允许内部策略导入已安装模块。"""
 
@@ -76,6 +104,7 @@ def validate_script_code(code: str) -> None:
     tree = ast.parse(code)
   except SyntaxError as error:
     raise ValueError(f"Python 语法错误: 第 {error.lineno} 行 {error.msg}") from error
+  warmup_trading_days_for_script(code)
   _ScriptValidator().visit(tree)
   callback = next(
     (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "on_bar"),

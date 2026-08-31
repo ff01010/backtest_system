@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from backend.services import bar_data, market_data
+from backend.services import bar_data, market_data, state_store
 
 
 _TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -112,6 +112,67 @@ def test_15m_aggregation_uses_qmt_right_closed_opening_window() -> None:
     "_bucket": pd.Timestamp("2026-07-30 09:45:00", tz="Asia/Shanghai"),
     "open": 1.0, "high": 16.1, "low": 0.9, "close": 16.0, "volume": 160,
     "time": "202607300945",
+  }]
+
+
+def test_daily_resolution_falls_back_to_complete_minutes_for_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+  def query_rows(query: str) -> list[dict[str, object]]:
+    if "period = '1d'" in query:
+      return [{"trade_date": "2026-07-30", "status": "partial"}]
+    if "period = '1m'" in query:
+      return [
+        {"trade_date": "2026-07-29", "status": "complete"},
+        {"trade_date": "2026-07-30", "status": "complete"},
+      ]
+    return []
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+  monkeypatch.setattr(state_store, "is_trade_calendar_range_covered", lambda *_: True)
+  monkeypatch.setattr(state_store, "list_open_trade_dates", lambda *_: ["2026-07-29"])
+
+  resolution = market_data.resolve_backtest_data(
+    "688981.SH", "1d", "2026-07-30", "2026-07-30", ["2026-07-30"], 1,
+  )
+
+  assert resolution.source_period == "1m"
+  assert resolution.derivation == "daily-from-1m-v1"
+  assert resolution.warmup_dates == ("2026-07-29",)
+
+
+def test_warmup_only_uses_contiguous_complete_trade_dates(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(state_store, "is_trade_calendar_range_covered", lambda *_: True)
+  monkeypatch.setattr(
+    state_store,
+    "list_open_trade_dates",
+    lambda *_: ["2025-09-01", "2025-09-02", "2025-09-03", "2025-09-04", "2025-09-05",
+                "2025-09-08", "2025-09-09", "2025-09-10", "2025-09-11"],
+  )
+  monkeypatch.setattr(
+    market_data,
+    "_coverage_for_period",
+    lambda *_: [
+      {"date": "2025-09-09", "status": "complete"},
+      {"date": "2025-09-10", "status": "complete"},
+      {"date": "2025-09-11", "status": "complete"},
+    ],
+  )
+
+  result = market_data._complete_dates_before("688981.SH", "1m", "2025-09-12", 5)
+
+  assert result == ["2025-09-09", "2025-09-10", "2025-09-11"]
+
+
+def test_daily_aggregation_uses_last_minute_end_time_without_lunch_split() -> None:
+  frame = pd.DataFrame([
+    {"time": "202607301130", "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5, "volume": 100},
+    {"time": "202607301500", "open": 10.6, "high": 12.0, "low": 10.0, "close": 11.5, "volume": 200},
+  ])
+  frame["_timestamp"] = pd.to_datetime(frame["time"], format="%Y%m%d%H%M").dt.tz_localize(_TIMEZONE)
+
+  result = market_data._aggregate_daily_minutes(frame)
+
+  assert result.to_dict("records") == [{
+    "time": "202607301500", "open": 10.0, "high": 12.0, "low": 9.0, "close": 11.5, "volume": 300,
   }]
 
 

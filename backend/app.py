@@ -32,7 +32,7 @@ from backend.date_codec import TradingDateError, format_legacy_date, normalize_d
 from backend import schemas
 from backend.time_utils import format_epoch_as_shanghai
 from backend.strategies.catalog import get_strategy_source_snapshot
-from backend.strategies.scripted import validate_script_code
+from backend.strategies.scripted import warmup_trading_days_for_script, validate_script_code
 from backend.services import (
   backtest_preflight,
   backtest_runner,
@@ -287,14 +287,12 @@ def _validate_saved_params(request: dict, config: dict) -> None:
   request_params = request.get("strategyParams", {})
   if not isinstance(request_params, dict):
     raise HTTPException(422, "策略参数格式非法")
-  mismatches = [
-    key
-    for key, value in saved_params.items()
-    if key not in _EXPERIMENT_PARAM_KEYS and request_params.get(key) != value
-  ]
+  mismatches: list[str] = []
+  for key, value in saved_params.items():
+    if key != "warmupTradingDays" and key not in _EXPERIMENT_PARAM_KEYS and request_params.get(key) != value:
+      mismatches.append(key)
   if mismatches:
     raise HTTPException(422, f"策略内容已修改，请先保存策略：{', '.join(sorted(mismatches))}")
-
 
 def _prepare_saved_strategy_snapshot(request: dict) -> None:
   try:
@@ -321,9 +319,16 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     mismatches.append("回测账户")
   if mismatches:
     raise HTTPException(422, f"策略内容已修改，请先保存策略：{', '.join(mismatches)}")
+  try:
+    warmup_days = warmup_trading_days_for_script(str(script["code"]))
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
+  if request.get("fillModel") == "l2_quote" and warmup_days != 0:
+    raise HTTPException(422, "L2 盘口回测不支持策略声明预热交易日")
   _validate_saved_params(request, config)
   request["strategy"] = config["strategy"]
   request["scriptId"] = script["id"]
+  request["warmupTradingDays"] = warmup_days
   request["configVersionId"] = None
   request["runDraft"] = False
   request["versionScriptSnapshot"] = {
@@ -338,6 +343,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "benchmarkSymbol": config.get("benchmarkSymbol"), "accountId": config.get("accountId"),
     "params": config.get("paramsJson", {}).get("params", {}),
     "description": script["description"], "runParams": request.get("strategyParams", {}),
+    "warmupTradingDays": warmup_days,
     "execution": execution_algorithm_snapshot(
       str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
     ),
@@ -394,6 +400,7 @@ def _require_preflight(request: dict[str, Any]) -> None:
     snapshot = backtest_preflight.require_available(
       str(request["symbol"]), str(request["timeframe"]), str(request["startDate"]),
       str(request["endDate"]), str(request.get("fillModel", "bar_next_open")),
+      int(request.get("warmupTradingDays", 0)),
     )
   except backtest_preflight.PreflightError as error:
     raise HTTPException(422, {"errorDetail": _preflight_error_detail(error.result)}) from error
@@ -877,6 +884,7 @@ def save_complete_strategy(payload: schemas.CompleteStrategySave):
   script_request = _model_dump(payload.script)
   config_request = _model_dump(payload.config)
   _validate_strategy_script(script_request)
+  _apply_script_warmup_to_config(script_request, config_request)
   if not settings.validate_symbol(config_request["symbol"]):
     raise HTTPException(422, f"非法标的: {config_request['symbol']}")
   if config_request.get("benchmarkSymbol") and not settings.validate_symbol(config_request["benchmarkSymbol"]):
@@ -892,6 +900,21 @@ def save_complete_strategy(payload: schemas.CompleteStrategySave):
     raise HTTPException(409, f"策略名称已存在: {payload.script.name}")
   except state_store.DatabaseError as error:
     raise HTTPException(500, f"PostgreSQL 保存完整策略失败: {error}") from error
+
+
+def _apply_script_warmup_to_config(script: dict[str, Any], config: dict[str, Any]) -> None:
+  """保存完整策略时，将代码声明写入与代码绑定的配置快照。"""
+  params_json = config.get("paramsJson")
+  params = params_json.get("params") if isinstance(params_json, dict) else None
+  if not isinstance(params, dict):
+    raise HTTPException(422, "完整策略必须包含回测参数")
+  try:
+    warmup_days = warmup_trading_days_for_script(str(script.get("code", "")))
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
+  if params.get("fillModel", "bar_next_open") == "l2_quote" and warmup_days != 0:
+    raise HTTPException(422, "L2 盘口回测不支持策略声明预热交易日")
+  params["warmupTradingDays"] = warmup_days
 
 
 def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
@@ -916,6 +939,7 @@ def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
   try:
     backtest_preflight.require_available(
       str(request["symbol"]), timeframe, str(params["startDate"]), str(params["endDate"]), str(fill_model),
+      0,
     )
   except backtest_preflight.PreflightError as error:
     raise HTTPException(422, {"errorDetail": _preflight_error_detail(error.result)}) from error
@@ -1037,7 +1061,9 @@ def backtest_preflight_check(
 ):
   try:
     start_date, end_date = normalize_date_range(start_date, end_date)
-    return backtest_preflight.preview(symbol, start_date, end_date, fill_model, timeframe)
+    return backtest_preflight.preview(
+      symbol, start_date, end_date, fill_model, timeframe,
+    )
   except ValueError as error:
     raise HTTPException(422, str(error)) from error
 
@@ -1263,7 +1289,14 @@ def data_status(
 ):
   if not settings.validate_timeframe(timeframe):
     raise HTTPException(422, f"不支持的周期: {timeframe}")
-  return {"status": market_data.status(symbol, timeframe)}
+  try:
+    return {"status": market_data.status(symbol, timeframe)}
+  except market_data.MarketDataError as error:
+    raise HTTPException(503, {
+      "code": "data.source_unavailable",
+      "message": "行情数据源暂时不可用，请稍后重试。",
+      "retryable": True,
+    }) from error
 
 
 if __name__ == "__main__":

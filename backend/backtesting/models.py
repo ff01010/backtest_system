@@ -131,3 +131,4 @@ class BacktestResult:
   equity_curve: list[EquityPoint]
   final_portfolio: PortfolioSnapshot
   portfolio_snapshots: list[PortfolioSnapshot] = field(default_factory=list)
+  unexecuted_orders: list[OrderIntent] = field(default_factory=list)

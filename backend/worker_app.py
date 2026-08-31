@@ -35,6 +35,7 @@ class WorkerRunRequest(BaseModel):
   baseQuantity: int = Field(default=0, ge=0)
   baseCostPrice: float = Field(default=0, ge=0)
   t0Enabled: bool = False
+  warmupBarCount: int = Field(default=0, ge=0)
 
 
 class WorkerL2SessionCreateRequest(BaseModel):
@@ -290,14 +291,30 @@ def run(payload: WorkerRunRequest) -> dict[str, Any]:
       base_cost_price=payload.baseCostPrice,
       t0_enabled=payload.t0Enabled,
     )
-    result = engine.run(strategy, bars)
+    result = engine.run(strategy, bars, payload.warmupBarCount)
   except ValueError as error:
     raise _worker_http_error(error) from error
   return {
     "trades": [fill_to_api_trade(fill) for fill in result.fills],
     "portfolioSnapshots": [_snapshot_to_dict(item) for item in result.portfolio_snapshots],
     "skippedSignals": strategy.skipped_signals,
+    "unexecutedOrders": [_unexecuted_order_to_api(item) for item in result.unexecuted_orders],
     "warnings": strategy.direction_warnings,
+  }
+
+
+def _unexecuted_order_to_api(order: Any) -> dict[str, Any]:
+  """将区间末尾未成交的下一开盘委托输出为可展示信号。"""
+  metadata = dict(order.metadata)
+  return {
+    "time": order.time, "signalTime": order.time, "executionTime": None,
+    "direction": str(metadata.get("direction") or order.side.value),
+    "action": str(metadata.get("direction") or order.side.value),
+    "side": order.side.value, "anchor": 0.0,
+    "price": float(metadata.get("recorded_price") or 0.0), "quantity": order.quantity,
+    "pnl": 0.0, "note": "回测区间结束，下一开盘委托未执行",
+    "priceSource": "当前 Bar 收盘价（未成交）", "status": "unexecuted",
+    "strategyModule": "用户脚本",
   }
 
 

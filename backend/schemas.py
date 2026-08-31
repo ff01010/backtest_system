@@ -143,6 +143,7 @@ class BacktestRunRequest(BaseModel):
   baseQuantity: int = Field(default=0, ge=0)
   baseCostPrice: float = Field(default=0, ge=0)
   t0Enabled: bool = False
+  warmupTradingDays: int = Field(default=0, ge=0, le=250)
   strategyParams: dict[str, Any] = Field(default_factory=dict)
   runDraft: bool = False
 

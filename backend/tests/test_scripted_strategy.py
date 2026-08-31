@@ -9,7 +9,12 @@ from backend.backtesting.models import Bar, PortfolioSnapshot, PositionSnapshot
 from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot
 from backend.services.backtest_errors import StrategyExecutionError, error_summary
-from backend.strategies.scripted import ScriptedBarStrategy, quote_mode_for_script, validate_script_code
+from backend.strategies.scripted import (
+  ScriptedBarStrategy,
+  quote_mode_for_script,
+  validate_script_code,
+  warmup_trading_days_for_script,
+)
 
 
 def _qmt_script_strategy(
@@ -48,6 +53,13 @@ def test_script_validator_rejects_non_integer_literal_quantity() -> None:
 def on_bar(bar, state):
   return [{'action': 'buy_open', 'quantity': 1.5}]
 """)
+
+
+def test_script_warmup_declaration_is_static_integer() -> None:
+  assert warmup_trading_days_for_script("WARMUP_TRADING_DAYS = 140\n") == 140
+  assert warmup_trading_days_for_script("def on_bar(bar, state):\n  return []\n") == 0
+  with pytest.raises(ValueError, match="模块顶层整数常量"):
+    warmup_trading_days_for_script("WARMUP_TRADING_DAYS = 100 + 40\n")
 
 
 def test_script_supports_classes_and_common_pure_builtins() -> None:

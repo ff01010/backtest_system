@@ -68,6 +68,25 @@ verify_clickhouse_connectivity() {
     || fail "quant-backtest-bar-runner 无法通过 quant-clickhouse:8123 连接 ClickHouse"
 }
 
+verify_trade_calendar() {
+  local check_code
+  check_code="$(cat <<'PY'
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from backend.services import state_store
+
+today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+latest = state_store.latest_trade_calendar_date()
+covered = state_store.is_trade_calendar_range_covered(today, today)
+if latest != today or not covered:
+  raise SystemExit(f"交易日历校验失败：latest={latest}, expected={today}, covered={covered}")
+print(f"交易日历校验通过：覆盖至 {today}")
+PY
+)"
+  "${compose[@]}" --profile calendar-sync run --rm --no-deps calendar-sync python -c "$check_code"
+}
+
 wait_for_application() {
   local port="$1" attempt health_url
   health_url="http://127.0.0.1:${port}/api/health"
@@ -101,6 +120,7 @@ validate_clickhouse_network
 wait_for_postgres
 "${compose[@]}" --profile migration run --rm migrate
 "${compose[@]}" --profile calendar-sync run --rm --build calendar-sync
+verify_trade_calendar || fail "交易日历同步后校验失败"
 "${compose[@]}" up -d --build --scale "l2-runner=$(read_l2_runner_replicas)" strategy-worker backend bar-runner l2-runner
 # Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。
 "${compose[@]}" up -d --build --force-recreate frontend

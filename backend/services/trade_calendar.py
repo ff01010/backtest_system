@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 import json
 from typing import Any, Iterator
 from urllib.error import URLError
@@ -14,6 +14,7 @@ from backend.services import state_store
 
 _EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 _SOURCE = "eastmoney_sse_index"
+_RECENT_BACKFILL_DAYS = 7
 
 
 class TradeCalendarSyncError(RuntimeError):
@@ -21,11 +22,12 @@ class TradeCalendarSyncError(RuntimeError):
 
 
 def sync_trade_calendar(start_date: str, end_date: str) -> dict[str, Any]:
-  """分年度拉取上证指数实际交易日期，并以自然日覆盖写入数据库。"""
-  start = date.fromisoformat(start_date)
+  """首次全量初始化，后续仅增量同步并回补最近自然日。"""
+  requested_start = date.fromisoformat(start_date)
   end = date.fromisoformat(end_date)
-  if start > end:
+  if requested_start > end:
     raise ValueError("开始日期不能晚于结束日期")
+  start = _sync_start(requested_start, end)
   open_count = 0
   chunks = 0
   for chunk_start, chunk_end in _year_ranges(start, end):
@@ -35,12 +37,23 @@ def sync_trade_calendar(start_date: str, end_date: str) -> dict[str, Any]:
     chunks += 1
   return {
     "exchange": "SSE",
+    "mode": "full" if start == requested_start else "incremental",
     "startDate": start_date,
+    "syncedStartDate": start.isoformat(),
     "endDate": end_date,
     "openDateCount": open_count,
     "chunks": chunks,
     "source": _SOURCE,
   }
+
+
+def _sync_start(requested_start: date, end: date) -> date:
+  latest_text = state_store.latest_trade_calendar_date("SSE")
+  if latest_text is None:
+    return requested_start
+  latest = date.fromisoformat(latest_text)
+  recent_start = latest - timedelta(days=_RECENT_BACKFILL_DAYS - 1)
+  return max(requested_start, min(recent_start, end))
 
 
 def _year_ranges(start: date, end: date) -> Iterator[tuple[date, date]]:

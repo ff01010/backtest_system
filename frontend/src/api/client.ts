@@ -411,6 +411,9 @@ export interface BacktestPreflightResponse {
   timeframes: Array<BacktestTimeframeAvailability & {
     missingDataTypes: string[];
     missingDates: string[];
+    availableWarmupDays?: number;
+    sourcePeriod?: string | null;
+    derivation?: string | null;
   }>;
 }
 
@@ -560,9 +563,23 @@ export async function deleteStrategyConfig(configId: string): Promise<boolean> {
 }
 
 export async function fetchDataStatus(symbol: string, timeframe = '5m'): Promise<DataStatus> {
-  const data = await fetchJson<{ status: DataStatus }>(
-    `${BASE}/data/status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`
+  const response = await fetch(
+    `${BASE}/data/status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`,
+    { credentials: 'include' },
   );
+  if (!response.ok) {
+    const text = await response.text();
+    let message: string | null = null;
+    try {
+      const payload = JSON.parse(text) as { detail?: { message?: unknown } };
+      if (typeof payload.detail?.message === 'string') {
+        message = payload.detail.message;
+      }
+    } catch {}
+    if (message) throw new Error(message);
+    throw new Error(`API ${response.status}: ${text}`);
+  }
+  const data = await response.json() as { status: DataStatus };
   return data.status;
 }
 

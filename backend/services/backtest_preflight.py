@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from backend import settings
 from backend.l2.providers import L2DataError
-from backend.services import bar_data, l2_quote_availability, state_store
+from backend.services import bar_data, l2_quote_availability, market_data, state_store
 
 
 class PreflightError(ValueError):
@@ -19,12 +19,22 @@ class PreflightError(ValueError):
     super().__init__(str(result.get("message") or "当前日期范围数据不完整。"))
 
 
-def preview(symbol: str, start_date: str, end_date: str, fill_model: str, timeframe: str | None = None) -> dict[str, Any]:
+def preview(
+  symbol: str,
+  start_date: str,
+  end_date: str,
+  fill_model: str,
+  timeframe: str | None = None,
+  warmup_trading_days: int = 0,
+) -> dict[str, Any]:
   trade_dates, calendar_days, calendar_available = _calendar_days(start_date, end_date)
   future_dates = [item["date"] for item in calendar_days if item["status"] == "future"]
   quote_dates = _available_quote_dates(symbol, trade_dates) if fill_model == "l2_quote" else None
   items = [
-    _preview_timeframe(symbol, item, trade_dates, fill_model, calendar_available, future_dates, quote_dates)
+    _preview_timeframe(
+      symbol, item, start_date, end_date, trade_dates, fill_model, calendar_available,
+      future_dates, quote_dates, warmup_trading_days,
+    )
     for item in settings.BAR_RUN_TIMEFRAMES
   ]
   selected = next((item for item in items if item["timeframe"] == timeframe), items[0])
@@ -43,12 +53,20 @@ def preview(symbol: str, start_date: str, end_date: str, fill_model: str, timefr
   }
 
 
-def require_available(symbol: str, timeframe: str, start_date: str, end_date: str, fill_model: str) -> dict[str, Any]:
+def require_available(
+  symbol: str,
+  timeframe: str,
+  start_date: str,
+  end_date: str,
+  fill_model: str,
+  warmup_trading_days: int = 0,
+) -> dict[str, Any]:
   trade_dates, calendar_days, calendar_available = _calendar_days(start_date, end_date)
   future_dates = [item["date"] for item in calendar_days if item["status"] == "future"]
   quote_dates = _available_quote_dates(symbol, trade_dates) if fill_model == "l2_quote" else None
   result = _preview_timeframe(
-    symbol, timeframe, trade_dates, fill_model, calendar_available, future_dates, quote_dates,
+    symbol, timeframe, start_date, end_date, trade_dates, fill_model, calendar_available,
+    future_dates, quote_dates, warmup_trading_days,
   )
   if not result["available"]:
     raise PreflightError(result)
@@ -60,7 +78,11 @@ def require_available(symbol: str, timeframe: str, start_date: str, end_date: st
         raise PreflightError(_failure(symbol, timeframe, start_date, end_date, "data.bar_missing"))
       _require_quotes(trade_dates, quote_dates or set())
     else:
-      bar_snapshot = bar_data.ensure_available(symbol, timeframe, start_date, end_date)
+      source = market_data.resolve_backtest_data(
+        symbol, timeframe, start_date, end_date,
+        trade_dates if calendar_available else None, warmup_trading_days,
+      )
+      bar_snapshot = {"provider": "qmt_kline", **market_data.snapshot_for_resolution(symbol, source)}
   except PreflightError:
     raise
   except ValueError as error:
@@ -71,15 +93,15 @@ def require_available(symbol: str, timeframe: str, start_date: str, end_date: st
 
 
 def _preview_timeframe(
-  symbol: str, timeframe: str, trade_dates: list[str], fill_model: str,
-  calendar_available: bool, future_dates: list[str], quote_dates: set[str] | None,
+  symbol: str, timeframe: str, start_date: str, end_date: str, trade_dates: list[str], fill_model: str,
+  calendar_available: bool, future_dates: list[str], quote_dates: set[str] | None, warmup_trading_days: int,
 ) -> dict[str, Any]:
   bar_dates: list[str] = []
   dates: list[str] = []
   codes: list[str] = []
-  if not calendar_available:
+  if fill_model == "l2_quote" and not calendar_available:
     codes.append("data.calendar_unavailable")
-  elif not trade_dates:
+  elif fill_model == "l2_quote" and not trade_dates:
     codes.append("data.no_trading_days")
   elif fill_model == "l2_quote":
     bar_dates = sorted(quote_dates or set())
@@ -87,16 +109,24 @@ def _preview_timeframe(
     if dates:
       codes.extend(["data.bar_missing", "data.l2_quote_missing"])
   else:
-    bar_dates = _available_bar_dates(symbol, timeframe, trade_dates)
-    dates = sorted(set(trade_dates) - set(bar_dates))
-    if dates:
-      codes.append("data.bar_missing")
+    data = market_data.preview_backtest_data(
+      symbol, timeframe, start_date, end_date, trade_dates if calendar_available else None, warmup_trading_days,
+    )
+    resolution = data.get("resolution")
+    bar_dates = list(resolution.formal_dates) if resolution is not None else []
+    dates = list(data["missingDates"])
+    codes.extend(data["missingDataTypes"])
   if future_dates:
     dates.extend(future_dates)
     codes.append("data.future_date")
   return {
     "timeframe": timeframe, "available": not codes, "missingDataTypes": codes,
-    "missingDates": sorted(set(dates)), "barDates": bar_dates, "reason": _message(codes),
+    "missingDates": sorted(set(dates)), "barDates": bar_dates,
+    "availableWarmupDays": data.get("availableWarmupDays", 0) if fill_model != "l2_quote" else 0,
+    "sourcePeriod": resolution.source_period if fill_model != "l2_quote" and resolution is not None else None,
+    "derivation": resolution.derivation if fill_model != "l2_quote" and resolution is not None else None,
+    "reason": data["reason"] if fill_model != "l2_quote" else _message(codes),
+    "message": data["reason"] if fill_model != "l2_quote" else _message(codes),
   }
 
 

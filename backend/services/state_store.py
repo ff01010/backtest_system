@@ -93,6 +93,19 @@ def replace_trade_calendar(
       """, rows)
 
 
+def latest_trade_calendar_date(exchange: str = "SSE") -> str | None:
+  """返回交易日历已写入的最新自然日，供增量同步确定起点。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT max(trade_date) AS latest_date
+        FROM market_trade_calendar
+        WHERE exchange=%s
+      """, (exchange,))
+      value = cur.fetchone()["latest_date"]
+      return str(value) if value else None
+
+
 def list_open_trade_dates(start_date: str, end_date: str, exchange: str = "SSE") -> list[str]:
   """返回指定交易所的开市日期。"""
   with _db() as conn:
