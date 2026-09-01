@@ -366,6 +366,22 @@ export async function cancelBacktestRun(runId: string): Promise<{ runId: string;
   return res.json();
 }
 
+export async function deleteBacktestRun(runId: string): Promise<void> {
+  const res = await fetch(`${BASE}/backtest/runs/${runId}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`API ${res.status}: ${text}`);
+  }
+}
+
+export async function deleteBacktestRuns(runIds: string[]): Promise<number> {
+  const data = await sendJson<{ deleted: number }>(`${BASE}/backtest/runs`, 'DELETE', { runIds });
+  return data.deleted;
+}
+
 export async function fetchBacktestRunChart(
   runId: string,
   date: string,

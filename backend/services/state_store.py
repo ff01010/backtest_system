@@ -1277,6 +1277,49 @@ def get_backtest_run(run_id: str) -> dict[str, Any]:
       return _normalize_run(row)
 
 
+def delete_backtest_run(run_id: str) -> bool:
+  """永久删除当前用户已结束的回测及由外键关联的数据库记录。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT status FROM backtest_run WHERE id=%s AND owner_user_id=%s FOR UPDATE",
+        (run_id, current_user_id()),
+      )
+      row = cur.fetchone()
+      if row is None:
+        raise KeyError(run_id)
+      if row["status"] not in {"succeeded", "failed", "cancelled"}:
+        raise ValueError("排队或运行中的回测不能删除，请先取消任务")
+      cur.execute(
+        "DELETE FROM backtest_run WHERE id=%s AND owner_user_id=%s",
+        (run_id, current_user_id()),
+      )
+      return cur.rowcount == 1
+
+
+def delete_backtest_runs(run_ids: list[str]) -> int:
+  """原子删除当前用户选中的多条已结束回测。"""
+  unique_run_ids = list(dict.fromkeys(run_ids))
+  if not unique_run_ids:
+    raise ValueError("请至少选择一条回测记录")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT id, status FROM backtest_run WHERE id=ANY(%s) AND owner_user_id=%s FOR UPDATE",
+        (unique_run_ids, current_user_id()),
+      )
+      rows = cur.fetchall()
+      if len(rows) != len(unique_run_ids):
+        raise KeyError("部分回测记录不存在或无删除权限")
+      if any(row["status"] not in {"succeeded", "failed", "cancelled"} for row in rows):
+        raise ValueError("选中的回测包含排队或运行中任务，请先取消任务")
+      cur.execute(
+        "DELETE FROM backtest_run WHERE id=ANY(%s) AND owner_user_id=%s",
+        (unique_run_ids, current_user_id()),
+      )
+      return cur.rowcount
+
+
 def get_backtest_result_page(
   run_id: str,
   result_key: str,

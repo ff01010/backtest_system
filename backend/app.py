@@ -1317,6 +1317,28 @@ def cancel_backtest_run(run_id: str):
   return {"runId": run_id, "status": "cancelling"}
 
 
+@app.delete("/api/backtest/runs")
+def delete_backtest_runs(payload: schemas.BacktestRunBatchDeleteRequest):
+  try:
+    deleted = state_store.delete_backtest_runs(payload.runIds)
+  except KeyError as error:
+    raise HTTPException(404, str(error)) from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+  return {"deleted": deleted}
+
+
+@app.delete("/api/backtest/runs/{run_id}")
+def delete_backtest_run(run_id: str):
+  try:
+    deleted = state_store.delete_backtest_run(run_id)
+  except KeyError as error:
+    raise HTTPException(404, "回测记录不存在") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+  return {"deleted": deleted}
+
+
 @app.post("/api/backtest/live")
 def create_live_run(payload: schemas.BacktestRunRequest):
   request = _model_dump(payload)

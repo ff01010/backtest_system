@@ -417,6 +417,10 @@ class BacktestRunMetaUpdate(BaseModel):
   tags: list[str] = Field(default_factory=list)
 
 
+class BacktestRunBatchDeleteRequest(BaseModel):
+  runIds: list[str] = Field(min_length=1, max_length=100)
+
+
 class StrategyConfigCreate(BaseModel):
   name: str = Field(min_length=1, max_length=64)
   scriptId: str | None = None

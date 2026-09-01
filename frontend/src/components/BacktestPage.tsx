@@ -16,6 +16,8 @@ import {
   createAccount,
   cancelBacktestRun,
   createStrategyScript,
+  deleteBacktestRun,
+  deleteBacktestRuns,
   deleteStrategyConfig,
   deleteStrategyScript,
   fetchAccounts,
@@ -960,6 +962,7 @@ export default function BacktestPage({
   const [strategySourceError, setStrategySourceError] = useState('');
   const [configVersions, setConfigVersions] = useState<StrategyConfigVersion[]>([]);
   const [backtestRuns, setBacktestRuns] = useState<BacktestRunHistory[]>([]);
+  const [selectedHistoryRunIds, setSelectedHistoryRunIds] = useState<Set<string>>(new Set());
   const [selectedHistoryRunId, setSelectedHistoryRunId] = useState<string | ''>('');
   const [compareHistoryRunId, setCompareHistoryRunId] = useState<string | ''>('');
   const [historyQuery, setHistoryQuery] = useState('');
@@ -1208,6 +1211,14 @@ export default function BacktestPage({
     if (typeof compareHistoryRunId !== 'string') {
       setCompareHistoryRunId(backtestRuns[1]?.id || backtestRuns[0].id);
     }
+  }, [backtestRuns]);
+
+  useEffect(() => {
+    setSelectedHistoryRunIds((previous) => {
+      const available = new Set(backtestRuns.map((run) => run.id));
+      const next = new Set([...previous].filter((runId) => available.has(runId)));
+      return next.size === previous.size ? previous : next;
+    });
   }, [backtestRuns]);
 
   useEffect(() => {
@@ -2293,13 +2304,21 @@ export default function BacktestPage({
       return (!historySymbolFilter || run.symbol === historySymbolFilter) && (!query || searchable.includes(query));
     });
   }, [backtestRuns, configNameById, historyQuery, historySymbolFilter]);
+  const deletableFilteredHistoryRuns = filteredHistoryRuns.filter(
+    (run) => run.status !== 'queued' && run.status !== 'running',
+  );
+  const selectedDeletableHistoryRunIds = deletableFilteredHistoryRuns
+    .filter((run) => selectedHistoryRunIds.has(run.id))
+    .map((run) => run.id);
+  const allDeletableHistoryRunsSelected = deletableFilteredHistoryRuns.length > 0
+    && selectedDeletableHistoryRunIds.length === deletableFilteredHistoryRuns.length;
   const historyPageCount = Math.max(1, Math.ceil(filteredHistoryRuns.length / historyPageSize));
   const safeHistoryPage = Math.min(historyPage, historyPageCount);
   const historyPageStart = (safeHistoryPage - 1) * historyPageSize;
   const pagedHistoryRuns = filteredHistoryRuns.slice(historyPageStart, historyPageStart + historyPageSize);
   const historyRangeStart = filteredHistoryRuns.length > 0 ? historyPageStart + 1 : 0;
   const historyRangeEnd = Math.min(historyPageStart + historyPageSize, filteredHistoryRuns.length);
-  const historyGridColumns = 'minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 74px';
+  const historyGridColumns = '32px minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 88px';
   const activePanelLabel = resultTabs.find((item) => item.id === activePanel)?.label || '概览';
   const runDisabled = running || activeRun != null || !hasSelectedConfig || versionDirty;
   const statusMessage = error || status || (versionDirty
@@ -2484,6 +2503,68 @@ export default function BacktestPage({
       setStatus(`已保存历史记录 ${formatRunReference(run.displayNo)} 的备注和标签`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '保存历史备注失败');
+    }
+  };
+
+  const handleDeleteBacktestRun = async (run: BacktestRunHistory) => {
+    if (run.status === 'queued' || run.status === 'running') {
+      setError('排队或运行中的回测不能删除，请先取消任务。');
+      return;
+    }
+    const confirmed = window.confirm(
+      `确认永久删除历史回测 ${formatRunReference(run.displayNo)} 吗？\n该操作会删除数据库中的回测记录和关联任务数据，无法恢复。`,
+    );
+    if (!confirmed) return;
+    setError('');
+    setStatus('');
+    try {
+      await deleteBacktestRun(run.id);
+      setSelectedHistoryRunIds((previous) => {
+        const next = new Set(previous);
+        next.delete(run.id);
+        return next;
+      });
+      if (selectedHistoryRunId === run.id) setSelectedHistoryRunId('');
+      if (compareHistoryRunId === run.id) setCompareHistoryRunId('');
+      await refreshBacktestRuns();
+      setStatus(`已永久删除历史回测 ${formatRunReference(run.displayNo)}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '删除历史回测失败');
+    }
+  };
+
+  const toggleHistoryRunSelection = (runId: string, checked: boolean) => {
+    setSelectedHistoryRunIds((previous) => {
+      const next = new Set(previous);
+      if (checked) next.add(runId);
+      else next.delete(runId);
+      return next;
+    });
+  };
+
+  const toggleAllHistoryRunSelections = (checked: boolean) => {
+    setSelectedHistoryRunIds(checked ? new Set(deletableFilteredHistoryRuns.map((run) => run.id)) : new Set());
+  };
+
+  const handleDeleteSelectedHistoryRuns = async () => {
+    const runIds = selectedDeletableHistoryRunIds;
+    if (runIds.length === 0) return;
+    const confirmed = window.confirm(
+      `确认永久删除选中的 ${runIds.length} 条历史回测吗？\n该操作会删除数据库中的回测记录和关联任务数据，无法恢复。`,
+    );
+    if (!confirmed) return;
+    setError('');
+    setStatus('');
+    try {
+      const deleted = await deleteBacktestRuns(runIds);
+      const deletedIds = new Set(runIds);
+      if (selectedHistoryRunId && deletedIds.has(selectedHistoryRunId)) setSelectedHistoryRunId('');
+      if (compareHistoryRunId && deletedIds.has(compareHistoryRunId)) setCompareHistoryRunId('');
+      setSelectedHistoryRunIds(new Set());
+      await refreshBacktestRuns();
+      setStatus(`已永久删除 ${deleted} 条历史回测`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '批量删除历史回测失败');
     }
   };
 
@@ -3830,9 +3911,19 @@ export default function BacktestPage({
                       {historySymbols.map((symbol) => <option key={symbol} value={symbol}>{symbol}</option>)}
                     </select>
                   </div>
+                  {selectedDeletableHistoryRunIds.length > 0 && (
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 14, padding: '8px 10px', border: '1px solid #fecaca', borderRadius: 4, background: '#fff1f2', color: '#9f1239', fontSize: 12 }}>
+                      <span>已选 {selectedDeletableHistoryRunIds.length} 条</span>
+                      <span style={{ display: 'flex', gap: 8 }}>
+                        <button onClick={() => setSelectedHistoryRunIds(new Set())} style={{ height: 28, borderRadius: 4, border: '1px solid #cbd5e1', background: '#ffffff', color: '#334155', cursor: 'pointer' }}>取消选择</button>
+                        <button onClick={() => void handleDeleteSelectedHistoryRuns()} style={{ height: 28, borderRadius: 4, border: '1px solid #fecaca', background: '#be123c', color: '#ffffff', cursor: 'pointer' }}>删除所选</button>
+                      </span>
+                    </div>
+                  )}
                   <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 16 }}>
                     <div className="history-experiment-table" style={{ minWidth: 0 }}>
                       <div className="history-experiment-head" style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', padding: '0 10px 8px' }}>
+                        <input type="checkbox" checked={allDeletableHistoryRunsSelected} disabled={deletableFilteredHistoryRuns.length === 0} onChange={(event) => toggleAllHistoryRunSelections(event.target.checked)} aria-label="选择当前筛选结果中的全部可删除回测" />
                         <span>ID</span>
                         <span>策略</span>
                         <span>标的/基准</span>
@@ -3846,8 +3937,10 @@ export default function BacktestPage({
                       {filteredHistoryRuns.length > 0 ? (
                         pagedHistoryRuns.map((run) => {
                           const isSelected = run.id === selectedHistoryRunId;
+                          const deletable = run.status !== 'queued' && run.status !== 'running';
                           return (
                             <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} onDoubleClick={() => handleViewHistoryResult(run)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
+                              <input type="checkbox" checked={selectedHistoryRunIds.has(run.id)} disabled={!deletable} onClick={(event) => event.stopPropagation()} onChange={(event) => toggleHistoryRunSelection(run.id, event.target.checked)} aria-label={`选择历史回测 ${formatRunReference(run.displayNo)}`} />
                               <button onClick={() => setSelectedHistoryRunId(run.id)} style={{ textAlign: 'left', border: 'none', background: 'transparent', padding: 0, color: '#0f172a', cursor: 'pointer', fontWeight: isSelected ? 700 : 500 }}>
                                 {formatRunReference(run.displayNo)}
                               </button>
@@ -3892,19 +3985,39 @@ export default function BacktestPage({
                                   </div>
                                 )}
                               </span>
-                              <button
-                                onClick={() => handleApplyBacktestRun(run)}
-                                style={{
-                                  height: 28,
-                                  borderRadius: 4,
-                                  border: '1px solid #cbd5e1',
-                                  background: '#f8fafc',
-                                  color: '#334155',
-                                  cursor: 'pointer',
-                                }}
-                              >
-                                复制
-                              </button>
+                              <span style={{ display: 'flex', gap: 4 }}>
+                                <button
+                                  onClick={() => handleApplyBacktestRun(run)}
+                                  style={{
+                                    height: 28,
+                                    borderRadius: 4,
+                                    border: '1px solid #cbd5e1',
+                                    background: '#f8fafc',
+                                    color: '#334155',
+                                    cursor: 'pointer',
+                                  }}
+                                >
+                                  复制
+                                </button>
+                                <button
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void handleDeleteBacktestRun(run);
+                                  }}
+                                  disabled={run.status === 'queued' || run.status === 'running'}
+                                  style={{
+                                    height: 28,
+                                    borderRadius: 4,
+                                    border: '1px solid #fecaca',
+                                    background: '#fff1f2',
+                                    color: '#be123c',
+                                    cursor: run.status === 'queued' || run.status === 'running' ? 'not-allowed' : 'pointer',
+                                    opacity: run.status === 'queued' || run.status === 'running' ? 0.55 : 1,
+                                  }}
+                                >
+                                  删除
+                                </button>
+                              </span>
                             </div>
                           );
                         })
