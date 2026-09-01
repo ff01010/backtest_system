@@ -124,6 +124,7 @@ class BacktestRunRequest(BaseModel):
   symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   benchmarkSymbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$")
   strategy: str = "user_script"
+  signalDatasetId: str | None = None
   timeframe: str = "5m"
   startDate: str
   endDate: str
@@ -463,6 +464,14 @@ class ErrorResponse(BaseModel):
 class LoginRequest(BaseModel):
   username: str = Field(min_length=1, max_length=64)
   password: str = Field(min_length=1, max_length=256)
+
+
+class ResearchAuthorizationCodeRequest(BaseModel):
+  state: str = Field(min_length=16, max_length=512)
+
+
+class ResearchAuthorizationCodeExchangeRequest(ResearchAuthorizationCodeRequest):
+  authorizationCode: str = Field(min_length=32, max_length=512)
 
 
 class UserCreate(BaseModel):

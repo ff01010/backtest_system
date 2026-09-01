@@ -123,7 +123,24 @@ class UserScriptAdapter:
     return backtest_runner.run_user_script_backtest(payload)
 
 
-_ADAPTERS: dict[str, StrategyAdapter] = {"user_script": UserScriptAdapter()}
+@dataclass(frozen=True)
+class ResearchSignalAdapter:
+  strategy_id: str = "research_signal"
+  display_name: str = "研究信号数据集"
+
+  def get_parameter_schema(self) -> dict[str, Any]:
+    return {}
+
+  def run(self, payload: dict[str, Any]) -> dict[str, Any]:
+    from backend.services import backtest_runner
+
+    return backtest_runner.run_research_signal_backtest(payload)
+
+
+_ADAPTERS: dict[str, StrategyAdapter] = {
+  "user_script": UserScriptAdapter(),
+  "research_signal": ResearchSignalAdapter(),
+}
 
 _VISIBLE_STRATEGY_IDS = ("user_script",)
 

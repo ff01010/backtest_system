@@ -82,6 +82,13 @@ def default_fee_profile() -> dict[str, float]:
 # 当前部署尚未配置 HTTPS，默认关闭 Secure 以保证同源 HTTP 登录可用。
 AUTH_COOKIE_SECURE = os.getenv("TREND_GRID_AUTH_COOKIE_SECURE", "false").lower() == "true"
 
+# 研究服务兑换一次性授权码时使用的后端间凭据，不能为空才允许兑换。
+RESEARCH_AUTH_SERVICE_TOKEN = os.getenv("TREND_GRID_RESEARCH_AUTH_SERVICE_TOKEN", "")
+RESEARCH_AUTH_CODE_LIFETIME_SECONDS = _read_bounded_int(
+  "TREND_GRID_RESEARCH_AUTH_CODE_LIFETIME_SECONDS", 60, 30, 300,
+)
+RESEARCH_CENTER_CALLBACK_URL = os.getenv("TREND_GRID_RESEARCH_CENTER_CALLBACK_URL", "")
+
 # 对外回测 API 默认关闭。启用后必须配置私有 pepper，避免仅用数据库摘要保护 API Key。
 PUBLIC_API_ENABLED = os.getenv("TREND_GRID_PUBLIC_API_ENABLED", "false").lower() == "true"
 API_KEY_PEPPER = os.getenv("TREND_GRID_API_KEY_PEPPER", "")

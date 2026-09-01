@@ -125,6 +125,14 @@ export async function logout(): Promise<void> {
   await sendJson<{ ok: boolean }>(`${BASE}/auth/logout`, 'POST', {});
 }
 
+export async function createResearchAuthorizationCode(state: string): Promise<{
+  authorizationCode: string;
+  expiresIn: number;
+  callbackUrl: string;
+}> {
+  return sendJson(`${BASE}/research/authorization-codes`, 'POST', { state });
+}
+
 export async function fetchApiKeys(): Promise<ApiAccessKey[]> {
   const data = await fetchJson<{ keys: ApiAccessKey[] }>(`${BASE}/api-keys`);
   return data.keys;

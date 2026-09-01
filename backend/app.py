@@ -9,10 +9,12 @@ import sys
 import os
 import ast
 import hashlib
+import hmac
 import json
 import logging
 import re
 from typing import Any
+from datetime import datetime, timezone
 from uuid import uuid4
 
 _viewer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,6 +41,7 @@ from backend.services import (
   market_data,
   qmt_instrument_directory,
   data_repository,
+  research_signal_snapshot,
   state_store,
   strategy_adapters,
 )
@@ -375,6 +378,10 @@ def _validate_backtest_request(request: dict) -> None:
   if not strategy_adapters.has_strategy(request["strategy"]):
     raise HTTPException(422, f"不支持的策略: {request['strategy']}")
 
+  if request["strategy"] == "research_signal":
+    _prepare_research_signal_request(request)
+    return
+
   if not request.get("configId"):
     raise HTTPException(422, "回测必须先选择并保存策略")
   _prepare_saved_strategy_snapshot(request)
@@ -393,6 +400,35 @@ def _validate_backtest_request(request: dict) -> None:
   request["feeProfile"] = settings.default_fee_profile()
   request["commissionRate"] = request["feeProfile"]["commissionRate"]
   _require_preflight(request)
+
+
+def _prepare_research_signal_request(request: dict[str, Any]) -> None:
+  dataset_id = request.get("signalDatasetId")
+  if not isinstance(dataset_id, str) or not dataset_id:
+    raise HTTPException(422, "研究信号回测必须选择信号数据集")
+  if request.get("fillModel") != "bar_next_open" or request.get("timeframe") != "1d":
+    raise HTTPException(422, "首期研究信号回测仅支持 1d 标准 Bar 回放")
+  request["holdingPolicy"] = "overnight"
+  request["strategyCategory"] = "directional_holding"
+  request["feeProfile"] = settings.default_fee_profile()
+  request["commissionRate"] = request["feeProfile"]["commissionRate"]
+  _require_preflight(request)
+  try:
+    request["researchSignalSnapshot"] = research_signal_snapshot.freeze_signal_snapshot(
+      dataset_id, str(state_store.current_user_id()), request["symbol"], request["startDate"],
+      request["endDate"], request["timeframe"],
+    )
+  except research_signal_snapshot.ResearchSignalSnapshotError as error:
+    raise HTTPException(422, str(error)) from error
+  snapshot = request["researchSignalSnapshot"]
+  request["savedConfigSnapshot"] = {
+    "strategy": "research_signal",
+    "signalDatasetId": dataset_id,
+    "snapshotHash": snapshot["snapshotHash"],
+    "signalDatasetVersion": snapshot["manifest"].get("version"),
+    "actionPolicyVersion": snapshot["manifest"].get("actionPolicyVersion"),
+    "predictionDatasetVersion": snapshot["manifest"].get("predictionDatasetVersion"),
+  }
 
 
 def _require_preflight(request: dict[str, Any]) -> None:
@@ -605,6 +641,53 @@ def current_user(request: Request):
     "displayName": user.display_name,
     "role": user.role,
   }}
+
+
+@app.post("/api/research/authorization-codes")
+def create_research_authorization_code(
+  payload: schemas.ResearchAuthorizationCodeRequest,
+):
+  """为已登录用户签发跳转研究中心所需的一次性授权码。"""
+  if not settings.RESEARCH_CENTER_CALLBACK_URL:
+    raise HTTPException(503, "研究中心回调地址尚未配置")
+  authorization_code = auth.create_research_authorization_code(
+    get_current_user(), payload.state,
+  )
+  return {
+    "authorizationCode": authorization_code,
+    "expiresIn": settings.RESEARCH_AUTH_CODE_LIFETIME_SECONDS,
+    "callbackUrl": settings.RESEARCH_CENTER_CALLBACK_URL,
+  }
+
+
+@app.post("/internal/v1/research-identity/exchange", include_in_schema=False)
+def exchange_research_authorization_code(
+  payload: schemas.ResearchAuthorizationCodeExchangeRequest,
+  request: Request,
+):
+  """仅允许研究服务以内部凭据兑换浏览器持有的一次性授权码。"""
+  expected_token = settings.RESEARCH_AUTH_SERVICE_TOKEN
+  received_token = request.headers.get("X-Service-Token", "")
+  if not expected_token or not hmac.compare_digest(received_token, expected_token):
+    raise HTTPException(401, "研究服务身份无效")
+  user = auth.exchange_research_authorization_code(
+    payload.authorizationCode, payload.state,
+  )
+  if not user:
+    raise HTTPException(401, "授权码无效、已使用或已过期")
+  now = datetime.now(timezone.utc)
+  issued_at = format_epoch_as_shanghai(now.timestamp())
+  expires_at = format_epoch_as_shanghai(
+    (now + auth.SESSION_LIFETIME).timestamp(),
+  )
+  return {
+    "backtestUserId": user.id,
+    "role": user.role,
+    "active": True,
+    "issuedAt": issued_at,
+    "expiresAt": expires_at,
+    "jti": uuid4().hex,
+  }
 
 
 @app.get("/api/api-keys")

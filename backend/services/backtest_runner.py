@@ -212,6 +212,65 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
   }
 
 
+def run_research_signal_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+  """Replay one frozen standard-signal snapshot through the existing Bar worker."""
+  snapshot = payload.get("researchSignalSnapshot")
+  if not isinstance(snapshot, dict) or not isinstance(snapshot.get("artifactFile"), str):
+    raise ValueError("研究信号冻结快照不存在")
+  signals = _load_frozen_research_signals(snapshot["artifactFile"])
+  worker_payload = dict(payload)
+  worker_payload["scriptId"] = f"research-signal:{snapshot['datasetId']}"
+  worker_payload["versionScriptSnapshot"] = {
+    "name": "冻结研究信号", "entryType": "on_bar", "code": _RESEARCH_SIGNAL_SCRIPT,
+  }
+  worker_payload["strategyParams"] = {**dict(payload.get("strategyParams") or {}), "signalsByDate": signals}
+  result = run_user_script_backtest(worker_payload)
+  result["researchSignalSnapshot"] = snapshot
+  return result
+
+
+def _load_frozen_research_signals(artifact_file: str) -> dict[str, str]:
+  try:
+    with open(artifact_file, "r", encoding="utf-8") as handle:
+      rows = [json.loads(line) for line in handle if line.strip()]
+  except (OSError, json.JSONDecodeError) as error:
+    raise ValueError("研究信号冻结文件不可读取") from error
+  signals: dict[str, str] = {}
+  for row in rows:
+    effective_at = str(row.get("effectiveAt", ""))
+    action = str(row.get("action", ""))
+    trade_date = effective_at[:10]
+    if len(trade_date) != 10 or action not in {"long", "short", "flat"} or trade_date in signals:
+      raise ValueError("冻结信号文件内容无效或同日存在多条信号")
+    signals[trade_date] = action
+  return signals
+
+
+_RESEARCH_SIGNAL_SCRIPT = """
+def on_bar(bar, state):
+  action = state['params']['signalsByDate'].get(bar['tradeDate'])
+  if action is None:
+    return []
+  position = bar['strategyPosition']
+  quantity = int(bar['cash'] / bar['close'] / 100) * 100
+  if action == 'long':
+    if position < 0:
+      return [{'action': 'buy_close', 'quantity': -position, 'reason': 'research_signal_long_close_short'}]
+    if position == 0 and quantity > 0:
+      return [{'action': 'buy_open', 'quantity': quantity, 'reason': 'research_signal_long'}]
+  if action == 'short':
+    if position > 0:
+      return [{'action': 'sell_close', 'quantity': position, 'reason': 'research_signal_short_close_long'}]
+    if position == 0 and quantity > 0:
+      return [{'action': 'sell_open', 'quantity': quantity, 'reason': 'research_signal_short'}]
+  if action == 'flat' and position > 0:
+    return [{'action': 'sell_close', 'quantity': position, 'reason': 'research_signal_flat_close_long'}]
+  if action == 'flat' and position < 0:
+    return [{'action': 'buy_close', 'quantity': -position, 'reason': 'research_signal_flat_close_short'}]
+  return []
+"""
+
+
 def _load_user_script_bars(payload: dict[str, Any]) -> tuple[pd.DataFrame, int, dict[str, Any]]:
   """标准自定义策略固定走与预检一致的 QMT 来源解析器。"""
   timeframe = str(payload.get("timeframe", "5m"))
