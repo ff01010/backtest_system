@@ -318,6 +318,60 @@ def revoke_session(token: str | None) -> None:
       cur.execute("UPDATE auth_session SET revoked_at=now() WHERE token_hash=%s AND revoked_at IS NULL", (token_hash,))
 
 
+def _authorization_code_hash(value: str) -> str:
+  return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def create_research_authorization_code(user: CurrentUser, state: str) -> str:
+  """签发仅能兑换一次的研究系统授权码，数据库只保留摘要。"""
+  authorization_code = secrets.token_urlsafe(36)
+  expires_at = datetime.now(timezone.utc) + timedelta(
+    seconds=settings.RESEARCH_AUTH_CODE_LIFETIME_SECONDS,
+  )
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        INSERT INTO research_authorization_code (code_hash, user_id, state_hash, expires_at)
+        VALUES (%s, %s, %s, %s)
+      """, (
+        _authorization_code_hash(authorization_code),
+        user.id,
+        _authorization_code_hash(state),
+        expires_at,
+      ))
+  return authorization_code
+
+
+def exchange_research_authorization_code(
+  authorization_code: str,
+  state: str,
+) -> CurrentUser | None:
+  """原子消费有效授权码并返回仍处于启用状态的回测用户。"""
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE research_authorization_code
+        SET consumed_at=now()
+        WHERE code_hash=%s
+          AND state_hash=%s
+          AND consumed_at IS NULL
+          AND expires_at > now()
+        RETURNING user_id
+      """, (
+        _authorization_code_hash(authorization_code),
+        _authorization_code_hash(state),
+      ))
+      code_row = cur.fetchone()
+      if not code_row:
+        return None
+      cur.execute("""
+        SELECT * FROM app_user
+        WHERE id=%s AND status='active'
+      """, (code_row["user_id"],))
+      user_row = cur.fetchone()
+      return _to_current_user(user_row) if user_row else None
+
+
 def list_users(page: int, page_size: int) -> dict[str, Any]:
   """按页返回人员，避免管理员页面一次加载全部账户。"""
   with _system_db() as conn:

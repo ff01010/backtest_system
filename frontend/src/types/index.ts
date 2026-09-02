@@ -180,6 +180,11 @@ export interface BacktestTrade {
   childIndex?: number;
   executionAlgorithm?: string;
   priceSource?: string;
+  fundingLimited?: boolean;
+  depthQuantity?: number;
+  affordableQuantity?: number;
+  remainingQuantity?: number;
+  availableCashBefore?: number;
   action?: string;
   status?: 'filled' | 'skipped' | string;
   direction: string;

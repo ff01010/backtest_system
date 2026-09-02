@@ -97,7 +97,7 @@ const fieldStyle = {
 const DEFAULT_PARAMS = {
   startDate: '2026-06-01',
   endDate: '2026-06-26',
-  initialCapital: '1000000',
+  initialCapital: '10000000',
   commissionRate: '0.00008',
   slippage: '0.0001',
   allowLong: true,
@@ -354,13 +354,18 @@ export function formatTradeDirection(side: string): string {
   return side === 'BUY' ? '买入' : '卖出';
 }
 
-export function formatTradeNote(direction: string, note: string): string {
+export function formatTradeNote(direction: string, note: string, fundingLimited = false): string {
   const normalizedNote = note.trim();
-  if (TRADE_NOTE_LABELS[normalizedNote]) return TRADE_NOTE_LABELS[normalizedNote];
-  if (!normalizedNote) return TRADE_ACTION_LABELS[direction] || '策略信号';
-  if (/[开平]|止损|止盈|强平/.test(normalizedNote)) return normalizedNote;
   const actionLabel = TRADE_ACTION_LABELS[direction];
-  return actionLabel ? `${actionLabel}：${normalizedNote}` : normalizedNote;
+  const baseNote = TRADE_NOTE_LABELS[normalizedNote]
+    || (!normalizedNote
+      ? actionLabel || '策略信号'
+      : /[开平]|止损|止盈|强平/.test(normalizedNote)
+        ? normalizedNote
+        : actionLabel
+          ? actionLabel + '：' + normalizedNote
+          : normalizedNote);
+  return fundingLimited ? baseNote + '；资金不足限制，已成交可负担部分' : baseNote;
 }
 
 function formatSignalTime(value: string): string {
@@ -706,6 +711,7 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
   const manifest = run.resultJson?.experimentManifest;
   const scriptSnapshot = asHistoryRecord(run.scriptSnapshot);
   const dataVersion = asHistoryRecord(run.dataVersion);
+  const barSnapshot = asHistoryRecord(dataVersion.barSnapshot);
   const strategyParams = asHistoryRecord(run.paramsSnapshot);
   const dataSnapshot = asHistoryRecord(run.resultJson?.dataSnapshot);
   const temporaryAggregation = asHistoryRecord(dataSnapshot.temporaryBarAggregation);
@@ -722,6 +728,9 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
     .filter(([key]) => !EXPERIMENT_PARAM_KEYS.has(key))
     .map(([key, value]) => ({ label: key, value }));
   const dataFiles = Array.isArray(dataVersion.files) ? dataVersion.files.length : null;
+  const sourceLabel = barSnapshot.derivation
+    ? '由完整 1m 数据派生日线'
+    : barSnapshot.sourcePeriod ? 'QMT 原始数据' : null;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -759,6 +768,7 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
             { label: 'K 线数量', value: manifest?.barCount },
             { label: '数据范围', value: manifest?.barRange ? `${manifest.barRange.start} - ${manifest.barRange.end}` : null },
             { label: '数据周期', value: manifest?.barRange?.timeframe },
+            { label: '数据来源', value: sourceLabel },
             { label: '数据文件', value: dataFiles == null ? null : `${dataFiles} 个` },
             { label: '数据指纹', value: shortenHistoryHash(dataVersion.dataHash ?? manifest?.dataHash) },
           ]}
@@ -1321,7 +1331,7 @@ export default function BacktestPage({
       setParams((prev) => {
         const next: BacktestParams = { ...prev };
         Object.entries(savedParams).forEach(([key, value]) => {
-          if (value !== undefined) next[key] = value;
+          if (key !== 'warmupTradingDays' && value !== undefined) next[key] = value;
         });
         return next;
       });
@@ -1342,7 +1352,7 @@ export default function BacktestPage({
         timeframe: config.timeframe,
         benchmarkSymbol: config.benchmarkSymbol || config.symbol,
         accountId: config.accountId || '',
-        params: savedParams || {},
+        params: Object.fromEntries(Object.entries(savedParams || {}).filter(([key]) => key !== 'warmupTradingDays')),
         script: { code: script.code, entryType: script.entryType },
       }));
     }
@@ -1364,7 +1374,7 @@ export default function BacktestPage({
     benchmarkSymbol: selectedBenchmarkSymbol || selectedSymbol,
     accountId: typeof selectedAccountId === 'number' ? selectedAccountId : null,
     paramsJson: {
-      params: { ...params },
+      params: Object.fromEntries(Object.entries(params).filter(([key]) => key !== 'warmupTradingDays')),
       scriptName: scriptForm.name.trim(),
     },
     enabled: true,
@@ -2118,7 +2128,7 @@ export default function BacktestPage({
       key: 'note',
       label: '说明',
       width: 'minmax(160px, 1.5fr)',
-      render: (trade) => formatTradeNote(trade.direction, trade.note),
+      render: (trade) => formatTradeNote(trade.direction, trade.note, trade.fundingLimited),
     },
     {
       key: 'price',
@@ -3147,6 +3157,11 @@ export default function BacktestPage({
                     {!isL2Quote && backtestTimeframes.length === 0 && (
                       <div style={{ color: '#b45309', fontSize: 12, marginTop: 5 }}>
                         正在读取回测引擎支持的周期。
+                      </div>
+                    )}
+                    {!isL2Quote && selectedTimeframe === '1d' && selectedPreflight?.available && (
+                      <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.45, marginTop: 5 }}>
+                        {selectedPreflight.derivation ? '日线由完整 1m 数据派生' : '使用 QMT 原始日线'}
                       </div>
                     )}
                   </label>
@@ -4914,5 +4929,3 @@ export default function BacktestPage({
     </div>
   ); */
 }
-
-

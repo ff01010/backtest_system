@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from backend import settings
-from backend.services import backtest_runner, state_store
+from backend.services import backtest_runner, research_result_outbox, state_store
 from backend.services.backtest_errors import error_summary
 from backend.services.system_error_log import system_error_log_record
 
@@ -49,6 +49,7 @@ class BarRunner:
       summary["warningCount"] = len(result.get("warnings") or [])
       summary["fillModel"] = str(payload.get("fillModel", "bar_next_open"))
       state_store.finish_bar_backtest_job(job["runId"], job["attemptToken"], "succeeded", summary, result)
+      _dispatch_research_result_outbox()
     except Exception as error:
       logger.exception("标准 Bar 回测任务失败: %s", job["runId"])
       status = "cancelled" if "已取消或租约丢失" in str(error) else "failed"
@@ -60,6 +61,7 @@ class BarRunner:
         system_error=system_error.to_dict() if system_error else None,
         owner_user_id=job["ownerUserId"],
       )
+      _dispatch_research_result_outbox()
 
 
 def main() -> None:

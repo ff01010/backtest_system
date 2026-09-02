@@ -174,6 +174,12 @@ def _fill_to_trade(fill: dict[str, Any]) -> dict[str, Any]:
   }
   if metadata.get("strategy_module"):
     trade["strategyModule"] = str(metadata["strategy_module"])
+  if metadata.get("fundingLimited") is True:
+    trade["fundingLimited"] = True
+    trade["depthQuantity"] = int(_number(metadata.get("depthQuantity"), 0))
+    trade["affordableQuantity"] = int(_number(metadata.get("affordableQuantity"), 0))
+    trade["remainingQuantity"] = int(_number(metadata.get("remainingQuantity"), 0))
+    trade["availableCashBefore"] = _number(metadata.get("availableCashBefore"), 0.0)
   return trade
 
 

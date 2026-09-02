@@ -19,7 +19,7 @@ def _arguments() -> argparse.Namespace:
 def main() -> None:
   arguments = _arguments()
   result = sync_trade_calendar(arguments.start, arguments.end)
-  print(f"交易日历同步完成：{result['startDate']} 至 {result['endDate']}，开市日 {result['openDateCount']} 个")
+  print(f"交易日历同步完成（{result['mode']}）：{result['syncedStartDate']} 至 {result['endDate']}，开市日 {result['openDateCount']} 个")
 
 
 if __name__ == '__main__':

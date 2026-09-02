@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Iterator
 
 import psycopg
@@ -91,6 +92,19 @@ def replace_trade_calendar(
         ON CONFLICT (exchange, trade_date) DO UPDATE SET
           is_open=EXCLUDED.is_open, source=EXCLUDED.source, updated_at=now()
       """, rows)
+
+
+def latest_trade_calendar_date(exchange: str = "SSE") -> str | None:
+  """返回交易日历已写入的最新自然日，供增量同步确定起点。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT max(trade_date) AS latest_date
+        FROM market_trade_calendar
+        WHERE exchange=%s
+      """, (exchange,))
+      value = cur.fetchone()["latest_date"]
+      return str(value) if value else None
 
 
 def list_open_trade_dates(start_date: str, end_date: str, exchange: str = "SSE") -> list[str]:
@@ -852,7 +866,36 @@ def _create_queued_backtest_job(
     INSERT INTO {job_table} (run_id, owner_user_id, payload)
     VALUES (%s, %s, %s)
   """, (run_id, owner_user_id, Jsonb(payload)))
+  _save_research_signal_snapshot(cur, run_id, owner_user_id, payload.get("researchSignalSnapshot"))
   return run_id, display_no
+
+
+def _save_research_signal_snapshot(cur: Any, run_id: str, owner_user_id: str, snapshot: object) -> None:
+  if not isinstance(snapshot, dict):
+    return
+  artifact_path = snapshot.get("artifactFile")
+  manifest = snapshot.get("manifest")
+  if not isinstance(artifact_path, str) or not isinstance(manifest, dict):
+    raise DatabaseError("研究信号冻结快照元数据无效")
+  path = Path(artifact_path)
+  if not path.is_file():
+    raise DatabaseError("研究信号冻结文件不存在")
+  content_sha256 = hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+  cur.execute(
+    """INSERT INTO artifact_file
+      (id, owner_user_id, run_id, artifact_type, storage_key, original_filename, content_type, byte_size, content_sha256)
+      VALUES (gen_random_uuid(), %s, %s, 'research_signal', %s, %s, 'application/x-ndjson', %s, %s)
+      RETURNING id""",
+    (owner_user_id, run_id, f"research_signals/{path.name}", path.name, path.stat().st_size, content_sha256),
+  )
+  artifact_id = cur.fetchone()["id"]
+  cur.execute(
+    """INSERT INTO research_signal_snapshot
+      (run_id, dataset_id, dataset_version, snapshot_hash, artifact_file_id, manifest, source_partitions)
+      VALUES (%s, %s::uuid, %s, %s, %s, %s, %s)""",
+    (run_id, snapshot["datasetId"], manifest.get("version"), snapshot["snapshotHash"], artifact_id,
+     Jsonb(manifest), Jsonb(snapshot.get("sourcePartitions") or [])),
+  )
 
 
 def create_l2_backtest_job(payload: dict[str, Any]) -> tuple[str, int]:
@@ -1121,9 +1164,28 @@ def finish_bar_backtest_job(
         WHERE id=%s
       """, (status, Jsonb(summary), Jsonb(result) if result else None,
              summary.get("error") if status != "succeeded" else None, run_id))
+      _enqueue_research_signal_result(cur, run_id, status, summary)
       if status == "failed" and system_error and owner_user_id:
         _insert_system_error(cur, run_id, owner_user_id, system_error)
       return True
+
+
+def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary: dict[str, Any]) -> None:
+  cur.execute(
+    """INSERT INTO research_signal_result_outbox (run_id, payload)
+      SELECT snapshot.run_id, jsonb_build_object(
+        'backtestRunId', snapshot.run_id::text,
+        'signalDatasetId', snapshot.dataset_id::text,
+        'signalDatasetVersion', snapshot.dataset_version,
+        'snapshotHash', snapshot.snapshot_hash,
+        'status', %s,
+        'performanceSummary', %s::jsonb
+      )
+      FROM research_signal_snapshot AS snapshot
+      WHERE snapshot.run_id = %s
+      ON CONFLICT (run_id) DO NOTHING""",
+    (status, Jsonb(summary), run_id),
+  )
 
 
 def request_l2_backtest_cancel(run_id: str) -> bool:

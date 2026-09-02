@@ -559,21 +559,32 @@ class BarBacktestEngine:
     self._t0_date: str | None = None
     self._order_event_sequence = 0
 
-  def run(self, strategy: BarStrategy, bars: Sequence[Bar]) -> BacktestResult:
+  def run(
+    self,
+    strategy: BarStrategy,
+    bars: Sequence[Bar],
+    warmup_bar_count: int = 0,
+  ) -> BacktestResult:
+    if warmup_bar_count < 0 or warmup_bar_count > len(bars):
+      raise ValueError("预热 Bar 数量无效")
     equity_curve: list[EquityPoint] = []
     portfolio_snapshots: list[PortfolioSnapshot] = []
-    if bars and self._base_quantity > 0:
-      self._ledger.initialize_long_position(bars[0].symbol, self._base_quantity, self._base_cost_price, "base_position")
+    warmup_bars = bars[:warmup_bar_count]
+    formal_bars = bars[warmup_bar_count:]
+    for bar in warmup_bars:
+      strategy.on_bar(bar, self._ledger.snapshot())
+    if formal_bars and self._base_quantity > 0:
+      self._ledger.initialize_long_position(formal_bars[0].symbol, self._base_quantity, self._base_cost_price, "base_position")
     self._order_event_sequence = 0
     pending_orders: list[_AcceptedBarOrder] = []
-    for index, bar in enumerate(bars):
+    for index, bar in enumerate(formal_bars):
       self._begin_day_if_needed(bar)
       if pending_orders:
         self._execute_accepted_orders(strategy, bar, pending_orders, False)
         pending_orders = []
       self._ledger.mark(bar.symbol, bar.close)
       orders = strategy.on_bar(bar, self._ledger.snapshot())
-      is_day_end = self._is_day_end(bars, index)
+      is_day_end = self._is_day_end(formal_bars, index)
       accepted_orders = self._accept_orders(strategy, orders, is_day_end, bar.time)
       if self._execute_on_next_bar_open:
         pending_orders = accepted_orders
@@ -582,11 +593,17 @@ class BarBacktestEngine:
         snapshot = self._execute_accepted_orders(strategy, bar, accepted_orders, is_day_end)
       equity_curve.append(EquityPoint(bar.time, snapshot.equity, snapshot.cash))
       portfolio_snapshots.append(snapshot)
+    unexecuted_orders = [item.intent for item in pending_orders]
+    for item in pending_orders:
+      self._notify_order_event(strategy, self._order_event(
+        item, "unexecuted", formal_bars[-1].time, rejection_reason="回测区间结束，下一开盘委托未执行",
+      ))
     return BacktestResult(
       self._ledger.fills,
       equity_curve,
       self._ledger.snapshot(),
       portfolio_snapshots,
+      unexecuted_orders,
     )
 
   def _accept_orders(

@@ -132,11 +132,12 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     script = state_store.get_strategy_script(script_id)
   if script["entryType"] != "on_bar":
     raise ValueError("所选策略代码不是可执行的 on_bar 脚本")
-  bars = _load_bars(
-    payload["symbol"], payload.get("timeframe", "5m"), payload["startDate"], payload["endDate"],
-  )
+  bars, warmup_bar_count, data_snapshot = _load_user_script_bars(payload)
+  formal_bars = bars.iloc[warmup_bar_count:].reset_index(drop=True)
   code_hash = hashlib.sha256(script["code"].encode("utf-8")).hexdigest()
-  manifest = _build_script_experiment_manifest(payload, bars, script_id, script["name"], code_hash)
+  manifest = _build_script_experiment_manifest(
+    payload, formal_bars, script_id, script["name"], code_hash, data_snapshot,
+  )
   manifest["strategySource"] = {
     "id": f"script:{script_id}",
     "name": script["name"],
@@ -173,13 +174,14 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     "baseQuantity": int(payload.get("baseQuantity", 0)),
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
+    "warmupBarCount": warmup_bar_count,
   })
   initial_cash = float(payload["initialCapital"])
   base_quantity = int(payload.get("baseQuantity", 0))
   base_cost_price = float(payload.get("baseCostPrice", 0))
   initial_equity = _initial_total_equity(initial_cash, base_quantity, base_cost_price)
   daily_holdings = _build_worker_daily_holdings(
-    bars, worker_result["portfolioSnapshots"], payload["symbol"], initial_equity,
+    formal_bars, worker_result["portfolioSnapshots"], payload["symbol"], initial_equity,
   )
   summary = _build_worker_summary(
     initial_cash, base_quantity, base_cost_price, bool(payload.get("t0Enabled", False)),
@@ -204,10 +206,82 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     "excessReturn": round(summary["totalReturn"] - benchmark_return, 6),
     "dailyHoldings": daily_holdings,
     "trades": worker_result["trades"],
-    "skippedSignals": worker_result["skippedSignals"],
+    "skippedSignals": worker_result["skippedSignals"] + worker_result.get("unexecutedOrders", []),
     "experimentManifest": manifest,
     "warnings": _build_warnings(payload) + benchmark_warnings + worker_result["warnings"],
   }
+
+
+def run_research_signal_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+  """Replay one frozen standard-signal snapshot through the existing Bar worker."""
+  snapshot = payload.get("researchSignalSnapshot")
+  if not isinstance(snapshot, dict) or not isinstance(snapshot.get("artifactFile"), str):
+    raise ValueError("研究信号冻结快照不存在")
+  signals = _load_frozen_research_signals(snapshot["artifactFile"])
+  worker_payload = dict(payload)
+  worker_payload["scriptId"] = f"research-signal:{snapshot['datasetId']}"
+  worker_payload["versionScriptSnapshot"] = {
+    "name": "冻结研究信号", "entryType": "on_bar", "code": _RESEARCH_SIGNAL_SCRIPT,
+  }
+  worker_payload["strategyParams"] = {**dict(payload.get("strategyParams") or {}), "signalsByDate": signals}
+  result = run_user_script_backtest(worker_payload)
+  result["researchSignalSnapshot"] = snapshot
+  return result
+
+
+def _load_frozen_research_signals(artifact_file: str) -> dict[str, str]:
+  try:
+    with open(artifact_file, "r", encoding="utf-8") as handle:
+      rows = [json.loads(line) for line in handle if line.strip()]
+  except (OSError, json.JSONDecodeError) as error:
+    raise ValueError("研究信号冻结文件不可读取") from error
+  signals: dict[str, str] = {}
+  for row in rows:
+    effective_at = str(row.get("effectiveAt", ""))
+    action = str(row.get("action", ""))
+    trade_date = effective_at[:10]
+    if len(trade_date) != 10 or action not in {"long", "short", "flat"} or trade_date in signals:
+      raise ValueError("冻结信号文件内容无效或同日存在多条信号")
+    signals[trade_date] = action
+  return signals
+
+
+_RESEARCH_SIGNAL_SCRIPT = """
+def on_bar(bar, state):
+  action = state['params']['signalsByDate'].get(bar['tradeDate'])
+  if action is None:
+    return []
+  position = bar['strategyPosition']
+  quantity = int(bar['cash'] / bar['close'] / 100) * 100
+  if action == 'long':
+    if position < 0:
+      return [{'action': 'buy_close', 'quantity': -position, 'reason': 'research_signal_long_close_short'}]
+    if position == 0 and quantity > 0:
+      return [{'action': 'buy_open', 'quantity': quantity, 'reason': 'research_signal_long'}]
+  if action == 'short':
+    if position > 0:
+      return [{'action': 'sell_close', 'quantity': position, 'reason': 'research_signal_short_close_long'}]
+    if position == 0 and quantity > 0:
+      return [{'action': 'sell_open', 'quantity': quantity, 'reason': 'research_signal_short'}]
+  if action == 'flat' and position > 0:
+    return [{'action': 'sell_close', 'quantity': position, 'reason': 'research_signal_flat_close_long'}]
+  if action == 'flat' and position < 0:
+    return [{'action': 'buy_close', 'quantity': -position, 'reason': 'research_signal_flat_close_short'}]
+  return []
+"""
+
+
+def _load_user_script_bars(payload: dict[str, Any]) -> tuple[pd.DataFrame, int, dict[str, Any]]:
+  """标准自定义策略固定走与预检一致的 QMT 来源解析器。"""
+  timeframe = str(payload.get("timeframe", "5m"))
+  saved = dict(payload.get("marketDataSnapshot") or {}).get("barSnapshot") or {}
+  formal_dates = saved.get("formalDates") if isinstance(saved.get("formalDates"), list) else None
+  resolution = market_data.resolve_backtest_data(
+    payload["symbol"], timeframe, payload["startDate"], payload["endDate"], formal_dates,
+    int(payload.get("warmupTradingDays", 0)),
+  )
+  frame, warmup_bar_count = market_data.load_backtest_bars(payload["symbol"], resolution)
+  return frame, warmup_bar_count, {"provider": "qmt_kline", **market_data.snapshot_for_resolution(payload["symbol"], resolution)}
 
 
 def _script_output_dir(payload: dict[str, Any]) -> str:

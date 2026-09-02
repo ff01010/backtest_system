@@ -14,6 +14,7 @@ import {
   fetchDates,
   fetchInstruments,
   fetchStrategies,
+  createResearchAuthorizationCode,
   logout,
 } from './api/client';
 import type { SessionUser } from './api/client';
@@ -21,9 +22,26 @@ import { useUrlState } from './hooks/useUrlState';
 import type { BacktestChartResponse, ChartResponse, DateItem, DisplayModule, DisplaySide, InstrumentItem } from './types';
 import { typography } from './styles/typography';
 
+function createResearchState(): string {
+  const bytes = new Uint8Array(24);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function enterResearchCenter(): Promise<void> {
+  const state = createResearchState();
+  const payload = await createResearchAuthorizationCode(state);
+  const callback = new URL(payload.callbackUrl);
+  callback.searchParams.set('authorizationCode', payload.authorizationCode);
+  callback.searchParams.set('state', state);
+  window.location.assign(callback.toString());
+}
+
 function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogout: () => void }) {
   const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'apiKeys' | 'users' | 'systemErrors'>('backtest');
   const [urlParams, setUrlParams] = useUrlState();
+  const [researchError, setResearchError] = useState<string | null>(null);
+  const [researchStarting, setResearchStarting] = useState(false);
 
   const [instruments, setInstruments] = useState<InstrumentItem[]>([]);
   const [strategies, setStrategies] = useState<string[]>(['user_script']);
@@ -158,6 +176,22 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
             </button>
           );
         })}
+        <button
+          type="button"
+          onClick={() => {
+            setResearchStarting(true);
+            setResearchError(null);
+            enterResearchCenter().catch((error: unknown) => {
+              setResearchError(error instanceof Error ? error.message : '无法进入研究中心');
+              setResearchStarting(false);
+            });
+          }}
+          disabled={researchStarting}
+          style={{ marginLeft: 8, border: '1px solid #437463', borderRadius: 4, padding: '5px 10px', background: '#163a32', color: '#c8f1e2', cursor: researchStarting ? 'wait' : 'pointer', fontSize: typography.sm }}
+        >
+          {researchStarting ? '正在进入…' : '研究中心'}
+        </button>
+        {researchError && <span role="alert" style={{ color: '#fda4af', fontSize: typography.sm }}>{researchError}</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10, color: 'var(--chrome-text)', fontSize: typography.sm }}>
           <span>{currentUser.displayName} · {currentUser.role === 'admin' ? '管理员' : '普通用户'}</span>
           <button onClick={onLogout} style={{ border: '1px solid #3a3f4b', borderRadius: 3, padding: '4px 9px', background: 'transparent', color: 'var(--chrome-text)', cursor: 'pointer' }}>退出</button>
