@@ -1048,6 +1048,7 @@ def claim_bar_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any]
     raise ValueError("Bar runner 标识和租约时长必须有效")
   with _db() as conn:
     with conn.cursor() as cur:
+      _finalize_expired_bar_backtest_cancellations(cur)
       cur.execute("""
         WITH candidate AS (
           SELECT run_id
@@ -1077,6 +1078,22 @@ def claim_bar_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any]
         "attemptNo": int(row["attempt_no"]),
         "attemptToken": _uuid(row["attempt_token"]),
       }
+
+
+def _finalize_expired_bar_backtest_cancellations(cur: Any) -> None:
+  """收尾执行器已退出的取消任务，避免其永久停留在运行中。"""
+  cur.execute("""
+    WITH expired_jobs AS (
+      UPDATE bar_backtest_job
+      SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
+      WHERE status='running' AND cancel_requested AND lease_expires_at < now()
+      RETURNING run_id
+    )
+    UPDATE backtest_run AS run
+    SET status='cancelled', error_message=NULL, finished_at=now()
+    FROM expired_jobs
+    WHERE run.id=expired_jobs.run_id AND run.status='running'
+  """)
 
 
 def heartbeat_l2_backtest_job(run_id: str, attempt_token: str, lease_seconds: int) -> bool:

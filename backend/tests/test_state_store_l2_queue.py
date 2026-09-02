@@ -158,3 +158,19 @@ def test_finish_bar_backtest_job_preserves_terminal_status_without_research_snap
   assert "FROM research_signal_snapshot" in enqueue_query
   assert "'status', %s::text" in enqueue_query
   assert enqueue_params[0] == status
+
+def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypatch: Any) -> None:
+  cursor = FakeCursor(None)
+  connection = FakeConnection(cursor)
+  monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+
+  assert state_store.claim_bar_backtest_job("runner-1", 30) is None
+
+  cleanup_query, cleanup_params = cursor.commands[0]
+  assert "UPDATE bar_backtest_job" in cleanup_query
+  assert "status='running' AND cancel_requested AND lease_expires_at < now()" in cleanup_query
+  assert "UPDATE backtest_run AS run" in cleanup_query
+  assert cleanup_params is None
+  claim_query, claim_params = cursor.commands[1]
+  assert "FOR UPDATE SKIP LOCKED" in claim_query
+  assert claim_params == (30, "runner-1")
