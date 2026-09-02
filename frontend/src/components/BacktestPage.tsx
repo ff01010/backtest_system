@@ -26,6 +26,7 @@ import {
   fetchBacktestTimeframes,
   fetchBacktestPreflight,
   fetchDataStatus,
+  fetchResearchSignalDatasets,
   fetchStrategyParameterSchema,
   fetchStrategySource,
   fetchStrategyConfigs,
@@ -113,6 +114,7 @@ const DEFAULT_PARAMS = {
   twapMinChildQuantity: '100',
   baseQuantity: '0',
   baseCostPrice: '0',
+  initialPositionEnabled: false,
   t0Enabled: false,
   minMarketCap: '10000000000',
   maxMarketCap: '80000000000',
@@ -209,6 +211,7 @@ type HistoryParamKey =
   | 'executionAlgorithm'
   | 'baseQuantity'
   | 'baseCostPrice'
+  | 'initialPositionEnabled'
   | 't0Enabled';
 
 const HISTORY_PARAM_LABELS: Record<HistoryParamKey, string> = {
@@ -233,6 +236,7 @@ const HISTORY_PARAM_LABELS: Record<HistoryParamKey, string> = {
   executionAlgorithm: '执行方式',
   baseQuantity: '底仓数量',
   baseCostPrice: '底仓成本价',
+  initialPositionEnabled: '启用初始底仓',
   t0Enabled: '启用底仓做T',
 };
 
@@ -401,26 +405,24 @@ function validateParams(params: BacktestParams) {
     errors.push('初始资金必须大于 0');
   }
   const isCorePositionOverlay = params.strategyCategory === 'core_position_overlay';
+  const initialPositionEnabled = isCorePositionOverlay || params.initialPositionEnabled;
   const baseQuantity = Number(params.baseQuantity);
   const baseCostPrice = Number(params.baseCostPrice);
-  if (!Number.isInteger(baseQuantity) || baseQuantity < 0) {
-    errors.push('底仓数量必须是非负整数');
-  } else if (baseQuantity === 0 && baseCostPrice !== 0) {
-    errors.push('底仓数量为 0 时底仓成本价必须为 0');
-  } else if (baseQuantity > 0 && (!Number.isFinite(baseCostPrice) || baseCostPrice <= 0)) {
-    errors.push('底仓数量大于 0 时必须填写底仓成本价');
-  }
-  if (isCorePositionOverlay && (baseQuantity <= 0 || baseCostPrice <= 0)) {
-    errors.push('底仓增强策略必须填写有效的底仓数量和成本价');
+  if (initialPositionEnabled) {
+    if (!Number.isInteger(baseQuantity) || baseQuantity <= 0) {
+      errors.push('启用初始底仓时底仓数量必须是正整数');
+    }
+    if (!Number.isFinite(baseCostPrice) || baseCostPrice <= 0) {
+      errors.push('启用初始底仓时必须填写有效的底仓成本价');
+    }
+  } else if (baseQuantity !== 0 || baseCostPrice !== 0) {
+    errors.push('未启用初始底仓时底仓数量和成本价必须为 0');
   }
   if (isCorePositionOverlay && !params.t0Enabled) {
     errors.push('底仓增强策略必须启用底仓做 T');
   }
-  if (!isCorePositionOverlay && (baseQuantity > 0 || baseCostPrice !== 0 || params.t0Enabled)) {
-    errors.push('方向性持仓策略不能设置底仓或启用底仓做 T');
-  }
-  if (params.t0Enabled && baseQuantity <= 0) {
-    errors.push('启用底仓做 T 时底仓数量必须大于 0');
+  if (!isCorePositionOverlay && params.t0Enabled) {
+    errors.push('方向性持仓策略不能启用底仓做 T');
   }
   if (!Number.isFinite(commissionRate) || commissionRate < 0) {
     errors.push('手续费率不能小于 0');
@@ -715,6 +717,7 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
   const dataVersion = asHistoryRecord(run.dataVersion);
   const barSnapshot = asHistoryRecord(dataVersion.barSnapshot);
   const strategyParams = asHistoryRecord(run.paramsSnapshot);
+  const researchSignal = asHistoryRecord(strategyParams.researchSignal);
   const dataSnapshot = asHistoryRecord(run.resultJson?.dataSnapshot);
   const temporaryAggregation = asHistoryRecord(dataSnapshot.temporaryBarAggregation);
   const temporaryDays = Array.isArray(temporaryAggregation.days) ? temporaryAggregation.days : [];
@@ -763,6 +766,19 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
             { label: '滑点', value: getHistoryRunParam(run, 'slippage') },
           ]}
         />
+        {Object.keys(researchSignal).length > 0 && (
+          <HistorySnapshotGroup
+            title="研究信号快照"
+            entries={[
+              { label: '数据集', value: researchSignal.datasetId },
+              { label: '版本', value: researchSignal.datasetVersion },
+              { label: '源周期', value: researchSignal.sourceTimeframe },
+              { label: '回测周期', value: researchSignal.backtestTimeframe },
+              { label: '冻结行数', value: researchSignal.rowCount },
+              { label: '快照指纹', value: shortenHistoryHash(researchSignal.snapshotHash) },
+            ]}
+          />
+        )}
         <HistorySnapshotGroup
           title="执行与数据"
           entries={[
@@ -958,6 +974,15 @@ export default function BacktestPage({
   const [loadingStrategySchema, setLoadingStrategySchema] = useState(false);
   const [strategyScripts, setStrategyScripts] = useState<StrategyScript[]>([]);
   const [strategyConfigs, setStrategyConfigs] = useState<StrategyConfig[]>([]);
+  const [researchSignalDatasets, setResearchSignalDatasets] = useState<Array<{
+    id: string;
+    name: string;
+    datasetKey: string | null;
+    version: number | null;
+    timeframe: string | null;
+    recordCount: number;
+  }>>([]);
+  const [selectedSignalDatasetId, setSelectedSignalDatasetId] = useState('');
   const [strategySource, setStrategySource] = useState<StrategySource | null>(null);
   const [strategySourceError, setStrategySourceError] = useState('');
   const [configVersions, setConfigVersions] = useState<StrategyConfigVersion[]>([]);
@@ -1047,6 +1072,9 @@ export default function BacktestPage({
   useEffect(() => {
     refreshStrategyAssets();
     refreshBacktestRuns();
+    fetchResearchSignalDatasets().then(setResearchSignalDatasets).catch(() => setResearchSignalDatasets([]));
+    const signalDatasetId = new URLSearchParams(window.location.search).get('signalDatasetId');
+    if (signalDatasetId) setSelectedSignalDatasetId(signalDatasetId);
   }, []);
 
   useEffect(() => {
@@ -1397,18 +1425,25 @@ export default function BacktestPage({
 
   const setStrategyCategory = (strategyCategory: 'core_position_overlay' | 'directional_holding') => {
     setParams((prev) => strategyCategory === 'core_position_overlay'
-      ? { ...prev, strategyCategory, holdingPolicy: 'intraday', t0Enabled: true }
+      ? { ...prev, strategyCategory, holdingPolicy: 'intraday', initialPositionEnabled: true, t0Enabled: true }
       : {
         ...prev,
         strategyCategory,
         holdingPolicy: 'overnight',
         baseQuantity: '0',
         baseCostPrice: '0',
+        initialPositionEnabled: false,
         t0Enabled: false,
       });
     if (strategyCategory === 'core_position_overlay' && !L2_TIMEFRAMES.includes(selectedTimeframe)) {
       setSelectedTimeframe('1m');
     }
+  };
+
+  const setInitialPositionEnabled = (enabled: boolean) => {
+    setParams((prev) => enabled
+      ? { ...prev, initialPositionEnabled: true }
+      : { ...prev, initialPositionEnabled: false, baseQuantity: '0', baseCostPrice: '0' });
   };
 
   const updateScriptForm = (changes: Partial<typeof scriptForm>) => {
@@ -1833,6 +1868,7 @@ export default function BacktestPage({
         symbol: selectedSymbol,
         benchmarkSymbol: selectedBenchmarkSymbol || selectedSymbol,
         strategy: selectedStrategy,
+        signalDatasetId: selectedSignalDatasetId || null,
         timeframe: selectedTimeframe,
         startDate: params.startDate,
         endDate: params.endDate,
@@ -1853,9 +1889,10 @@ export default function BacktestPage({
               completionPolicy: 'cancel_remaining',
             }
           : {},
-        baseQuantity: Number(params.baseQuantity),
-        baseCostPrice: Number(params.baseCostPrice),
-        t0Enabled: params.t0Enabled,
+        baseQuantity: params.strategyCategory === 'core_position_overlay' || params.initialPositionEnabled ? Number(params.baseQuantity) : 0,
+        baseCostPrice: params.strategyCategory === 'core_position_overlay' || params.initialPositionEnabled ? Number(params.baseCostPrice) : 0,
+        initialPositionEnabled: params.strategyCategory === 'core_position_overlay' || params.initialPositionEnabled,
+        t0Enabled: params.strategyCategory === 'core_position_overlay',
         isDefault: false,
         strategyParams: Object.fromEntries(Object.entries(params).filter(([key]) => !EXECUTION_PARAM_KEYS.has(key))),
         runDraft: false,
@@ -1988,8 +2025,10 @@ export default function BacktestPage({
   const resultInitialCash = Number(resultParams.initialCapital ?? params.initialCapital);
   const resultBaseQuantity = Number(resultParams.baseQuantity ?? params.baseQuantity);
   const resultBaseCostPrice = Number(resultParams.baseCostPrice ?? params.baseCostPrice);
+  const resultInitialPositionEnabled = isOverlayResult
+    || (resultHistoryRun ? resultParams.initialPositionEnabled === true : params.initialPositionEnabled);
   const initialTotalEquity = Number.isFinite(resultInitialCash)
-    ? resultInitialCash + (isOverlayResult && Number.isFinite(resultBaseQuantity) && Number.isFinite(resultBaseCostPrice)
+    ? resultInitialCash + (resultInitialPositionEnabled && Number.isFinite(resultBaseQuantity) && Number.isFinite(resultBaseCostPrice)
       ? resultBaseQuantity * resultBaseCostPrice
       : 0)
     : null;
@@ -2380,6 +2419,15 @@ export default function BacktestPage({
     setSelectedConfigId(run.configId || '');
     setSelectedScriptId(run.scriptId || '');
     setSelectedAccountId(run.accountId || '');
+    const restoredStrategyCategory = saved.strategyCategory === 'core_position_overlay' || saved.strategyCategory === 'directional_holding'
+      ? saved.strategyCategory
+      : run.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'directional_holding'
+        ? run.strategyCategory
+        : Number(saved.baseQuantity || 0) > 0 || saved.t0Enabled === true
+          ? 'core_position_overlay'
+          : 'directional_holding';
+    const restoredInitialPositionEnabled = restoredStrategyCategory === 'core_position_overlay'
+      || saved.initialPositionEnabled === true;
     setParams({
       ...DEFAULT_PARAMS,
       ...savedStrategyParams,
@@ -2390,16 +2438,17 @@ export default function BacktestPage({
       slippage: textValue('slippage', DEFAULT_PARAMS.slippage),
       allowLong: boolValue('allowLong', DEFAULT_PARAMS.allowLong),
       allowShort: boolValue('allowShort', DEFAULT_PARAMS.allowShort),
-      strategyCategory: textValue('strategyCategory', run.strategyCategory || (Number(saved.baseQuantity || 0) > 0 || saved.t0Enabled === true ? 'core_position_overlay' : 'directional_holding')),
-      holdingPolicy: run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity || 0) > 0 || saved.t0Enabled === true ? 'intraday' : 'overnight',
+      strategyCategory: restoredStrategyCategory,
+      holdingPolicy: restoredStrategyCategory === 'core_position_overlay' ? 'intraday' : 'overnight',
       fillModel: normalizeFillModel(savedStrategyParams.fillModel || run.fillModel),
       executionAlgorithm: run.paramsJson.executionAlgorithm === 'twap' ? 'twap' : 'immediate',
       twapDurationSeconds: String(asHistoryRecord(run.paramsJson.executionParameters).durationSeconds ?? DEFAULT_PARAMS.twapDurationSeconds),
       twapIntervalSeconds: String(asHistoryRecord(run.paramsJson.executionParameters).intervalSeconds ?? DEFAULT_PARAMS.twapIntervalSeconds),
       twapMinChildQuantity: String(asHistoryRecord(run.paramsJson.executionParameters).minChildQuantity ?? DEFAULT_PARAMS.twapMinChildQuantity),
-      baseQuantity: textValue('baseQuantity', DEFAULT_PARAMS.baseQuantity),
-      baseCostPrice: textValue('baseCostPrice', DEFAULT_PARAMS.baseCostPrice),
-      t0Enabled: boolValue('t0Enabled', DEFAULT_PARAMS.t0Enabled),
+      baseQuantity: restoredInitialPositionEnabled ? textValue('baseQuantity', DEFAULT_PARAMS.baseQuantity) : DEFAULT_PARAMS.baseQuantity,
+      baseCostPrice: restoredInitialPositionEnabled ? textValue('baseCostPrice', DEFAULT_PARAMS.baseCostPrice) : DEFAULT_PARAMS.baseCostPrice,
+      initialPositionEnabled: restoredInitialPositionEnabled,
+      t0Enabled: restoredStrategyCategory === 'core_position_overlay',
     });
     setStatus(`已恢复历史回测 ${formatRunReference(run.displayNo)} 的参数`);
   };
@@ -2431,6 +2480,15 @@ export default function BacktestPage({
     setStatus('');
     setBacktestErrorDetail(null);
     setRunning(true);
+    const rerunStrategyCategory = saved.strategyCategory === 'core_position_overlay' || saved.strategyCategory === 'directional_holding'
+      ? saved.strategyCategory
+      : run.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'directional_holding'
+        ? run.strategyCategory
+        : Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true
+          ? 'core_position_overlay'
+          : 'directional_holding';
+    const rerunInitialPositionEnabled = rerunStrategyCategory === 'core_position_overlay'
+      || saved.initialPositionEnabled === true;
     try {
       const data = await runBacktest({
         configId: run.configId,
@@ -2442,6 +2500,7 @@ export default function BacktestPage({
         symbol: run.symbol,
         benchmarkSymbol: run.benchmarkSymbol,
         strategy: run.strategy,
+        signalDatasetId: typeof saved.signalDatasetId === 'string' ? saved.signalDatasetId : null,
         timeframe: run.timeframe || '5m',
         startDate: normalizeApiDate(run.startDate),
         endDate: normalizeApiDate(run.endDate),
@@ -2450,14 +2509,15 @@ export default function BacktestPage({
         slippage: Number(saved.slippage ?? 0),
         allowLong: saved.allowLong !== false,
         allowShort: saved.allowShort !== false,
-        strategyCategory: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'core_position_overlay' : 'directional_holding',
-        holdingPolicy: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? 'intraday' : 'overnight',
+        strategyCategory: rerunStrategyCategory,
+        holdingPolicy: rerunStrategyCategory === 'core_position_overlay' ? 'intraday' : 'overnight',
         fillModel: normalizeFillModel(run.fillModel),
         executionAlgorithm: run.paramsJson.executionAlgorithm === 'twap' ? 'twap' : 'immediate',
         executionParameters: asHistoryRecord(run.paramsJson.executionParameters) as Record<string, number | string>,
-        baseQuantity: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseQuantity ?? 0 : 0),
-        baseCostPrice: Number(saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true ? saved.baseCostPrice ?? 0 : 0),
-        t0Enabled: saved.strategyCategory === 'core_position_overlay' || run.strategyCategory === 'core_position_overlay' || Number(saved.baseQuantity ?? 0) > 0 || saved.t0Enabled === true,
+        baseQuantity: Number(rerunInitialPositionEnabled ? saved.baseQuantity ?? 0 : 0),
+        baseCostPrice: Number(rerunInitialPositionEnabled ? saved.baseCostPrice ?? 0 : 0),
+        initialPositionEnabled: rerunInitialPositionEnabled,
+        t0Enabled: rerunStrategyCategory === 'core_position_overlay',
         isDefault: false,
         strategyParams: (saved.strategyParams || {}) as Record<string, string | boolean>,
       });
@@ -2778,6 +2838,38 @@ export default function BacktestPage({
                     {isCorePositionOverlay ? '围绕固定底仓做T；日终恢复到底仓，核心评价做T超额收益。' : '在信号触发时开仓、平仓并跨日持有；核心评价持仓与方向收益。'}
                   </div>
                 </label>
+                {!isCorePositionOverlay && (
+                  <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, color: '#334155', fontSize: 13, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={params.initialPositionEnabled}
+                      onChange={(e) => setInitialPositionEnabled(e.target.checked)}
+                      style={{ marginTop: 2 }}
+                    />
+                    <span>
+                      <span style={{ fontWeight: 700 }}>启用初始底仓</span>
+                      <span style={{ display: 'block', color: '#64748b', fontSize: 12, lineHeight: 1.55, marginTop: 3 }}>关闭时以现金开始；启用后初始持仓参与收益，并按 A 股 T+1 规则处理。</span>
+                    </span>
+                  </label>
+                )}
+                {(isCorePositionOverlay || params.initialPositionEnabled) && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, borderTop: '1px solid #dbe3ef', paddingTop: 10 }}>
+                    <div style={{ color: '#0f172a', fontSize: 12, fontWeight: 700 }}>{isCorePositionOverlay ? '底仓增强' : '初始底仓'}</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                      <label>
+                        <div style={labelStyle}>底仓数量</div>
+                        <input value={params.baseQuantity} onChange={(e) => setParam('baseQuantity', e.target.value)} style={fieldStyle} />
+                      </label>
+                      <label>
+                        <div style={labelStyle}>底仓成本价</div>
+                        <input value={params.baseCostPrice} onChange={(e) => setParam('baseCostPrice', e.target.value)} style={fieldStyle} />
+                      </label>
+                    </div>
+                    <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.55 }}>
+                      {isCorePositionOverlay ? '已启用底仓做 T 额度限制，日终会恢复至底仓。' : '首个交易日的初始持仓可卖；当日新买入股票仍不可卖出。'}
+                    </div>
+                  </div>
+                )}
                 <label>
                   <div style={labelStyle}>初始资金</div>
                   <input value={params.initialCapital} onChange={(e) => setParam('initialCapital', e.target.value)} style={fieldStyle} />
@@ -3290,9 +3382,23 @@ export default function BacktestPage({
                       固定比例；0.001 表示 0.1%，买入上调、卖出下调。
                     </div>
                   </label>
-                  {isCorePositionOverlay && (
+                  {!isCorePositionOverlay && (
+                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, color: '#334155', fontSize: 12, cursor: 'pointer', borderTop: '1px solid #dbe3ef', paddingTop: 10 }}>
+                      <input
+                        type="checkbox"
+                        checked={params.initialPositionEnabled}
+                        onChange={(e) => setInitialPositionEnabled(e.target.checked)}
+                        style={{ marginTop: 1 }}
+                      />
+                      <span>
+                        <span style={{ fontWeight: 700 }}>启用初始底仓</span>
+                        <span style={{ display: 'block', color: '#64748b', fontSize: 11, lineHeight: 1.5, marginTop: 3 }}>关闭时以现金开始；启用后初始持仓参与收益。</span>
+                      </span>
+                    </label>
+                  )}
+                  {(isCorePositionOverlay || params.initialPositionEnabled) && (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 8, borderTop: '1px solid #dbe3ef', paddingTop: 10 }}>
-                      <div style={{ color: '#0f172a', fontSize: 12, fontWeight: 700 }}>底仓增强</div>
+                      <div style={{ color: '#0f172a', fontSize: 12, fontWeight: 700 }}>{isCorePositionOverlay ? '底仓增强' : '初始底仓'}</div>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                         <label>
                           <div style={labelStyle}>底仓数量</div>
@@ -3303,12 +3409,14 @@ export default function BacktestPage({
                           <input value={params.baseCostPrice} onChange={(e) => setParam('baseCostPrice', e.target.value)} style={fieldStyle} />
                         </label>
                       </div>
-                      <div style={{ color: '#0f766e', fontSize: 12, fontWeight: 700 }}>
-                        已启用底仓做 T 额度限制
-                      </div>
-                      <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>
-                        当日买入股票不可卖出；做 T 额度只允许底仓参与有限次成交。日终会恢复至底仓，必要时按最后十档快照强制结算。
-                      </div>
+                      {isCorePositionOverlay ? (
+                        <>
+                          <div style={{ color: '#0f766e', fontSize: 12, fontWeight: 700 }}>已启用底仓做 T 额度限制</div>
+                          <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>当日买入股票不可卖出；做 T 额度只允许底仓参与有限次成交。日终会恢复至底仓，必要时按最后十档快照强制结算。</div>
+                        </>
+                      ) : (
+                        <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>初始持仓在首个交易日可卖；当日新买入股票仍按 A 股 T+1 限制，策略不会在日终自动恢复底仓。</div>
+                      )}
                     </div>
                   )}
                   <div style={{
@@ -4753,6 +4861,16 @@ export default function BacktestPage({
               当前引擎暂未支持禁用做空，本次仍按策略默认双向逻辑执行
             </div>
           )}
+
+          <section style={{ borderTop: '1px solid #e2e8f0', paddingTop: 10 }}>
+            <div style={{ ...labelStyle, marginBottom: 7 }}>研究信号（可选）</div>
+            <select value={selectedSignalDatasetId} onChange={(event) => setSelectedSignalDatasetId(event.target.value)} disabled={params.fillModel !== 'bar_next_open'} style={fieldStyle}>
+              <option value="">不使用研究信号</option>
+              {researchSignalDatasets.map((item) => <option key={item.id} value={item.id}>{item.name} · v{item.version ?? '—'} · {item.timeframe ?? '—'} · {item.recordCount} 条</option>)}
+            </select>
+            <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5, marginTop: 6 }}>信号在回测启动前冻结，并以 effectiveAt 对齐到第一根可执行 Bar；脚本从 bar['researchSignal'] 读取，不决定仓位。</div>
+            {params.fillModel !== 'bar_next_open' && <div style={{ color: '#b45309', fontSize: 11, marginTop: 4 }}>研究信号联动首期仅支持标准 Bar 回放。</div>}
+          </section>
 
           <div style={{
             color: dataCoverageColor,

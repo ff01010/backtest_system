@@ -147,6 +147,7 @@ class L2Runner:
       "symbol": str(payload["symbol"]),
       "baseQuantity": int(payload.get("baseQuantity", 0)),
       "baseCostPrice": float(payload.get("baseCostPrice", 0)),
+      "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
       "t0Enabled": bool(payload.get("t0Enabled", False)),
       "quoteMode": _quote_mode(payload),
       "instrumentRules": instrument_rules,

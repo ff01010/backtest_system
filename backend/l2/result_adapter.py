@@ -388,6 +388,7 @@ def _build_manifest(raw_result: dict[str, Any], payload: dict[str, Any]) -> dict
     "resultSchemaVersion": 2,
     "baseQuantity": int(_number(payload.get("baseQuantity"), 0)),
     "baseCostPrice": _number(payload.get("baseCostPrice"), 0.0),
+    "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
     "executionEnvironment": "l2-runner",
     "executionAlgorithm": str(payload.get("executionAlgorithm") or "immediate"),

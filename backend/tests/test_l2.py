@@ -501,6 +501,27 @@ def test_l2_session_uses_continuous_mode_for_quote_script() -> None:
   assert L2Runner._session_payload(payload)["quoteMode"] == "continuous"
 
 
+def test_l2_session_payload_keeps_directional_initial_position() -> None:
+  session = L2Runner._session_payload({
+    "symbol": "688981.SH",
+    "scriptId": "script-1",
+    "savedScriptSnapshot": {"id": "script-1", "code": "def on_bar(bar, state):\n  return []"},
+    "strategyParams": {},
+    "initialCapital": 1_000_000,
+    "commissionRate": 0.0003,
+    "strategyCategory": "directional_holding",
+    "holdingPolicy": "overnight",
+    "baseQuantity": 1_000,
+    "baseCostPrice": 10,
+    "initialPositionEnabled": True,
+  })
+
+  assert session["strategyCategory"] == "directional_holding"
+  assert session["holdingPolicy"] == "overnight"
+  assert session["initialPositionEnabled"] is True
+  assert session["baseQuantity"] == 1_000
+
+
 def test_l2_base_position_is_sellable_and_visible_to_script() -> None:
   engine = L2ExecutionEngine(BuyStrategy(), 100_000, 0, InstrumentRules(), holding_policy="overnight", base_quantity=1_000, base_cost_price=10)
   engine.initialize_base_position("688981.SH")

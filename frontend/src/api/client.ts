@@ -255,6 +255,7 @@ export interface BacktestRunPayload {
   symbol: string;
   benchmarkSymbol: string | null;
   strategy: string;
+  signalDatasetId?: string | null;
   timeframe: string;
   startDate: string;
   endDate: string;
@@ -270,10 +271,25 @@ export interface BacktestRunPayload {
   executionParameters: Record<string, number | string>;
   baseQuantity: number;
   baseCostPrice: number;
+  initialPositionEnabled: boolean;
   t0Enabled: boolean;
   isDefault: boolean;
   strategyParams?: Record<string, string | boolean>;
   runDraft?: boolean;
+}
+
+export interface ResearchSignalDataset {
+  id: string;
+  name: string;
+  datasetKey: string | null;
+  version: number | null;
+  timeframe: string | null;
+  recordCount: number;
+}
+
+export async function fetchResearchSignalDatasets(): Promise<ResearchSignalDataset[]> {
+  const data = await fetchJson<{ items: ResearchSignalDataset[] }>(BASE + '/research/signal-datasets');
+  return data.items;
 }
 
 export interface QueuedBacktestResponse {

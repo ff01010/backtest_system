@@ -42,3 +42,23 @@ def test_freeze_snapshot_rejects_duplicate_event_key(monkeypatch: pytest.MonkeyP
     research_signal_snapshot.freeze_signal_snapshot(
       "dataset-1", "user-1", "000001.SZ", "2026-01-05", "2026-01-05", "1d", str(tmp_path),
     )
+
+
+def test_alignment_uses_first_bar_at_or_after_effective_time() -> None:
+  row = research_signal_snapshot._canonical_signal(_row("a", "2026-01-05T09:31:00+08:00"))
+
+  plan = research_signal_snapshot._build_alignment_plan(
+    [row], ["20260105093000", "20260105093500"],
+  )
+
+  assert plan == [{
+    "signalId": "a",
+    "action": "long",
+    "effectiveAt": "2026-01-05T09:31:00.000000+08:00",
+    "executionBarTime": "20260105093500",
+  }]
+
+
+def test_rejects_signal_timeframe_finer_than_backtest() -> None:
+  with pytest.raises(research_signal_snapshot.ResearchSignalSnapshotError, match="不能细于"):
+    research_signal_snapshot._validate_timeframe_alignment("1m", "5m")

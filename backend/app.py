@@ -354,7 +354,8 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
 
 
 def _validate_backtest_request(request: dict) -> None:
-  """校验回测请求并确认使用已保存的当前策略。"""
+  """校验回测请求，并为可选研究信号创建不可变快照。"""
+
   if not settings.validate_symbol(request["symbol"]):
     raise HTTPException(422, f"非法标的: {request['symbol']}")
   if request.get("benchmarkSymbol") and not settings.validate_symbol(request["benchmarkSymbol"]):
@@ -370,66 +371,55 @@ def _validate_backtest_request(request: dict) -> None:
     ))
   except ValueError as error:
     raise HTTPException(422, str(error)) from error
-  if fill_model == "l2_quote":
-    if not settings.validate_l2_backtest_timeframe(request["timeframe"]):
-      raise HTTPException(422, f"L2 回测不支持 {request['timeframe']}")
-  elif not settings.validate_l2_backtest_timeframe(request["timeframe"]):
+  if not settings.validate_l2_backtest_timeframe(request["timeframe"]):
     raise HTTPException(422, f"当前回测引擎不支持 {request['timeframe']}")
+  if request["strategy"] == "research_signal":
+    raise HTTPException(422, "研究信号必须作为已保存策略的可选输入，不能单独运行")
   if not strategy_adapters.has_strategy(request["strategy"]):
     raise HTTPException(422, f"不支持的策略: {request['strategy']}")
-
-  if request["strategy"] == "research_signal":
-    _prepare_research_signal_request(request)
-    return
-
   if not request.get("configId"):
     raise HTTPException(422, "回测必须先选择并保存策略")
   _prepare_saved_strategy_snapshot(request)
-
   if request["strategy"] != "user_script":
     raise HTTPException(422, "当前仅支持数据库中的用户脚本策略")
-
   if fill_model == "l2_quote":
+    if request.get("signalDatasetId"):
+      raise HTTPException(422, "研究信号联动首期仅支持标准 Bar 回放")
     request["fillModel"] = "l2_quote"
-    request["feeProfile"] = settings.default_fee_profile()
-    request["commissionRate"] = request["feeProfile"]["commissionRate"]
-    _require_preflight(request)
-    return
-
-  request["fillModel"] = "bar_next_open"
+  else:
+    request["fillModel"] = "bar_next_open"
   request["feeProfile"] = settings.default_fee_profile()
   request["commissionRate"] = request["feeProfile"]["commissionRate"]
   _require_preflight(request)
+  if request.get("signalDatasetId"):
+    _prepare_research_signal_attachment(request)
 
 
-def _prepare_research_signal_request(request: dict[str, Any]) -> None:
+def _prepare_research_signal_attachment(request: dict[str, Any]) -> None:
   dataset_id = request.get("signalDatasetId")
   if not isinstance(dataset_id, str) or not dataset_id:
-    raise HTTPException(422, "研究信号回测必须选择信号数据集")
-  if request.get("fillModel") != "bar_next_open" or request.get("timeframe") != "1d":
-    raise HTTPException(422, "首期研究信号回测仅支持 1d 标准 Bar 回放")
-  request["holdingPolicy"] = "overnight"
-  request["strategyCategory"] = "directional_holding"
-  request["feeProfile"] = settings.default_fee_profile()
-  request["commissionRate"] = request["feeProfile"]["commissionRate"]
-  _require_preflight(request)
+    raise HTTPException(422, "研究信号数据集无效")
   try:
-    request["researchSignalSnapshot"] = research_signal_snapshot.freeze_signal_snapshot(
+    bars, warmup_bar_count, _ = backtest_runner._load_user_script_bars(request)
+    bar_times = [str(row.time) for row in bars.iloc[warmup_bar_count:].itertuples(index=False)]
+    snapshot = research_signal_snapshot.freeze_signal_snapshot(
       dataset_id, str(state_store.current_user_id()), request["symbol"], request["startDate"],
-      request["endDate"], request["timeframe"],
+      request["endDate"], request["timeframe"], bar_times,
     )
   except research_signal_snapshot.ResearchSignalSnapshotError as error:
     raise HTTPException(422, str(error)) from error
-  snapshot = request["researchSignalSnapshot"]
-  request["savedConfigSnapshot"] = {
-    "strategy": "research_signal",
-    "signalDatasetId": dataset_id,
+  request["researchSignalSnapshot"] = snapshot
+  saved_snapshot = dict(request.get("savedConfigSnapshot") or {})
+  saved_snapshot["researchSignal"] = {
+    "datasetId": snapshot["datasetId"],
+    "datasetVersion": snapshot["manifest"].get("version"),
     "snapshotHash": snapshot["snapshotHash"],
-    "signalDatasetVersion": snapshot["manifest"].get("version"),
-    "actionPolicyVersion": snapshot["manifest"].get("actionPolicyVersion"),
-    "predictionDatasetVersion": snapshot["manifest"].get("predictionDatasetVersion"),
+    "sourceTimeframe": snapshot["sourceTimeframe"],
+    "backtestTimeframe": snapshot["timeframe"],
+    "rowCount": snapshot["rowCount"],
+    "alignment": snapshot["alignment"],
   }
-
+  request["savedConfigSnapshot"] = saved_snapshot
 
 def _require_preflight(request: dict[str, Any]) -> None:
   try:
@@ -529,6 +519,7 @@ def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest)
     executionParameters=execution_parameters,
     baseQuantity=values.get("baseQuantity", 0),
     baseCostPrice=values.get("baseCostPrice", 0),
+    initialPositionEnabled=values.get("initialPositionEnabled", False),
     t0Enabled=values.get("t0Enabled", False),
     strategyParams={
       key: value for key, value in saved_params.items()
@@ -571,6 +562,17 @@ def startup():
 @app.get("/api/health")
 def health():
   return {"status": "ok"}
+
+
+@app.get("/api/research/signal-datasets")
+def research_signal_datasets() -> dict[str, Any]:
+  """供回测工作台选择当前用户可用的已发布研究信号。"""
+
+  try:
+    items = research_signal_snapshot.list_published_signal_datasets(str(state_store.current_user_id()))
+  except research_signal_snapshot.ResearchSignalSnapshotError as error:
+    raise HTTPException(422, str(error)) from error
+  return {"items": items}
 
 
 def _load_strategy_guide() -> str:

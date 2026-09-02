@@ -16,6 +16,14 @@ from backend.services.system_error_log import system_error_log_record
 logger = logging.getLogger(__name__)
 
 
+def _dispatch_research_result_outbox() -> None:
+  """发送研究信号回测回流，不影响已落库的回测结果。"""
+  try:
+    research_result_outbox.dispatch_pending()
+  except Exception:
+    logger.exception("研究信号回测结果回流派发失败")
+
+
 class BarRunner:
   """以 PostgreSQL 租约执行标准 Bar 回测。"""
 
