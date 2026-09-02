@@ -135,3 +135,26 @@ def test_delete_backtest_runs_deletes_all_selected_runs_atomically(monkeypatch: 
   assert "FOR UPDATE" in cursor.commands[0][0]
   assert cursor.commands[0][1] == (["run-1", "run-2"], "user-1")
   assert "DELETE FROM backtest_run" in cursor.commands[1][0]
+
+
+@pytest.mark.parametrize("status", ["succeeded", "cancelled"])
+def test_finish_bar_backtest_job_preserves_terminal_status_without_research_snapshot(
+  monkeypatch: Any,
+  status: str,
+) -> None:
+  cursor = FakeCursor({"run_id": "run-1"})
+  connection = FakeConnection(cursor)
+  monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+
+  assert state_store.finish_bar_backtest_job(
+    "run-1", "attempt-1", status, {"totalReturn": 0.1}, {"equity": []},
+  ) is True
+
+  assert "UPDATE bar_backtest_job" in cursor.commands[0][0]
+  assert cursor.commands[0][1] == (status, None, "run-1", "attempt-1")
+  assert "UPDATE backtest_run" in cursor.commands[1][0]
+  assert cursor.commands[1][1][0] == status
+  enqueue_query, enqueue_params = cursor.commands[2]
+  assert "FROM research_signal_snapshot" in enqueue_query
+  assert "'status', %s::text" in enqueue_query
+  assert enqueue_params[0] == status
