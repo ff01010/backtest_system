@@ -467,3 +467,21 @@ def test_qmt_trend_follow_script_applies_break_even_and_morning_force_close() ->
     "final_force",
   ]
   assert [fill.quantity for fill in final_result.fills] == [1200, 200, 1000]
+
+
+def test_script_context_exposes_frozen_research_signal_only_on_aligned_bar() -> None:
+  strategy = ScriptedBarStrategy("research", """def on_bar(bar, state):
+  return []
+""", {
+    "_researchSignalByBarTime": {
+      "20260727093500": {"signalId": "sig-1", "action": "long"},
+    },
+  })
+  portfolio = PortfolioSnapshot(cash=100_000, equity=100_000, positions={})
+
+  unmatched = strategy._context(Bar("20260727093000", "688981.SH", 10, 10, 10, 10), portfolio)
+  matched = strategy._context(Bar("20260727093500", "688981.SH", 10, 10, 10, 10), portfolio)
+
+  assert unmatched["researchSignal"] is None
+  assert matched["researchSignal"] == {"signalId": "sig-1", "action": "long"}
+  assert "_researchSignalByBarTime" not in matched["params"]

@@ -35,6 +35,7 @@ def _config() -> dict[str, object]:
         "executionAlgorithm": "immediate",
         "baseQuantity": "0",
         "baseCostPrice": "0",
+        "initialPositionEnabled": False,
         "t0Enabled": False,
         "window": "20",
       },
@@ -66,7 +67,8 @@ def test_public_request_only_overrides_allowed_runtime_fields(monkeypatch: pytes
   assert request["startDate"] == "2026-06-02"
   assert request["endDate"] == "2026-06-03"
   assert request["initialCapital"] == 200_000
-  assert request["strategyParams"] == {"allowLong": True, "allowShort": True, "strategyCategory": "directional_holding", "holdingPolicy": "overnight", "fillModel": "bar_next_open", "baseQuantity": "0", "baseCostPrice": "0", "t0Enabled": False, "window": "20"}
+  assert request["initialPositionEnabled"] is False
+  assert request["strategyParams"] == {"allowLong": True, "allowShort": True, "strategyCategory": "directional_holding", "holdingPolicy": "overnight", "fillModel": "bar_next_open", "baseQuantity": "0", "baseCostPrice": "0", "initialPositionEnabled": False, "t0Enabled": False, "window": "20"}
 
 
 def test_public_request_rejects_unpublished_config(monkeypatch: pytest.MonkeyPatch) -> None:

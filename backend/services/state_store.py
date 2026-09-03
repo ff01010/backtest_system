@@ -1048,6 +1048,7 @@ def claim_bar_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any]
     raise ValueError("Bar runner 标识和租约时长必须有效")
   with _db() as conn:
     with conn.cursor() as cur:
+      _finalize_expired_bar_backtest_cancellations(cur)
       cur.execute("""
         WITH candidate AS (
           SELECT run_id
@@ -1077,6 +1078,22 @@ def claim_bar_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any]
         "attemptNo": int(row["attempt_no"]),
         "attemptToken": _uuid(row["attempt_token"]),
       }
+
+
+def _finalize_expired_bar_backtest_cancellations(cur: Any) -> None:
+  """收尾执行器已退出的取消任务，避免其永久停留在运行中。"""
+  cur.execute("""
+    WITH expired_jobs AS (
+      UPDATE bar_backtest_job
+      SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
+      WHERE status='running' AND cancel_requested AND lease_expires_at < now()
+      RETURNING run_id
+    )
+    UPDATE backtest_run AS run
+    SET status='cancelled', error_message=NULL, finished_at=now()
+    FROM expired_jobs
+    WHERE run.id=expired_jobs.run_id AND run.status='running'
+  """)
 
 
 def heartbeat_l2_backtest_job(run_id: str, attempt_token: str, lease_seconds: int) -> bool:
@@ -1171,6 +1188,7 @@ def finish_bar_backtest_job(
 
 
 def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary: dict[str, Any]) -> None:
+  """仅为存在研究信号快照的回测写入结果回传队列。"""
   cur.execute(
     """INSERT INTO research_signal_result_outbox (run_id, payload)
       SELECT snapshot.run_id, jsonb_build_object(
@@ -1178,7 +1196,7 @@ def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary:
         'signalDatasetId', snapshot.dataset_id::text,
         'signalDatasetVersion', snapshot.dataset_version,
         'snapshotHash', snapshot.snapshot_hash,
-        'status', %s,
+        'status', %s::text,
         'performanceSummary', %s::jsonb
       )
       FROM research_signal_snapshot AS snapshot
@@ -1275,6 +1293,49 @@ def get_backtest_run(run_id: str) -> dict[str, Any]:
       if not row:
         raise KeyError(run_id)
       return _normalize_run(row)
+
+
+def delete_backtest_run(run_id: str) -> bool:
+  """永久删除当前用户已结束的回测及由外键关联的数据库记录。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT status FROM backtest_run WHERE id=%s AND owner_user_id=%s FOR UPDATE",
+        (run_id, current_user_id()),
+      )
+      row = cur.fetchone()
+      if row is None:
+        raise KeyError(run_id)
+      if row["status"] not in {"succeeded", "failed", "cancelled"}:
+        raise ValueError("排队或运行中的回测不能删除，请先取消任务")
+      cur.execute(
+        "DELETE FROM backtest_run WHERE id=%s AND owner_user_id=%s",
+        (run_id, current_user_id()),
+      )
+      return cur.rowcount == 1
+
+
+def delete_backtest_runs(run_ids: list[str]) -> int:
+  """原子删除当前用户选中的多条已结束回测。"""
+  unique_run_ids = list(dict.fromkeys(run_ids))
+  if not unique_run_ids:
+    raise ValueError("请至少选择一条回测记录")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT id, status FROM backtest_run WHERE id=ANY(%s) AND owner_user_id=%s FOR UPDATE",
+        (unique_run_ids, current_user_id()),
+      )
+      rows = cur.fetchall()
+      if len(rows) != len(unique_run_ids):
+        raise KeyError("部分回测记录不存在或无删除权限")
+      if any(row["status"] not in {"succeeded", "failed", "cancelled"} for row in rows):
+        raise ValueError("选中的回测包含排队或运行中任务，请先取消任务")
+      cur.execute(
+        "DELETE FROM backtest_run WHERE id=ANY(%s) AND owner_user_id=%s",
+        (unique_run_ids, current_user_id()),
+      )
+      return cur.rowcount
 
 
 def get_backtest_result_page(

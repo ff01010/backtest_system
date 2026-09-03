@@ -148,6 +148,7 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
       "code": script["code"],
     }],
   }
+  research_signal_by_bar_time = _research_signal_by_bar_time(payload.get("researchSignalSnapshot"))
   worker_result = strategy_worker.run_script({
     "scriptId": script_id,
     "code": script["code"],
@@ -156,6 +157,7 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
       "allowLong": payload.get("allowLong", True),
       "allowShort": payload.get("allowShort", True),
       "corePositionOverlay": _strategy_category(payload) == "core_position_overlay",
+      "_researchSignalByBarTime": research_signal_by_bar_time,
     },
     "bars": [
       {"time": str(row.time), "symbol": payload["symbol"], "open": float(row.open),
@@ -173,6 +175,7 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     "executionParameters": dict(payload.get("executionParameters") or {}),
     "baseQuantity": int(payload.get("baseQuantity", 0)),
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
+    "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
     "warmupBarCount": warmup_bar_count,
   })
@@ -193,7 +196,7 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     float(payload["initialCapital"]),
   )
   benchmark_return = _compute_benchmark_return(benchmark_equity)
-  return {
+  response = {
     "strategyCategory": _strategy_category(payload),
     "resultSchemaVersion": 2,
     "strategyMetrics": _strategy_metrics(_strategy_category(payload), summary),
@@ -210,6 +213,51 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     "experimentManifest": manifest,
     "warnings": _build_warnings(payload) + benchmark_warnings + worker_result["warnings"],
   }
+  if isinstance(payload.get("researchSignalSnapshot"), dict):
+    response["researchSignalSnapshot"] = payload["researchSignalSnapshot"]
+  return response
+
+
+def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
+  """Build the worker-only Bar lookup from the immutable artifact and alignment plan."""
+
+  if snapshot is None:
+    return {}
+  if not isinstance(snapshot, dict) or not isinstance(snapshot.get("artifactFile"), str):
+    raise ValueError("研究信号冻结快照不存在")
+  try:
+    with open(snapshot["artifactFile"], "r", encoding="utf-8") as handle:
+      rows = [json.loads(line) for line in handle if line.strip()]
+  except (OSError, json.JSONDecodeError) as error:
+    raise ValueError("研究信号冻结文件不可读取") from error
+  rows_by_id = {
+    row.get("signalId"): row
+    for row in rows
+    if isinstance(row, dict) and isinstance(row.get("signalId"), str)
+  }
+  plan = snapshot.get("alignmentPlan")
+  if not isinstance(plan, list):
+    raise ValueError("研究信号对齐计划不存在")
+  aligned: dict[str, dict[str, Any]] = {}
+  for item in plan:
+    if not isinstance(item, dict):
+      raise ValueError("研究信号对齐计划无效")
+    signal_id = item.get("signalId")
+    bar_time = item.get("executionBarTime")
+    row = rows_by_id.get(signal_id)
+    if not isinstance(signal_id, str) or not isinstance(bar_time, str) or not isinstance(row, dict):
+      raise ValueError("研究信号对齐计划引用无效")
+    if row.get("action") not in {"long", "short", "flat"} or bar_time in aligned:
+      raise ValueError("同一 Bar 不能注入多条研究信号")
+    aligned[bar_time] = {
+      key: row[key]
+      for key in (
+        "signalId", "instrument", "timeframe", "signalTime", "availableAt", "effectiveAt",
+        "sequence", "predictedLabelId", "action", "modelVersionId", "sourceHash", "diagnostic",
+      )
+      if key in row
+    }
+  return aligned
 
 
 def run_research_signal_backtest(payload: dict[str, Any]) -> dict[str, Any]:
@@ -316,6 +364,10 @@ def _build_script_experiment_manifest(
     "allowShort": payload.get("allowShort", True),
     "holdingPolicy": holding_policy,
     "strategyCategory": _strategy_category(payload),
+    "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
+    "baseQuantity": int(payload.get("baseQuantity", 0)),
+    "baseCostPrice": float(payload.get("baseCostPrice", 0)),
+    "t0Enabled": bool(payload.get("t0Enabled", False)),
     "resultSchemaVersion": 2,
   })
   experiment_hash = _stable_hash({
@@ -350,6 +402,10 @@ def _build_script_experiment_manifest(
     },
     "holdingPolicy": holding_policy,
     "strategyCategory": _strategy_category(payload),
+    "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
+    "baseQuantity": int(payload.get("baseQuantity", 0)),
+    "baseCostPrice": float(payload.get("baseCostPrice", 0)),
+    "t0Enabled": bool(payload.get("t0Enabled", False)),
     "resultSchemaVersion": 2,
     "executionEnvironment": "strategy-worker",
   }

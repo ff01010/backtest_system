@@ -214,6 +214,17 @@ def test_backtest_requires_saved_strategy_params(monkeypatch: pytest.MonkeyPatch
     api_app._validate_backtest_request(request)
 
 
+def test_saved_initial_position_setting_must_match_run_request() -> None:
+  config = {"paramsJson": {"params": {"initialPositionEnabled": False}}}
+  request = {"strategyParams": {"initialPositionEnabled": False}}
+
+  api_app._validate_saved_params(request, config)
+
+  request["strategyParams"]["initialPositionEnabled"] = True
+  with pytest.raises(HTTPException, match="initialPositionEnabled"):
+    api_app._validate_saved_params(request, config)
+
+
 def test_bar_source_error_is_exposed_as_request_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:
   from backend.l2.providers import L2DataError
   from backend.services import bar_data
@@ -272,7 +283,9 @@ def test_legacy_backtest_request_defaults_to_allowing_long() -> None:
   )
 
   assert request.allowLong is True
-  assert request.holdingPolicy == "intraday"
+  assert request.strategyCategory == "directional_holding"
+  assert request.holdingPolicy == "overnight"
+  assert request.initialPositionEnabled is False
 
 
 def test_strategy_category_enforces_its_execution_semantics() -> None:
@@ -280,15 +293,30 @@ def test_strategy_category_enforces_its_execution_semantics() -> None:
     symbol="688981.SH", startDate="20260101", endDate="20260131",
     initialCapital=1_000_000, commissionRate=0.0003, slippage=0,
     strategyCategory="core_position_overlay", holdingPolicy="intraday", fillModel="l2_quote",
-    baseQuantity=1_000, baseCostPrice=10, t0Enabled=True,
+    baseQuantity=1_000, baseCostPrice=10, initialPositionEnabled=True, t0Enabled=True,
+  )
+  directional_with_initial_position = schemas.BacktestRunRequest(
+    symbol="688981.SH", startDate="20260101", endDate="20260131",
+    initialCapital=1_000_000, commissionRate=0.0003, slippage=0,
+    strategyCategory="directional_holding", holdingPolicy="overnight",
+    baseQuantity=1_000, baseCostPrice=10, initialPositionEnabled=True,
   )
 
   assert overlay.strategyCategory == "core_position_overlay"
-  with pytest.raises(ValueError, match="方向性持仓策略不能设置底仓"):
+  assert directional_with_initial_position.strategyCategory == "directional_holding"
+  assert directional_with_initial_position.t0Enabled is False
+  with pytest.raises(ValueError, match="未启用初始底仓"):
     schemas.BacktestRunRequest(
       symbol="688981.SH", startDate="20260101", endDate="20260131",
       initialCapital=1_000_000, commissionRate=0.0003, slippage=0,
       strategyCategory="directional_holding", baseQuantity=1_000, baseCostPrice=10,
+    )
+  with pytest.raises(ValueError, match="不能启用底仓做 T"):
+    schemas.BacktestRunRequest(
+      symbol="688981.SH", startDate="20260101", endDate="20260131",
+      initialCapital=1_000_000, commissionRate=0.0003, slippage=0,
+      strategyCategory="directional_holding", holdingPolicy="overnight",
+      baseQuantity=1_000, baseCostPrice=10, initialPositionEnabled=True, t0Enabled=True,
     )
 
 

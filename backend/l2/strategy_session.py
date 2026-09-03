@@ -349,6 +349,7 @@ def _session_payload(payload: dict[str, Any]) -> dict[str, Any]:
     "holdingPolicy": str(payload.get("holdingPolicy") or "intraday"),
     "baseQuantity": int(payload.get("baseQuantity", 0)),
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
+    "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
     "feeProfile": dict(payload.get("feeProfile") or {}),
     "executionAlgorithm": str(payload.get("executionAlgorithm") or "immediate"),

@@ -136,13 +136,14 @@ class BacktestRunRequest(BaseModel):
   orderPct: float | None = Field(default=None, ge=0)
   allowLong: bool = True
   allowShort: bool = True
-  strategyCategory: Literal["core_position_overlay", "directional_holding"] | None = None
-  holdingPolicy: Literal["intraday", "overnight"] = "intraday"
+  strategyCategory: Literal["core_position_overlay", "directional_holding"] = "directional_holding"
+  holdingPolicy: Literal["intraday", "overnight"] = "overnight"
   fillModel: Literal["bar_next_open", "l2_quote"] = "bar_next_open"
   executionAlgorithm: Literal["immediate", "twap"] = "immediate"
   executionParameters: dict[str, Any] = Field(default_factory=dict)
   baseQuantity: int = Field(default=0, ge=0)
   baseCostPrice: float = Field(default=0, ge=0)
+  initialPositionEnabled: bool = False
   t0Enabled: bool = False
   warmupTradingDays: int = Field(default=0, ge=0, le=250)
   strategyParams: dict[str, Any] = Field(default_factory=dict)
@@ -163,6 +164,8 @@ class BacktestRunRequest(BaseModel):
     if not allow_long and not allow_short:
       raise ValueError("至少选择一个交易方向")
     if self.strategyCategory == "core_position_overlay":
+      if not self.initialPositionEnabled:
+        raise ValueError("底仓增强策略必须启用初始底仓")
       if self.baseQuantity <= 0 or self.baseCostPrice <= 0:
         raise ValueError("底仓增强策略必须填写有效的底仓数量和成本价")
       if not self.t0Enabled:
@@ -170,10 +173,15 @@ class BacktestRunRequest(BaseModel):
       if self.holdingPolicy != "intraday":
         raise ValueError("底仓增强策略必须在日终恢复底仓")
     elif self.strategyCategory == "directional_holding":
-      if self.baseQuantity > 0 or self.baseCostPrice != 0 or self.t0Enabled:
-        raise ValueError("方向性持仓策略不能设置底仓或启用底仓做 T")
       if self.holdingPolicy != "overnight":
         raise ValueError("方向性持仓策略必须允许跨日持仓")
+      if self.t0Enabled:
+        raise ValueError("方向性持仓策略不能启用底仓做 T")
+      if self.initialPositionEnabled:
+        if self.baseQuantity <= 0 or self.baseCostPrice <= 0:
+          raise ValueError("启用初始底仓时必须填写有效的底仓数量和成本价")
+      elif self.baseQuantity != 0 or self.baseCostPrice != 0:
+        raise ValueError("未启用初始底仓时底仓数量和成本价必须为 0")
     if self.baseQuantity == 0 and self.baseCostPrice != 0:
       raise ValueError("底仓数量为 0 时底仓成本价必须为 0")
     if self.baseQuantity > 0 and self.baseCostPrice <= 0:
@@ -415,6 +423,10 @@ class BacktestRunHistory(BaseModel):
 class BacktestRunMetaUpdate(BaseModel):
   note: str = ""
   tags: list[str] = Field(default_factory=list)
+
+
+class BacktestRunBatchDeleteRequest(BaseModel):
+  runIds: list[str] = Field(min_length=1, max_length=100)
 
 
 class StrategyConfigCreate(BaseModel):

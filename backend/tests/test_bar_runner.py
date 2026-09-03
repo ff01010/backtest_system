@@ -21,6 +21,7 @@ def test_bar_runner_finishes_queued_job(monkeypatch: pytest.MonkeyPatch) -> None
     "summary": {"tradeCount": 3}, "warnings": ["示例"], "outputDir": "", "trades": [],
   })
   monkeypatch.setattr(bar_runner.state_store, "heartbeat_bar_backtest_job", lambda *_: True)
+  monkeypatch.setattr(bar_runner.research_result_outbox, "dispatch_pending", lambda: 0)
   monkeypatch.setattr(
     bar_runner.state_store,
     "finish_bar_backtest_job",
@@ -55,6 +56,7 @@ def test_bar_runner_persists_remote_strategy_diagnostic(monkeypatch: pytest.Monk
 
   monkeypatch.setattr(bar_runner.state_store, "claim_bar_backtest_job", lambda *_: job)
   monkeypatch.setattr(bar_runner.backtest_runner, "run_backtest", fail_backtest)
+  monkeypatch.setattr(bar_runner.research_result_outbox, "dispatch_pending", lambda: 0)
   monkeypatch.setattr(
     bar_runner.state_store,
     "finish_bar_backtest_job",
@@ -64,6 +66,15 @@ def test_bar_runner_persists_remote_strategy_diagnostic(monkeypatch: pytest.Monk
   assert bar_runner.BarRunner("test-worker").run_once() is True
   assert finished["kwargs"]["system_error"]["reason"] == "missing_variable"
   assert finished["kwargs"]["system_error"]["exception_type"] == "NameError"
+
+
+def test_research_result_outbox_failure_does_not_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+  def raise_dispatch_error() -> int:
+    raise RuntimeError("研究服务暂不可用")
+
+  monkeypatch.setattr(bar_runner.research_result_outbox, "dispatch_pending", raise_dispatch_error)
+
+  bar_runner._dispatch_research_result_outbox()
 
 
 def test_worker_summary_uses_cash_and_base_cost_as_initial_equity() -> None:
@@ -82,3 +93,32 @@ def test_worker_summary_uses_cash_and_base_cost_as_initial_equity() -> None:
   assert summary["t0ExcessPnl"] == 20_000.0
   assert summary["orderCount"] == 0
   assert summary["fillCount"] == 0
+
+def test_bar_runner_marks_job_cancelled_when_lease_keeper_detects_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+  job = {
+    "runId": "run-cancelled",
+    "ownerUserId": "owner-1",
+    "attemptToken": "attempt-1",
+    "payload": {"fillModel": "bar_next_open"},
+  }
+  finished: dict[str, Any] = {}
+  monkeypatch.setattr(bar_runner.state_store, "claim_bar_backtest_job", lambda *_: job)
+  monkeypatch.setattr(bar_runner.backtest_runner, "run_backtest", lambda _: {
+    "summary": {"tradeCount": 1}, "warnings": [], "outputDir": "", "trades": [],
+  })
+  monkeypatch.setattr(bar_runner._BarJobLeaseKeeper, "start", lambda _: None)
+  monkeypatch.setattr(bar_runner._BarJobLeaseKeeper, "stop", lambda _: None)
+  monkeypatch.setattr(
+    bar_runner._BarJobLeaseKeeper,
+    "ensure_active",
+    lambda _: (_ for _ in ()).throw(ValueError("Bar 任务租约丢失或已取消")),
+  )
+  monkeypatch.setattr(bar_runner.research_result_outbox, "dispatch_pending", lambda: 0)
+  monkeypatch.setattr(
+    bar_runner.state_store,
+    "finish_bar_backtest_job",
+    lambda *args, **kwargs: finished.update({"args": args, "kwargs": kwargs}) or True,
+  )
+
+  assert bar_runner.BarRunner("test-worker").run_once() is True
+  assert finished["args"][2] == "cancelled"

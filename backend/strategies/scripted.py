@@ -190,6 +190,14 @@ class ScriptedBarStrategy:
     self._quote_callback = namespace.get("on_quote")
     self._order_event_callback = namespace.get("on_order_event")
     self._execution_params = dict(params)
+    research_signal_by_bar_time = self._execution_params.pop("_researchSignalByBarTime", {})
+    if not isinstance(research_signal_by_bar_time, dict):
+      raise StrategyExecutionError.from_exception(ValueError("研究信号上下文格式无效"))
+    self._research_signal_by_bar_time = {
+      key: dict(value)
+      for key, value in research_signal_by_bar_time.items()
+      if isinstance(key, str) and isinstance(value, dict)
+    }
     self._script_params = {
       key: value
       for key, value in self._execution_params.items()
@@ -271,6 +279,7 @@ class ScriptedBarStrategy:
       "basePosition": portfolio.base_position,
       "sellableQuantity": portfolio.sellable_quantity,
       "t0AvailableQuantity": portfolio.t0_available_quantity,
+      "researchSignal": self._research_signal_by_bar_time.get(time_context.time),
       "params": self._script_params,
     }
 

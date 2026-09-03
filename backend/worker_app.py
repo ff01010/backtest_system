@@ -34,6 +34,7 @@ class WorkerRunRequest(BaseModel):
   holdingPolicy: str = "intraday"
   baseQuantity: int = Field(default=0, ge=0)
   baseCostPrice: float = Field(default=0, ge=0)
+  initialPositionEnabled: bool = False
   t0Enabled: bool = False
   warmupBarCount: int = Field(default=0, ge=0)
 
@@ -52,6 +53,7 @@ class WorkerL2SessionCreateRequest(BaseModel):
   symbol: str = ""
   baseQuantity: int = Field(default=0, ge=0)
   baseCostPrice: float = Field(default=0, ge=0)
+  initialPositionEnabled: bool = False
   t0Enabled: bool = False
   quoteMode: str = "order_driven"
   instrumentRules: dict[str, Any] = Field(default_factory=dict)
