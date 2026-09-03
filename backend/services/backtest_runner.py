@@ -12,6 +12,7 @@ import os
 import sys
 from contextlib import redirect_stdout
 from io import StringIO
+from collections.abc import Callable
 from typing import Any, Sequence
 
 import pandas as pd
@@ -53,8 +54,15 @@ def __getattr__(name: str) -> Any:
   raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def run_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+def run_backtest(
+  payload: dict[str, Any],
+  script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
   """按策略 ID 分发到对应适配器。"""
+  if payload["strategy"] == "user_script":
+    return _sanitize_json_value(run_user_script_backtest(payload, script_executor))
+  if payload["strategy"] == "research_signal":
+    return _sanitize_json_value(run_research_signal_backtest(payload, script_executor))
   from backend.services.strategy_adapters import get_strategy_adapter
 
   adapter = get_strategy_adapter(payload["strategy"])
@@ -115,7 +123,10 @@ def run_trend_grid_backtest(payload: dict[str, Any]) -> dict[str, Any]:
   return response
 
 
-def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+def run_user_script_backtest(
+  payload: dict[str, Any],
+  script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
   """将脚本快照交给隔离容器运行，后端只持有数据和结果。"""
   script_id = payload.get("scriptId")
   if not isinstance(script_id, str) or not script_id:
@@ -149,7 +160,8 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     }],
   }
   research_signal_by_bar_time = _research_signal_by_bar_time(payload.get("researchSignalSnapshot"))
-  worker_result = strategy_worker.run_script({
+  execute_script = script_executor or strategy_worker.run_script
+  worker_result = execute_script({
     "scriptId": script_id,
     "code": script["code"],
     "params": {
@@ -260,7 +272,10 @@ def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
   return aligned
 
 
-def run_research_signal_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+def run_research_signal_backtest(
+  payload: dict[str, Any],
+  script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
   """Replay one frozen standard-signal snapshot through the existing Bar worker."""
   snapshot = payload.get("researchSignalSnapshot")
   if not isinstance(snapshot, dict) or not isinstance(snapshot.get("artifactFile"), str):
@@ -272,7 +287,7 @@ def run_research_signal_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     "name": "冻结研究信号", "entryType": "on_bar", "code": _RESEARCH_SIGNAL_SCRIPT,
   }
   worker_payload["strategyParams"] = {**dict(payload.get("strategyParams") or {}), "signalsByDate": signals}
-  result = run_user_script_backtest(worker_payload)
+  result = run_user_script_backtest(worker_payload, script_executor)
   result["researchSignalSnapshot"] = snapshot
   return result
 

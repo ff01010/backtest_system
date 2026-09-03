@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -27,7 +28,14 @@ class ConflictError(DatabaseError):
   """违反唯一约束等写入冲突。"""
 
 
-_L2_FAIR_CLAIM_LOCK_KEY = 314159265
+class RunnerUnavailableError(DatabaseError):
+  """指定类型的回测执行器暂时不可用。"""
+
+
+_BACKTEST_SCHEDULER_LOCK_KEY = 314159265
+# 保留旧名称，避免外部诊断脚本在迁移期间失效。
+_L2_FAIR_CLAIM_LOCK_KEY = _BACKTEST_SCHEDULER_LOCK_KEY
+logger = logging.getLogger(__name__)
 
 
 def _translate_error(error: Exception) -> DatabaseError:
@@ -70,9 +78,18 @@ def ensure_schema() -> None:
   """确认数据库和迁移已经准备好；DDL 只允许由部署迁移执行。"""
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("SELECT to_regclass('public.backtest_run') AS table_name")
-      if cur.fetchone()["table_name"] is None:
+      cur.execute("""
+        SELECT to_regclass('public.backtest_run') AS run_table,
+          to_regclass('public.backtest_execution_slot') AS slot_table
+      """)
+      row = cur.fetchone()
+      if row["run_table"] is None:
         raise DatabaseError("数据库迁移尚未执行，请先运行 deploy 的 migrate 服务")
+      if row["slot_table"] is None:
+        raise DatabaseError("数据库缺少统一回测调度迁移 021，请先运行 deploy 的 migrate 服务")
+      cur.execute("SELECT to_regclass('public.backtest_runner_health') AS health_table")
+      if cur.fetchone()["health_table"] is None:
+        raise DatabaseError("数据库缺少 Runner 健康迁移 022，请先运行 deploy 的 migrate 服务")
 
 
 def replace_trade_calendar(
@@ -434,6 +451,9 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
     "note": row.get("note", ""),
     "tags": _json(row.get("tags"), []),
     "resultJson": result,
+    "queuedAt": _format_time(row.get("queued_at")),
+    "startedAt": _format_time(row.get("started_at")),
+    "cancelRequested": bool(row.get("cancel_requested", False)),
     "createdAt": _format_time(row["created_at"]),
     "finishedAt": _format_time(row.get("finished_at")),
   }
@@ -955,11 +975,17 @@ def create_api_backtest_job(
           str(run["status"]),
           str(run["fill_model"] or payload.get("fillModel", "bar_next_open")),
         )
+      job_kind = "l2" if payload.get("fillModel") == "l2_quote" else "bar"
+      if (
+        settings.BACKTEST_RUNNER_AVAILABILITY_REQUIRED
+        and not _has_healthy_backtest_runner(cur, job_kind)
+      ):
+        raise RunnerUnavailableError("回测执行服务暂不可用，请稍后重试")
       cur.execute("""
         SELECT count(*) AS value
         FROM api_idempotency_record record
         JOIN backtest_run run ON run.id=record.run_id
-        WHERE record.api_key_id=%s AND run.status IN ('queued', 'running')
+        WHERE record.api_key_id=%s AND run.status IN ('queued', 'running', 'cancelling')
       """, (api_key_id,))
       if int(cur.fetchone()["value"]) >= settings.PUBLIC_API_MAX_INFLIGHT:
         raise ValueError("API Key 正在排队或运行的回测已达上限")
@@ -993,43 +1019,241 @@ def create_api_backtest_job(
       return run_id, display_no, False, "queued", str(payload.get("fillModel", "bar_next_open"))
 
 
-def _claim_fair_l2_job_row(cur: Any, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
-  """在短事务调度锁内按用户运行数领取一条 L2 任务。"""
-  cur.execute("SELECT pg_advisory_xact_lock(%s)", (_L2_FAIR_CLAIM_LOCK_KEY,))
+def _finalize_expired_backtest_jobs(cur: Any) -> None:
+  """回收过期槽位，并将已失去执行器的取消任务收敛到终态。"""
+  for table in ("bar_backtest_job", "l2_backtest_job"):
+    cur.execute(f"""
+      WITH expired_jobs AS (
+        UPDATE {table}
+        SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
+        WHERE status='cancelling' AND lease_expires_at < now()
+        RETURNING run_id
+      )
+      UPDATE backtest_run AS run
+      SET status='cancelled', error_message=NULL, finished_at=now()
+      FROM expired_jobs
+      WHERE run.id=expired_jobs.run_id AND run.status='cancelling'
+    """)
+  cur.execute("DELETE FROM backtest_execution_slot WHERE lease_expires_at < now()")
+
+
+def _next_backtest_candidate(cur: Any, job_kind: str | None = None) -> dict[str, Any] | None:
+  """在全局锁内按用户当前占用数、提交时间选择下一条任务。"""
   cur.execute("""
-    WITH candidate AS (
-      SELECT job.run_id
-      FROM l2_backtest_job AS job
-      WHERE (job.status='queued' AND NOT job.cancel_requested)
-         OR (job.status='running' AND job.lease_expires_at < now() AND NOT job.cancel_requested)
-      ORDER BY (
-        SELECT count(*)
-        FROM l2_backtest_job AS active
-        WHERE active.owner_user_id=job.owner_user_id
-          AND active.status='running'
-          AND active.lease_expires_at >= now()
-      ), job.created_at, job.run_id
-      FOR UPDATE OF job SKIP LOCKED
-      LIMIT 1
-    )
-    UPDATE l2_backtest_job AS job
-    SET status='running', attempt_no=attempt_no + 1, attempt_token=gen_random_uuid(),
-      lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
-      started_at=COALESCE(started_at, now()), updated_at=now()
-    FROM candidate
-    WHERE job.run_id=candidate.run_id
-    RETURNING job.run_id, job.owner_user_id, job.payload, job.attempt_no, job.attempt_token
-  """, (lease_seconds, worker_id))
+    SELECT candidate.*,
+      (SELECT count(*) FROM backtest_execution_slot slot
+       WHERE slot.owner_user_id=candidate.owner_user_id) AS owner_active_count
+    FROM (
+      SELECT 'bar' AS job_kind, run_id, owner_user_id, created_at
+      FROM bar_backtest_job
+      WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
+        AND NOT cancel_requested
+      UNION ALL
+      SELECT 'l2' AS job_kind, run_id, owner_user_id, created_at
+      FROM l2_backtest_job
+      WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
+        AND NOT cancel_requested
+    ) AS candidate
+    WHERE (%s::text IS NULL OR candidate.job_kind=%s::text)
+    ORDER BY owner_active_count, candidate.created_at, candidate.run_id
+    LIMIT 1
+  """, (job_kind, job_kind))
   return cur.fetchone()
 
 
+def _scheduler_capacity(cur: Any) -> tuple[int, int]:
+  cur.execute("""
+    SELECT count(*) AS active_count,
+      (SELECT override_limit FROM backtest_scheduler_capacity
+       WHERE singleton AND override_expires_at > now()) AS override_limit
+    FROM backtest_execution_slot
+  """)
+  row = cur.fetchone() or {}
+  return int(row.get("active_count", 0)), int(row["override_limit"]) if row.get("override_limit") else 0
+
+
+def _record_backtest_runner_heartbeat(
+  cur: Any,
+  worker_id: str,
+  job_kind: str,
+  status: str,
+  current_run_id: str | None = None,
+  error_code: str | None = None,
+) -> None:
+  """限频写入 Runner 心跳，不保存异常正文或敏感诊断。"""
+  cur.execute("""
+    INSERT INTO backtest_runner_health (
+      worker_id, job_kind, status, current_run_id, last_error_code
+    ) VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (worker_id) DO UPDATE SET
+      job_kind=EXCLUDED.job_kind, status=EXCLUDED.status,
+      current_run_id=EXCLUDED.current_run_id, last_error_code=EXCLUDED.last_error_code,
+      heartbeat_at=now()
+    WHERE backtest_runner_health.heartbeat_at
+        < now() - make_interval(secs => %s)
+      OR backtest_runner_health.status IS DISTINCT FROM EXCLUDED.status
+      OR backtest_runner_health.current_run_id IS DISTINCT FROM EXCLUDED.current_run_id
+      OR backtest_runner_health.last_error_code IS DISTINCT FROM EXCLUDED.last_error_code
+  """, (
+    worker_id, job_kind, status, current_run_id, error_code,
+    settings.BACKTEST_RUNNER_HEARTBEAT_WRITE_SECONDS,
+  ))
+
+
+def record_backtest_runner_heartbeat(
+  worker_id: str,
+  job_kind: str,
+  status: str,
+  current_run_id: str | None = None,
+  error_code: str | None = None,
+) -> None:
+  if job_kind not in {"bar", "l2"} or status not in {"ready", "running", "error"}:
+    raise ValueError("Runner 心跳类型或状态无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      _record_backtest_runner_heartbeat(
+        cur, worker_id, job_kind, status, current_run_id, error_code,
+      )
+
+
+def has_healthy_backtest_runner(job_kind: str) -> bool:
+  """判断指定类型是否至少有一个处于有效心跳期的执行器。"""
+  if not settings.BACKTEST_RUNNER_AVAILABILITY_REQUIRED:
+    return True
+  with _db() as conn:
+    with conn.cursor() as cur:
+      return _has_healthy_backtest_runner(cur, job_kind)
+
+
+def _has_healthy_backtest_runner(cur: Any, job_kind: str) -> bool:
+  cur.execute("""
+    SELECT EXISTS (
+      SELECT 1 FROM backtest_runner_health
+      WHERE job_kind=%s AND status IN ('ready', 'running')
+        AND heartbeat_at >= now() - make_interval(secs => %s)
+    ) AS available
+  """, (job_kind, settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS))
+  return bool(cur.fetchone()["available"])
+
+
+def get_backtest_runner_health() -> dict[str, Any]:
+  """返回健康接口使用的聚合信息，不暴露 worker 标识和内部错误。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        WITH kinds(job_kind) AS (VALUES ('bar'::text), ('l2'::text))
+        SELECT kinds.job_kind,
+          count(health.worker_id) FILTER (
+            WHERE health.status IN ('ready', 'running')
+              AND health.heartbeat_at >= now() - make_interval(secs => %s)
+          ) AS healthy_count,
+          count(health.worker_id) FILTER (
+            WHERE health.status='error'
+              AND health.heartbeat_at >= now() - make_interval(secs => %s)
+          ) AS error_count,
+          CASE WHEN kinds.job_kind='bar'
+            THEN (SELECT count(*) FROM bar_backtest_job WHERE status='queued')
+            ELSE (SELECT count(*) FROM l2_backtest_job WHERE status='queued')
+          END AS queued_count
+        FROM kinds
+        LEFT JOIN backtest_runner_health health ON health.job_kind=kinds.job_kind
+        GROUP BY kinds.job_kind
+        ORDER BY kinds.job_kind
+      """, (
+        settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS,
+        settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS,
+      ))
+      rows = cur.fetchall()
+  runners = {
+    str(row["job_kind"]): {
+      "healthy": int(row["healthy_count"]),
+      "errors": int(row["error_count"]),
+      "queued": int(row["queued_count"]),
+    }
+    for row in rows
+  }
+  return {
+    "status": (
+      "ok"
+      if not settings.BACKTEST_RUNNER_AVAILABILITY_REQUIRED
+      or all(item["healthy"] > 0 for item in runners.values())
+      else "degraded"
+    ),
+    "runners": runners,
+  }
+
+
+def _claim_backtest_job(
+  cur: Any,
+  job_kind: str,
+  worker_id: str,
+  lease_seconds: int,
+) -> dict[str, Any] | None:
+  """领取 Bar/L2 共用容量中的一个槽位。"""
+  if job_kind not in {"bar", "l2"}:
+    raise ValueError("回测任务类型无效")
+  cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BACKTEST_SCHEDULER_LOCK_KEY,))
+  _finalize_expired_backtest_jobs(cur)
+  candidate = _next_backtest_candidate(cur)
+  if not candidate:
+    return None
+  if candidate["job_kind"] != job_kind:
+    logger.info(
+      "全局最优先任务等待对应执行器: kind=%s reason=%s",
+      candidate["job_kind"], f"{candidate['job_kind']}_executor_wait",
+    )
+    candidate = _next_backtest_candidate(cur, job_kind)
+    if not candidate:
+      return None
+
+  active_count, override_limit = _scheduler_capacity(cur)
+  normal_limit = override_limit or settings.BACKTEST_BASE_CONCURRENCY
+  owner_active_count = int(candidate.get("owner_active_count", 0))
+  fairness_burst = (
+    override_limit == 0
+    and settings.BACKTEST_FAIRNESS_BURST_ENABLED
+    and active_count < settings.BACKTEST_BURST_MAX_CONCURRENCY
+    and owner_active_count < settings.BACKTEST_USER_GUARANTEED_CONCURRENCY
+  )
+  if active_count >= normal_limit and not fairness_burst:
+    reason = "burst_limit_wait" if active_count >= settings.BACKTEST_BURST_MAX_CONCURRENCY else "capacity_wait"
+    logger.info("回测任务等待统一槽位: kind=%s reason=%s", job_kind, reason)
+    return None
+
+  table = "bar_backtest_job" if job_kind == "bar" else "l2_backtest_job"
+  cur.execute(f"""
+    UPDATE {table}
+    SET status='running', attempt_no=attempt_no + 1, attempt_token=gen_random_uuid(),
+      lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
+      started_at=COALESCE(started_at, now()), updated_at=now()
+    WHERE run_id=%s AND NOT cancel_requested
+      AND (status='queued' OR (status='running' AND lease_expires_at < now()))
+    RETURNING run_id, owner_user_id, payload, attempt_no, attempt_token, lease_expires_at
+  """, (lease_seconds, worker_id, candidate["run_id"]))
+  row = cur.fetchone()
+  if not row:
+    return None
+  cur.execute("""
+    INSERT INTO backtest_execution_slot (
+      run_id, owner_user_id, job_kind, attempt_token, worker_id, is_burst, lease_expires_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (run_id) DO UPDATE SET
+      attempt_token=EXCLUDED.attempt_token, worker_id=EXCLUDED.worker_id,
+      is_burst=EXCLUDED.is_burst, acquired_at=now(), lease_expires_at=EXCLUDED.lease_expires_at
+  """, (
+    row["run_id"], row["owner_user_id"], job_kind, row["attempt_token"], worker_id,
+    active_count >= settings.BACKTEST_BASE_CONCURRENCY, row["lease_expires_at"],
+  ))
+  return row
+
+
 def claim_l2_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
-  """原子公平领取一个任务，并为本次尝试生成不可复用令牌。"""
+  """从统一容量中原子领取一个 L2 任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("L2 runner 标识和租约时长必须有效")
   with _db() as conn:
     with conn.cursor() as cur:
-      row = _claim_fair_l2_job_row(cur, worker_id, lease_seconds)
+      row = _claim_backtest_job(cur, "l2", worker_id, lease_seconds)
       if not row:
         return None
       cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
@@ -1043,31 +1267,12 @@ def claim_l2_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] 
 
 
 def claim_bar_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
-  """原子领取一个标准 Bar 回测任务。"""
+  """从统一容量中原子领取一个标准 Bar 回测任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("Bar runner 标识和租约时长必须有效")
   with _db() as conn:
     with conn.cursor() as cur:
-      _finalize_expired_bar_backtest_cancellations(cur)
-      cur.execute("""
-        WITH candidate AS (
-          SELECT run_id
-          FROM bar_backtest_job
-          WHERE (status='queued' AND NOT cancel_requested)
-             OR (status='running' AND lease_expires_at < now() AND NOT cancel_requested)
-          ORDER BY created_at
-          FOR UPDATE SKIP LOCKED
-          LIMIT 1
-        )
-        UPDATE bar_backtest_job AS job
-        SET status='running', attempt_no=attempt_no + 1, attempt_token=gen_random_uuid(),
-          lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
-          started_at=COALESCE(started_at, now()), updated_at=now()
-        FROM candidate
-        WHERE job.run_id=candidate.run_id
-        RETURNING job.run_id, job.owner_user_id, job.payload, job.attempt_no, job.attempt_token
-      """, (lease_seconds, worker_id))
-      row = cur.fetchone()
+      row = _claim_backtest_job(cur, "bar", worker_id, lease_seconds)
       if not row:
         return None
       cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
@@ -1081,43 +1286,59 @@ def claim_bar_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any]
 
 
 def _finalize_expired_bar_backtest_cancellations(cur: Any) -> None:
-  """收尾执行器已退出的取消任务，避免其永久停留在运行中。"""
-  cur.execute("""
-    WITH expired_jobs AS (
-      UPDATE bar_backtest_job
-      SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
-      WHERE status='running' AND cancel_requested AND lease_expires_at < now()
-      RETURNING run_id
-    )
-    UPDATE backtest_run AS run
-    SET status='cancelled', error_message=NULL, finished_at=now()
-    FROM expired_jobs
-    WHERE run.id=expired_jobs.run_id AND run.status='running'
-  """)
+  """兼容旧诊断调用，实际收尾已统一覆盖 Bar 与 L2。"""
+  _finalize_expired_backtest_jobs(cur)
 
 
-def heartbeat_l2_backtest_job(run_id: str, attempt_token: str, lease_seconds: int) -> bool:
+def heartbeat_l2_backtest_job(
+  run_id: str, attempt_token: str, lease_seconds: int, worker_id: str | None = None,
+) -> bool:
   """仅持有当前 attempt_token 的 runner 可以续租。"""
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE l2_backtest_job
-        SET lease_expires_at=now() + make_interval(secs => %s), updated_at=now()
-        WHERE run_id=%s AND attempt_token=%s AND status='running' AND NOT cancel_requested
-      """, (lease_seconds, run_id, attempt_token))
-      return cur.rowcount == 1
+      return _heartbeat_backtest_job(
+        cur, "l2_backtest_job", run_id, attempt_token, lease_seconds, worker_id,
+      )
 
 
-def heartbeat_bar_backtest_job(run_id: str, attempt_token: str, lease_seconds: int) -> bool:
+def heartbeat_bar_backtest_job(
+  run_id: str, attempt_token: str, lease_seconds: int, worker_id: str | None = None,
+) -> bool:
   """仅持有当前租约的 Bar runner 可以续租。"""
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE bar_backtest_job
-        SET lease_expires_at=now() + make_interval(secs => %s), updated_at=now()
-        WHERE run_id=%s AND attempt_token=%s AND status='running' AND NOT cancel_requested
-      """, (lease_seconds, run_id, attempt_token))
-      return cur.rowcount == 1
+      return _heartbeat_backtest_job(
+        cur, "bar_backtest_job", run_id, attempt_token, lease_seconds, worker_id,
+      )
+
+
+def _heartbeat_backtest_job(
+  cur: Any,
+  table: str,
+  run_id: str,
+  attempt_token: str,
+  lease_seconds: int,
+  worker_id: str | None = None,
+) -> bool:
+  cur.execute(f"""
+    WITH renewed_job AS (
+      UPDATE {table}
+      SET lease_expires_at=now() + make_interval(secs => %s), updated_at=now()
+      WHERE run_id=%s AND attempt_token=%s AND status='running' AND NOT cancel_requested
+      RETURNING run_id, attempt_token, lease_expires_at
+    )
+    UPDATE backtest_execution_slot AS slot
+    SET lease_expires_at=renewed_job.lease_expires_at
+    FROM renewed_job
+    WHERE slot.run_id=renewed_job.run_id AND slot.attempt_token=renewed_job.attempt_token
+    RETURNING slot.run_id
+  """, (lease_seconds, run_id, attempt_token))
+  renewed = cur.fetchone() is not None
+  if renewed and worker_id:
+    _record_backtest_runner_heartbeat(
+      cur, worker_id, "bar" if table == "bar_backtest_job" else "l2", "running", run_id,
+    )
+  return renewed
 
 
 def finish_l2_backtest_job(
@@ -1134,21 +1355,12 @@ def finish_l2_backtest_job(
     raise ValueError("L2 任务终态无效")
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE l2_backtest_job
-        SET status=%s, error_message=%s, lease_expires_at=NULL, finished_at=now(), updated_at=now()
-        WHERE run_id=%s AND attempt_token=%s AND status='running'
-        RETURNING run_id
-      """, (status, summary.get("error") if status != "succeeded" else None, run_id, attempt_token))
-      if cur.fetchone() is None:
+      effective_status = _finish_backtest_job(
+        cur, "l2_backtest_job", run_id, attempt_token, status, summary, result,
+      )
+      if effective_status is None:
         return False
-      cur.execute("""
-        UPDATE backtest_run
-        SET status=%s, result_summary=%s, result_json=%s, error_message=%s, finished_at=now()
-        WHERE id=%s
-      """, (status, Jsonb(summary), Jsonb(result) if result else None,
-             summary.get("error") if status != "succeeded" else None, run_id))
-      if status == "failed" and system_error and owner_user_id:
+      if effective_status == "failed" and system_error and owner_user_id:
         _insert_system_error(cur, run_id, owner_user_id, system_error)
       return True
 
@@ -1167,24 +1379,57 @@ def finish_bar_backtest_job(
     raise ValueError("Bar 任务终态无效")
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE bar_backtest_job
-        SET status=%s, error_message=%s, lease_expires_at=NULL, finished_at=now(), updated_at=now()
-        WHERE run_id=%s AND attempt_token=%s AND status='running'
-        RETURNING run_id
-      """, (status, summary.get("error") if status != "succeeded" else None, run_id, attempt_token))
-      if cur.fetchone() is None:
+      effective_status = _finish_backtest_job(
+        cur, "bar_backtest_job", run_id, attempt_token, status, summary, result,
+      )
+      if effective_status is None:
         return False
-      cur.execute("""
-        UPDATE backtest_run
-        SET status=%s, result_summary=%s, result_json=%s, error_message=%s, finished_at=now()
-        WHERE id=%s
-      """, (status, Jsonb(summary), Jsonb(result) if result else None,
-             summary.get("error") if status != "succeeded" else None, run_id))
-      _enqueue_research_signal_result(cur, run_id, status, summary)
-      if status == "failed" and system_error and owner_user_id:
+      _enqueue_research_signal_result(cur, run_id, effective_status, summary)
+      if effective_status == "failed" and system_error and owner_user_id:
         _insert_system_error(cur, run_id, owner_user_id, system_error)
       return True
+
+
+def _finish_backtest_job(
+  cur: Any,
+  table: str,
+  run_id: str,
+  attempt_token: str,
+  requested_status: str,
+  summary: dict[str, Any],
+  result: dict[str, Any] | None,
+) -> str | None:
+  """以数据库中的取消状态优先，防止迟到成功结果覆盖取消。"""
+  cur.execute(f"""
+    UPDATE {table}
+    SET status=CASE WHEN cancel_requested OR status='cancelling' THEN 'cancelled' ELSE %s END,
+      error_message=CASE WHEN cancel_requested OR status='cancelling' THEN NULL ELSE %s END,
+      lease_expires_at=NULL, finished_at=now(), updated_at=now()
+    WHERE run_id=%s AND attempt_token=%s AND status IN ('running', 'cancelling')
+    RETURNING status
+  """, (
+    requested_status, summary.get("error") if requested_status != "succeeded" else None,
+    run_id, attempt_token,
+  ))
+  row = cur.fetchone()
+  if row is None:
+    return None
+  effective_status = str(row["status"])
+  effective_result = result if effective_status == "succeeded" else None
+  effective_error = summary.get("error") if effective_status == "failed" else None
+  cur.execute("""
+    UPDATE backtest_run
+    SET status=%s, result_summary=%s, result_json=%s, error_message=%s, finished_at=now()
+    WHERE id=%s AND status IN ('running', 'cancelling')
+  """, (
+    effective_status, Jsonb(summary), Jsonb(effective_result) if effective_result else None,
+    effective_error, run_id,
+  ))
+  cur.execute(
+    "DELETE FROM backtest_execution_slot WHERE run_id=%s AND attempt_token=%s",
+    (run_id, attempt_token),
+  )
+  return effective_status
 
 
 def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary: dict[str, Any]) -> None:
@@ -1210,57 +1455,156 @@ def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary:
 
 
 def request_l2_backtest_cancel(run_id: str) -> bool:
-  """请求取消尚未结束的 L2 任务。"""
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE l2_backtest_job
-        SET cancel_requested=true,
-          status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
-          finished_at=CASE WHEN status='queued' THEN now() ELSE finished_at END,
-          updated_at=now()
-        WHERE run_id=%s AND status IN ('queued', 'running')
-        RETURNING status
-      """, (run_id,))
-      row = cur.fetchone()
-      if row is None:
-        return False
-      if row["status"] == "cancelled":
-        cur.execute("UPDATE backtest_run SET status='cancelled', finished_at=now() WHERE id=%s", (run_id,))
-      return True
+  """兼容旧调用：仅在该运行属于 L2 队列时请求取消。"""
+  return _request_backtest_cancel(run_id, "l2_backtest_job") is not None
 
 
 def request_bar_backtest_cancel(run_id: str) -> bool:
-  """请求取消标准 Bar 回测；运行中的任务会在当前策略调用返回后结束。"""
+  """兼容旧调用：仅在该运行属于 Bar 队列时请求取消。"""
+  return _request_backtest_cancel(run_id, "bar_backtest_job") is not None
+
+
+def request_backtest_cancel(run_id: str) -> str | None:
+  """幂等取消任意回测，返回数据库真实状态。"""
+  status = _request_backtest_cancel(run_id, "l2_backtest_job")
+  return status if status is not None else _request_backtest_cancel(run_id, "bar_backtest_job")
+
+
+def _request_backtest_cancel(run_id: str, table: str) -> str | None:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE bar_backtest_job
+      cur.execute(f"""
+        UPDATE {table}
         SET cancel_requested=true,
-          status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
+          status=CASE WHEN status='queued' THEN 'cancelled' WHEN status='running' THEN 'cancelling' ELSE status END,
           finished_at=CASE WHEN status='queued' THEN now() ELSE finished_at END,
           updated_at=now()
-        WHERE run_id=%s AND status IN ('queued', 'running')
+        WHERE run_id=%s
         RETURNING status
       """, (run_id,))
       row = cur.fetchone()
       if row is None:
-        return False
-      if row["status"] == "cancelled":
-        cur.execute("UPDATE backtest_run SET status='cancelled', finished_at=now() WHERE id=%s", (run_id,))
-      return True
+        return None
+      status = str(row["status"])
+      cur.execute("""
+        UPDATE backtest_run
+        SET status=%s, finished_at=CASE WHEN %s='cancelled' THEN COALESCE(finished_at, now()) ELSE finished_at END
+        WHERE id=%s AND status IN ('queued', 'running', 'cancelling')
+      """, (status, status, run_id))
+      return status
+
+
+def get_backtest_scheduler_capacity() -> dict[str, Any]:
+  """返回管理员可见的统一容量与当前占用。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT
+          CASE WHEN capacity.override_expires_at > now() THEN capacity.override_limit END AS override_limit,
+          CASE WHEN capacity.override_expires_at > now() THEN capacity.override_expires_at END AS override_expires_at,
+          count(slot.run_id) AS active_count,
+          count(slot.run_id) FILTER (WHERE slot.job_kind='bar') AS bar_active_count,
+          count(slot.run_id) FILTER (WHERE slot.job_kind='l2') AS l2_active_count
+        FROM backtest_scheduler_capacity capacity
+        LEFT JOIN backtest_execution_slot slot ON slot.lease_expires_at >= now()
+        WHERE capacity.singleton
+        GROUP BY capacity.override_limit, capacity.override_expires_at
+      """)
+      row = cur.fetchone() or {}
+      override_limit = int(row["override_limit"]) if row.get("override_limit") else None
+      return {
+        "baseLimit": settings.BACKTEST_BASE_CONCURRENCY,
+        "burstLimit": settings.BACKTEST_BURST_MAX_CONCURRENCY,
+        "effectiveLimit": override_limit or settings.BACKTEST_BASE_CONCURRENCY,
+        "overrideLimit": override_limit,
+        "overrideExpiresAt": row.get("override_expires_at"),
+        "activeCount": int(row.get("active_count", 0)),
+        "barActiveCount": int(row.get("bar_active_count", 0)),
+        "l2ActiveCount": int(row.get("l2_active_count", 0)),
+      }
+
+
+def set_backtest_scheduler_capacity(limit: int, ttl_seconds: int, reason: str) -> dict[str, Any]:
+  """设置有时限的人工容量；到期只阻止新领取，不终止在途任务。"""
+  if not 8 <= limit <= settings.BACKTEST_BURST_MAX_CONCURRENCY:
+    raise ValueError(f"临时容量必须在 8 至 {settings.BACKTEST_BURST_MAX_CONCURRENCY} 之间")
+  if not 60 <= ttl_seconds <= settings.BACKTEST_CAPACITY_OVERRIDE_MAX_TTL_SECONDS:
+    raise ValueError("临时容量有效期超出部署允许范围")
+  if not reason.strip():
+    raise ValueError("临时扩容必须填写原因")
+  actor_user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BACKTEST_SCHEDULER_LOCK_KEY,))
+      cur.execute("SELECT override_limit FROM backtest_scheduler_capacity WHERE singleton FOR UPDATE")
+      row = cur.fetchone() or {}
+      snapshot = _scheduler_audit_snapshot(cur)
+      cur.execute("""
+        UPDATE backtest_scheduler_capacity
+        SET override_limit=%s, override_expires_at=now() + make_interval(secs => %s),
+          updated_by_user_id=%s, update_reason=%s, updated_at=now()
+        WHERE singleton
+        RETURNING override_expires_at
+      """, (limit, ttl_seconds, actor_user_id, reason.strip()))
+      expires_at = cur.fetchone()["override_expires_at"]
+      cur.execute("""
+        INSERT INTO backtest_scheduler_capacity_audit (
+          actor_user_id, old_limit, new_limit, expires_at, reason, scheduler_snapshot
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+      """, (
+        actor_user_id, row.get("override_limit"), limit, expires_at, reason.strip(), Jsonb(snapshot),
+      ))
+  return get_backtest_scheduler_capacity()
+
+
+def clear_backtest_scheduler_capacity(reason: str) -> dict[str, Any]:
+  """提前结束人工扩容并记录审计。"""
+  actor_user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BACKTEST_SCHEDULER_LOCK_KEY,))
+      cur.execute("SELECT override_limit FROM backtest_scheduler_capacity WHERE singleton FOR UPDATE")
+      row = cur.fetchone() or {}
+      snapshot = _scheduler_audit_snapshot(cur)
+      cur.execute("""
+        UPDATE backtest_scheduler_capacity
+        SET override_limit=NULL, override_expires_at=NULL, updated_by_user_id=%s,
+          update_reason=%s, updated_at=now()
+        WHERE singleton
+      """, (actor_user_id, reason.strip()))
+      cur.execute("""
+        INSERT INTO backtest_scheduler_capacity_audit (
+          actor_user_id, old_limit, new_limit, expires_at, reason, scheduler_snapshot
+        ) VALUES (%s, %s, NULL, NULL, %s, %s)
+      """, (actor_user_id, row.get("override_limit"), reason.strip(), Jsonb(snapshot)))
+  return get_backtest_scheduler_capacity()
+
+
+def _scheduler_audit_snapshot(cur: Any) -> dict[str, int]:
+  """记录数据库可验证的扩容现场；主机资源由发布监控系统留存。"""
+  cur.execute("""
+    SELECT
+      (SELECT count(*) FROM backtest_execution_slot WHERE lease_expires_at >= now()) AS active_count,
+      (SELECT count(*) FROM bar_backtest_job WHERE status='queued')
+        + (SELECT count(*) FROM l2_backtest_job WHERE status='queued') AS queued_count
+  """)
+  row = cur.fetchone() or {}
+  return {"activeCount": int(row.get("active_count", 0)), "queuedCount": int(row.get("queued_count", 0))}
 
 
 def _run_query(where: str = "") -> str:
   return f"""
     SELECT r.*, s.id AS strategy_id,
       i.symbol || '.' || i.exchange AS symbol,
-      b.symbol || '.' || b.exchange AS benchmark_symbol
+      b.symbol || '.' || b.exchange AS benchmark_symbol,
+      COALESCE(bar_job.cancel_requested, l2_job.cancel_requested, false) AS cancel_requested
     FROM backtest_run r
     LEFT JOIN user_strategy_version sv ON sv.id=r.strategy_version_id
     LEFT JOIN user_strategy s ON s.id=sv.strategy_id
     LEFT JOIN market_instrument i ON i.id=r.instrument_id
     LEFT JOIN market_instrument b ON b.id=r.benchmark_instrument_id
+    LEFT JOIN bar_backtest_job bar_job ON bar_job.run_id=r.id
+    LEFT JOIN l2_backtest_job l2_job ON l2_job.run_id=r.id
     WHERE r.owner_user_id=%s {where}
   """
 

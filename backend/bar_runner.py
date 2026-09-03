@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from backend import settings
+from backend.bar_strategy_session import BarStrategySession
 from backend.services import backtest_runner, research_result_outbox, state_store
 from backend.services.backtest_errors import error_summary
 from backend.services.system_error_log import system_error_log_record
@@ -30,14 +31,57 @@ class BarRunner:
 
   def __init__(self, worker_id: str | None = None) -> None:
     self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
+    self._health_signature: tuple[str, str | None, str | None] | None = None
+    self._health_written_at = 0.0
 
   def run_forever(self) -> None:
+    backoff_seconds = 1.0
     while True:
-      job = state_store.claim_bar_backtest_job(self._worker_id, settings.L2_JOB_LEASE_SECONDS)
+      try:
+        job = state_store.claim_bar_backtest_job(self._worker_id, settings.L2_JOB_LEASE_SECONDS)
+      except state_store.DatabaseError as error:
+        self._handle_database_error(error, backoff_seconds)
+        backoff_seconds = min(
+          backoff_seconds * 2, settings.BACKTEST_RUNNER_ERROR_BACKOFF_MAX_SECONDS,
+        )
+        continue
+      backoff_seconds = 1.0
       if job is None:
+        self._record_health("ready")
         time.sleep(settings.L2_RUNNER_POLL_SECONDS)
         continue
-      self._run_job(job)
+      self._record_health("running", job["runId"])
+      try:
+        self._run_job(job)
+      except state_store.DatabaseError as error:
+        self._handle_database_error(error, backoff_seconds)
+
+  def _handle_database_error(self, error: Exception, backoff_seconds: float) -> None:
+    logger.exception("Bar Runner 数据库操作失败，%.1f 秒后重试", backoff_seconds)
+    self._record_health("error", error_code=type(error).__name__)
+    time.sleep(backoff_seconds)
+
+  def _record_health(
+    self,
+    status: str,
+    current_run_id: str | None = None,
+    error_code: str | None = None,
+  ) -> None:
+    signature = (status, current_run_id, error_code)
+    now = time.monotonic()
+    if (
+      signature == self._health_signature
+      and now - self._health_written_at < settings.BACKTEST_RUNNER_HEARTBEAT_WRITE_SECONDS
+    ):
+      return
+    try:
+      state_store.record_backtest_runner_heartbeat(
+        self._worker_id, "bar", status, current_run_id, error_code,
+      )
+      self._health_signature = signature
+      self._health_written_at = now
+    except state_store.DatabaseError:
+      logger.exception("Bar Runner 健康心跳写入失败")
 
   def run_once(self) -> bool:
     job = state_store.claim_bar_backtest_job(self._worker_id, settings.L2_JOB_LEASE_SECONDS)
@@ -47,13 +91,17 @@ class BarRunner:
     return True
 
   def _run_job(self, job: dict[str, Any]) -> None:
-    lease = _BarJobLeaseKeeper(job)
+    lease = _BarJobLeaseKeeper(job, self._worker_id)
     stage = "bar.initialize"
     try:
       lease.start()
       payload = dict(job["payload"])
       stage = "bar.backtest"
-      result = backtest_runner.run_backtest(payload)
+      if payload.get("strategy") in {"user_script", "research_signal"}:
+        session = BarStrategySession(lease.ensure_active, settings.BACKTEST_CANCEL_GRACE_SECONDS)
+        result = backtest_runner.run_backtest(payload, session.run_script)
+      else:
+        result = backtest_runner.run_backtest(payload)
       lease.ensure_active()
       summary = dict(result["summary"])
       summary["warningCount"] = len(result.get("warnings") or [])
@@ -79,8 +127,9 @@ class BarRunner:
 class _BarJobLeaseKeeper:
   """在 Bar 策略调用阻塞时维持租约，并记录取消信号。"""
 
-  def __init__(self, job: dict[str, Any]) -> None:
+  def __init__(self, job: dict[str, Any], worker_id: str = "unknown") -> None:
     self._job = job
+    self._worker_id = worker_id
     self._stop_event = threading.Event()
     self._lock = threading.Lock()
     self._failure: Exception | None = None
@@ -100,11 +149,18 @@ class _BarJobLeaseKeeper:
       raise failure
 
   def _run(self) -> None:
-    interval = max(1.0, min(10.0, settings.L2_JOB_LEASE_SECONDS / 3))
+    interval = min(settings.BACKTEST_CANCEL_POLL_SECONDS, settings.L2_JOB_LEASE_SECONDS / 3)
     while not self._stop_event.wait(interval):
-      if not state_store.heartbeat_bar_backtest_job(
-        self._job["runId"], self._job["attemptToken"], settings.L2_JOB_LEASE_SECONDS,
-      ):
+      try:
+        renewed = state_store.heartbeat_bar_backtest_job(
+          self._job["runId"], self._job["attemptToken"], settings.L2_JOB_LEASE_SECONDS,
+          self._worker_id,
+        )
+      except Exception as error:
+        with self._lock:
+          self._failure = error
+        return
+      if not renewed:
         with self._lock:
           self._failure = ValueError("Bar 任务租约丢失或已取消")
         return
@@ -112,6 +168,7 @@ class _BarJobLeaseKeeper:
 
 def main() -> None:
   logging.basicConfig(level=os.getenv("TREND_GRID_LOG_LEVEL", "INFO"))
+  state_store.ensure_schema()
   BarRunner().run_forever()
 
 

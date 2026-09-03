@@ -384,6 +384,9 @@ export interface BacktestRunHistory {
   outputDir: string;
   note: string;
   tags: string[];
+  queuedAt: string;
+  startedAt: string;
+  cancelRequested: boolean;
   resultJson: BacktestRunResponse | null;
   createdAt: string;
   finishedAt: string;

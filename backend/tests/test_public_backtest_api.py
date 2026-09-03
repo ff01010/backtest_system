@@ -97,3 +97,24 @@ def test_public_request_hash_is_stable_and_changes_with_override() -> None:
 
   assert api_app._public_request_hash(first) == api_app._public_request_hash(same)
   assert api_app._public_request_hash(first) != api_app._public_request_hash(changed)
+
+
+def test_backtest_submission_rejects_unavailable_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(api_app.state_store, "has_healthy_backtest_runner", lambda _: False)
+
+  with pytest.raises(HTTPException) as raised:
+    api_app._require_backtest_runner("bar_next_open")
+
+  assert raised.value.status_code == 503
+  assert raised.value.detail == "回测执行服务暂不可用，请稍后重试"
+
+
+def test_health_reports_runner_degradation_without_internal_counts(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(api_app.state_store, "get_backtest_runner_health", lambda: {
+    "status": "degraded",
+    "runners": {"bar": {"healthy": 0, "queued": 3}},
+  })
+
+  assert api_app.health() == {"status": "degraded", "backtest": "unavailable"}

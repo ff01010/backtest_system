@@ -324,6 +324,9 @@ export async function runBacktest(payload: BacktestRunPayload): Promise<Backtest
         throw new Error(`回测参数校验失败：${message}`);
       }
     }
+    if (res.status === 503) {
+      throw new Error('回测执行服务暂不可用，请稍后重试');
+    }
     throw new Error(`API ${res.status}: 回测请求失败`);
   }
   return res.json();
@@ -373,7 +376,10 @@ export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistor
   return data.run;
 }
 
-export async function cancelBacktestRun(runId: string): Promise<{ runId: string; status: 'cancelling' }> {
+export async function cancelBacktestRun(runId: string): Promise<{
+  runId: string;
+  status: 'queued' | 'running' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
+}> {
   const res = await fetch(`${BASE}/backtest/runs/${runId}/cancel`, {
     method: 'POST',
     credentials: 'include',

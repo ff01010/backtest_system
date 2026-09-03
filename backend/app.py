@@ -562,7 +562,22 @@ def startup():
 
 @app.get("/api/health")
 def health():
-  return {"status": "ok"}
+  runner_health = state_store.get_backtest_runner_health()
+  return {
+    "status": runner_health["status"],
+    "backtest": "ok" if runner_health["status"] == "ok" else "unavailable",
+  }
+
+
+def _require_backtest_runner(fill_model: str) -> None:
+  job_kind = "l2" if fill_model == "l2_quote" else "bar"
+  try:
+    available = state_store.has_healthy_backtest_runner(job_kind)
+  except state_store.DatabaseError as error:
+    logger.exception("检查回测执行器可用性失败")
+    raise HTTPException(503, "回测执行服务暂不可用，请稍后重试") from error
+  if not available:
+    raise HTTPException(503, "回测执行服务暂不可用，请稍后重试")
 
 
 @app.get("/api/research/signal-datasets")
@@ -792,6 +807,33 @@ def admin_system_errors(
   return {"items": state_store.list_system_error_logs(
     limit, user_id, run_id, error_code, from_time, to_time,
   )}
+
+
+@app.get("/api/admin/backtest-capacity")
+def admin_backtest_capacity(request: Request):
+  _require_admin(request)
+  return state_store.get_backtest_scheduler_capacity()
+
+
+@app.put("/api/admin/backtest-capacity")
+def update_admin_backtest_capacity(
+  payload: schemas.BacktestCapacityOverrideRequest,
+  request: Request,
+):
+  _require_admin(request)
+  try:
+    return state_store.set_backtest_scheduler_capacity(payload.limit, payload.ttlSeconds, payload.reason)
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
+
+
+@app.delete("/api/admin/backtest-capacity")
+def clear_admin_backtest_capacity(
+  request: Request,
+  reason: str = Query("管理员提前结束临时扩容", min_length=1, max_length=500),
+):
+  _require_admin(request)
+  return state_store.clear_backtest_scheduler_capacity(reason)
 
 
 @app.get("/api/strategies")
@@ -1193,6 +1235,8 @@ def public_create_backtest(payload: schemas.PublicBacktestCreateRequest, request
     )
   except state_store.ConflictError as error:
     raise HTTPException(409, str(error)) from error
+  except state_store.RunnerUnavailableError as error:
+    raise HTTPException(503, str(error)) from error
   except ValueError as error:
     raise HTTPException(429, str(error)) from error
   return {
@@ -1270,15 +1314,17 @@ def public_backtest_trades(
 @app.post("/api/v1/backtests/{run_id}/cancel")
 def public_cancel_backtest(run_id: str, request: Request):
   _require_public_scope(request, "backtest:cancel")
-  if not state_store.request_l2_backtest_cancel(run_id) and not state_store.request_bar_backtest_cancel(run_id):
+  status = state_store.request_backtest_cancel(run_id)
+  if status is None:
     raise HTTPException(404, "未找到可取消的回测任务")
-  return {"run_id": run_id, "status": "cancelling", "request_id": request.state.request_id}
+  return {"run_id": run_id, "status": status, "request_id": request.state.request_id}
 
 
 @app.post("/api/backtest/run")
 def run_backtest(payload: schemas.BacktestRunRequest):
   request = _model_dump(payload)
   _validate_backtest_request(request)
+  _require_backtest_runner(str(request.get("fillModel", "bar_next_open")))
 
   if request.get("fillModel") == "l2_quote":
     try:
@@ -1314,10 +1360,11 @@ def run_backtest(payload: schemas.BacktestRunRequest):
 
 @app.post("/api/backtest/runs/{run_id}/cancel")
 def cancel_backtest_run(run_id: str):
-  """请求取消未结束的回测；Runner 会在当前可中断边界结束。"""
-  if not state_store.request_l2_backtest_cancel(run_id) and not state_store.request_bar_backtest_cancel(run_id):
+  """幂等请求取消，并返回数据库中的真实任务状态。"""
+  status = state_store.request_backtest_cancel(run_id)
+  if status is None:
     raise HTTPException(404, "未找到可取消的回测任务")
-  return {"runId": run_id, "status": "cancelling"}
+  return {"runId": run_id, "status": status}
 
 
 @app.delete("/api/backtest/runs")

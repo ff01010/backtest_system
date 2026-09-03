@@ -386,6 +386,17 @@ function formatSignalTime(value: string): string {
   return value;
 }
 
+function formatElapsedTime(startedAt: string, now: number): string {
+  const started = Date.parse(startedAt);
+  if (!Number.isFinite(started)) return '';
+  const seconds = Math.max(0, Math.floor((now - started) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  if (hours > 0) return `${hours}小时${minutes % 60}分`;
+  if (minutes > 0) return `${minutes}分${seconds % 60}秒`;
+  return `${seconds}秒`;
+}
+
 function getTradeSource(direction: string): '策略信号' | '系统结算' {
   return direction.startsWith('FORCE_') ? '系统结算' : '策略信号';
 }
@@ -1084,6 +1095,7 @@ export default function BacktestPage({
       try {
         const run = await fetchBacktestRun(pendingRun.runId);
         if (disposed) return;
+        setBacktestRuns((prev) => prev.map((item) => (item.id === run.id ? run : item)));
         if (run.status === 'ok' && run.resultJson) {
           setResult({
             ...run.resultJson,
@@ -1122,6 +1134,37 @@ export default function BacktestPage({
       window.clearInterval(timer);
     };
   }, [pendingRun]);
+
+  const backgroundActiveRunIds = backtestRuns
+    .filter((run) => (
+      run.id !== pendingRun?.runId
+      && (run.status === 'queued' || run.status === 'running' || run.status === 'cancelling')
+    ))
+    .map((run) => run.id)
+    .join(',');
+
+  useEffect(() => {
+    if (!backgroundActiveRunIds) return undefined;
+    let disposed = false;
+    const poll = async () => {
+      const settled = await Promise.allSettled(
+        backgroundActiveRunIds.split(',').map((runId) => fetchBacktestRun(runId)),
+      );
+      if (disposed) return;
+      const updates = new Map(
+        settled.flatMap((item) => item.status === 'fulfilled' ? [[item.value.id, item.value] as const] : []),
+      );
+      if (updates.size > 0) {
+        setBacktestRuns((prev) => prev.map((item) => updates.get(item.id) || item));
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 2000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [backgroundActiveRunIds]);
 
   useEffect(() => {
     if (!hasSelectedConfig || !publishedFingerprint) return;
@@ -2051,22 +2094,40 @@ export default function BacktestPage({
 
   const activeRun = useMemo(() => {
     const pending = pendingRun ? backtestRuns.find((run) => run.id === pendingRun.runId) : null;
-    if (pending && (pending.status === 'queued' || pending.status === 'running')) return pending;
-    return backtestRuns.find((run) => run.status === 'running')
+    if (pending && (pending.status === 'queued' || pending.status === 'running' || pending.status === 'cancelling')) return pending;
+    return backtestRuns.find((run) => run.status === 'cancelling')
+      || backtestRuns.find((run) => run.status === 'running')
       || backtestRuns.find((run) => run.status === 'queued')
       || null;
   }, [backtestRuns, pendingRun]);
+  const [activeRunClock, setActiveRunClock] = useState(Date.now());
+
+  useEffect(() => {
+    if (!activeRun || activeRun.status === 'queued') return undefined;
+    setActiveRunClock(Date.now());
+    const timer = window.setInterval(() => setActiveRunClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [activeRun?.id, activeRun?.status]);
+  const activeRunElapsed = activeRun?.startedAt
+    ? formatElapsedTime(activeRun.startedAt, activeRunClock)
+    : '';
 
   const handleCancelRun = async () => {
     if (!activeRun) return;
     setCancellingRun(true);
     setError('');
     try {
-      await cancelBacktestRun(activeRun.id);
-      setStatus(`回测 ${formatRunReference(activeRun.displayNo)} 正在取消，当前处理块结束后停止`);
-      await refreshBacktestRuns();
+      const response = await cancelBacktestRun(activeRun.id);
+      const run = await fetchBacktestRun(activeRun.id);
+      setBacktestRuns((prev) => prev.map((item) => (item.id === run.id ? run : item)));
+      setStatus(
+        response.status === 'cancelling'
+          ? `回测 ${formatRunReference(activeRun.displayNo)} 正在取消`
+          : `回测 ${formatRunReference(activeRun.displayNo)} ${response.status === 'cancelled' ? '已取消' : '已结束'}`,
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : '取消回测失败');
+      await refreshBacktestRuns().catch(() => undefined);
     } finally {
       setCancellingRun(false);
     }
@@ -2344,7 +2405,7 @@ export default function BacktestPage({
     });
   }, [backtestRuns, configNameById, historyQuery, historySymbolFilter]);
   const deletableFilteredHistoryRuns = filteredHistoryRuns.filter(
-    (run) => run.status !== 'queued' && run.status !== 'running',
+    (run) => run.status !== 'queued' && run.status !== 'running' && run.status !== 'cancelling',
   );
   const selectedDeletableHistoryRunIds = deletableFilteredHistoryRuns
     .filter((run) => selectedHistoryRunIds.has(run.id))
@@ -2567,7 +2628,7 @@ export default function BacktestPage({
   };
 
   const handleDeleteBacktestRun = async (run: BacktestRunHistory) => {
-    if (run.status === 'queued' || run.status === 'running') {
+    if (run.status === 'queued' || run.status === 'running' || run.status === 'cancelling') {
       setError('排队或运行中的回测不能删除，请先取消任务。');
       return;
     }
@@ -2701,15 +2762,18 @@ export default function BacktestPage({
         {activeRun ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ color: '#a16207', fontSize: 12 }}>
-              {activeRun.fillModel === 'l2_quote' ? 'L2 盘口回放' : '标准 Bar 回放'} {formatRunReference(activeRun.displayNo)} {activeRun.status === 'queued' ? '排队中' : '运行中'}
+              {activeRun.fillModel === 'l2_quote' ? 'L2 盘口回放' : '标准 Bar 回放'} {formatRunReference(activeRun.displayNo)} {activeRun.status === 'queued' ? '排队中' : activeRun.status === 'cancelling' ? '取消中' : '运行中'}
+              {activeRun.status !== 'queued' && activeRunElapsed ? ` · ${activeRunElapsed}` : ''}
             </span>
-            <button
-              onClick={handleCancelRun}
-              disabled={cancellingRun}
-              style={{ height: 36, borderRadius: 4, border: '1px solid #dc2626', background: '#fef2f2', color: '#b91c1c', padding: '0 14px', cursor: cancellingRun ? 'wait' : 'pointer', fontWeight: 700, fontSize: 14 }}
-            >
-              {cancellingRun ? '正在取消...' : '取消回测'}
-            </button>
+            {activeRun.status !== 'cancelling' && (
+              <button
+                onClick={handleCancelRun}
+                disabled={cancellingRun}
+                style={{ height: 36, borderRadius: 4, border: '1px solid #dc2626', background: '#fef2f2', color: '#b91c1c', padding: '0 14px', cursor: cancellingRun ? 'wait' : 'pointer', fontWeight: 700, fontSize: 14 }}
+              >
+                {cancellingRun ? '正在取消...' : '取消回测'}
+              </button>
+            )}
           </div>
         ) : (
           <button
@@ -4045,7 +4109,7 @@ export default function BacktestPage({
                       {filteredHistoryRuns.length > 0 ? (
                         pagedHistoryRuns.map((run) => {
                           const isSelected = run.id === selectedHistoryRunId;
-                          const deletable = run.status !== 'queued' && run.status !== 'running';
+                          const deletable = run.status !== 'queued' && run.status !== 'running' && run.status !== 'cancelling';
                           return (
                             <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} onDoubleClick={() => handleViewHistoryResult(run)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
                               <input type="checkbox" checked={selectedHistoryRunIds.has(run.id)} disabled={!deletable} onClick={(event) => event.stopPropagation()} onChange={(event) => toggleHistoryRunSelection(run.id, event.target.checked)} aria-label={`选择历史回测 ${formatRunReference(run.displayNo)}`} />
@@ -4112,15 +4176,15 @@ export default function BacktestPage({
                                     event.stopPropagation();
                                     void handleDeleteBacktestRun(run);
                                   }}
-                                  disabled={run.status === 'queued' || run.status === 'running'}
+                                  disabled={run.status === 'queued' || run.status === 'running' || run.status === 'cancelling'}
                                   style={{
                                     height: 28,
                                     borderRadius: 4,
                                     border: '1px solid #fecaca',
                                     background: '#fff1f2',
                                     color: '#be123c',
-                                    cursor: run.status === 'queued' || run.status === 'running' ? 'not-allowed' : 'pointer',
-                                    opacity: run.status === 'queued' || run.status === 'running' ? 0.55 : 1,
+                                    cursor: run.status === 'queued' || run.status === 'running' || run.status === 'cancelling' ? 'not-allowed' : 'pointer',
+                                    opacity: run.status === 'queued' || run.status === 'running' || run.status === 'cancelling' ? 0.55 : 1,
                                   }}
                                 >
                                   删除

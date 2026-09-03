@@ -416,6 +416,9 @@ class BacktestRunHistory(BaseModel):
   outputDir: str
   note: str
   tags: list[str]
+  queuedAt: str = ""
+  startedAt: str = ""
+  cancelRequested: bool = False
   createdAt: str
   finishedAt: str
 
@@ -427,6 +430,12 @@ class BacktestRunMetaUpdate(BaseModel):
 
 class BacktestRunBatchDeleteRequest(BaseModel):
   runIds: list[str] = Field(min_length=1, max_length=100)
+
+
+class BacktestCapacityOverrideRequest(BaseModel):
+  limit: int = Field(ge=8, le=12)
+  ttlSeconds: int = Field(ge=60, le=86400)
+  reason: str = Field(min_length=1, max_length=500)
 
 
 class StrategyConfigCreate(BaseModel):
