@@ -145,6 +145,8 @@ def test_finish_bar_backtest_job_preserves_terminal_status_without_research_snap
   cursor = FakeCursor({"run_id": "run-1"})
   connection = FakeConnection(cursor)
   monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+  monkeypatch.setattr(state_store.settings, "RESEARCH_RESULT_REPORT_ENABLED", True)
+  monkeypatch.setattr(state_store.settings, "BACKTEST_INSTANCE_ID", "server")
 
   assert state_store.finish_bar_backtest_job(
     "run-1", "attempt-1", status, {"totalReturn": 0.1}, {"equity": []},
@@ -156,8 +158,24 @@ def test_finish_bar_backtest_job_preserves_terminal_status_without_research_snap
   assert cursor.commands[1][1][0] == status
   enqueue_query, enqueue_params = cursor.commands[2]
   assert "FROM research_signal_snapshot" in enqueue_query
+  assert "'backtestInstanceId', %s::text" in enqueue_query
   assert "'status', %s::text" in enqueue_query
-  assert enqueue_params[0] == status
+  assert enqueue_params[:2] == ("server", status)
+
+
+def test_finish_bar_backtest_job_skips_result_outbox_when_reporting_disabled(
+  monkeypatch: Any,
+) -> None:
+  cursor = FakeCursor({"run_id": "run-1"})
+  connection = FakeConnection(cursor)
+  monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+  monkeypatch.setattr(state_store.settings, "RESEARCH_RESULT_REPORT_ENABLED", False)
+
+  assert state_store.finish_bar_backtest_job(
+    "run-1", "attempt-1", "succeeded", {"totalReturn": 0.1}, {"equity": []},
+  ) is True
+
+  assert len(cursor.commands) == 2
 
 def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypatch: Any) -> None:
   cursor = FakeCursor(None)

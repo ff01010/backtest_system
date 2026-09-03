@@ -2,6 +2,7 @@
 """数据路径和 PostgreSQL 连接配置。"""
 
 import os
+import re
 
 
 def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -13,6 +14,13 @@ def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> in
   if not minimum <= value <= maximum:
     raise ValueError(f"{name} 必须在 {minimum} 至 {maximum} 之间")
   return value
+
+
+def _read_bool(name: str, default: bool) -> bool:
+  raw = os.getenv(name, str(default)).strip().lower()
+  if raw not in {"true", "false"}:
+    raise ValueError(f"{name} 必须是 true 或 false")
+  return raw == "true"
 
 
 # K 线数据根目录。各周期位于 {KLINE_ROOT}/{timeframe}/{symbol}/ 下。
@@ -88,6 +96,22 @@ RESEARCH_AUTH_CODE_LIFETIME_SECONDS = _read_bounded_int(
   "TREND_GRID_RESEARCH_AUTH_CODE_LIFETIME_SECONDS", 60, 30, 300,
 )
 RESEARCH_CENTER_CALLBACK_URL = os.getenv("TREND_GRID_RESEARCH_CENTER_CALLBACK_URL", "")
+
+# 区分本机与服务器回测来源；本机默认不把调试结果回传研究中心。
+BACKTEST_INSTANCE_ID = os.getenv("BACKTEST_INSTANCE_ID", "local").strip()
+RESEARCH_RESULT_REPORT_ENABLED = _read_bool("RESEARCH_RESULT_REPORT_ENABLED", False)
+RESEARCH_SIGNAL_API_URL = os.getenv("RESEARCH_SIGNAL_API_URL", "").rstrip("/")
+RESEARCH_SIGNAL_SERVICE_TOKEN = os.getenv("RESEARCH_SIGNAL_SERVICE_TOKEN", "")
+
+
+def validate_research_integration_configuration() -> None:
+  """拒绝不明确的实例标识，以及缺少回传目标的启用配置。"""
+  if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", BACKTEST_INSTANCE_ID):
+    raise ValueError("BACKTEST_INSTANCE_ID 必须是小写字母开头的 1 至 32 位标识")
+  if RESEARCH_RESULT_REPORT_ENABLED and (
+    not RESEARCH_SIGNAL_API_URL or not RESEARCH_SIGNAL_SERVICE_TOKEN
+  ):
+    raise ValueError("启用研究结果回传时必须配置研究中心地址和服务令牌")
 
 # 对外回测 API 默认关闭。启用后必须配置私有 pepper，避免仅用数据库摘要保护 API Key。
 PUBLIC_API_ENABLED = os.getenv("TREND_GRID_PUBLIC_API_ENABLED", "false").lower() == "true"

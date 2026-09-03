@@ -1189,9 +1189,12 @@ def finish_bar_backtest_job(
 
 def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary: dict[str, Any]) -> None:
   """仅为存在研究信号快照的回测写入结果回传队列。"""
+  if not settings.RESEARCH_RESULT_REPORT_ENABLED:
+    return
   cur.execute(
     """INSERT INTO research_signal_result_outbox (run_id, payload)
       SELECT snapshot.run_id, jsonb_build_object(
+        'backtestInstanceId', %s::text,
         'backtestRunId', snapshot.run_id::text,
         'signalDatasetId', snapshot.dataset_id::text,
         'signalDatasetVersion', snapshot.dataset_version,
@@ -1202,7 +1205,7 @@ def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary:
       FROM research_signal_snapshot AS snapshot
       WHERE snapshot.run_id = %s
       ON CONFLICT (run_id) DO NOTHING""",
-    (status, Jsonb(summary), run_id),
+    (settings.BACKTEST_INSTANCE_ID, status, Jsonb(summary), run_id),
   )
 
 

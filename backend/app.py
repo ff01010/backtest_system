@@ -556,6 +556,7 @@ def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
 @app.on_event("startup")
 def startup():
   settings.validate_public_api_configuration()
+  settings.validate_research_integration_configuration()
   state_store.ensure_schema()
 
 
