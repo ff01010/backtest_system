@@ -122,8 +122,15 @@ def test_complete_strategy_save_uses_one_store_call(monkeypatch: pytest.MonkeyPa
 
   def save(
     script: dict[str, Any], config: dict[str, Any], script_id: str | None, config_id: str | None,
+    expected_revision: int | None,
   ) -> dict[str, dict[str, Any]]:
-    captured.update(script=script, config=config, script_id=script_id, config_id=config_id)
+    captured.update(
+      script=script,
+      config=config,
+      script_id=script_id,
+      config_id=config_id,
+      expected_revision=expected_revision,
+    )
     return {'script': {'id': 'script-1'}, 'config': {'id': 'config-1'}}
 
   monkeypatch.setattr(api_app, '_validate_strategy_script', lambda _: None)
@@ -143,4 +150,5 @@ def test_complete_strategy_save_uses_one_store_call(monkeypatch: pytest.MonkeyPa
   assert result['script']['id'] == 'script-1'
   assert captured['script_id'] is None
   assert captured['config_id'] is None
+  assert captured['expected_revision'] is None
   assert captured['config']['scriptId'] is None

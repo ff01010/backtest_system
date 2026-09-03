@@ -46,7 +46,14 @@ async function sendJson<T>(url: string, method: string, payload: unknown): Promi
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`API ${res.status}: ${text}`);
+    let message = text;
+    try {
+      const body = JSON.parse(text) as { detail?: unknown };
+      if (typeof body.detail === 'string') message = body.detail;
+    } catch {
+      // 非 JSON 错误保留服务端原文，便于诊断代理层问题。
+    }
+    throw new Error(message || `API ${res.status}: 请求失败`);
   }
   return res.json();
 }
@@ -432,6 +439,7 @@ export interface StrategyScriptPayload {
   description: string;
   code: string;
   entryType: string;
+  signalRequired: boolean;
 }
 
 export interface BacktestTimeframeAvailability {
@@ -584,11 +592,12 @@ export async function saveCompleteStrategy(
   config: StrategyConfigPayload,
   scriptId: string | null,
   configId: string | null,
+  expectedRevision: number | null,
 ): Promise<{ script: StrategyScript; config: StrategyConfig }> {
   return sendJson<{ script: StrategyScript; config: StrategyConfig }>(
     `${BASE}/complete-strategies`,
     'POST',
-    { script, config, scriptId, configId },
+    { script, config, scriptId, configId, expectedRevision },
   );
 }
 

@@ -128,6 +128,27 @@ def validate_script_code(code: str) -> None:
       _validate_literal_orders(optional_callback)
 
 
+def script_uses_research_signal(code: str) -> bool:
+  """判断策略是否显式读取研究信号字段。"""
+  try:
+    tree = ast.parse(code)
+  except SyntaxError:
+    return False
+  for node in ast.walk(tree):
+    if isinstance(node, ast.Subscript):
+      if isinstance(node.slice, ast.Constant) and node.slice.value == "researchSignal":
+        return True
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+      continue
+    if node.func.attr != "get" or not node.args:
+      continue
+    first_argument = node.args[0]
+    if isinstance(first_argument, ast.Constant) and first_argument.value == "researchSignal":
+      return True
+  return False
+
+
+
 def quote_mode_for_script(code: str, configured_mode: str | None = None) -> str:
   """根据已保存脚本确定 L2 快照回放方式。"""
   validate_script_code(code)
@@ -215,7 +236,7 @@ class ScriptedBarStrategy:
     try:
       context = self._context(bar, portfolio)
       actions = self._callback(context, self._state)
-      return self._to_orders(actions, bar.symbol, bar.time, bar.close)
+      return self._to_orders(actions, bar.symbol, bar.time, bar.close, context["researchSignal"])
     except StrategyExecutionError:
       raise
     except ScriptTimeContextError as error:
@@ -321,6 +342,7 @@ class ScriptedBarStrategy:
     symbol: str | Bar,
     signal_time: str | None = None,
     signal_price: float | None = None,
+    research_signal: dict[str, Any] | None = None,
   ) -> list[OrderIntent]:
     """将回调动作转换为订单；保留旧测试使用 Bar 参数的兼容方式。"""
     if isinstance(symbol, Bar):
@@ -361,6 +383,9 @@ class ScriptedBarStrategy:
           "recorded_price": signal_price,
           "signal_time": signal_time,
           "strategy_module": "用户脚本",
+          "research_signal_id": research_signal.get("signalId") if isinstance(research_signal, dict) else None,
+          "research_signal_action": research_signal.get("action") if isinstance(research_signal, dict) else None,
+          "research_signal_effective_at": research_signal.get("effectiveAt") if isinstance(research_signal, dict) else None,
           "client_order_key": str(action["clientOrderKey"]) if action.get("clientOrderKey") is not None else None,
         },
       ))

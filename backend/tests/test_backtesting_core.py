@@ -8,6 +8,7 @@ from backend.backtesting.engine import BarBacktestEngine, NextOpenExecutionModel
 from backend.backtesting.fees import FeeProfile
 from backend.backtesting.legacy import fill_to_api_trade, legacy_trades_to_fills
 from backend.backtesting.models import Bar, OrderIntent, OrderSide, PortfolioSnapshot, PositionEffect
+from backend.backtesting.models import Fill
 from backend.services.backtest_runner import _compute_performance_stats
 from backend.backtesting.trend_grid_compat import (
   LegacyTrendGridIntentStrategy,
@@ -487,3 +488,24 @@ def test_trend_grid_bar_strategy_emits_orders_per_completed_bar() -> None:
   assert orders[0].time == bar.time
   assert orders[0].position_key == "trend_grid:A"
   assert orders[0].position_effect == PositionEffect.OPEN_LONG
+
+
+def test_fill_api_preserves_active_research_signal_context() -> None:
+  fill = Fill(
+    time="20260602094000",
+    symbol="688981.SH",
+    side=OrderSide.BUY,
+    quantity=200,
+    price=80.0,
+    fee=5.0,
+    reason="研究信号开多",
+    metadata={
+      "research_signal_id": "sig-1",
+      "research_signal_action": "long",
+      "research_signal_effective_at": "2026-06-02T01:35:00Z",
+    },
+  )
+  trade = fill_to_api_trade(fill)
+  assert trade["researchSignalAction"] == "long"
+  assert trade["researchSignalEffectiveAt"] == "2026-06-02T01:35:00Z"
+  assert trade["researchSignalId"] == "sig-1"

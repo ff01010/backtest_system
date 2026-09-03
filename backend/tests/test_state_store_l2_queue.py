@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
@@ -277,3 +278,47 @@ def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypa
   claim_query, claim_params = cursor.commands[4]
   assert "UNION ALL" in claim_query
   assert claim_params == (None, None)
+
+def test_save_research_signal_snapshot_reuses_matching_artifact(
+  tmp_path: Path,
+) -> None:
+  artifact_path = tmp_path / "dataset_hash.ndjson"
+  artifact_path.write_text('{"action":"long"}\n', encoding="utf-8")
+  cursor = FakeCursor({"id": "artifact-1"})
+  snapshot = {
+    "datasetId": "251294ab-87cd-46ab-9d48-d96987e51b84",
+    "snapshotHash": "a" * 64,
+    "artifactFile": str(artifact_path),
+    "manifest": {"version": 1},
+    "sourcePartitions": [],
+  }
+
+  state_store._save_research_signal_snapshot(cursor, "run-2", "user-1", snapshot)
+
+  artifact_query, artifact_params = cursor.commands[0]
+  assert "ON CONFLICT (storage_key) DO UPDATE" in artifact_query
+  assert "artifact_file.content_sha256=EXCLUDED.content_sha256" in artifact_query
+  assert artifact_params is not None
+  assert artifact_params[1] == "run-2"
+  snapshot_query, snapshot_params = cursor.commands[1]
+  assert "INSERT INTO research_signal_snapshot" in snapshot_query
+  assert snapshot_params is not None
+  assert snapshot_params[0] == "run-2"
+  assert snapshot_params[4] == "artifact-1"
+
+
+def test_save_research_signal_snapshot_rejects_storage_key_content_conflict(
+  tmp_path: Path,
+) -> None:
+  artifact_path = tmp_path / "dataset_hash.ndjson"
+  artifact_path.write_text('{"action":"long"}\n', encoding="utf-8")
+  cursor = FakeCursor(None)
+  snapshot = {
+    "datasetId": "251294ab-87cd-46ab-9d48-d96987e51b84",
+    "snapshotHash": "a" * 64,
+    "artifactFile": str(artifact_path),
+    "manifest": {"version": 1},
+  }
+
+  with pytest.raises(state_store.DatabaseError, match="已有存储记录冲突"):
+    state_store._save_research_signal_snapshot(cursor, "run-2", "user-1", snapshot)

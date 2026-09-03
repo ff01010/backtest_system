@@ -90,6 +90,15 @@ def ensure_schema() -> None:
       cur.execute("SELECT to_regclass('public.backtest_runner_health') AS health_table")
       if cur.fetchone()["health_table"] is None:
         raise DatabaseError("数据库缺少 Runner 健康迁移 022，请先运行 deploy 的 migrate 服务")
+      cur.execute("""
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='strategy_config'
+            AND column_name='strategy_version_id'
+        ) AS has_strategy_ownership
+      """)
+      if not cur.fetchone()["has_strategy_ownership"]:
+        raise DatabaseError("数据库缺少策略归属迁移 023，请先运行 deploy 的 migrate 服务")
 
 
 def replace_trade_calendar(
@@ -359,22 +368,33 @@ def _normalize_script(row: dict[str, Any]) -> dict[str, Any]:
   runtime = _json(row.get("runtime_config"), {})
   return {
     "id": _uuid(row["id"]),
+    "versionId": _uuid(row.get("version_id")),
+    "versionNo": int(row.get("version_no") or 1),
     "name": row["name"],
     "description": row["description"],
     "language": "python",
     "code": row["source_code"],
     "entryType": runtime.get("entryType", "on_bar"),
+    "signalRequired": bool(runtime.get("signalRequired", False)),
     "status": runtime.get("status", "draft"),
+    "contentFingerprint": row.get("content_fingerprint", ""),
     "createdAt": _format_time(row["created_at"]),
     "updatedAt": _format_time(row["updated_at"]),
   }
 
 
 def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
+  runtime = _json(row.get("runtime_config"), {})
   return {
     "id": _uuid(row["id"]),
     "name": row["name"],
     "scriptId": _uuid(row["strategy_id"]),
+    "strategyVersionId": _uuid(row.get("strategy_version_id")),
+    "scriptVersionNo": int(row.get("script_version_no") or 1),
+    "description": row.get("script_description", ""),
+    "code": row.get("source_code", ""),
+    "entryType": runtime.get("entryType", "on_bar"),
+    "signalRequired": bool(runtime.get("signalRequired", False)),
     "strategy": row["strategy_key"],
     "mode": row["mode"],
     "symbol": f"{row['symbol']}.{row['exchange']}",
@@ -384,6 +404,8 @@ def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
     "paramsJson": _json(row["params"], {}),
     "enabled": bool(row["enabled"]),
     "published": bool(row["published"]),
+    "publishedVersionId": _uuid(row.get("published_version_id")),
+    "revision": int(row.get("revision") or 1),
     "createdAt": _format_time(row["created_at"]),
     "updatedAt": _format_time(row["updated_at"]),
   }
@@ -396,6 +418,7 @@ def _normalize_version(row: dict[str, Any]) -> dict[str, Any]:
   return {
     "id": _uuid(row["id"]),
     "configId": _uuid(row["config_id"]),
+    "strategyVersionId": _uuid(row.get("strategy_version_id")) or _uuid(snapshot.get("strategyVersionId")),
     "versionNo": int(row["version_no"]),
     "name": snapshot["name"],
     "scriptId": _uuid(snapshot.get("scriptId")),
@@ -542,10 +565,11 @@ def delete_account(account_id: int) -> bool:
 def _script_query(where: str = "") -> str:
   return f"""
     SELECT s.id, s.name, s.description, s.created_at, s.updated_at,
-      v.source_code, v.runtime_config
+      v.id AS version_id, v.version_no, v.source_code, v.runtime_config,
+      v.content_fingerprint
     FROM user_strategy s
     JOIN user_strategy_version v ON v.strategy_id=s.id AND v.version_no=s.current_version_no
-    WHERE s.owner_user_id=%s {where}
+    WHERE s.owner_user_id=%s AND s.status='active' {where}
   """
 
 
@@ -556,57 +580,99 @@ def list_strategy_scripts() -> list[dict[str, Any]]:
       return [_normalize_script(row) for row in cur.fetchall()]
 
 
-def _insert_script_version(cur: Any, script_id: str, version_no: int, payload: dict[str, Any]) -> None:
-  source = payload["code"]
+def _script_runtime_config(payload: dict[str, Any], status: str = "active") -> dict[str, Any]:
+  return {
+    "entryType": payload.get("entryType", "on_bar"),
+    "signalRequired": bool(payload.get("signalRequired", False)),
+    "status": status,
+  }
+
+
+def _script_content_fingerprint(source: str, runtime: dict[str, Any]) -> str:
+  entry_type = str(runtime.get("entryType", "on_bar"))
+  signal_required = "1" if bool(runtime.get("signalRequired", False)) else "0"
+  value = f"{len(source)}:{source}{len(entry_type)}:{entry_type}{signal_required}"
+  return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _insert_script_version(
+  cur: Any,
+  script_id: str,
+  version_no: int,
+  payload: dict[str, Any],
+  status: str = "active",
+) -> tuple[str, str]:
+  source = str(payload["code"])
+  runtime = _script_runtime_config(payload, status)
+  fingerprint = _script_content_fingerprint(source, runtime)
   cur.execute("""
     INSERT INTO user_strategy_version (
-      id, strategy_id, version_no, source_code, source_checksum, runtime_config, created_by_user_id
-    ) VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s)
+      id, strategy_id, version_no, source_code, source_checksum, runtime_config,
+      content_fingerprint, created_by_user_id
+    ) VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s)
+    RETURNING id
   """, (script_id, version_no, source, hashlib.sha256(source.encode("utf-8")).hexdigest(),
-         Jsonb({"entryType": payload.get("entryType", "on_bar"), "status": payload.get("status", "draft")}),
-         current_user_id()))
+         Jsonb(runtime), fingerprint, current_user_id()))
+  return _uuid(cur.fetchone()["id"]) or "", fingerprint
 
 
-def _write_strategy_script(cur: Any, script_id: str | None, payload: dict[str, Any]) -> str:
+def _write_strategy_script(
+  cur: Any,
+  script_id: str | None,
+  payload: dict[str, Any],
+) -> tuple[str, str, int]:
   if script_id is None:
     cur.execute("""
       INSERT INTO user_strategy (id, owner_user_id, name, description, strategy_type, status)
       VALUES (gen_random_uuid(), %s, %s, %s, 'python', 'active') RETURNING id
     """, (current_user_id(), payload["name"], payload.get("description", "")))
     saved_id = _uuid(cur.fetchone()["id"]) or ""
-    _insert_script_version(cur, saved_id, 1, payload)
-    return saved_id
-  cur.execute("SELECT current_version_no FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, current_user_id()))
+    version_id, _ = _insert_script_version(cur, saved_id, 1, payload)
+    return saved_id, version_id, 1
+  cur.execute("""
+    SELECT strategy.current_version_no, version.id AS version_id,
+      version.content_fingerprint
+    FROM user_strategy strategy
+    JOIN user_strategy_version version
+      ON version.strategy_id=strategy.id
+      AND version.version_no=strategy.current_version_no
+    WHERE strategy.id=%s AND strategy.owner_user_id=%s
+    FOR UPDATE OF strategy
+  """, (script_id, current_user_id()))
   row = cur.fetchone()
   if not row:
     raise KeyError(script_id)
+  runtime = _script_runtime_config(payload)
+  fingerprint = _script_content_fingerprint(str(payload["code"]), runtime)
+  version_no = int(row["current_version_no"])
+  version_id = _uuid(row["version_id"]) or ""
+  if row.get("content_fingerprint") != fingerprint:
+    version_no += 1
+    version_id, _ = _insert_script_version(cur, script_id, version_no, payload)
   cur.execute("""
-    UPDATE user_strategy SET name=%s, description=%s, updated_at=now()
+    UPDATE user_strategy
+    SET name=%s, description=%s, current_version_no=%s, status='active', updated_at=now()
     WHERE id=%s AND owner_user_id=%s
-  """, (payload["name"], payload.get("description", ""), script_id, current_user_id()))
-  cur.execute("""
-    UPDATE user_strategy_version SET source_code=%s, source_checksum=%s, runtime_config=%s
-    WHERE strategy_id=%s AND version_no=%s
   """, (
-    payload["code"], hashlib.sha256(payload["code"].encode("utf-8")).hexdigest(),
-    Jsonb({"entryType": payload.get("entryType", "on_bar"), "status": "active"}),
-    script_id, int(row["current_version_no"]),
+    payload["name"], payload.get("description", ""), version_no,
+    script_id, current_user_id(),
   ))
-  if cur.rowcount == 0:
-    _insert_script_version(cur, script_id, int(row["current_version_no"]), payload)
-  return script_id
+  return script_id, version_id, version_no
 
 
 def create_strategy_script(payload: dict[str, Any]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      script_id = _write_strategy_script(cur, None, payload)
+      script_id, _, _ = _write_strategy_script(cur, None, payload)
   return get_strategy_script(script_id)
 
 
 def update_strategy_script(script_id: str, payload: dict[str, Any]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
+      cur.execute("SELECT 1 FROM strategy_config WHERE strategy_id=%s", (script_id,))
+      if cur.fetchone():
+        raise ConflictError("该脚本已归属完整策略，请通过策略方案保存")
       _write_strategy_script(cur, script_id, payload)
   return get_strategy_script(script_id)
 
@@ -621,21 +687,62 @@ def get_strategy_script(script_id: str) -> dict[str, Any]:
       return _normalize_script(row)
 
 
+def get_strategy_script_version(version_id: str, script_id: str | None = None) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT strategy.id, strategy.name, strategy.description,
+          strategy.created_at, strategy.updated_at,
+          version.id AS version_id, version.version_no, version.source_code,
+          version.runtime_config, version.content_fingerprint
+        FROM user_strategy_version version
+        JOIN user_strategy strategy ON strategy.id=version.strategy_id
+        WHERE version.id=%s AND strategy.owner_user_id=%s
+          AND (%s::uuid IS NULL OR strategy.id=%s::uuid)
+      """, (version_id, current_user_id(), script_id, script_id))
+      row = cur.fetchone()
+      if not row:
+        raise KeyError(version_id)
+      return _normalize_script(row)
+
+
 def delete_strategy_script(script_id: str) -> bool:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("DELETE FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, current_user_id()))
+      cur.execute("""
+        UPDATE user_strategy SET status='archived', updated_at=now()
+        WHERE id=%s AND owner_user_id=%s
+          AND NOT EXISTS (SELECT 1 FROM strategy_config WHERE strategy_id=%s)
+      """, (script_id, current_user_id(), script_id))
       return cur.rowcount > 0
 
 
 def _config_query(where: str = "") -> str:
   return f"""
     SELECT c.*, i.symbol, i.exchange,
-      CASE WHEN b.id IS NULL THEN NULL ELSE b.symbol || '.' || b.exchange END AS benchmark_symbol
+      CASE WHEN b.id IS NULL THEN NULL ELSE b.symbol || '.' || b.exchange END AS benchmark_symbol,
+      strategy.description AS script_description,
+      version.version_no AS script_version_no,
+      version.source_code, version.runtime_config,
+      version.content_fingerprint,
+      latest_version.id AS published_version_id
     FROM strategy_config c
     JOIN market_instrument i ON i.id=c.instrument_id
     LEFT JOIN market_instrument b ON b.id=c.benchmark_instrument_id
-    WHERE c.owner_user_id=%s {where}
+    LEFT JOIN user_strategy strategy ON strategy.id=c.strategy_id
+    LEFT JOIN user_strategy_version current_version
+      ON current_version.strategy_id=strategy.id
+      AND current_version.version_no=strategy.current_version_no
+    LEFT JOIN user_strategy_version version
+      ON version.id=COALESCE(c.strategy_version_id, current_version.id)
+    LEFT JOIN LATERAL (
+      SELECT config_version.id
+      FROM strategy_config_version config_version
+      WHERE config_version.config_id=c.id
+      ORDER BY config_version.version_no DESC
+      LIMIT 1
+    ) latest_version ON true
+    WHERE c.owner_user_id=%s AND c.archived_at IS NULL {where}
   """
 
 
@@ -646,50 +753,57 @@ def list_strategy_configs() -> list[dict[str, Any]]:
       return [_normalize_config(row) for row in cur.fetchall()]
 
 
-def _config_snapshot(config: dict[str, Any], strategy_version_id: str | None) -> dict[str, Any]:
+def _config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+  params_json = dict(config.get("paramsJson") or {})
+  code = str(config.get("code") or "")
+  params_json["scriptCodeHash"] = hashlib.sha256(code.encode("utf-8")).hexdigest()
+  params_json["scriptSnapshot"] = {
+    "id": config.get("scriptId"),
+    "versionId": config.get("strategyVersionId"),
+    "name": config["name"],
+    "description": config.get("description", ""),
+    "code": code,
+    "entryType": config.get("entryType", "on_bar"),
+    "signalRequired": bool(config.get("signalRequired", False)),
+  }
   return {
-    "name": config["name"], "scriptId": config.get("scriptId"), "strategyVersionId": strategy_version_id,
+    "name": config["name"], "scriptId": config.get("scriptId"),
+    "strategyVersionId": config.get("strategyVersionId"),
     "strategy": config["strategy"], "mode": config["mode"], "symbol": config["symbol"],
     "timeframe": config.get("timeframe", "5m"), "benchmarkSymbol": config.get("benchmarkSymbol"),
-    "accountId": config.get("accountId"), "paramsJson": _with_script_code_hash(config).get("paramsJson", {}),
+    "accountId": config.get("accountId"), "paramsJson": params_json,
   }
 
 
-def _script_version_id(cur: Any, script_id: str | None) -> str | None:
-  if not script_id:
-    return None
-  cur.execute("""
-    SELECT v.id FROM user_strategy s JOIN user_strategy_version v
-      ON v.strategy_id=s.id AND v.version_no=s.current_version_no
-    WHERE s.id=%s AND s.owner_user_id=%s
-  """, (script_id, current_user_id()))
-  row = cur.fetchone()
-  if not row:
-    raise KeyError(script_id)
-  return _uuid(row["id"])
-
-
-def _write_config(cur: Any, config_id: str | None, payload: dict[str, Any]) -> str:
+def _write_config(
+  cur: Any,
+  config_id: str | None,
+  payload: dict[str, Any],
+  strategy_id: str,
+  strategy_version_id: str,
+) -> str:
   instrument_id = _instrument_id(cur, payload["symbol"])
   benchmark_id = _instrument_id(cur, payload["benchmarkSymbol"]) if payload.get("benchmarkSymbol") else None
   if config_id is None:
     cur.execute("""
       INSERT INTO strategy_config (
-        owner_user_id, name, strategy_id, strategy_key, mode, instrument_id, timeframe,
+        owner_user_id, name, strategy_id, strategy_version_id, strategy_key, mode, instrument_id, timeframe,
         benchmark_instrument_id, account_id, params, enabled, published
-      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true) RETURNING id
-    """, (current_user_id(), payload["name"], payload.get("scriptId"), payload.get("strategy", "user_script"),
+      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true) RETURNING id
+    """, (current_user_id(), payload["name"], strategy_id, strategy_version_id,
+           payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
            payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True)))
   else:
     cur.execute("""
-      UPDATE strategy_config SET name=%s, strategy_id=%s, strategy_key=%s, mode=%s,
+      UPDATE strategy_config SET name=%s, strategy_version_id=%s, strategy_key=%s, mode=%s,
         instrument_id=%s, timeframe=%s, benchmark_instrument_id=%s, account_id=%s, params=%s,
-        enabled=%s, published=true, updated_at=now() WHERE id=%s AND owner_user_id=%s RETURNING id
-    """, (payload["name"], payload.get("scriptId"), payload.get("strategy", "user_script"),
+        enabled=%s, published=true, revision=revision + 1, updated_at=now()
+      WHERE id=%s AND owner_user_id=%s AND strategy_id=%s RETURNING id
+    """, (payload["name"], strategy_version_id, payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
            payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True),
-           config_id, current_user_id()))
+           config_id, current_user_id(), strategy_id))
   row = cur.fetchone()
   if not row:
     raise KeyError(config_id)
@@ -697,71 +811,112 @@ def _write_config(cur: Any, config_id: str | None, payload: dict[str, Any]) -> s
 
 
 def create_strategy_config(payload: dict[str, Any]) -> dict[str, Any]:
-  with _db() as conn:
-    with conn.cursor() as cur:
-      config_id = _write_config(cur, None, payload)
-  config = get_strategy_config(config_id)
-  if payload.get("publish", True):
-    publish_strategy_config(config_id)
-    return get_strategy_config(config_id)
-  return config
+  raise ConflictError("请使用完整策略保存接口创建策略，不能单独绑定脚本")
 
 
 def update_strategy_config(config_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-  with _db() as conn:
-    with conn.cursor() as cur:
-      _write_config(cur, config_id, payload)
-  return get_strategy_config(config_id)
+  raise ConflictError("请使用完整策略保存接口修改策略，不能单独改绑脚本")
+
+
+def _get_strategy_config_with_cursor(
+  cur: Any,
+  config_id: str,
+  for_update: bool = False,
+) -> dict[str, Any]:
+  suffix = "AND c.id=%s FOR UPDATE OF c" if for_update else "AND c.id=%s"
+  cur.execute(_config_query(suffix), (current_user_id(), config_id))
+  row = cur.fetchone()
+  if not row:
+    raise KeyError(config_id)
+  return _normalize_config(row)
 
 
 
 def save_complete_strategy(
-  script_payload: dict[str, Any], config_payload: dict[str, Any], script_id: str | None, config_id: str | None,
+  script_payload: dict[str, Any],
+  config_payload: dict[str, Any],
+  script_id: str | None,
+  config_id: str | None,
+  expected_revision: int | None = None,
 ) -> dict[str, dict[str, Any]]:
-  """在同一事务中保存脚本与完整回测策略，避免预检通过后出现半完成数据。"""
+  """原子保存一对一完整策略，并自动创建精确的发布版本。"""
   with _db() as conn:
     with conn.cursor() as cur:
-      saved_script_id = _write_strategy_script(cur, script_id, script_payload)
+      owned_script_id: str | None = None
+      if config_id is not None:
+        cur.execute("""
+          SELECT strategy_id, revision FROM strategy_config
+          WHERE id=%s AND owner_user_id=%s FOR UPDATE
+        """, (config_id, current_user_id()))
+        current = cur.fetchone()
+        if not current:
+          raise KeyError(config_id)
+        owned_script_id = _uuid(current["strategy_id"])
+        if script_id and script_id != owned_script_id:
+          raise ConflictError("策略脚本归属不一致，禁止将方案改绑到其他脚本")
+        if expected_revision is None or int(current["revision"]) != expected_revision:
+          raise ConflictError("该策略已在其他会话中更新，请刷新后重试")
+      saved_script_id, strategy_version_id, _ = _write_strategy_script(
+        cur, owned_script_id, script_payload,
+      )
       config = {**config_payload, "scriptId": saved_script_id}
-      saved_config_id = _write_config(cur, config_id, config)
+      saved_config_id = _write_config(
+        cur, config_id, config, saved_script_id, strategy_version_id,
+      )
+      saved_config = _get_strategy_config_with_cursor(cur, saved_config_id)
+      _publish_strategy_config_with_cursor(cur, saved_config)
   return {
     "script": get_strategy_script(saved_script_id),
     "config": get_strategy_config(saved_config_id),
   }
+
+
 def _version_fingerprint(snapshot: dict[str, Any]) -> str:
   return hashlib.sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def _publish_strategy_config_with_cursor(
+  cur: Any,
+  config: dict[str, Any],
+) -> tuple[str, bool]:
+  config_id = str(config["id"])
+  strategy_version_id = str(config["strategyVersionId"])
+  snapshot = _config_snapshot(config)
+  cur.execute("""
+    SELECT id, snapshot FROM strategy_config_version
+    WHERE config_id=%s ORDER BY version_no DESC LIMIT 1
+  """, (config_id,))
+  previous = cur.fetchone()
+  if previous and _version_fingerprint(previous["snapshot"]) == _version_fingerprint(snapshot):
+    cur.execute("UPDATE strategy_config SET published=true WHERE id=%s", (config_id,))
+    return _uuid(previous["id"]) or "", False
+  cur.execute("""
+    SELECT COALESCE(MAX(version_no), 0) + 1 AS value
+    FROM strategy_config_version WHERE config_id=%s
+  """, (config_id,))
+  version_no = int(cur.fetchone()["value"])
+  cur.execute("""
+    INSERT INTO strategy_config_version (
+      config_id, version_no, strategy_version_id, snapshot
+    ) VALUES (%s, %s, %s, %s) RETURNING id
+  """, (config_id, version_no, strategy_version_id, Jsonb(snapshot)))
+  version_id = _uuid(cur.fetchone()["id"]) or ""
+  cur.execute("UPDATE strategy_config SET published=true WHERE id=%s", (config_id,))
+  return version_id, True
+
+
 def publish_strategy_config(config_id: str) -> tuple[dict[str, Any], bool]:
-  config = get_strategy_config(config_id)
   with _db() as conn:
     with conn.cursor() as cur:
-      strategy_version_id = _script_version_id(cur, config.get("scriptId"))
-      snapshot = _config_snapshot(config, strategy_version_id)
-      cur.execute("SELECT id, snapshot FROM strategy_config_version WHERE config_id=%s ORDER BY version_no DESC LIMIT 1", (config_id,))
-      previous = cur.fetchone()
-      if previous and _version_fingerprint(previous["snapshot"]) == _version_fingerprint(snapshot):
-        cur.execute("UPDATE strategy_config SET published=true, updated_at=now() WHERE id=%s", (config_id,))
-        return get_strategy_config_version(_uuid(previous["id"]) or ""), False
-      cur.execute("SELECT COALESCE(MAX(version_no), 0) + 1 AS value FROM strategy_config_version WHERE config_id=%s", (config_id,))
-      version_no = int(cur.fetchone()["value"])
-      cur.execute("""
-        INSERT INTO strategy_config_version (config_id, version_no, strategy_version_id, snapshot)
-        VALUES (%s, %s, %s, %s) RETURNING id
-      """, (config_id, version_no, strategy_version_id, Jsonb(snapshot)))
-      version_id = _uuid(cur.fetchone()["id"]) or ""
-      cur.execute("UPDATE strategy_config SET published=true, updated_at=now() WHERE id=%s", (config_id,))
-  return get_strategy_config_version(version_id), True
+      config = _get_strategy_config_with_cursor(cur, config_id, for_update=True)
+      version_id, created = _publish_strategy_config_with_cursor(cur, config)
+  return get_strategy_config_version(version_id), created
 
 
 def get_strategy_config(config_id: str) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(_config_query("AND c.id=%s"), (current_user_id(), config_id))
-      row = cur.fetchone()
-      if not row:
-        raise KeyError(config_id)
-      return _normalize_config(row)
+      return _get_strategy_config_with_cursor(cur, config_id)
 
 
 def get_strategy_config_version(version_id: str) -> dict[str, Any]:
@@ -805,8 +960,20 @@ def list_strategy_config_versions(config_id: str) -> list[dict[str, Any]]:
 def delete_strategy_config(config_id: str) -> bool:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("DELETE FROM strategy_config WHERE id=%s AND owner_user_id=%s", (config_id, current_user_id()))
-      return cur.rowcount > 0
+      cur.execute("""
+        UPDATE strategy_config
+        SET archived_at=now(), published=false, revision=revision + 1, updated_at=now()
+        WHERE id=%s AND owner_user_id=%s AND archived_at IS NULL
+        RETURNING strategy_id
+      """, (config_id, current_user_id()))
+      row = cur.fetchone()
+      if not row:
+        return False
+      cur.execute("""
+        UPDATE user_strategy SET status='archived', updated_at=now()
+        WHERE id=%s AND owner_user_id=%s
+      """, (row["strategy_id"], current_user_id()))
+      return True
 
 
 def _with_script_code_hash(payload: dict[str, Any]) -> dict[str, Any]:
@@ -814,10 +981,22 @@ def _with_script_code_hash(payload: dict[str, Any]) -> dict[str, Any]:
   params = dict(normalized.get("paramsJson") or {})
   script_id = normalized.get("scriptId")
   if script_id:
-    script = get_strategy_script(str(script_id))
+    version_id = normalized.get("strategyVersionId") or params.get("strategyVersionId")
+    script = (
+      get_strategy_script_version(str(version_id), str(script_id))
+      if version_id
+      else get_strategy_script(str(script_id))
+    )
     code_hash = hashlib.sha256(script["code"].encode("utf-8")).hexdigest()
     params["scriptCodeHash"] = code_hash
-    params["scriptSnapshot"] = {"id": script["id"], "name": script["name"], "code": script["code"], "entryType": script["entryType"]}
+    params["scriptSnapshot"] = {
+      "id": script["id"],
+      "versionId": script.get("versionId"),
+      "name": script["name"],
+      "code": script["code"],
+      "entryType": script["entryType"],
+      "signalRequired": bool(script.get("signalRequired", False)),
+    }
   normalized["paramsJson"] = params
   return normalized
 
@@ -856,8 +1035,9 @@ def _create_backtest_run_row(
       gen_random_uuid(), %s, %s, %s, %s, %s, %s,
       CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
     ) RETURNING id, display_no
-  """, (owner_user_id, display_no, None, db_status, Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
-         config_id, None, payload.get("accountId"), instrument_id, benchmark_id,
+  """, (owner_user_id, display_no, payload.get("strategyVersionId"), db_status,
+         Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
+         config_id, payload.get("configVersionId"), payload.get("accountId"), instrument_id, benchmark_id,
          payload.get("timeframe", "5m"), "bar_close_signal_fill", Jsonb(script_snapshot) if script_snapshot else None,
          Jsonb(params_snapshot), payload.get("executionKind", "published")))
   row = cur.fetchone()
@@ -905,10 +1085,20 @@ def _save_research_signal_snapshot(cur: Any, run_id: str, owner_user_id: str, sn
     """INSERT INTO artifact_file
       (id, owner_user_id, run_id, artifact_type, storage_key, original_filename, content_type, byte_size, content_sha256)
       VALUES (gen_random_uuid(), %s, %s, 'research_signal', %s, %s, 'application/x-ndjson', %s, %s)
+      ON CONFLICT (storage_key) DO UPDATE
+      SET storage_key=EXCLUDED.storage_key
+      WHERE artifact_file.artifact_type=EXCLUDED.artifact_type
+        AND artifact_file.original_filename=EXCLUDED.original_filename
+        AND artifact_file.content_type=EXCLUDED.content_type
+        AND artifact_file.byte_size=EXCLUDED.byte_size
+        AND artifact_file.content_sha256=EXCLUDED.content_sha256
       RETURNING id""",
     (owner_user_id, run_id, f"research_signals/{path.name}", path.name, path.stat().st_size, content_sha256),
   )
-  artifact_id = cur.fetchone()["id"]
+  artifact_row = cur.fetchone()
+  if artifact_row is None:
+    raise DatabaseError("研究信号冻结文件与已有存储记录冲突")
+  artifact_id = artifact_row["id"]
   cur.execute(
     """INSERT INTO research_signal_snapshot
       (run_id, dataset_id, dataset_version, snapshot_hash, artifact_file_id, manifest, source_partitions)

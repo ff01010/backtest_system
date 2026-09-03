@@ -275,6 +275,9 @@ class BacktestTrade(BaseModel):
   priceSource: str | None = None
   action: str | None = None
   status: str = "filled"
+  researchSignalId: str | None = None
+  researchSignalAction: Literal["long", "short", "flat"] | None = None
+  researchSignalEffectiveAt: str | None = None
 
 
 class BacktestChartTrade(BaseModel):
@@ -333,12 +336,16 @@ class BacktestRunResponse(BaseModel):
 
 class StrategyScript(BaseModel):
   id: str
+  versionId: str | None = None
+  versionNo: int = 1
   name: str
   description: str
   language: str
   code: str
   entryType: str
+  signalRequired: bool = False
   status: str
+  contentFingerprint: str = ""
   createdAt: str
   updatedAt: str
 
@@ -348,6 +355,7 @@ class StrategyScriptCreate(BaseModel):
   description: str = ""
   code: str = Field(min_length=1)
   entryType: str = "on_bar"
+  signalRequired: bool = False
   status: str = "draft"
 
 
@@ -356,6 +364,7 @@ class StrategyScriptUpdate(BaseModel):
   description: str = ""
   code: str = Field(min_length=1)
   entryType: str = "on_bar"
+  signalRequired: bool = False
   status: str = "draft"
 
 
@@ -363,6 +372,12 @@ class StrategyConfig(BaseModel):
   id: str
   name: str
   scriptId: str | None
+  strategyVersionId: str | None = None
+  scriptVersionNo: int = 1
+  description: str = ""
+  code: str = ""
+  entryType: str = "on_bar"
+  signalRequired: bool = False
   strategy: str
   mode: str
   symbol: str
@@ -372,6 +387,8 @@ class StrategyConfig(BaseModel):
   paramsJson: dict[str, Any]
   enabled: bool
   published: bool = True
+  publishedVersionId: str | None = None
+  revision: int = 1
   createdAt: str
   updatedAt: str
 
@@ -379,6 +396,7 @@ class StrategyConfig(BaseModel):
 class StrategyConfigVersion(BaseModel):
   id: str
   configId: str
+  strategyVersionId: str | None = None
   versionNo: int
   name: str
   scriptId: str | None
@@ -475,6 +493,7 @@ class CompleteStrategySave(BaseModel):
   config: StrategyConfigCreate
   scriptId: str | None = None
   configId: str | None = None
+  expectedRevision: int | None = Field(default=None, ge=1)
 
 
 

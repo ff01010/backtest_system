@@ -15,11 +15,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createAccount,
   cancelBacktestRun,
-  createStrategyScript,
   deleteBacktestRun,
   deleteBacktestRuns,
   deleteStrategyConfig,
-  deleteStrategyScript,
   fetchAccounts,
   fetchBacktestRuns,
   fetchBacktestRun,
@@ -30,12 +28,11 @@ import {
   fetchStrategyParameterSchema,
   fetchStrategySource,
   fetchStrategyConfigs,
-  fetchStrategyScripts,
+  fetchStrategyConfigVersions,
   BacktestRequestError,
   runBacktest,
   saveCompleteStrategy,
   updateBacktestRunMeta,
-  updateStrategyScript,
 } from '../api/client';
 import type { BacktestRunPayload, BacktestTimeframeAvailability } from '../api/client';
 import type {
@@ -51,7 +48,6 @@ import type {
   StrategyConfig,
   StrategyParameterSchema,
   StrategyConfigVersion,
-  StrategyScript,
   StrategySource,
 } from '../types';
 import { typography } from '../styles/typography';
@@ -277,6 +273,7 @@ function createEmptyScriptForm(timeframe = '5m') {
     description: '',
     code: getDefaultScriptCode(timeframe),
     entryType: 'on_bar',
+    signalRequired: false,
   };
 }
 
@@ -330,6 +327,19 @@ export function hasLegacyTimeSlice(code: string): boolean {
 
 export function hasEnabledTradeDirection(allowLong: boolean, allowShort: boolean): boolean {
   return allowLong || allowShort;
+}
+
+export function getResearchSignalSelectionError(
+  signalRequired: boolean,
+  signalDatasetId: string
+): string | null {
+  if (signalRequired && !signalDatasetId) {
+    return '当前策略必须选择研究信号后才能运行';
+  }
+  if (!signalRequired && signalDatasetId) {
+    return '当前策略未声明为研究信号驱动策略，不能附加研究信号';
+  }
+  return null;
 }
 
 const TRADE_ACTION_LABELS: Record<string, string> = {
@@ -758,6 +768,7 @@ function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
             { label: '策略', value: formatStrategyName(run.strategy) },
             { label: '方案版本', value: run.configVersionId == null ? null : `#${run.configVersionId}` },
             { label: '脚本', value: run.scriptId == null ? null : `#${run.scriptId}` },
+            { label: '信号模式', value: scriptSnapshot.signalRequired ? '研究信号驱动（必选）' : '普通策略' },
             { label: '运行周期', value: `${run.timeframe || '5m'} K 线` },
             { label: '交易方向', value: getHistoryDirectionLabel(run) },
             { label: '持仓规则', value: getHistoryRunParam(run, 'holdingPolicy') },
@@ -923,7 +934,7 @@ function sortFingerprintValue(value: unknown): unknown {
   return value;
 }
 
-function buildStrategyDraftFingerprint(input: {
+export function buildStrategyDraftFingerprint(input: {
   strategy: string;
   mode: string;
   symbol: string;
@@ -931,7 +942,7 @@ function buildStrategyDraftFingerprint(input: {
   benchmarkSymbol: string;
   accountId: number | '';
   params: Record<string, unknown>;
-  script: { code: string; entryType: string };
+  script: { code: string; entryType: string; signalRequired: boolean };
 }): string {
   return JSON.stringify(sortFingerprintValue({
     strategy: input.strategy,
@@ -943,6 +954,26 @@ function buildStrategyDraftFingerprint(input: {
     params: input.params,
     script: input.script,
   }));
+}
+
+export function buildSavedStrategyFingerprint(config: StrategyConfig): string {
+  const savedParams = config.paramsJson.params as Record<string, unknown> | undefined;
+  return buildStrategyDraftFingerprint({
+    strategy: config.strategy,
+    mode: config.mode,
+    symbol: config.symbol,
+    timeframe: config.timeframe,
+    benchmarkSymbol: config.benchmarkSymbol || config.symbol,
+    accountId: config.accountId || '',
+    params: Object.fromEntries(
+      Object.entries(savedParams || {}).filter(([key]) => key !== 'warmupTradingDays')
+    ),
+    script: {
+      code: config.code,
+      entryType: config.entryType,
+      signalRequired: config.signalRequired,
+    },
+  });
 }
 
 export default function BacktestPage({
@@ -983,7 +1014,6 @@ export default function BacktestPage({
   const [strategyParameterSchema, setStrategyParameterSchema] = useState<StrategyParameterSchema | null>(null);
   const [strategySchemaError, setStrategySchemaError] = useState('');
   const [loadingStrategySchema, setLoadingStrategySchema] = useState(false);
-  const [strategyScripts, setStrategyScripts] = useState<StrategyScript[]>([]);
   const [strategyConfigs, setStrategyConfigs] = useState<StrategyConfig[]>([]);
   const [researchSignalDatasets, setResearchSignalDatasets] = useState<Array<{
     id: string;
@@ -1014,7 +1044,6 @@ export default function BacktestPage({
   const [configName, setConfigName] = useState('');
   const [scriptForm, setScriptForm] = useState(createEmptyScriptForm());
   const [strategyGuideOpen, setStrategyGuideOpen] = useState(false);
-  const hasSelectedScript = hasSavedStrategyId(selectedScriptId);
   const hasSelectedConfig = hasSavedStrategyId(selectedConfigId);
   const [activePanel, setActivePanel] = useState<WorkbenchPanel>('overview');
   const [chartRange, setChartRange] = useState<ChartRange>('all');
@@ -1064,11 +1093,13 @@ export default function BacktestPage({
     script: {
       code: scriptForm.code,
       entryType: scriptForm.entryType,
+      signalRequired: scriptForm.signalRequired,
     },
   }), [
     params,
     scriptForm.code,
     scriptForm.entryType,
+    scriptForm.signalRequired,
     selectedAccountId,
     selectedBenchmarkSymbol,
     selectedStrategy,
@@ -1267,7 +1298,19 @@ export default function BacktestPage({
   }, [tradeSideFilter, tradePnlFilter, tradeStatusFilter, tradePageSize, result]);
 
   useEffect(() => {
-    setConfigVersions([]);
+    if (!selectedConfigId) {
+      setConfigVersions([]);
+      return;
+    }
+    let cancelled = false;
+    fetchStrategyConfigVersions(selectedConfigId)
+      .then((versions) => {
+        if (!cancelled) setConfigVersions(versions);
+      })
+      .catch(() => {
+        if (!cancelled) setConfigVersions([]);
+      });
+    return () => { cancelled = true; };
   }, [selectedConfigId]);
 
   useEffect(() => {
@@ -1346,11 +1389,7 @@ export default function BacktestPage({
   };
 
   const refreshStrategyAssets = async () => {
-    const [scripts, configs] = await Promise.all([
-      fetchStrategyScripts(),
-      fetchStrategyConfigs(),
-    ]);
-    setStrategyScripts(scripts);
+    const configs = await fetchStrategyConfigs();
     setStrategyConfigs(configs);
   };
 
@@ -1419,25 +1458,15 @@ export default function BacktestPage({
       });
     }
     setVersionDirty(false);
-    const script = strategyScripts.find((item) => item.id === config.scriptId);
-    if (script) {
-      setScriptForm({
-        name: script.name,
-        description: script.description,
-        code: script.code,
-        entryType: script.entryType,
-      });
-      setPublishedFingerprint(buildStrategyDraftFingerprint({
-        strategy: config.strategy,
-        mode: 'backtest',
-        symbol: config.symbol,
-        timeframe: config.timeframe,
-        benchmarkSymbol: config.benchmarkSymbol || config.symbol,
-        accountId: config.accountId || '',
-        params: Object.fromEntries(Object.entries(savedParams || {}).filter(([key]) => key !== 'warmupTradingDays')),
-        script: { code: script.code, entryType: script.entryType },
-      }));
-    }
+    setScriptForm({
+      name: config.name,
+      description: config.description,
+      code: config.code,
+      entryType: config.entryType,
+      signalRequired: config.signalRequired,
+    });
+    if (!config.signalRequired) setSelectedSignalDatasetId('');
+    setPublishedFingerprint(buildSavedStrategyFingerprint(config));
     setStatus(`已加载策略 ${config.name}`);
     setError('');
   };
@@ -1655,20 +1684,6 @@ export default function BacktestPage({
     if (account) applyAccount(account);
   };
 
-  const handleScriptSelect = (value: string) => {
-    const scriptId = value || '';
-    setSelectedScriptId(scriptId);
-    const script = strategyScripts.find((item) => item.id === scriptId);
-    if (!script) return;
-    setScriptForm({
-      name: script.name,
-      description: script.description,
-      code: script.code,
-      entryType: script.entryType,
-    });
-    if (script.entryType === 'on_bar') setSelectedStrategy('user_script');
-  };
-
   const handleConfigSelect = (value: string) => {
     if (!value) {
       setSelectedConfigId('');
@@ -1679,7 +1694,7 @@ export default function BacktestPage({
     if (config) applyStrategyConfig(config);
   };
 
-  const handleNewScript = () => {
+  const handleNewStrategy = () => {
     setSelectedConfigId('');
     setSelectedScriptId('');
     setConfigName('');
@@ -1692,54 +1707,25 @@ export default function BacktestPage({
     setError('');
   };
 
-  const handleSaveScript = async () => {
+  const handleCopyStrategy = () => {
+    if (!hasSelectedConfig) return;
+    const sourceName = configName.trim() || scriptForm.name.trim() || '未命名策略';
+    const existingNames = new Set(strategyConfigs.map((item) => item.name));
+    let copyNumber = 1;
+    let copiedName = `${sourceName} 副本`;
+    while (existingNames.has(copiedName)) {
+      copyNumber += 1;
+      copiedName = `${sourceName} 副本 ${copyNumber}`;
+    }
+    setSelectedConfigId('');
+    setSelectedScriptId('');
+    setConfigVersions([]);
+    setConfigName(copiedName);
+    setScriptForm((previous) => ({ ...previous, name: copiedName }));
+    setPublishedFingerprint('');
+    setVersionDirty(true);
+    setStatus('已复制为新策略草稿；保存后会创建独立脚本和独立版本链');
     setError('');
-    setStatus('');
-    if (!scriptForm.name.trim()) {
-      setError('策略脚本名称不能为空');
-      return;
-    }
-    try {
-      const payload = {
-        name: scriptForm.name.trim(),
-        description: scriptForm.description.trim(),
-        code: scriptForm.code,
-        entryType: scriptForm.entryType,
-      };
-      const script = hasSelectedScript
-        ? await updateStrategyScript(selectedScriptId, payload)
-        : await createStrategyScript(payload);
-      await refreshStrategyAssets();
-      setSelectedScriptId(script.id);
-      setScriptForm({
-        name: script.name,
-        description: script.description,
-        code: script.code,
-        entryType: script.entryType,
-      });
-      if (hasSelectedConfig) {
-        setStatus(`已保存策略代码 ${script.name}，请继续保存策略配置`);
-      } else {
-        setStatus(`已保存策略脚本 ${script.name}`);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '保存策略脚本失败');
-    }
-  };
-
-  const handleDeleteScript = async () => {
-    if (!hasSelectedScript) return;
-    setError('');
-    setStatus('');
-    try {
-      await deleteStrategyScript(selectedScriptId);
-      await refreshStrategyAssets();
-      setSelectedScriptId('');
-      setScriptForm(createEmptyScriptForm(selectedTimeframe));
-      setStatus('已删除策略脚本');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '删除策略脚本失败');
-    }
   };
 
   const showPreflightNotice = (message: string): void => {
@@ -1782,6 +1768,7 @@ export default function BacktestPage({
         entryType: isCustomScript
           ? 'on_bar'
           : (strategySource ? `catalog:${strategySource.id}` : scriptForm.entryType),
+        signalRequired: isCustomScript ? scriptForm.signalRequired : false,
       };
       const strategyId = isCustomScript ? 'user_script' : selectedStrategy;
       const configPayload = {
@@ -1792,12 +1779,14 @@ export default function BacktestPage({
         ),
         publish: false,
       };
-      const existingConfig = strategyConfigs.find((item) => item.name === strategyName);
-      const targetConfigId = hasSelectedConfig
-        ? selectedConfigId
-        : existingConfig?.id;
+      const currentConfig = strategyConfigs.find((item) => item.id === selectedConfigId);
+      const targetConfigId = hasSelectedConfig ? selectedConfigId : null;
       const { script: savedScript, config } = await saveCompleteStrategy(
-        scriptPayload, configPayload, hasSelectedScript ? selectedScriptId : null, targetConfigId || null,
+        scriptPayload,
+        configPayload,
+        hasSelectedConfig ? selectedScriptId : null,
+        targetConfigId,
+        currentConfig?.revision ?? null,
       );
       await refreshStrategyAssets();
       setSelectedConfigId(config.id);
@@ -1809,8 +1798,9 @@ export default function BacktestPage({
         description: savedScript.description,
         code: savedScript.code,
         entryType: savedScript.entryType,
+        signalRequired: savedScript.signalRequired,
       });
-      setPublishedFingerprint(draftFingerprint);
+      setPublishedFingerprint(buildSavedStrategyFingerprint(config));
       setVersionDirty(false);
       setStatus(`已保存策略 ${config.name}`);
       return config.id;
@@ -1825,16 +1815,7 @@ export default function BacktestPage({
     setError('');
     setStatus('');
     try {
-      const deletedConfig = strategyConfigs.find((item) => item.id === selectedConfigId) || null;
       await deleteStrategyConfig(selectedConfigId);
-      if (deletedConfig?.scriptId != null) {
-        const stillUsed = strategyConfigs.some(
-          (item) => item.id !== selectedConfigId && item.scriptId === deletedConfig.scriptId
-        );
-        if (!stillUsed) {
-          await deleteStrategyScript(deletedConfig.scriptId);
-        }
-      }
       await refreshStrategyAssets();
       setSelectedConfigId('');
       setSelectedScriptId('');
@@ -1886,6 +1867,11 @@ export default function BacktestPage({
     }
     if (versionDirty) {
       setError('策略内容已修改，请先保存策略');
+      return;
+    }
+    const researchSignalError = getResearchSignalSelectionError(scriptForm.signalRequired, selectedSignalDatasetId);
+    if (researchSignalError) {
+      setError(researchSignalError);
       return;
     }
     const selectedPreflight = preflight?.timeframes.find((item) => item.timeframe === selectedTimeframe);
@@ -2222,9 +2208,12 @@ export default function BacktestPage({
           : trade.strategyModule === 'B'
             ? 'B 均值'
             : '策略信号';
-        const source = isSystem ? systemSource : moduleName;
+        const researchContext = trade.researchSignalId
+          ? ` · ${trade.researchSignalAction || '研究信号'}`
+          : '';
+        const source = isSystem ? systemSource : `${moduleName}${researchContext}`;
         return (
-          <span style={{
+          <span title={trade.researchSignalId ? `研究信号 ${trade.researchSignalId}` : undefined} style={{
             display: 'inline-flex', alignItems: 'center', height: 22, padding: '0 7px',
             borderRadius: 11, fontSize: 11, fontWeight: 700,
             color: isSystem ? '#9a3412' : '#0369a1',
@@ -2360,7 +2349,6 @@ export default function BacktestPage({
     { id: 'history' as WorkbenchPanel, label: '历史回测', icon: History },
   ];
   const activeConfig = strategyConfigs.find((item) => item.id === selectedConfigId);
-  const activeScript = strategyScripts.find((item) => item.id === selectedScriptId);
   const configNameById = new Map(strategyConfigs.map((item) => [item.id, item.name]));
   const selectedHistoryRun = backtestRuns.find((item) => item.id === selectedHistoryRunId) || null;
   const compareHistoryRun = backtestRuns.find((item) => item.id === compareHistoryRunId) || null;
@@ -2440,6 +2428,9 @@ export default function BacktestPage({
         priceSource: trade.priceSource || '成交模型价格',
         quantity: trade.quantity,
         pnl: trade.pnl,
+        researchSignalId: trade.researchSignalId || '',
+        researchSignalAction: trade.researchSignalAction || '',
+        researchSignalEffectiveAt: trade.researchSignalEffectiveAt || '',
         note: trade.note,
       }))
     );
@@ -2866,7 +2857,7 @@ export default function BacktestPage({
                 <div style={{ color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
                   <div>名称：{activeConfig?.name || configName || '未选择策略方案'}</div>
                   <div>模式：回测</div>
-                  <div>脚本：{activeScript?.name || '未绑定'}</div>
+                  <div>脚本版本：{activeConfig ? `v${activeConfig.scriptVersionNo}` : '未绑定'}</div>
                   <div>标的：{selectedSymbol}</div>
                   <div>基准：{selectedBenchmarkSymbol}</div>
                 </div>
@@ -2951,6 +2942,7 @@ export default function BacktestPage({
                 </div>
               </section>
 
+
               <section style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 8 }}>
                   运行前检查
@@ -3011,7 +3003,7 @@ export default function BacktestPage({
                 <div>历史回测：{backtestRuns.length}</div>
                 <div>当前方案：{activeConfig?.name || '未选择'}</div>
                 <div>方案版本：{configVersions.length}</div>
-                <div>当前脚本：{activeScript?.name || '未选择'}</div>
+                <div>当前脚本版本：{activeConfig?.scriptVersionNo ?? '未选择'}</div>
               </div>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 10 }}>
@@ -3057,7 +3049,7 @@ export default function BacktestPage({
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
                 <div>已保存策略：{strategyConfigs.length}</div>
-                <div>关联脚本：{strategyScripts.length}</div>
+                <div>独立脚本：{strategyConfigs.length}</div>
                 <div>当前回测：{result ? formatRunReference(result.displayNo) : '暂无'}</div>
               </div>
               <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
@@ -3163,7 +3155,7 @@ export default function BacktestPage({
                   <div className="strategy-asset-actions" style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}>
                     <button
                       className="strategy-save-action"
-                      onClick={handleNewScript}
+                      onClick={handleNewStrategy}
                       style={{
                         height: 34,
                         borderRadius: 4,
@@ -3174,6 +3166,21 @@ export default function BacktestPage({
                       }}
                     >
                       新建策略
+                    </button>
+                    <button
+                      onClick={handleCopyStrategy}
+                      disabled={!hasSelectedConfig}
+                      style={{
+                        height: 34,
+                        borderRadius: 4,
+                        border: '1px solid #cbd5e1',
+                        background: '#ffffff',
+                        color: '#334155',
+                        cursor: hasSelectedConfig ? 'pointer' : 'not-allowed',
+                        opacity: hasSelectedConfig ? 1 : 0.55,
+                      }}
+                    >
+                      复制策略
                     </button>
                     <button
                       onClick={handleSaveConfig}
@@ -3210,7 +3217,7 @@ export default function BacktestPage({
                     </button>
                   </div>
                   <div className="strategy-asset-note" style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
-                    保存会同时更新代码和参数。每次回测会保存当时快照，可在历史回测中回溯。
+                    保存会同时更新代码和参数，并生成不可变版本。每次回测都绑定当时的精确版本。
                   </div>
                 </section>
 
@@ -3246,7 +3253,7 @@ export default function BacktestPage({
                     )}
                   </div>
                   {selectedStrategy === 'user_script' ? (
-                    <div className="strategy-editor-body" style={{ display: 'grid', gridTemplateRows: 'auto auto minmax(0, 1fr) auto', gap: 10, minHeight: 0 }}>
+                    <div className="strategy-editor-body" style={{ display: 'grid', gridTemplateRows: 'auto auto auto minmax(0, 1fr) auto', gap: 10, minHeight: 0 }}>
                       <input
                         value={scriptForm.name}
                         onChange={(e) => updateScriptForm({ name: e.target.value })}
@@ -3259,6 +3266,23 @@ export default function BacktestPage({
                         placeholder="策略说明（选填）"
                         style={fieldStyle}
                       />
+                      <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, color: '#334155', fontSize: 12 }}>
+                        <input
+                          type="checkbox"
+                          checked={scriptForm.signalRequired}
+                          onChange={(event) => {
+                            const enabled = event.target.checked;
+                            updateScriptForm({ signalRequired: enabled });
+                            if (!enabled) setSelectedSignalDatasetId('');
+                          }}
+                        />
+                        <span>
+                          <strong>研究信号驱动策略</strong>
+                          <span style={{ display: 'block', color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>
+                            启用后必须选择研究信号，代码也必须显式读取 bar['researchSignal']。
+                          </span>
+                        </span>
+                      </label>
                       <textarea
                         className="strategy-code-editor"
                         value={scriptForm.code}
@@ -3378,6 +3402,32 @@ export default function BacktestPage({
                       </div>
                     )}
                   </label>
+                  <section style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700 }}>研究信号</div>
+                    <select
+                      value={selectedSignalDatasetId}
+                      onChange={(event) => setSelectedSignalDatasetId(event.target.value)}
+                      disabled={isL2Quote || !scriptForm.signalRequired}
+                      style={fieldStyle}
+                    >
+                      <option value="">不使用研究信号</option>
+                      {researchSignalDatasets.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name} · v{item.version ?? '—'} · {item.timeframe ?? '—'} · {item.recordCount} 条
+                        </option>
+                      ))}
+                    </select>
+                    <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>
+                      {scriptForm.signalRequired
+                        ? "当前有效信号会持续注入 bar['researchSignal']；策略负责仓位、底仓与风控。"
+                        : '当前策略未声明为研究信号驱动策略。'}
+                    </div>
+                    {isL2Quote && (
+                      <div style={{ color: '#b45309', fontSize: 11, lineHeight: 1.5 }}>
+                        研究信号联动首期仅支持标准 Bar 回放。
+                      </div>
+                    )}
+                  </section>
                   <label>
                     <div style={labelStyle}>运行周期</div>
                     <select
@@ -4751,32 +4801,30 @@ export default function BacktestPage({
             flexDirection: 'column',
             gap: 10,
           }}>
-            <label>
-              <div style={labelStyle}>策略代码</div>
-              <select
-                value={selectedScriptId}
-                onChange={(e) => handleScriptSelect(e.target.value)}
-                style={fieldStyle}
-              >
-                {selectedScriptId === '' && (
-                  <option value="" disabled>新建策略（未保存）</option>
-                )}
-                {strategyScripts.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name} · {item.status}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+            <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
+              策略代码归属于当前完整策略，不能单独切换或复用其他策略的脚本。
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
               <button
-                onClick={handleNewScript}
+                onClick={handleNewStrategy}
                 style={{
                   height: 32, borderRadius: 4, border: '1px solid #cbd5e1',
                   background: '#f8fafc', color: '#334155', cursor: 'pointer',
                 }}
               >
                 新建
+              </button>
+              <button
+                onClick={handleCopyStrategy}
+                disabled={!hasSelectedConfig}
+                style={{
+                  height: 32, borderRadius: 4, border: '1px solid #cbd5e1',
+                  background: '#f8fafc', color: '#334155',
+                  cursor: hasSelectedConfig ? 'pointer' : 'not-allowed',
+                  opacity: hasSelectedConfig ? 1 : 0.55,
+                }}
+              >
+                复制
               </button>
               <button
                 onClick={handleSaveConfig}
@@ -4926,15 +4974,6 @@ export default function BacktestPage({
             </div>
           )}
 
-          <section style={{ borderTop: '1px solid #e2e8f0', paddingTop: 10 }}>
-            <div style={{ ...labelStyle, marginBottom: 7 }}>研究信号（可选）</div>
-            <select value={selectedSignalDatasetId} onChange={(event) => setSelectedSignalDatasetId(event.target.value)} disabled={params.fillModel !== 'bar_next_open'} style={fieldStyle}>
-              <option value="">不使用研究信号</option>
-              {researchSignalDatasets.map((item) => <option key={item.id} value={item.id}>{item.name} · v{item.version ?? '—'} · {item.timeframe ?? '—'} · {item.recordCount} 条</option>)}
-            </select>
-            <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5, marginTop: 6 }}>信号在回测启动前冻结，并以 effectiveAt 对齐到第一根可执行 Bar；脚本从 bar['researchSignal'] 读取，不决定仓位。</div>
-            {params.fillModel !== 'bar_next_open' && <div style={{ color: '#b45309', fontSize: 11, marginTop: 4 }}>研究信号联动首期仅支持标准 Bar 回放。</div>}
-          </section>
 
           <div style={{
             color: dataCoverageColor,

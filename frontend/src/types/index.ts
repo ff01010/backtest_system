@@ -195,6 +195,9 @@ export interface BacktestTrade {
   pnl: number;
   note: string;
   strategyModule?: string;
+  researchSignalId?: string;
+  researchSignalAction?: 'long' | 'short' | 'flat';
+  researchSignalEffectiveAt?: string;
 }
 
 export interface ExecutionPlan {
@@ -291,11 +294,15 @@ export interface ExperimentManifest {
 
 export interface StrategyScript {
   id: string;
+  versionId: string | null;
+  versionNo: number;
   name: string;
   description: string;
   language: string;
   code: string;
   entryType: string;
+  signalRequired: boolean;
+  contentFingerprint: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -330,6 +337,12 @@ export interface StrategyConfig {
   id: string;
   name: string;
   scriptId: string | null;
+  strategyVersionId: string | null;
+  scriptVersionNo: number;
+  description: string;
+  code: string;
+  entryType: string;
+  signalRequired: boolean;
   strategy: string;
   mode: 'backtest' | 'live' | string;
   symbol: string;
@@ -339,6 +352,8 @@ export interface StrategyConfig {
   paramsJson: Record<string, unknown>;
   enabled: boolean;
   published: boolean;
+  publishedVersionId: string | null;
+  revision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -346,6 +361,7 @@ export interface StrategyConfig {
 export interface StrategyConfigVersion {
   id: string;
   configId: string;
+  strategyVersionId: string | null;
   versionNo: number;
   name: string;
   scriptId: string | null;

@@ -34,7 +34,11 @@ from backend.date_codec import TradingDateError, format_legacy_date, normalize_d
 from backend import schemas
 from backend.time_utils import format_epoch_as_shanghai
 from backend.strategies.catalog import get_strategy_source_snapshot
-from backend.strategies.scripted import warmup_trading_days_for_script, validate_script_code
+from backend.strategies.scripted import (
+  script_uses_research_signal,
+  warmup_trading_days_for_script,
+  validate_script_code,
+)
 from backend.services import (
   backtest_preflight,
   backtest_runner,
@@ -267,6 +271,8 @@ def _validate_strategy_script(payload: dict) -> None:
     raise HTTPException(422, f"Python 语法错误: 第 {error.lineno} 行 {error.msg}")
   if payload.get("status") not in {"draft", "published", "disabled"}:
     raise HTTPException(422, f"非法脚本状态: {payload.get('status')}")
+  if payload.get("signalRequired") and not script_uses_research_signal(str(payload.get("code", ""))):
+    raise HTTPException(422, "研究信号驱动策略必须显式读取 bar['researchSignal']")
 
 
 _EXPERIMENT_PARAM_KEYS = {
@@ -306,10 +312,22 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
   if not script_id:
     raise HTTPException(422, "策略必须先保存代码")
   try:
-    script = state_store.get_strategy_script(str(script_id))
+    strategy_version_id = config.get("strategyVersionId")
+    script = (
+      state_store.get_strategy_script_version(str(strategy_version_id), str(script_id))
+      if strategy_version_id
+      else state_store.get_strategy_script(str(script_id))
+    )
   except KeyError as error:
     raise HTTPException(422, "策略保存的代码不存在") from error
   mismatches = []
+  signal_required = bool(script.get("signalRequired", False))
+  signal_selected = bool(request.get("signalDatasetId"))
+  if signal_required and not signal_selected:
+    raise HTTPException(422, "当前策略必须选择研究信号后才能运行")
+  if signal_selected and not signal_required:
+    raise HTTPException(422, "当前策略未声明为研究信号驱动策略，不能附加研究信号")
+
   for key, saved_value, request_value in (
     ("标的", config["symbol"], request["symbol"]),
     ("周期", config["timeframe"], request["timeframe"]),
@@ -331,12 +349,15 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
   _validate_saved_params(request, config)
   request["strategy"] = config["strategy"]
   request["scriptId"] = script["id"]
+  request["strategyVersionId"] = script.get("versionId") or strategy_version_id
   request["warmupTradingDays"] = warmup_days
-  request["configVersionId"] = None
+  request["configVersionId"] = config.get("publishedVersionId")
   request["runDraft"] = False
   request["versionScriptSnapshot"] = {
     "id": script["id"], "name": script["name"], "description": script["description"],
     "code": script["code"], "entryType": script["entryType"],
+    "versionId": script.get("versionId") or strategy_version_id,
+    "signalRequired": signal_required,
     "codeHash": hashlib.sha256(script["code"].encode("utf-8")).hexdigest(),
   }
   request["savedScriptSnapshot"] = request["versionScriptSnapshot"]
@@ -347,6 +368,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "params": config.get("paramsJson", {}).get("params", {}),
     "description": script["description"], "runParams": request.get("strategyParams", {}),
     "warmupTradingDays": warmup_days,
+    "signalRequired": signal_required,
     "execution": execution_algorithm_snapshot(
       str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
     ),
@@ -939,8 +961,8 @@ def create_strategy_script(payload: schemas.StrategyScriptCreate):
   try:
     script = state_store.create_strategy_script(request)
     return {"script": script}
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略脚本名称已存在: {payload.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
     raise HTTPException(500, f"PostgreSQL 写入策略脚本失败: {e}")
 
@@ -954,8 +976,8 @@ def update_strategy_script(script_id: str, payload: schemas.StrategyScriptUpdate
     return {"script": script}
   except KeyError:
     raise HTTPException(404, f"策略脚本不存在: {script_id}")
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略脚本名称已存在: {payload.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
     raise HTTPException(500, f"PostgreSQL 更新策略脚本失败: {e}")
 
@@ -982,8 +1004,8 @@ def create_strategy_config(payload: schemas.StrategyConfigCreate):
   try:
     config = state_store.create_strategy_config(request)
     return {"config": config}
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略配置名称已存在: {payload.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
     raise HTTPException(500, f"PostgreSQL 写入策略配置失败: {e}")
 
@@ -1001,8 +1023,8 @@ def update_strategy_config(config_id: str, payload: schemas.StrategyConfigUpdate
     return {"config": config}
   except KeyError:
     raise HTTPException(404, f"策略配置不存在: {config_id}")
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略配置名称已存在: {payload.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
     raise HTTPException(500, f"PostgreSQL 更新策略配置失败: {e}")
 
@@ -1021,13 +1043,24 @@ def save_complete_strategy(payload: schemas.CompleteStrategySave):
   try:
     return state_store.save_complete_strategy(
       script_request, config_request, payload.scriptId, payload.configId,
+      payload.expectedRevision,
     )
   except KeyError as error:
     raise HTTPException(404, "策略脚本或策略配置不存在") from error
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略名称已存在: {payload.script.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as error:
     raise HTTPException(500, f"PostgreSQL 保存完整策略失败: {error}") from error
+
+
+@app.get("/api/complete-strategies/{config_id}")
+def get_complete_strategy(config_id: str):
+  try:
+    return {"config": state_store.get_strategy_config(config_id)}
+  except KeyError as error:
+    raise HTTPException(404, f"策略不存在: {config_id}") from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"PostgreSQL 读取完整策略失败: {error}") from error
 
 
 def _apply_script_warmup_to_config(script: dict[str, Any], config: dict[str, Any]) -> None:

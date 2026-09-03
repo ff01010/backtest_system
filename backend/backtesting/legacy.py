@@ -66,4 +66,12 @@ def fill_to_api_trade(fill: Fill) -> dict[str, Any]:
   module = str(fill.metadata.get("strategy_module", ""))
   if module:
     trade["strategyModule"] = module
+  for metadata_key, response_key in (
+    ("research_signal_id", "researchSignalId"),
+    ("research_signal_action", "researchSignalAction"),
+    ("research_signal_effective_at", "researchSignalEffectiveAt"),
+  ):
+    if fill.metadata.get(metadata_key) is not None:
+      trade[response_key] = fill.metadata[metadata_key]
+
   return trade

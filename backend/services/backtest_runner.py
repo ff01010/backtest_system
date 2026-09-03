@@ -22,6 +22,7 @@ from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExec
 from backend.backtesting.legacy import fill_to_api_trade
 from backend.strategies.catalog import create_bar_strategy, get_strategy_source_snapshot
 from backend.strategies.external_engine import load_external_engine
+from backend.strategies.script_time_context import normalize_script_bar_time
 from backend.services import bar_data, market_data, state_store, strategy_worker
 
 _BACKTEST_SYSTEM_ROOT = os.path.dirname(
@@ -159,7 +160,10 @@ def run_user_script_backtest(
       "code": script["code"],
     }],
   }
-  research_signal_by_bar_time = _research_signal_by_bar_time(payload.get("researchSignalSnapshot"))
+  research_signal_by_bar_time = _research_signal_by_bar_time(
+    payload.get("researchSignalSnapshot"),
+    [str(row.time) for row in bars.itertuples(index=False)],
+  )
   execute_script = script_executor or strategy_worker.run_script
   worker_result = execute_script({
     "scriptId": script_id,
@@ -230,8 +234,11 @@ def run_user_script_backtest(
   return response
 
 
-def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
-  """Build the worker-only Bar lookup from the immutable artifact and alignment plan."""
+def _research_signal_by_bar_time(
+  snapshot: object,
+  bar_times: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+  """从冻结切换点构建每根 Bar 对应的当前有效信号。"""
 
   if snapshot is None:
     return {}
@@ -250,7 +257,7 @@ def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
   plan = snapshot.get("alignmentPlan")
   if not isinstance(plan, list):
     raise ValueError("研究信号对齐计划不存在")
-  aligned: dict[str, dict[str, Any]] = {}
+  transitions: dict[str, dict[str, Any]] = {}
   for item in plan:
     if not isinstance(item, dict):
       raise ValueError("研究信号对齐计划无效")
@@ -259,9 +266,10 @@ def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
     row = rows_by_id.get(signal_id)
     if not isinstance(signal_id, str) or not isinstance(bar_time, str) or not isinstance(row, dict):
       raise ValueError("研究信号对齐计划引用无效")
-    if row.get("action") not in {"long", "short", "flat"} or bar_time in aligned:
+    canonical_time = normalize_script_bar_time(bar_time).time
+    if row.get("action") not in {"long", "short", "flat"} or canonical_time in transitions:
       raise ValueError("同一 Bar 不能注入多条研究信号")
-    aligned[bar_time] = {
+    transitions[canonical_time] = {
       key: row[key]
       for key in (
         "signalId", "instrument", "timeframe", "signalTime", "availableAt", "effectiveAt",
@@ -269,7 +277,16 @@ def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
       )
       if key in row
     }
-  return aligned
+    transitions[canonical_time]["datasetId"] = snapshot.get("datasetId")
+    transitions[canonical_time]["datasetVersion"] = (snapshot.get("manifest") or {}).get("version")
+  active_by_bar_time: dict[str, dict[str, Any]] = {}
+  current_signal: dict[str, Any] | None = None
+  for raw_bar_time in bar_times:
+    canonical_time = normalize_script_bar_time(raw_bar_time).time
+    current_signal = transitions.get(canonical_time, current_signal)
+    if current_signal is not None:
+      active_by_bar_time[canonical_time] = dict(current_signal)
+  return active_by_bar_time
 
 
 def run_research_signal_backtest(
