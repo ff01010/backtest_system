@@ -536,6 +536,7 @@ def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest)
     allowShort=values.get("allowShort", True),
     strategyCategory=values.get("strategyCategory"),
     holdingPolicy=values.get("holdingPolicy", "intraday"),
+    overlaySettlementPolicy=values.get("overlaySettlementPolicy", "intraday_restore"),
     fillModel=values.get("fillModel", "bar_next_open"),
     executionAlgorithm=execution_algorithm,
     executionParameters=execution_parameters,
@@ -559,6 +560,10 @@ def _public_request_hash(payload: schemas.PublicBacktestCreateRequest) -> str:
 
 
 def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
+  result = run.get("resultJson") if isinstance(run.get("resultJson"), dict) else {}
+  params = run.get("paramsJson") if isinstance(run.get("paramsJson"), dict) else {}
+  manifest = result.get("experimentManifest") if isinstance(result.get("experimentManifest"), dict) else {}
+
   return {
     "run_id": run["id"],
     "display_no": run["displayNo"],
@@ -566,6 +571,9 @@ def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
     "symbol": run["symbol"],
     "timeframe": run["timeframe"],
     "fill_model": run["fillModel"],
+    "strategy_category": result.get("strategyCategory") or params.get("strategyCategory"),
+    "overlay_settlement_policy": manifest.get("overlaySettlementPolicy") or params.get("overlaySettlementPolicy"),
+    "result_schema_version": result.get("resultSchemaVersion"),
     "status": run["status"],
     "start_date": run["startDate"],
     "end_date": run["endDate"],

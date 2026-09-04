@@ -222,6 +222,7 @@ def on_bar(bar, state):
       "script:13:overlay_short": PositionSnapshot("688981.SH", 400, 12),
     },
     base_position=5_000,
+    overlay_quantity=600,
   )
 
   context = strategy._context(Bar("20260727093000", "688981.SH", 10, 10, 10, 10), portfolio)
@@ -229,6 +230,8 @@ def on_bar(bar, state):
   assert context["position"] == 600
   assert context["strategyPosition"] == 600
   assert context["basePosition"] == 5_000
+  assert context["actualPosition"] == 5_600
+  assert context["overlayQuantity"] == 600
 
 
 def test_script_context_error_explains_supported_time_contract() -> None:
@@ -411,7 +414,7 @@ def test_qmt_trend_follow_script_applies_two_take_profit_levels() -> None:
   assert [fill.quantity for fill in result.fills] == [1200, 600, 600]
 
 
-def test_qmt_trend_follow_script_opens_long_when_only_long_is_enabled() -> None:
+def test_qmt_trend_follow_script_cannot_close_same_day_long_without_sellable_inventory() -> None:
   strategy = _qmt_script_strategy(7, {"allowLong": True, "allowShort": False})
   bars = [
     Bar("20260727093000", "688981.SH", 10, 10, 10, 10),
@@ -424,11 +427,8 @@ def test_qmt_trend_follow_script_opens_long_when_only_long_is_enabled() -> None:
 
   result = BarBacktestEngine(1_000_000).run(strategy, bars)
 
-  assert [fill.metadata["direction"] for fill in result.fills] == [
-    "BUY_OPEN",
-    "SELL_CLOSE",
-  ]
-  assert [fill.reason for fill in result.fills] == ["higher_valley_open_long", "stop"]
+  assert [fill.metadata["direction"] for fill in result.fills] == ["BUY_OPEN"]
+  assert result.final_portfolio.long_positions["688981.SH"].quantity == 1200
 
 
 def test_qmt_trend_follow_script_applies_break_even_and_morning_force_close() -> None:

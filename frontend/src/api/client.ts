@@ -273,6 +273,7 @@ export interface BacktestRunPayload {
   allowShort: boolean;
   strategyCategory: 'core_position_overlay' | 'directional_holding';
   holdingPolicy: 'intraday' | 'overnight';
+  overlaySettlementPolicy: 'intraday_restore' | 'cross_day_carry';
   fillModel: 'bar_next_open' | 'l2_quote';
   executionAlgorithm: 'immediate' | 'twap';
   executionParameters: Record<string, number | string>;

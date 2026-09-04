@@ -281,7 +281,7 @@ def test_recorded_price_execution_model_applies_full_transaction_cost() -> None:
   assert result.final_portfolio.equity == 10_097.329
 
 
-def test_intraday_policy_blocks_final_bar_entries_and_forces_close() -> None:
+def test_intraday_policy_does_not_bypass_t1_for_same_day_long_position() -> None:
   class DayStrategy:
     def on_bar(
       self,
@@ -303,9 +303,8 @@ def test_intraday_policy_blocks_final_bar_entries_and_forces_close() -> None:
     ]
   )
 
-  assert len(result.fills) == 2
-  assert result.fills[-1].metadata["direction"] == "FORCE_SELL"
-  assert result.final_portfolio.long_positions == {}
+  assert len(result.fills) == 1
+  assert result.final_portfolio.long_positions["688981.SH"].quantity == 100
   assert result.final_portfolio.short_positions == {}
 
 
@@ -488,6 +487,74 @@ def test_trend_grid_bar_strategy_emits_orders_per_completed_bar() -> None:
   assert orders[0].time == bar.time
   assert orders[0].position_key == "trend_grid:A"
   assert orders[0].position_effect == PositionEffect.OPEN_LONG
+
+
+
+
+def test_close_long_is_limited_to_actual_sellable_quantity() -> None:
+  class PartialCloseStrategy:
+    position_key = "strategy:partial-close"
+
+    def on_bar(
+      self,
+      bar: Bar,
+      portfolio: PortfolioSnapshot,
+    ) -> list[OrderIntent]:
+      return [OrderIntent(
+        bar.symbol,
+        OrderSide.SELL,
+        150,
+        "close available",
+        position_effect=PositionEffect.CLOSE_LONG,
+        position_key=self.position_key,
+      )]
+
+  result = BarBacktestEngine(
+    initial_cash=10_000,
+    base_quantity=100,
+    base_cost_price=10,
+    holding_policy="overnight",
+    strategy_category="directional_holding",
+  ).run(PartialCloseStrategy(), [
+    Bar("202607230930", "688981.SH", 11, 11, 11, 11),
+  ])
+
+  assert len(result.fills) == 1
+  assert result.fills[0].quantity == 100
+  assert result.final_portfolio.long_positions == {}
+
+
+def test_overlay_sell_is_limited_by_position_and_t0_capacity() -> None:
+  class OverlaySellStrategy:
+    position_key = "strategy:overlay-sell"
+
+    def on_bar(
+      self,
+      bar: Bar,
+      portfolio: PortfolioSnapshot,
+    ) -> list[OrderIntent]:
+      return [OrderIntent(
+        bar.symbol,
+        OrderSide.SELL,
+        150,
+        "negative overlay",
+        position_effect=PositionEffect.OPEN_SHORT,
+        position_key=self.position_key,
+      )]
+
+  result = BarBacktestEngine(
+    initial_cash=10_000,
+    base_quantity=100,
+    base_cost_price=10,
+    t0_enabled=True,
+    strategy_category="core_position_overlay",
+    overlay_settlement_policy="cross_day_carry",
+  ).run(OverlaySellStrategy(), [
+    Bar("202607230930", "688981.SH", 11, 11, 11, 11),
+  ])
+
+  assert len(result.fills) == 1
+  assert result.fills[0].quantity == 100
 
 
 def test_fill_api_preserves_active_research_signal_context() -> None:

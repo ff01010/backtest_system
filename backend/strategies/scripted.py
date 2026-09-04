@@ -278,10 +278,15 @@ class ScriptedBarStrategy:
         str(event["symbol"]) if event.get("symbol") else None,
       ) from error
 
+  @property
+  def position_key(self) -> str:
+    """返回该脚本独占的账户持仓键。"""
+    return self._position_key
+
   def _context(self, bar: Bar, portfolio: PortfolioSnapshot) -> dict[str, Any]:
-    long_qty = self._strategy_position(portfolio.long_positions_by_key, ":overlay_long")
-    short_qty = self._strategy_position(portfolio.short_positions_by_key, ":overlay_short")
+    strategy_position = self._portfolio_strategy_position(portfolio)
     time_context = normalize_script_bar_time(bar.time)
+    actual_position = self._portfolio_actual_position(portfolio)
     return {
       "time": time_context.time,
       "datetime": time_context.datetime,
@@ -295,8 +300,10 @@ class ScriptedBarStrategy:
       "volume": bar.volume,
       "cash": portfolio.cash,
       "equity": portfolio.equity,
-      "position": long_qty - short_qty,
-      "strategyPosition": long_qty - short_qty,
+      "position": strategy_position,
+      "actualPosition": actual_position,
+      "overlayQuantity": portfolio.overlay_quantity,
+      "strategyPosition": strategy_position,
       "basePosition": portfolio.base_position,
       "sellableQuantity": portfolio.sellable_quantity,
       "t0AvailableQuantity": portfolio.t0_available_quantity,
@@ -310,8 +317,8 @@ class ScriptedBarStrategy:
     portfolio: PortfolioSnapshot,
     time_context: Any,
   ) -> dict[str, Any]:
-    long_qty = self._strategy_position(portfolio.long_positions_by_key, ":overlay_long")
-    short_qty = self._strategy_position(portfolio.short_positions_by_key, ":overlay_short")
+    strategy_position = self._portfolio_strategy_position(portfolio)
+    actual_position = self._portfolio_actual_position(portfolio)
     return {
       "time": time_context.time,
       "datetime": time_context.datetime,
@@ -323,8 +330,10 @@ class ScriptedBarStrategy:
       "asks": [{"price": item.price, "volume": item.volume} for item in quote.asks],
       "cash": portfolio.cash,
       "equity": portfolio.equity,
-      "position": long_qty - short_qty,
-      "strategyPosition": long_qty - short_qty,
+      "position": strategy_position,
+      "actualPosition": actual_position,
+      "overlayQuantity": portfolio.overlay_quantity,
+      "strategyPosition": strategy_position,
       "basePosition": portfolio.base_position,
       "sellableQuantity": portfolio.sellable_quantity,
       "t0AvailableQuantity": portfolio.t0_available_quantity,
@@ -335,6 +344,20 @@ class ScriptedBarStrategy:
     direct = positions.get(self._position_key)
     overlay = positions.get(f"{self._position_key}{overlay_suffix}")
     return (direct.quantity if direct else 0) + (overlay.quantity if overlay else 0)
+
+  def _portfolio_strategy_position(self, portfolio: PortfolioSnapshot) -> int:
+    if portfolio.overlay_quantity is not None:
+      return portfolio.overlay_quantity
+    long_qty = self._strategy_position(portfolio.long_positions_by_key, ":overlay_long")
+    short_qty = self._strategy_position(portfolio.short_positions_by_key, ":overlay_short")
+    return long_qty - short_qty
+
+
+  @staticmethod
+  def _portfolio_actual_position(portfolio: PortfolioSnapshot) -> int:
+    long_quantity = sum(item.quantity for item in portfolio.long_positions_by_key.values())
+    short_quantity = sum(item.quantity for item in portfolio.short_positions_by_key.values())
+    return long_quantity - short_quantity
 
   def _to_orders(
     self,

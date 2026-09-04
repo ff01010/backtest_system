@@ -6,6 +6,10 @@ import math
 from collections.abc import Iterable
 from typing import Any
 
+from backend.backtesting.models import OrderSide, PositionEffect
+from backend.backtesting.overlay import OverlayFill, build_overlay_report
+from backend.backtesting.trade_metrics import ClosedTradeFill, build_closed_trade_metrics
+
 
 _TRADING_DAYS_PER_YEAR = 242
 
@@ -39,7 +43,8 @@ def normalize_l2_result(raw_result: dict[str, Any], payload: dict[str, Any]) -> 
   base_cost_price = _number(payload.get("baseCostPrice"), 0.0)
   initial_capital = initial_cash + base_quantity * base_cost_price
   daily_holdings = _build_daily_holdings(raw_result.get("equity"), raw_result.get("fills"), initial_capital, base_quantity)
-  trades = [_fill_to_trade(item) for item in _records(raw_result.get("fills"))]
+  raw_fills = _records(raw_result.get("fills"))
+  trades = [_fill_to_trade(item, index) for index, item in enumerate(raw_fills)]
   skipped_signals = _build_skipped_signals(raw_result)
   summary = _build_summary(initial_capital, trades, daily_holdings, initial_cash, base_quantity, base_cost_price, bool(payload.get("t0Enabled", False)))
   summary.update(_execution_counts(raw_result.get("orders"), trades))
@@ -49,9 +54,22 @@ def normalize_l2_result(raw_result: dict[str, Any], payload: dict[str, Any]) -> 
     warnings.append("L2 回测暂未计算基准曲线，超额收益显示为 --")
 
   category = _strategy_category(payload)
+  cycles: list[dict[str, Any]] = []
+  uses_version_three = payload.get("strategyCategory") in {"core_position_overlay", "directional_holding"}
+  if category == "core_position_overlay" and uses_version_three:
+    report = build_overlay_report(
+      _overlay_fills(raw_fills), daily_holdings, initial_cash, base_quantity, base_cost_price,
+    )
+    _merge_overlay_report(trades, daily_holdings, summary, report)
+    cycles = report["cycles"]
+  elif uses_version_three:
+    summary.update(build_closed_trade_metrics(
+      _directional_fills(raw_fills),
+      base_quantity if bool(payload.get("initialPositionEnabled", False)) else 0,
+    ))
   return {
     "strategyCategory": category,
-    "resultSchemaVersion": 2,
+    "resultSchemaVersion": 3 if uses_version_three else 2,
     "strategyMetrics": _strategy_metrics(category, summary),
     "outputDir": "",
     "summary": summary,
@@ -64,6 +82,7 @@ def normalize_l2_result(raw_result: dict[str, Any], payload: dict[str, Any]) -> 
     "benchmarkReturn": None,
     "excessReturn": None,
     "dailyHoldings": daily_holdings,
+    "cycles": cycles,
     "trades": trades,
     "skippedSignals": skipped_signals,
     "orderEvents": _records(raw_result.get("orders")),
@@ -130,6 +149,7 @@ def _build_daily_holdings(
       "marketValue": round(long_value - short_value, 2),
       "totalEquity": round(total_equity, 2),
       "dailyPnl": round(total_equity - previous_total, 2),
+      "sellableQuantity": int(_number(point.get("sellableQty"), 0)),
     })
     previous_total = total_equity
   return holdings
@@ -150,11 +170,12 @@ def _market_values(
   return 0.0, 0.0
 
 
-def _fill_to_trade(fill: dict[str, Any]) -> dict[str, Any]:
+def _fill_to_trade(fill: dict[str, Any], index: int) -> dict[str, Any]:
   metadata = _mapping(fill.get("metadata"))
   side = _normalize_side(fill.get("side"))
   direction = str(metadata.get("direction") or side)
   trade = {
+    "fillId": f"fill-{index + 1}",
     "time": str(metadata.get("signal_time") or fill.get("time") or ""),
     "signalTime": str(metadata.get("signal_time") or fill.get("time") or ""),
     "executionTime": str(fill.get("time") or ""),
@@ -165,6 +186,9 @@ def _fill_to_trade(fill: dict[str, Any]) -> dict[str, Any]:
     "price": _number(fill.get("price"), 0.0),
     "quantity": int(_number(fill.get("quantity"), 0)),
     "pnl": _number(fill.get("realized_pnl"), 0.0),
+    "accountRealizedPnl": _number(fill.get("realized_pnl"), 0.0),
+    "totalFee": _number(fill.get("fee"), 0.0),
+    "positionKey": str(fill.get("position_key") or "default"),
     "note": str(fill.get("reason") or ""),
     "priceSource": str(metadata.get("price_source") or "L2 成交模型价格"),
     "status": "filled",
@@ -181,6 +205,61 @@ def _fill_to_trade(fill: dict[str, Any]) -> dict[str, Any]:
     trade["remainingQuantity"] = int(_number(metadata.get("remainingQuantity"), 0))
     trade["availableCashBefore"] = _number(metadata.get("availableCashBefore"), 0.0)
   return trade
+
+
+def _overlay_fills(raw_fills: list[dict[str, Any]]) -> list[OverlayFill]:
+  return [OverlayFill(
+    fill_id=f"fill-{index + 1}",
+    time=str(item.get("time") or ""),
+    symbol=str(item.get("symbol") or ""),
+    side=OrderSide(_normalize_side(item.get("side"))),
+    quantity=int(_number(item.get("quantity"), 0)),
+    price=_number(item.get("price"), 0.0),
+    fee=_number(item.get("fee"), 0.0),
+    account_realized_pnl=_number(item.get("realized_pnl"), 0.0),
+  ) for index, item in enumerate(raw_fills)]
+
+
+
+def _directional_fills(raw_fills: list[dict[str, Any]]) -> list[ClosedTradeFill]:
+  return [ClosedTradeFill(
+    symbol=str(item.get("symbol") or ""),
+    position_key=str(item.get("position_key") or "strategy_position"),
+    position_effect=PositionEffect(str(item.get("position_effect")).split(".")[-1]),
+    quantity=int(_number(item.get("quantity"), 0)),
+    realized_pnl=_number(item.get("realized_pnl"), 0.0),
+  ) for item in raw_fills]
+
+def _merge_overlay_report(
+  trades: list[dict[str, Any]],
+  daily_holdings: list[dict[str, Any]],
+  summary: dict[str, Any],
+  report: dict[str, Any],
+) -> None:
+  for trade in trades:
+    attribution = report["attributions"].get(trade["fillId"])
+    if attribution:
+      trade.update(attribution)
+      trade["pnl"] = _number(attribution.get("realizedOverlayPnl"), 0.0)
+  for holding, overlay_daily in zip(daily_holdings, report["daily"], strict=True):
+    holding.update(overlay_daily)
+  metrics = report["metrics"]
+  account_pnl = _number(summary.get("totalPnl"), 0.0)
+  base_pnl = _number(summary.get("baseHoldingPnl"), 0.0)
+  summary.update({
+    "accountPnl": account_pnl,
+    "accountRealizedPnl": round(sum(_number(item.get("accountRealizedPnl"), 0.0) for item in trades), 2),
+    "baseBenchmarkPnl": base_pnl,
+    "overlayPnl": round(account_pnl - base_pnl, 2),
+    **metrics,
+    "winRate": metrics["cycleWinRate"],
+    "winningTrades": metrics["winningCycles"],
+    "losingTrades": metrics["losingCycles"],
+    "avgWin": metrics["avgWin"],
+    "avgLoss": metrics["avgLoss"],
+    "profitLossRatio": metrics["profitLossRatio"],
+    "tradeMetricVersion": 3,
+  })
 
 
 def _normalize_trade(trade: dict[str, Any]) -> dict[str, Any]:
@@ -384,8 +463,11 @@ def _build_manifest(raw_result: dict[str, Any], payload: dict[str, Any]) -> dict
     "fillModel": "l2_quote",
     "randomSeed": 0,
     "holdingPolicy": payload.get("holdingPolicy", "intraday"),
+    "overlaySettlementPolicy": payload.get("overlaySettlementPolicy", "intraday_restore"),
     "strategyCategory": _strategy_category(payload),
-    "resultSchemaVersion": 2,
+    "resultSchemaVersion": (
+      3 if payload.get("strategyCategory") in {"core_position_overlay", "directional_holding"} else 2
+    ),
     "baseQuantity": int(_number(payload.get("baseQuantity"), 0)),
     "baseCostPrice": _number(payload.get("baseCostPrice"), 0.0),
     "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
@@ -437,6 +519,13 @@ def _strategy_metrics(category: str, summary: dict[str, Any]) -> dict[str, dict[
       "baseHoldingReturn": summary.get("baseHoldingReturn"),
       "t0ExcessPnl": summary.get("t0ExcessPnl"),
       "t0ExcessReturn": summary.get("t0ExcessReturn"),
+      "baseBenchmarkPnl": summary.get("baseBenchmarkPnl"),
+      "overlayPnl": summary.get("overlayPnl"),
+      "realizedOverlayPnl": summary.get("realizedOverlayPnl"),
+      "unrealizedOverlayPnl": summary.get("unrealizedOverlayPnl"),
+      "completedCycleCount": summary.get("completedCycleCount"),
+      "openCycleCount": summary.get("openCycleCount"),
+      "cycleWinRate": summary.get("cycleWinRate"),
     }}
   return {"holdingMetrics": {
     "totalPnl": summary.get("totalPnl"),

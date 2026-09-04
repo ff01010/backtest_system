@@ -8,6 +8,7 @@ import re
 import time
 import traceback
 from collections.abc import Callable
+from dataclasses import asdict
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
@@ -106,9 +107,12 @@ def _execute_script(payload: dict[str, Any]) -> dict[str, Any]:
     base_quantity=int(payload.get("baseQuantity", 0)),
     base_cost_price=float(payload.get("baseCostPrice", 0)),
     t0_enabled=bool(payload.get("t0Enabled", False)),
+    strategy_category=str(payload.get("strategyCategory") or "directional_holding"),
+    overlay_settlement_policy=str(payload.get("overlaySettlementPolicy") or "intraday_restore"),
   )
   result = engine.run(strategy, bars, int(payload.get("warmupBarCount", 0)))
   return {
+    "fills": [asdict(fill) for fill in result.fills],
     "trades": [fill_to_api_trade(fill) for fill in result.fills],
     "portfolioSnapshots": [_snapshot_to_dict(item) for item in result.portfolio_snapshots],
     "skippedSignals": strategy.skipped_signals,
@@ -129,6 +133,9 @@ def _snapshot_to_dict(snapshot: Any) -> dict[str, Any]:
       symbol: {"quantity": position.quantity, "averagePrice": position.average_price}
       for symbol, position in snapshot.short_positions.items()
     },
+    "basePosition": int(snapshot.base_position),
+    "overlayQuantity": snapshot.overlay_quantity,
+    "sellableQuantity": snapshot.sellable_quantity,
   }
 
 

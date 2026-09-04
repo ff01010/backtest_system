@@ -187,6 +187,7 @@ class L2Runner:
       "passiveParticipationRate": float(params.get("l2PassiveParticipationRate", 0.1)),
       "holdingPolicy": _holding_policy(payload),
       "strategyCategory": _strategy_category(payload),
+      "overlaySettlementPolicy": _overlay_settlement_policy(payload),
       "symbol": str(payload["symbol"]),
       "baseQuantity": int(payload.get("baseQuantity", 0)),
       "baseCostPrice": float(payload.get("baseCostPrice", 0)),
@@ -208,7 +209,14 @@ def _strategy_category(payload: dict[str, Any]) -> str:
 def _holding_policy(payload: dict[str, Any]) -> str:
   if payload.get("strategyCategory") not in {"core_position_overlay", "directional_holding"}:
     return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
-  return "intraday" if _strategy_category(payload) == "core_position_overlay" else "overnight"
+  return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
+
+
+def _overlay_settlement_policy(payload: dict[str, Any]) -> str:
+  policy = str(payload.get("overlaySettlementPolicy") or "")
+  if policy in {"intraday_restore", "cross_day_carry"}:
+    return policy
+  return "intraday_restore"
 
 
 def _validate_quote_coverage(

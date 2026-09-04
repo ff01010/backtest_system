@@ -20,6 +20,9 @@ import yaml
 
 from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel, RecordedPriceExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade
+from backend.backtesting.models import OrderSide, PositionEffect
+from backend.backtesting.overlay import OverlayFill, build_overlay_report
+from backend.backtesting.trade_metrics import ClosedTradeFill, build_closed_trade_metrics
 from backend.strategies.catalog import create_bar_strategy, get_strategy_source_snapshot
 from backend.strategies.external_engine import load_external_engine
 from backend.strategies.script_time_context import normalize_script_bar_time
@@ -186,6 +189,8 @@ def run_user_script_backtest(
     "feeProfile": dict(payload.get("feeProfile") or {}),
     "slippage": float(payload["slippage"]),
     "holdingPolicy": _holding_policy(payload),
+    "strategyCategory": _strategy_category(payload),
+    "overlaySettlementPolicy": _overlay_settlement_policy(payload),
     "fillModel": str(payload.get("fillModel", "bar_next_open")),
     "executionAlgorithm": str(payload.get("executionAlgorithm", "immediate")),
     "executionParameters": dict(payload.get("executionParameters") or {}),
@@ -206,6 +211,23 @@ def run_user_script_backtest(
     initial_cash, base_quantity, base_cost_price, bool(payload.get("t0Enabled", False)),
     worker_result["trades"], daily_holdings,
   )
+  cycles: list[dict[str, Any]] = []
+  if _strategy_category(payload) == "core_position_overlay":
+    _ensure_fill_ids(worker_result["trades"])
+    report = build_overlay_report(
+      _overlay_fills(worker_result.get("fills", [])),
+      daily_holdings,
+      initial_cash,
+      base_quantity,
+      base_cost_price,
+    )
+    _merge_overlay_report(worker_result["trades"], daily_holdings, summary, report)
+    cycles = report["cycles"]
+  else:
+    summary.update(build_closed_trade_metrics(
+      _directional_fills(worker_result.get("fills", [])),
+      base_quantity if bool(payload.get("initialPositionEnabled", False)) else 0,
+    ))
   benchmark_symbol = payload.get("benchmarkSymbol") or payload["symbol"]
   benchmark_equity, benchmark_warnings = _build_benchmark_equity(
     benchmark_symbol, payload.get("timeframe", "5m"), payload["startDate"], payload["endDate"],
@@ -214,7 +236,7 @@ def run_user_script_backtest(
   benchmark_return = _compute_benchmark_return(benchmark_equity)
   response = {
     "strategyCategory": _strategy_category(payload),
-    "resultSchemaVersion": 2,
+    "resultSchemaVersion": 3,
     "strategyMetrics": _strategy_metrics(_strategy_category(payload), summary),
     "outputDir": _script_output_dir(payload),
     "summary": summary,
@@ -224,6 +246,7 @@ def run_user_script_backtest(
     "benchmarkReturn": benchmark_return,
     "excessReturn": round(summary["totalReturn"] - benchmark_return, 6),
     "dailyHoldings": daily_holdings,
+    "cycles": cycles,
     "trades": worker_result["trades"],
     "skippedSignals": worker_result["skippedSignals"] + worker_result.get("unexecutedOrders", []),
     "experimentManifest": manifest,
@@ -395,12 +418,13 @@ def _build_script_experiment_manifest(
     "allowLong": payload.get("allowLong", True),
     "allowShort": payload.get("allowShort", True),
     "holdingPolicy": holding_policy,
+    "overlaySettlementPolicy": _overlay_settlement_policy(payload),
     "strategyCategory": _strategy_category(payload),
     "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
     "baseQuantity": int(payload.get("baseQuantity", 0)),
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
-    "resultSchemaVersion": 2,
+    "resultSchemaVersion": 3,
   })
   experiment_hash = _stable_hash({
     "engineVersion": "isolated-script-worker-v1",
@@ -433,12 +457,13 @@ def _build_script_experiment_manifest(
       **dict(payload.get("feeProfile") or {}),
     },
     "holdingPolicy": holding_policy,
+    "overlaySettlementPolicy": _overlay_settlement_policy(payload),
     "strategyCategory": _strategy_category(payload),
     "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
     "baseQuantity": int(payload.get("baseQuantity", 0)),
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
-    "resultSchemaVersion": 2,
+    "resultSchemaVersion": 3,
     "executionEnvironment": "strategy-worker",
   }
 
@@ -466,6 +491,7 @@ def _build_worker_daily_holdings(
       "shortMarketValue": round(short_qty * float(row.close), 2),
       "marketValue": round((long_qty - short_qty) * float(row.close), 2),
       "totalEquity": round(total_equity, 2), "dailyPnl": round(total_equity - previous_total, 2),
+      "sellableQuantity": int(snapshot.get("sellableQuantity") or 0),
     })
     previous_total = total_equity
   return items
@@ -505,6 +531,87 @@ def _build_worker_summary(
 
 def _initial_total_equity(initial_cash: float, base_quantity: int, base_cost_price: float) -> float:
   return initial_cash + max(0, base_quantity) * max(0.0, base_cost_price)
+
+
+def _ensure_fill_ids(trades: list[dict[str, Any]]) -> None:
+  for index, trade in enumerate(trades):
+    trade["fillId"] = str(trade.get("fillId") or f"fill-{index + 1}")
+
+
+def _overlay_fills(raw_fills: object) -> list[OverlayFill]:
+  if not isinstance(raw_fills, list):
+    raise ValueError("标准 Bar 回测缺少增强归属成交")
+  items: list[OverlayFill] = []
+  for index, raw in enumerate(raw_fills):
+    if not isinstance(raw, dict):
+      raise ValueError("标准 Bar 增强归属成交格式无效")
+    side_value = raw.get("side")
+    side = side_value if isinstance(side_value, OrderSide) else OrderSide(str(side_value).split(".")[-1])
+    items.append(OverlayFill(
+      fill_id=f"fill-{index + 1}",
+      time=str(raw.get("time") or ""),
+      symbol=str(raw.get("symbol") or ""),
+      side=side,
+      quantity=int(raw.get("quantity") or 0),
+      price=float(raw.get("price") or 0),
+      fee=float(raw.get("fee") or 0),
+      account_realized_pnl=float(raw.get("realized_pnl") or 0),
+    ))
+  return items
+
+
+
+def _directional_fills(raw_fills: object) -> list[ClosedTradeFill]:
+  if not isinstance(raw_fills, list):
+    raise ValueError("标准 Bar 回测缺少方向性成交")
+  items: list[ClosedTradeFill] = []
+  for raw in raw_fills:
+    if not isinstance(raw, dict):
+      raise ValueError("标准 Bar 方向性成交格式无效")
+    effect_value = raw.get("position_effect")
+    effect = effect_value if isinstance(effect_value, PositionEffect) else PositionEffect(
+      str(effect_value).split(".")[-1],
+    )
+    items.append(ClosedTradeFill(
+      symbol=str(raw.get("symbol") or ""),
+      position_key=str(raw.get("position_key") or "strategy_position"),
+      position_effect=effect,
+      quantity=int(raw.get("quantity") or 0),
+      realized_pnl=float(raw.get("realized_pnl") or 0),
+    ))
+  return items
+
+
+def _merge_overlay_report(
+  trades: list[dict[str, Any]],
+  daily_holdings: list[dict[str, Any]],
+  summary: dict[str, Any],
+  report: dict[str, Any],
+) -> None:
+  for trade in trades:
+    attribution = report["attributions"].get(trade["fillId"])
+    if attribution:
+      trade.update(attribution)
+      trade["pnl"] = float(attribution.get("realizedOverlayPnl") or 0)
+  for holding, daily in zip(daily_holdings, report["daily"], strict=True):
+    holding.update(daily)
+  metrics = report["metrics"]
+  account_pnl = float(summary["totalPnl"])
+  base_pnl = float(summary.get("baseHoldingPnl") or 0)
+  summary.update({
+    "accountPnl": account_pnl,
+    "accountRealizedPnl": round(sum(float(item.get("accountRealizedPnl") or 0) for item in trades), 2),
+    "baseBenchmarkPnl": base_pnl,
+    "overlayPnl": round(account_pnl - base_pnl, 2),
+    **metrics,
+    "winRate": metrics["cycleWinRate"],
+    "winningTrades": metrics["winningCycles"],
+    "losingTrades": metrics["losingCycles"],
+    "avgWin": metrics["avgWin"],
+    "avgLoss": metrics["avgLoss"],
+    "profitLossRatio": metrics["profitLossRatio"],
+    "tradeMetricVersion": 3,
+  })
 
 
 def _build_worker_base_metrics(
@@ -805,7 +912,14 @@ def _strategy_category(payload: dict[str, Any]) -> str:
 def _holding_policy(payload: dict[str, Any]) -> str:
   if payload.get("strategyCategory") not in {"core_position_overlay", "directional_holding"}:
     return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
-  return "intraday" if _strategy_category(payload) == "core_position_overlay" else "overnight"
+  return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
+
+
+def _overlay_settlement_policy(payload: dict[str, Any]) -> str:
+  policy = str(payload.get("overlaySettlementPolicy") or "")
+  if policy in {"intraday_restore", "cross_day_carry"}:
+    return policy
+  return "intraday_restore"
 
 
 def _strategy_metrics(category: str, summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -815,6 +929,13 @@ def _strategy_metrics(category: str, summary: dict[str, Any]) -> dict[str, dict[
       "baseHoldingReturn": summary.get("baseHoldingReturn"),
       "t0ExcessPnl": summary.get("t0ExcessPnl"),
       "t0ExcessReturn": summary.get("t0ExcessReturn"),
+      "baseBenchmarkPnl": summary.get("baseBenchmarkPnl"),
+      "overlayPnl": summary.get("overlayPnl"),
+      "realizedOverlayPnl": summary.get("realizedOverlayPnl"),
+      "unrealizedOverlayPnl": summary.get("unrealizedOverlayPnl"),
+      "completedCycleCount": summary.get("completedCycleCount"),
+      "openCycleCount": summary.get("openCycleCount"),
+      "cycleWinRate": summary.get("cycleWinRate"),
     }}
   return {"holdingMetrics": {
     "totalPnl": summary.get("totalPnl"),

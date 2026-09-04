@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections import defaultdict
 from typing import Any, Callable, Protocol, Sequence
 
@@ -537,6 +537,8 @@ class BarBacktestEngine:
     base_quantity: int = 0,
     base_cost_price: float = 0.0,
     t0_enabled: bool = False,
+    strategy_category: str = "directional_holding",
+    overlay_settlement_policy: str = "intraday_restore",
   ) -> None:
     if commission_rate < 0:
       raise ValueError("手续费率不能小于 0")
@@ -546,11 +548,17 @@ class BarBacktestEngine:
       raise ValueError("底仓数量和成本价无效")
     if t0_enabled and base_quantity <= 0:
       raise ValueError("启用底仓做 T 时底仓数量必须大于 0")
+    if strategy_category not in {"core_position_overlay", "directional_holding"}:
+      raise ValueError("策略类别无效")
+    if overlay_settlement_policy not in {"intraday_restore", "cross_day_carry"}:
+      raise ValueError("增强仓结算规则无效")
     self._ledger = PortfolioLedger(initial_cash)
     self._commission_rate = commission_rate
     self._fee_profile = fee_profile
     self._execution_model = execution_model or ClosePriceExecutionModel()
     self._holding_policy = holding_policy
+    self._strategy_category = strategy_category
+    self._overlay_settlement_policy = overlay_settlement_policy
     self._execute_on_next_bar_open = execute_on_next_bar_open
     self._base_quantity = base_quantity
     self._base_cost_price = base_cost_price
@@ -558,6 +566,8 @@ class BarBacktestEngine:
     self._t0_remaining = base_quantity if t0_enabled else 0
     self._t0_date: str | None = None
     self._order_event_sequence = 0
+    self._day_sellable_by_key: dict[tuple[str, str], int] = {}
+    self._initial_position_key = "base_position"
 
   def run(
     self,
@@ -572,9 +582,9 @@ class BarBacktestEngine:
     warmup_bars = bars[:warmup_bar_count]
     formal_bars = bars[warmup_bar_count:]
     for bar in warmup_bars:
-      strategy.on_bar(bar, self._ledger.snapshot())
+      strategy.on_bar(bar, self._snapshot())
     if formal_bars and self._base_quantity > 0:
-      self._ledger.initialize_long_position(formal_bars[0].symbol, self._base_quantity, self._base_cost_price, "base_position")
+      self._initialize_position(strategy, formal_bars[0].symbol)
     self._order_event_sequence = 0
     pending_orders: list[_AcceptedBarOrder] = []
     for index, bar in enumerate(formal_bars):
@@ -583,7 +593,7 @@ class BarBacktestEngine:
         self._execute_accepted_orders(strategy, bar, pending_orders, False)
         pending_orders = []
       self._ledger.mark(bar.symbol, bar.close)
-      orders = strategy.on_bar(bar, self._ledger.snapshot())
+      orders = strategy.on_bar(bar, self._snapshot())
       is_day_end = self._is_day_end(formal_bars, index)
       accepted_orders = self._accept_orders(strategy, orders, is_day_end, bar.time)
       if self._execute_on_next_bar_open:
@@ -601,7 +611,7 @@ class BarBacktestEngine:
     return BacktestResult(
       self._ledger.fills,
       equity_curve,
-      self._ledger.snapshot(),
+      self._snapshot(),
       portfolio_snapshots,
       unexecuted_orders,
     )
@@ -614,7 +624,8 @@ class BarBacktestEngine:
     event_time: str,
   ) -> list[_AcceptedBarOrder]:
     accepted: list[_AcceptedBarOrder] = []
-    for order in self._eligible_orders(orders, is_day_end):
+    normalized_orders = [self._normalize_overlay_order(order) for order in orders]
+    for order in self._eligible_orders(normalized_orders, is_day_end):
       self._order_event_sequence += 1
       item = _AcceptedBarOrder(f"bar-{self._order_event_sequence}", order)
       accepted.append(item)
@@ -629,16 +640,29 @@ class BarBacktestEngine:
     is_day_end: bool,
   ) -> PortfolioSnapshot:
     for item in orders:
-      fill = self._execution_model.create_fill(item.intent, bar, self._commission_rate, self._fee_profile)
+      executable_order = self._limit_order_to_available_position(item.intent)
+      if executable_order is None:
+        rejection_reason = self._execution_rejection_reason(item.intent) or "订单没有可成交数量"
+        self._notify_order_event(strategy, self._order_event(
+          item, "rejected", bar.time, rejection_reason=rejection_reason,
+        ))
+        continue
+      execution_item = _AcceptedBarOrder(item.order_id, executable_order)
+      fill = self._execution_model.create_fill(executable_order, bar, self._commission_rate, self._fee_profile)
       if fill is None:
         self._notify_order_event(strategy, self._order_event(
           item, "rejected", bar.time, rejection_reason="标准 Bar 成交模型未产生有效成交",
         ))
         continue
       applied_fill = self._ledger.apply_fill(fill)
-      if self._uses_t0_capacity(item.intent):
+      if executable_order.position_effect == PositionEffect.CLOSE_LONG:
+        position_id = (executable_order.symbol, executable_order.position_key)
+        self._day_sellable_by_key[position_id] = max(
+          0, self._day_sellable_by_key.get(position_id, 0) - applied_fill.quantity,
+        )
+      if self._uses_t0_capacity(executable_order):
         self._t0_remaining = max(0, self._t0_remaining - applied_fill.quantity)
-      self._notify_order_event(strategy, self._order_event(item, "filled", applied_fill.time, applied_fill))
+      self._notify_order_event(strategy, self._order_event(execution_item, "filled", applied_fill.time, applied_fill))
     return self._close_day_if_needed_with_events(strategy, bar, is_day_end)
 
   def _close_day_if_needed_with_events(
@@ -647,11 +671,11 @@ class BarBacktestEngine:
     bar: Bar,
     is_day_end: bool,
   ) -> PortfolioSnapshot:
-    if self._holding_policy == "intraday" and is_day_end:
-      orders = self._ledger.force_close_orders(bar, {"base_position"} if self._base_quantity > 0 else None)
+    if self._restores_at_day_end() and is_day_end:
+      orders = self._settlement_orders(bar)
       accepted = self._accept_orders(strategy, orders, False, bar.time)
       self._execute_accepted_orders(strategy, bar, accepted, False)
-    return self._ledger.snapshot()
+    return self._snapshot()
 
   @staticmethod
   def _notify_order_event(strategy: BarStrategy, event: dict[str, Any]) -> None:
@@ -713,7 +737,10 @@ class BarBacktestEngine:
 
     equity_curve: list[EquityPoint] = []
     portfolio_snapshots: list[PortfolioSnapshot] = []
+    if bars and self._base_quantity > 0:
+      self._initialize_position(strategy, bars[0].symbol)  # type: ignore[arg-type]
     for index, bar in enumerate(bars):
+      self._begin_day_if_needed(bar)
       self._ledger.mark(bar.symbol, bar.close)
       snapshot = self._execute_orders(
         bar,
@@ -729,7 +756,7 @@ class BarBacktestEngine:
     return BacktestResult(
       self._ledger.fills,
       equity_curve,
-      self._ledger.snapshot(),
+      self._snapshot(),
       portfolio_snapshots,
     )
 
@@ -742,11 +769,14 @@ class BarBacktestEngine:
     equity_curve: list[EquityPoint] = []
     portfolio_snapshots: list[PortfolioSnapshot] = []
     next_index = 0
+    if bars and self._base_quantity > 0:
+      self._initialize_position(strategy, bars[0].symbol)  # type: ignore[arg-type]
 
     def emit(bar: Bar, orders: Sequence[OrderIntent]) -> None:
       nonlocal next_index
       if next_index >= len(bars) or bars[next_index].time != bar.time:
         raise ValueError("流式策略 K 线顺序与回测数据不一致")
+      self._begin_day_if_needed(bar)
       self._ledger.mark(bar.symbol, bar.close)
       snapshot = self._execute_orders(bar, orders, self._is_day_end(bars, next_index))
       equity_curve.append(EquityPoint(bar.time, snapshot.equity, snapshot.cash))
@@ -759,7 +789,7 @@ class BarBacktestEngine:
     return BacktestResult(
       self._ledger.fills,
       equity_curve,
-      self._ledger.snapshot(),
+      self._snapshot(),
       portfolio_snapshots,
     )
 
@@ -769,29 +799,43 @@ class BarBacktestEngine:
     orders: Sequence[OrderIntent],
     is_day_end: bool,
   ) -> PortfolioSnapshot:
-    for order in self._eligible_orders(orders, is_day_end):
+    normalized = [self._normalize_overlay_order(order) for order in orders]
+    for order in self._eligible_orders(normalized, is_day_end):
       if order.symbol != bar.symbol:
         raise ValueError("订单标的与 K 线标的不一致")
-      fill = self._execution_model.create_fill(order, bar, self._commission_rate, self._fee_profile)
+      executable_order = self._limit_order_to_available_position(order)
+      if executable_order is None:
+        continue
+      fill = self._execution_model.create_fill(executable_order, bar, self._commission_rate, self._fee_profile)
       if fill is not None:
-        self._ledger.apply_fill(fill)
-        if self._uses_t0_capacity(order):
+        applied_fill = self._ledger.apply_fill(fill)
+        if executable_order.position_effect == PositionEffect.CLOSE_LONG:
+          position_id = (executable_order.symbol, executable_order.position_key)
+          self._day_sellable_by_key[position_id] = max(
+            0, self._day_sellable_by_key.get(position_id, 0) - applied_fill.quantity,
+          )
+        if self._uses_t0_capacity(executable_order):
           self._t0_remaining = max(0, self._t0_remaining - fill.quantity)
     return self._close_day_if_needed(bar, is_day_end)
 
   def _close_day_if_needed(self, bar: Bar, is_day_end: bool) -> PortfolioSnapshot:
-    if self._holding_policy == "intraday" and is_day_end:
-      for order in self._ledger.force_close_orders(bar, {"base_position"} if self._base_quantity > 0 else None):
+    if self._restores_at_day_end() and is_day_end:
+      for order in self._settlement_orders(bar):
         fill = self._execution_model.create_fill(order, bar, self._commission_rate, self._fee_profile)
         if fill is not None:
           self._ledger.apply_fill(fill)
-    return self._ledger.snapshot()
+    return self._snapshot()
 
   def _begin_day_if_needed(self, bar: Bar) -> None:
     if self._t0_date == bar.date:
       return
     self._t0_date = bar.date
     self._t0_remaining = self._base_quantity if self._t0_enabled else 0
+    snapshot = self._ledger.snapshot()
+    self._day_sellable_by_key = {
+      identity: position.quantity
+      for identity, position in snapshot.long_positions_by_identity.items()
+    }
 
   def _eligible_orders(
     self,
@@ -800,27 +844,137 @@ class BarBacktestEngine:
   ) -> list[OrderIntent]:
     eligible = list(orders)
     if self._t0_enabled:
-      opening_effects = {PositionEffect.OPEN_LONG, PositionEffect.OPEN_SHORT}
       remaining = self._t0_remaining
       t0_eligible: list[OrderIntent] = []
       for order in eligible:
-        if order.position_effect not in opening_effects or order.position_key == "base_position":
+        if not self._uses_t0_capacity(order):
           t0_eligible.append(order)
           continue
-        if order.quantity <= remaining:
-          t0_eligible.append(order)
-          remaining -= order.quantity
+        executable_quantity = min(order.quantity, remaining)
+        if executable_quantity <= 0:
+          continue
+        t0_eligible.append(
+          order if executable_quantity == order.quantity else replace(order, quantity=executable_quantity)
+        )
+        remaining -= executable_quantity
       eligible = t0_eligible
-    if self._holding_policy != "intraday" or not is_day_end:
+    if not self._restores_at_day_end() or not is_day_end:
       return eligible
     opening_effects = {PositionEffect.OPEN_LONG, PositionEffect.OPEN_SHORT}
     return [order for order in eligible if order.position_effect not in opening_effects]
 
   def _uses_t0_capacity(self, order: OrderIntent) -> bool:
-    return (
-      self._t0_enabled
-      and order.position_effect in {PositionEffect.OPEN_LONG, PositionEffect.OPEN_SHORT}
-      and order.position_key != "base_position"
+    if self._is_overlay_mode():
+      return self._t0_enabled and order.metadata.get("source") != "system"
+    return self._t0_enabled and order.position_effect in {PositionEffect.OPEN_LONG, PositionEffect.OPEN_SHORT}
+
+  def _initialize_position(self, strategy: BarStrategy, symbol: str) -> None:
+    self._initial_position_key = (
+      "base_position" if self._is_overlay_mode()
+      else str(getattr(strategy, "position_key", "default"))
+    )
+    self._ledger.initialize_long_position(
+      symbol, self._base_quantity, self._base_cost_price, self._initial_position_key,
+    )
+
+  def _normalize_overlay_order(self, order: OrderIntent) -> OrderIntent:
+    if not self._is_overlay_mode():
+      return order
+    effect = PositionEffect.OPEN_LONG if order.side == OrderSide.BUY else PositionEffect.CLOSE_LONG
+    metadata = {
+      **order.metadata,
+      "strategy_position_effect": order.position_effect.value if order.position_effect else None,
+      "strategy_position_key": order.position_key,
+      "inventory_source": "base_delivery" if order.side == OrderSide.SELL else "overlay_inventory",
+    }
+    return OrderIntent(
+      symbol=order.symbol,
+      side=order.side,
+      quantity=order.quantity,
+      reason=order.reason,
+      limit_price=order.limit_price,
+      time=order.time,
+      position_effect=effect,
+      position_key="base_position",
+      metadata=metadata,
+    )
+
+  def _execution_rejection_reason(self, order: OrderIntent) -> str | None:
+    if order.position_effect != PositionEffect.CLOSE_LONG:
+      return None
+    snapshot = self._ledger.snapshot()
+    position = snapshot.long_positions_by_identity.get((order.symbol, order.position_key))
+    if position is None or position.quantity <= 0:
+      return "平多数量超过实际持仓"
+    sellable = self._day_sellable_by_key.get((order.symbol, order.position_key), 0)
+    return "T+1 可卖数量不足" if sellable <= 0 else None
+
+  def _limit_order_to_available_position(self, order: OrderIntent) -> OrderIntent | None:
+    if order.position_effect != PositionEffect.CLOSE_LONG:
+      return order
+    snapshot = self._ledger.snapshot()
+    position = snapshot.long_positions_by_identity.get((order.symbol, order.position_key))
+    if position is None:
+      return None
+    sellable = self._day_sellable_by_key.get((order.symbol, order.position_key), 0)
+    executable_quantity = min(order.quantity, position.quantity, sellable)
+    if executable_quantity <= 0:
+      return None
+    if executable_quantity == order.quantity:
+      return order
+    return replace(order, quantity=executable_quantity)
+
+  def _settlement_orders(self, bar: Bar) -> list[OrderIntent]:
+    if not self._is_overlay_mode():
+      excluded = {self._initial_position_key} if self._base_quantity > 0 else None
+      return self._ledger.force_close_orders(bar, excluded)
+    snapshot = self._ledger.snapshot()
+    position = snapshot.long_positions_by_identity.get((bar.symbol, "base_position"))
+    actual_quantity = position.quantity if position else 0
+    difference = self._base_quantity - actual_quantity
+    if difference == 0:
+      return []
+    side = OrderSide.BUY if difference > 0 else OrderSide.SELL
+    effect = PositionEffect.OPEN_LONG if difference > 0 else PositionEffect.CLOSE_LONG
+    return [OrderIntent(
+      symbol=bar.symbol,
+      side=side,
+      quantity=abs(difference),
+      reason="尾盘恢复底仓",
+      time=bar.time,
+      position_effect=effect,
+      position_key="base_position",
+      metadata={"direction": "FORCE_SETTLEMENT", "source": "system", "recorded_price": bar.close},
+    )]
+
+  def _is_overlay_mode(self) -> bool:
+    return self._strategy_category == "core_position_overlay"
+
+  def _restores_at_day_end(self) -> bool:
+    if self._is_overlay_mode():
+      return self._overlay_settlement_policy == "intraday_restore"
+    return self._holding_policy == "intraday"
+
+  def _snapshot(self) -> PortfolioSnapshot:
+    snapshot = self._ledger.snapshot()
+    actual_quantity = sum(item.quantity for item in snapshot.long_positions.values()) - sum(
+      item.quantity for item in snapshot.short_positions.values()
+    )
+    return PortfolioSnapshot(
+      cash=snapshot.cash,
+      equity=snapshot.equity,
+      positions=snapshot.positions,
+      long_positions=snapshot.long_positions,
+      short_positions=snapshot.short_positions,
+      long_positions_by_key=snapshot.long_positions_by_key,
+      short_positions_by_key=snapshot.short_positions_by_key,
+      long_positions_by_identity=snapshot.long_positions_by_identity,
+      short_positions_by_identity=snapshot.short_positions_by_identity,
+      realized_pnl=snapshot.realized_pnl,
+      base_position=self._base_quantity,
+      overlay_quantity=actual_quantity - self._base_quantity if self._is_overlay_mode() else None,
+      sellable_quantity=sum(self._day_sellable_by_key.values()),
+      t0_available_quantity=self._t0_remaining if self._t0_enabled else None,
     )
 
   @staticmethod

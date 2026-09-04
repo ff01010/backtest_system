@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildStrategyDraftFingerprint,
   buildSavedStrategyFingerprint,
+  getConfigSectionForError,
   getResearchSignalSelectionError,
   hasEnabledTradeDirection,
   hasLegacyTimeSlice,
@@ -41,6 +42,14 @@ describe('isCustomScriptStrategy', () => {
     );
     expect(getResearchSignalSelectionError(true, 'dataset-1')).toBeNull();
     expect(getResearchSignalSelectionError(false, '')).toBeNull();
+  });
+
+  it('将运行前错误定位到对应的参数分组', () => {
+    expect(getConfigSectionForError('当前日期范围数据不完整')).toBe('scope');
+    expect(getConfigSectionForError('当前策略必须选择研究信号后才能运行')).toBe('inputs');
+    expect(getConfigSectionForError('TWAP 执行时长必须是不少于 3 秒的整数')).toBe('execution');
+    expect(getConfigSectionForError('初始资金必须大于 0')).toBe('capital');
+    expect(getConfigSectionForError('启用初始底仓时底仓数量必须是正整数')).toBe('strategy');
   });
 
   it('研究信号声明属于策略草稿指纹', () => {

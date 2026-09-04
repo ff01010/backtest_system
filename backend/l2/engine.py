@@ -18,8 +18,6 @@ from backend.l2.models import InstrumentRules, L2Order, NormalizedBar, QuoteLeve
 _STAMP_DUTY_RATE = 0.0005
 _TRANSFER_FEE_RATE = 0.00001
 _BASE_POSITION_KEY = "base_position"
-_OVERLAY_LONG_SUFFIX = ":overlay_long"
-_OVERLAY_SHORT_SUFFIX = ":overlay_short"
 
 
 class L2ExecutionEngine:
@@ -40,6 +38,8 @@ class L2ExecutionEngine:
     fee_profile: FeeProfile | None = None,
     execution_algorithm: str = "immediate",
     execution_parameters: dict[str, Any] | None = None,
+    strategy_category: str = "directional_holding",
+    overlay_settlement_policy: str = "intraday_restore",
   ) -> None:
     if latency_ms < 0 or not 0 < passive_participation_rate <= 1:
       raise ValueError("L2 延迟或被动参与率无效")
@@ -49,6 +49,10 @@ class L2ExecutionEngine:
       raise ValueError("底仓数量和成本价无效")
     if t0_enabled and base_quantity <= 0:
       raise ValueError("启用底仓做 T 时底仓数量必须大于 0")
+    if strategy_category not in {"core_position_overlay", "directional_holding"}:
+      raise ValueError("策略类别无效")
+    if overlay_settlement_policy not in {"intraday_restore", "cross_day_carry"}:
+      raise ValueError("增强仓结算规则无效")
     self._strategy = strategy
     self._ledger = PortfolioLedger(initial_cash)
     self._commission_rate = commission_rate
@@ -69,6 +73,8 @@ class L2ExecutionEngine:
     self._latency = timedelta(milliseconds=latency_ms)
     self._participation = passive_participation_rate
     self._holding_policy = holding_policy
+    self._strategy_category = strategy_category
+    self._overlay_settlement_policy = overlay_settlement_policy
     self._target_base_quantity = base_quantity
     self._t0_enabled = t0_enabled
     self._orders: list[L2Order] = []
@@ -84,13 +90,23 @@ class L2ExecutionEngine:
     self._sequence = 0
     self._base_initialized = False
     self._base_cost_price = base_cost_price
+    self._initial_position_key = _BASE_POSITION_KEY
     self._order_fee_state: dict[str, tuple[float, float]] = {}
 
   def initialize_base_position(self, symbol: str) -> None:
     """在首个交易日前将外部底仓登记到当前标的。"""
     if self._target_base_quantity <= 0:
       return
-    self._ledger.initialize_long_position(symbol, self._target_base_quantity, self._base_cost_price, _BASE_POSITION_KEY)
+    self._initial_position_key = (
+      _BASE_POSITION_KEY if self._is_overlay_mode()
+      else str(getattr(self._strategy, "position_key", "default"))
+    )
+    self._ledger.initialize_long_position(
+      symbol,
+      self._target_base_quantity,
+      self._base_cost_price,
+      self._initial_position_key,
+    )
     self._base_initialized = True
 
   def begin_day(self, trade_date: str) -> None:
@@ -148,7 +164,7 @@ class L2ExecutionEngine:
 
   def requires_day_end_quote(self) -> bool:
     """日内模式有仓位时，需要收盘前最后盘口执行强平。"""
-    if self._holding_policy != "intraday":
+    if not self._restores_at_day_end():
       return False
     snapshot = self._ledger.snapshot()
     return bool(snapshot.long_positions_by_key or snapshot.short_positions_by_key)
@@ -157,7 +173,7 @@ class L2ExecutionEngine:
     """收盘撤单并在日内模式用最后有效盘口尝试平仓。"""
     self._cancel_open_orders("日终撤单")
     self._execution_runtime.cancel_all("日终撤单")
-    if self._holding_policy == "intraday":
+    if self._restores_at_day_end():
       self._force_close_at_last_quote(trade_date)
     if self._last_bar is not None:
       self._record_equity(self._last_bar)
@@ -203,9 +219,11 @@ class L2ExecutionEngine:
     if rejection_reason:
       self._record_rejection(intent, signal_time, rejection_reason)
       return
-    if self._uses_t0_capacity(intent) and intent.quantity > self._t0_remaining():
-      self._record_rejection(intent, signal_time, "底仓做 T 剩余额度不足")
-      return
+    if self._uses_t0_capacity(intent):
+      intents = self._limit_intents_to_quantity(intents, self._t0_remaining())
+      if not intents:
+        self._record_rejection(intent, signal_time, "底仓做 T 剩余额度不足")
+        return
     for item in intents:
       if not self._valid_execution_intent(item, signal_time):
         continue
@@ -349,7 +367,7 @@ class L2ExecutionEngine:
         "availableCashBefore": round(available_cash_before, 8),
       })
     fill = Fill(time, order.intent.symbol, order.side, quantity, price, fee, order.intent.reason, order.intent.position_effect, order.intent.position_key, metadata=metadata)
-    self._ledger.apply_fill(fill)
+    applied_fill = self._ledger.apply_fill(fill)
     self._execution_runtime.on_fill(order.intent.metadata.get("parent_order_id"), quantity)
     order.remaining_quantity -= quantity
     order.filled_quantity += quantity
@@ -375,7 +393,9 @@ class L2ExecutionEngine:
       "cumulativeQuantity": order.filled_quantity,
       "commission": fee,
       "clientOrderKey": order.intent.metadata.get("client_order_key"),
-      "positionEffect": order.intent.position_effect.value if order.intent.position_effect else None,
+      "positionEffect": self._reported_position_effect(order.intent),
+      "accountPositionEffect": order.intent.position_effect.value if order.intent.position_effect else None,
+      "accountRealizedPnl": applied_fill.realized_pnl,
     })
     return quantity
 
@@ -481,7 +501,7 @@ class L2ExecutionEngine:
       "execution_mode": "l2_quote",
     })
     fill = Fill(self._last_quote.time, order.intent.symbol, order.side, quantity, price, fee, order.intent.reason, order.intent.position_effect, order.intent.position_key, metadata=metadata)
-    self._ledger.apply_fill(fill)
+    applied_fill = self._ledger.apply_fill(fill)
     order.filled_quantity += quantity
     order.remaining_quantity = 0
     order.status = "filled"
@@ -496,7 +516,9 @@ class L2ExecutionEngine:
       "cumulativeQuantity": order.filled_quantity,
       "commission": fee,
       "clientOrderKey": order.intent.metadata.get("client_order_key"),
-      "positionEffect": order.intent.position_effect.value if order.intent.position_effect else None,
+      "positionEffect": self._reported_position_effect(order.intent),
+      "accountPositionEffect": order.intent.position_effect.value if order.intent.position_effect else None,
+      "accountRealizedPnl": applied_fill.realized_pnl,
     })
     self._warnings.append(f"{order.intent.symbol} {source}")
 
@@ -542,6 +564,9 @@ class L2ExecutionEngine:
 
   def _record_equity(self, bar: NormalizedBar) -> None:
     snapshot = self._snapshot()
+    actual_quantity = sum(item.quantity for item in snapshot.long_positions.values()) - sum(
+      item.quantity for item in snapshot.short_positions.values()
+    )
     self._equity.append({
       "time": bar.end_time,
       "equity": snapshot.equity,
@@ -549,15 +574,11 @@ class L2ExecutionEngine:
       "close": bar.close,
       "longQty": sum(item.quantity for item in snapshot.long_positions.values()),
       "shortQty": sum(item.quantity for item in snapshot.short_positions.values()),
-      "baseQty": snapshot.long_positions_by_key.get(_BASE_POSITION_KEY).quantity if _BASE_POSITION_KEY in snapshot.long_positions_by_key else 0,
-      "overlayLongQty": sum(
-        position.quantity for position_key, position in snapshot.long_positions_by_key.items()
-        if position_key.endswith(_OVERLAY_LONG_SUFFIX)
-      ),
-      "overlayShortQty": sum(
-        position.quantity for position_key, position in snapshot.short_positions_by_key.items()
-        if position_key.endswith(_OVERLAY_SHORT_SUFFIX)
-      ),
+      "baseQty": self._target_base_quantity,
+      "targetBaseQty": self._target_base_quantity,
+      "actualQty": actual_quantity,
+      "overlayQty": snapshot.overlay_quantity or 0,
+      "sellableQty": snapshot.sellable_quantity or 0,
     })
 
   def _record_acceptance(self, order: L2Order, signal_time: Any) -> None:
@@ -572,7 +593,8 @@ class L2ExecutionEngine:
     self._notify_strategy_event({
       **event,
       "clientOrderKey": order.intent.metadata.get("client_order_key"),
-      "positionEffect": order.intent.position_effect.value if order.intent.position_effect else None,
+      "positionEffect": self._reported_position_effect(order.intent),
+      "accountPositionEffect": order.intent.position_effect.value if order.intent.position_effect else None,
     })
 
   def _record_rejection(self, intent: OrderIntent, signal_time: Any, reason: str) -> None:
@@ -587,7 +609,8 @@ class L2ExecutionEngine:
     self._notify_strategy_event({
       **event,
       "clientOrderKey": intent.metadata.get("client_order_key"),
-      "positionEffect": intent.position_effect.value if intent.position_effect else None,
+      "positionEffect": self._reported_position_effect(intent),
+      "accountPositionEffect": intent.position_effect.value if intent.position_effect else None,
     })
 
   @staticmethod
@@ -706,11 +729,9 @@ class L2ExecutionEngine:
     return reason
 
   def _uses_t0_capacity(self, intent: OrderIntent) -> bool:
-    return (
-      self._t0_enabled
-      and intent.position_effect in {PositionEffect.OPEN_LONG, PositionEffect.OPEN_SHORT}
-      and intent.position_key != _BASE_POSITION_KEY
-    )
+    if self._is_overlay_mode():
+      return self._t0_enabled and intent.metadata.get("source") != "system"
+    return self._t0_enabled and intent.position_effect in {PositionEffect.OPEN_LONG, PositionEffect.OPEN_SHORT}
 
   def _t0_remaining(self) -> int:
     return max(0, self._t0_available - sum(self._t0_reserved.values()))
@@ -738,53 +759,71 @@ class L2ExecutionEngine:
     if intent.position_effect != PositionEffect.CLOSE_LONG:
       return [intent], None
     snapshot = self._ledger.snapshot()
-    if self._is_overlay_mode():
-      position = snapshot.long_positions_by_key.get(intent.position_key)
-      if position is None or intent.quantity > position.quantity:
-        return [], "平多数量超过策略多仓"
-      return [intent], None
     position_keys = [intent.position_key]
-    if _BASE_POSITION_KEY in snapshot.long_positions_by_key and intent.position_key != _BASE_POSITION_KEY:
-      position_keys.append(_BASE_POSITION_KEY)
     total_position = sum(
       snapshot.long_positions_by_key.get(position_key).quantity
       for position_key in position_keys
       if snapshot.long_positions_by_key.get(position_key)
     )
-    if intent.quantity > total_position:
+    if total_position <= 0:
       return [], "平多数量超过实际持仓"
-    remaining = intent.quantity
+    remaining = min(intent.quantity, total_position)
     items: list[OrderIntent] = []
     for position_key in position_keys:
       quantity = min(remaining, self._sellable_for_position(intent.symbol, position_key))
       if quantity <= 0:
         continue
-      metadata = intent.metadata if position_key == intent.position_key else {**intent.metadata, "base_position_used": True}
-      items.append(replace(intent, quantity=quantity, position_key=position_key, metadata=metadata))
+      items.append(replace(intent, quantity=quantity, position_key=position_key))
       remaining -= quantity
       if remaining == 0:
         return items, None
-    return [], "T+1 可卖数量不足"
+    return (items, None) if items else ([], "T+1 可卖数量不足")
+
+  @staticmethod
+  def _limit_intents_to_quantity(intents: list[OrderIntent], available: int) -> list[OrderIntent]:
+    limited: list[OrderIntent] = []
+    remaining = max(0, available)
+    for intent in intents:
+      quantity = min(intent.quantity, remaining)
+      if quantity <= 0:
+        break
+      limited.append(intent if quantity == intent.quantity else replace(intent, quantity=quantity))
+      remaining -= quantity
+      if remaining == 0:
+        break
+    return limited
+
 
   def _normalize_overlay_intent(self, intent: OrderIntent) -> OrderIntent:
     if not self._is_overlay_mode():
       return intent
-    if intent.position_effect in {PositionEffect.OPEN_LONG, PositionEffect.CLOSE_LONG}:
-      return replace(intent, position_key=self._overlay_position_key(intent.position_key, _OVERLAY_LONG_SUFFIX))
-    if intent.position_effect in {PositionEffect.OPEN_SHORT, PositionEffect.CLOSE_SHORT}:
-      return replace(intent, position_key=self._overlay_position_key(intent.position_key, _OVERLAY_SHORT_SUFFIX))
-    return intent
+    effect = PositionEffect.OPEN_LONG if intent.side == OrderSide.BUY else PositionEffect.CLOSE_LONG
+    metadata = {
+      **intent.metadata,
+      "strategy_position_effect": intent.position_effect.value if intent.position_effect else None,
+      "strategy_position_key": intent.position_key,
+      "inventory_source": "base_delivery" if intent.side == OrderSide.SELL else "overlay_inventory",
+    }
+    return replace(intent, position_effect=effect, position_key=_BASE_POSITION_KEY, metadata=metadata)
 
   def _is_overlay_mode(self) -> bool:
-    return self._target_base_quantity > 0 and self._holding_policy == "intraday"
+    return self._strategy_category == "core_position_overlay"
+
+  def _restores_at_day_end(self) -> bool:
+    if self._is_overlay_mode():
+      return self._overlay_settlement_policy == "intraday_restore"
+    return self._holding_policy == "intraday"
 
   @staticmethod
-  def _overlay_position_key(position_key: str, suffix: str) -> str:
-    return position_key if position_key.endswith(suffix) else f"{position_key}{suffix}"
+  def _reported_position_effect(intent: OrderIntent) -> str | None:
+    value = intent.metadata.get("strategy_position_effect")
+    return str(value) if value else intent.position_effect.value if intent.position_effect else None
 
   def _snapshot(self):
     snapshot = self._ledger.snapshot()
-    base_position = snapshot.long_positions_by_key.get(_BASE_POSITION_KEY)
+    actual_quantity = sum(item.quantity for item in snapshot.long_positions.values()) - sum(
+      item.quantity for item in snapshot.short_positions.values()
+    )
     return snapshot.__class__(
       cash=snapshot.cash, equity=snapshot.equity, positions=snapshot.positions,
       long_positions=snapshot.long_positions, short_positions=snapshot.short_positions,
@@ -792,6 +831,7 @@ class L2ExecutionEngine:
       long_positions_by_identity=snapshot.long_positions_by_identity,
       short_positions_by_identity=snapshot.short_positions_by_identity,
       realized_pnl=snapshot.realized_pnl, base_position=self._target_base_quantity,
+      overlay_quantity=actual_quantity - self._target_base_quantity if self._is_overlay_mode() else None,
       sellable_quantity=sum(
         self._sellable_for_position(symbol, position_key)
         for symbol, position_key in self._day_sellable_by_key

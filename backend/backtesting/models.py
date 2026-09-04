@@ -110,6 +110,7 @@ class PortfolioSnapshot:
   short_positions_by_identity: dict[tuple[str, str], PositionSnapshot] = field(default_factory=dict)
   realized_pnl: float = 0.0
   base_position: int = 0
+  overlay_quantity: int | None = None
   sellable_quantity: int | None = None
   t0_available_quantity: int | None = None
 

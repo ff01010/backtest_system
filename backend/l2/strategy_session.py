@@ -347,6 +347,8 @@ def _session_payload(payload: dict[str, Any]) -> dict[str, Any]:
     "latencyMs": int(payload.get("latencyMs", 0)),
     "passiveParticipationRate": float(payload.get("passiveParticipationRate", 0.1)),
     "holdingPolicy": str(payload.get("holdingPolicy") or "intraday"),
+    "strategyCategory": str(payload.get("strategyCategory") or "directional_holding"),
+    "overlaySettlementPolicy": str(payload.get("overlaySettlementPolicy") or "intraday_restore"),
     "baseQuantity": int(payload.get("baseQuantity", 0)),
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
     "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
@@ -423,4 +425,6 @@ def _build_engine(payload: dict[str, Any], strategy: ScriptedBarStrategy) -> L2E
     ),
     str(payload.get("executionAlgorithm") or "immediate"),
     dict(payload.get("executionParameters") or {}),
+    str(payload.get("strategyCategory") or "directional_holding"),
+    str(payload.get("overlaySettlementPolicy") or "intraday_restore"),
   )
