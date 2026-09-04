@@ -253,7 +253,7 @@ def _canonical_signal(row: dict[str, Any]) -> dict[str, Any]:
 
 def _build_alignment_plan(rows: list[dict[str, Any]], bar_times: list[str]) -> list[dict[str, str]]:
   parsed_bars = sorted((_parse_bar_time(value), value) for value in bar_times)
-  plan: list[dict[str, str]] = []
+  transitions: dict[str, dict[str, str]] = {}
   cursor = 0
   for row in rows:
     effective_at = _parse_timestamp(row["effectiveAt"])
@@ -261,13 +261,15 @@ def _build_alignment_plan(rows: list[dict[str, Any]], bar_times: list[str]) -> l
       cursor += 1
     if cursor >= len(parsed_bars):
       continue
-    plan.append({
+    execution_bar_time = parsed_bars[cursor][1]
+    # 同一根 Bar 只能向策略暴露一个当前信号；排序后的最后事件代表该 Bar 的最终可见状态。
+    transitions[execution_bar_time] = {
       "signalId": row["signalId"],
       "action": row["action"],
       "effectiveAt": row["effectiveAt"],
-      "executionBarTime": parsed_bars[cursor][1],
-    })
-  return plan
+      "executionBarTime": execution_bar_time,
+    }
+  return [transitions[raw_time] for _, raw_time in parsed_bars if raw_time in transitions]
 
 
 def _parse_bar_time(value: str) -> datetime:

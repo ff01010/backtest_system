@@ -529,6 +529,31 @@ def test_research_signal_lookup_normalizes_and_forward_fills(tmp_path: Path) -> 
   assert active["20260602100500"]["signalId"] == "sig-flat"
 
 
+def test_research_signal_lookup_uses_last_transition_from_legacy_same_bar_plan(tmp_path: Path) -> None:
+  artifact_file = tmp_path / "signals.ndjson"
+  artifact_file.write_text(
+    '{"signalId":"sig-long","action":"long"}\n'
+    '{"signalId":"sig-flat","action":"flat"}\n',
+    encoding="utf-8",
+  )
+  snapshot = {
+    "artifactFile": str(artifact_file),
+    "datasetId": "dataset-1",
+    "manifest": {"version": 1},
+    "alignmentPlan": [
+      {"signalId": "sig-long", "executionBarTime": "202606020935"},
+      {"signalId": "sig-flat", "executionBarTime": "202606020935"},
+    ],
+  }
+
+  active = backtest_runner._research_signal_by_bar_time(
+    snapshot, ["202606020935", "202606020940"],
+  )
+
+  assert active["20260602093500"]["signalId"] == "sig-flat"
+  assert active["20260602094000"]["action"] == "flat"
+
+
 @pytest.mark.parametrize(
   ("signal_required", "dataset_id", "message"),
   [

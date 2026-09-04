@@ -35,7 +35,11 @@ import {
   saveCompleteStrategy,
   updateBacktestRunMeta,
 } from '../api/client';
-import type { BacktestRunPayload, BacktestTimeframeAvailability } from '../api/client';
+import type {
+  BacktestRunPayload,
+  BacktestTimeframeAvailability,
+  ResearchSignalDataset,
+} from '../api/client';
 import type {
   BacktestAccount,
   BacktestErrorDetail,
@@ -389,6 +393,32 @@ export function getResearchSignalSelectionError(
   }
   if (!signalRequired && signalDatasetId) {
     return '当前策略未声明为研究信号驱动策略，不能附加研究信号';
+  }
+  return null;
+}
+
+const RESEARCH_TIMEFRAME_MINUTES: Record<string, number> = {
+  '1m': 1,
+  '3m': 3,
+  '5m': 5,
+  '15m': 15,
+  '30m': 30,
+  '45m': 45,
+  '60m': 60,
+  '1d': 24 * 60,
+};
+
+export function getResearchSignalTimeframeError(
+  signalTimeframe: string | null | undefined,
+  backtestTimeframe: string
+): string | null {
+  if (!signalTimeframe) return null;
+  const signalMinutes = RESEARCH_TIMEFRAME_MINUTES[signalTimeframe];
+  const backtestMinutes = RESEARCH_TIMEFRAME_MINUTES[backtestTimeframe];
+  if (signalMinutes == null) return `研究信号周期 ${signalTimeframe} 暂不受支持`;
+  if (backtestMinutes == null) return `回测周期 ${backtestTimeframe} 暂不支持研究信号对齐`;
+  if (signalMinutes < backtestMinutes) {
+    return `研究信号周期 ${signalTimeframe} 细于回测周期 ${backtestTimeframe}，不能无损对齐`;
   }
   return null;
 }
@@ -1185,14 +1215,9 @@ export default function BacktestPage({
   const [strategySchemaError, setStrategySchemaError] = useState('');
   const [loadingStrategySchema, setLoadingStrategySchema] = useState(false);
   const [strategyConfigs, setStrategyConfigs] = useState<StrategyConfig[]>([]);
-  const [researchSignalDatasets, setResearchSignalDatasets] = useState<Array<{
-    id: string;
-    name: string;
-    datasetKey: string | null;
-    version: number | null;
-    timeframe: string | null;
-    recordCount: number;
-  }>>([]);
+  const [researchSignalDatasets, setResearchSignalDatasets] = useState<ResearchSignalDataset[]>([]);
+  const [researchSignalLoadError, setResearchSignalLoadError] = useState('');
+  const [loadingResearchSignals, setLoadingResearchSignals] = useState(false);
   const [selectedSignalDatasetId, setSelectedSignalDatasetId] = useState('');
   const [strategySource, setStrategySource] = useState<StrategySource | null>(null);
   const [strategySourceError, setStrategySourceError] = useState('');
@@ -1247,6 +1272,14 @@ export default function BacktestPage({
     () => Object.entries(strategyParameterSchema || {}),
     [strategyParameterSchema]
   );
+  const selectedResearchSignal = useMemo(
+    () => researchSignalDatasets.find((item) => item.id === selectedSignalDatasetId) ?? null,
+    [researchSignalDatasets, selectedSignalDatasetId]
+  );
+  const researchSignalTimeframeError = getResearchSignalTimeframeError(
+    selectedResearchSignal?.timeframe,
+    selectedTimeframe
+  );
   const strategySourceCode = useMemo(() => (
     strategySource?.sources
       .map((source) => `# ${source.path}\n\n${source.code}`)
@@ -1286,9 +1319,24 @@ export default function BacktestPage({
   useEffect(() => {
     refreshStrategyAssets();
     refreshBacktestRuns();
-    fetchResearchSignalDatasets().then(setResearchSignalDatasets).catch(() => setResearchSignalDatasets([]));
     const signalDatasetId = new URLSearchParams(window.location.search).get('signalDatasetId');
     if (signalDatasetId) setSelectedSignalDatasetId(signalDatasetId);
+    setLoadingResearchSignals(true);
+    setResearchSignalLoadError('');
+    fetchResearchSignalDatasets()
+      .then((items) => {
+        setResearchSignalDatasets(items);
+        if (signalDatasetId && !items.some((item) => item.id === signalDatasetId)) {
+          setResearchSignalLoadError('链接中的研究信号不存在、尚未发布或当前账号无权访问');
+        }
+      })
+      .catch((loadError: unknown) => {
+        setResearchSignalDatasets([]);
+        setResearchSignalLoadError(
+          loadError instanceof Error ? loadError.message : '研究信号列表加载失败'
+        );
+      })
+      .finally(() => setLoadingResearchSignals(false));
   }, []);
 
   useEffect(() => {
@@ -2066,6 +2114,11 @@ export default function BacktestPage({
     const researchSignalError = getResearchSignalSelectionError(scriptForm.signalRequired, selectedSignalDatasetId);
     if (researchSignalError) {
       setError(researchSignalError);
+      revealConfigSection('inputs');
+      return;
+    }
+    if (researchSignalTimeframeError) {
+      setError(researchSignalTimeframeError);
       revealConfigSection('inputs');
       return;
     }
@@ -3780,11 +3833,14 @@ export default function BacktestPage({
                     <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700 }}>研究信号</div>
                     <select
                       value={selectedSignalDatasetId}
-                      onChange={(event) => setSelectedSignalDatasetId(event.target.value)}
-                      disabled={isL2Quote || !scriptForm.signalRequired}
+                      onChange={(event) => {
+                        setSelectedSignalDatasetId(event.target.value);
+                        setResearchSignalLoadError('');
+                      }}
+                      disabled={isL2Quote || !scriptForm.signalRequired || loadingResearchSignals}
                       style={fieldStyle}
                     >
-                      <option value="">不使用研究信号</option>
+                      <option value="">{loadingResearchSignals ? '正在加载研究信号…' : '不使用研究信号'}</option>
                       {researchSignalDatasets.map((item) => (
                         <option key={item.id} value={item.id}>
                           {item.name} · v{item.version ?? '—'} · {item.timeframe ?? '—'} · {item.recordCount} 条
@@ -3796,6 +3852,25 @@ export default function BacktestPage({
                         ? "当前有效信号会持续注入 bar['researchSignal']；策略负责仓位、底仓与风控。"
                         : '当前策略未声明为研究信号驱动策略。'}
                     </div>
+                    {researchSignalLoadError && (
+                      <div style={{ color: '#b91c1c', fontSize: 11, lineHeight: 1.5 }}>
+                        {researchSignalLoadError}
+                      </div>
+                    )}
+                    {selectedResearchSignal && (
+                      <div style={{
+                        display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8,
+                        padding: 10, border: '1px solid #cbd5e1', borderRadius: 4, background: '#f8fafc',
+                      }}>
+                        <div><div style={labelStyle}>数据集</div><strong>{selectedResearchSignal.name}</strong></div>
+                        <div><div style={labelStyle}>不可变版本</div><strong>v{selectedResearchSignal.version ?? '—'}</strong></div>
+                        <div><div style={labelStyle}>信号周期</div><strong>{selectedResearchSignal.timeframe ?? '—'}</strong></div>
+                        <div><div style={labelStyle}>信号记录</div><strong>{selectedResearchSignal.recordCount.toLocaleString()} 条</strong></div>
+                        <div style={{ gridColumn: '1 / -1', color: researchSignalTimeframeError ? '#b91c1c' : '#047857', fontSize: 11 }}>
+                          {researchSignalTimeframeError || `可对齐到当前 ${selectedTimeframe} 回测；运行时将冻结版本和生效时点。`}
+                        </div>
+                      </div>
+                    )}
                     {isL2Quote && (
                       <div style={{ color: '#b45309', fontSize: 11, lineHeight: 1.5 }}>
                         研究信号联动首期仅支持标准 Bar 回放。

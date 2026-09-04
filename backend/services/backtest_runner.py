@@ -290,8 +290,9 @@ def _research_signal_by_bar_time(
     if not isinstance(signal_id, str) or not isinstance(bar_time, str) or not isinstance(row, dict):
       raise ValueError("研究信号对齐计划引用无效")
     canonical_time = normalize_script_bar_time(bar_time).time
-    if row.get("action") not in {"long", "short", "flat"} or canonical_time in transitions:
-      raise ValueError("同一 Bar 不能注入多条研究信号")
+    if row.get("action") not in {"long", "short", "flat"}:
+      raise ValueError("研究信号动作无效")
+    # 兼容旧快照：旧版对齐计划可能把多个顺序事件映射到同一 Bar，按计划顺序以最后一条为准。
     transitions[canonical_time] = {
       key: row[key]
       for key in (

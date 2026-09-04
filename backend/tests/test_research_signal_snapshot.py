@@ -59,6 +59,26 @@ def test_alignment_uses_first_bar_at_or_after_effective_time() -> None:
   }]
 
 
+def test_alignment_keeps_last_ordered_signal_when_events_share_one_bar() -> None:
+  rows = [
+    research_signal_snapshot._canonical_signal(_row("first", "2026-01-05T09:31:00+08:00")),
+    research_signal_snapshot._canonical_signal({
+      **_row("last", "2026-01-05T09:31:00+08:00"),
+      "sequence": 2,
+      "action": "flat",
+    }),
+  ]
+
+  plan = research_signal_snapshot._build_alignment_plan(rows, ["20260105093000", "20260105093500"])
+
+  assert plan == [{
+    "signalId": "last",
+    "action": "flat",
+    "effectiveAt": "2026-01-05T09:31:00.000000+08:00",
+    "executionBarTime": "20260105093500",
+  }]
+
+
 def test_rejects_signal_timeframe_finer_than_backtest() -> None:
   with pytest.raises(research_signal_snapshot.ResearchSignalSnapshotError, match="不能细于"):
     research_signal_snapshot._validate_timeframe_alignment("1m", "5m")

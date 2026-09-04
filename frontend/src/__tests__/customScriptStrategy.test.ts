@@ -4,6 +4,7 @@ import {
   buildSavedStrategyFingerprint,
   getConfigSectionForError,
   getResearchSignalSelectionError,
+  getResearchSignalTimeframeError,
   hasEnabledTradeDirection,
   hasLegacyTimeSlice,
   hasSavedStrategyId,
@@ -42,6 +43,15 @@ describe('isCustomScriptStrategy', () => {
     );
     expect(getResearchSignalSelectionError(true, 'dataset-1')).toBeNull();
     expect(getResearchSignalSelectionError(false, '')).toBeNull();
+  });
+
+  it('研究信号只能对齐到相同或更细的回测周期', () => {
+    expect(getResearchSignalTimeframeError('1d', '5m')).toBeNull();
+    expect(getResearchSignalTimeframeError('5m', '5m')).toBeNull();
+    expect(getResearchSignalTimeframeError('1m', '5m')).toBe(
+      '研究信号周期 1m 细于回测周期 5m，不能无损对齐'
+    );
+    expect(getResearchSignalTimeframeError('2h', '5m')).toBe('研究信号周期 2h 暂不受支持');
   });
 
   it('将运行前错误定位到对应的参数分组', () => {
