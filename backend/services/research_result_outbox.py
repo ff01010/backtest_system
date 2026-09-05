@@ -4,23 +4,20 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from psycopg.types.json import Jsonb
 
+from backend import settings
 from backend.services import state_store
-
-
-_RESEARCH_API_URL = os.getenv("RESEARCH_SIGNAL_API_URL", "").rstrip("/")
-_SERVICE_TOKEN = os.getenv("RESEARCH_SIGNAL_SERVICE_TOKEN", "")
 
 
 def dispatch_pending(limit: int = 10) -> int:
   """Attempt pending deliveries without allowing failures to affect stored runs."""
-
+  if not settings.RESEARCH_RESULT_REPORT_ENABLED:
+    return 0
   delivered = 0
   for _ in range(limit):
     item = _claim_one()
@@ -60,14 +57,16 @@ def _claim_one() -> dict[str, Any] | None:
 
 
 def _post_result(payload: dict[str, Any]) -> None:
-  if not _RESEARCH_API_URL or not _SERVICE_TOKEN:
+  if not settings.RESEARCH_SIGNAL_API_URL or not settings.RESEARCH_SIGNAL_SERVICE_TOKEN:
     raise ValueError("研究回流服务尚未配置")
+  compatible_payload = dict(payload)
+  compatible_payload.setdefault("backtestInstanceId", settings.BACKTEST_INSTANCE_ID)
   request = Request(
-    f"{_RESEARCH_API_URL}/internal/v1/backtest-links",
-    data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+    f"{settings.RESEARCH_SIGNAL_API_URL}/internal/v1/backtest-links",
+    data=json.dumps(compatible_payload, separators=(",", ":")).encode("utf-8"),
     headers={
       "Content-Type": "application/json",
-      "X-Service-Token": _SERVICE_TOKEN,
+      "X-Service-Token": settings.RESEARCH_SIGNAL_SERVICE_TOKEN,
       "X-User-Id": "backtest-service",
     },
     method="POST",

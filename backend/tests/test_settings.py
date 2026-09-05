@@ -50,6 +50,23 @@ def test_quote_prefetch_size_has_safe_bounds(monkeypatch: pytest.MonkeyPatch) ->
     settings._read_bounded_int("TEST_L2_PREFETCH_SIZE", 16, 16, 512)
 
 
+def test_read_bool_rejects_ambiguous_value(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setenv("TEST_RESEARCH_REPORT_ENABLED", "yes")
+
+  with pytest.raises(ValueError, match="true 或 false"):
+    settings._read_bool("TEST_RESEARCH_REPORT_ENABLED", False)
+
+
+def test_research_reporting_requires_target_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(settings, "BACKTEST_INSTANCE_ID", "server")
+  monkeypatch.setattr(settings, "RESEARCH_RESULT_REPORT_ENABLED", True)
+  monkeypatch.setattr(settings, "RESEARCH_SIGNAL_API_URL", "")
+  monkeypatch.setattr(settings, "RESEARCH_SIGNAL_SERVICE_TOKEN", "")
+
+  with pytest.raises(ValueError, match="必须配置研究中心地址和服务令牌"):
+    settings.validate_research_integration_configuration()
+
+
 def test_l2_strategy_config_accepts_derived_l2_timeframe() -> None:
   assert settings.validate_l2_backtest_timeframe("3m")
   assert settings.validate_backtest_timeframe("3m")

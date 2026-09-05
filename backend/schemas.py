@@ -138,6 +138,7 @@ class BacktestRunRequest(BaseModel):
   allowShort: bool = True
   strategyCategory: Literal["core_position_overlay", "directional_holding"] = "directional_holding"
   holdingPolicy: Literal["intraday", "overnight"] = "overnight"
+  overlaySettlementPolicy: Literal["intraday_restore", "cross_day_carry"] = "intraday_restore"
   fillModel: Literal["bar_next_open", "l2_quote"] = "bar_next_open"
   executionAlgorithm: Literal["immediate", "twap"] = "immediate"
   executionParameters: dict[str, Any] = Field(default_factory=dict)
@@ -170,8 +171,6 @@ class BacktestRunRequest(BaseModel):
         raise ValueError("底仓增强策略必须填写有效的底仓数量和成本价")
       if not self.t0Enabled:
         raise ValueError("底仓增强策略必须启用底仓做 T")
-      if self.holdingPolicy != "intraday":
-        raise ValueError("底仓增强策略必须在日终恢复底仓")
     elif self.strategyCategory == "directional_holding":
       if self.holdingPolicy != "overnight":
         raise ValueError("方向性持仓策略必须允许跨日持仓")
@@ -224,11 +223,28 @@ class PublicBacktestCreateRequest(BaseModel):
 
 class BacktestSummary(BaseModel):
   totalPnl: float | None
+  accountPnl: float | None = None
+  accountRealizedPnl: float | None = None
   totalReturn: float | None
   baseHoldingPnl: float | None = None
   baseHoldingReturn: float | None = None
   t0ExcessPnl: float | None = None
   t0ExcessReturn: float | None = None
+  baseBenchmarkPnl: float | None = None
+  overlayPnl: float | None = None
+  realizedOverlayPnl: float | None = None
+  unrealizedOverlayPnl: float | None = None
+  completedCyclePnl: float | None = None
+  completedCycleCount: int = 0
+  openCycleCount: int = 0
+  winningCycles: int = 0
+  losingCycles: int = 0
+  breakevenCycles: int = 0
+  cycleWinRate: float | None = None
+  tradeMetricVersion: int | None = None
+  completedTradeCount: int = 0
+  openTradeCount: int = 0
+  breakevenTrades: int = 0
   maxDrawdown: float | None
   maxDrawdownRate: float | None
   annualVolatility: float | None
@@ -275,6 +291,20 @@ class BacktestTrade(BaseModel):
   priceSource: str | None = None
   action: str | None = None
   status: str = "filled"
+  researchSignalId: str | None = None
+  researchSignalAction: Literal["long", "short", "flat"] | None = None
+  researchSignalEffectiveAt: str | None = None
+  fillId: str | None = None
+  positionKey: str | None = None
+  inventorySource: str | None = None
+  cycleId: str | None = None
+  cycleEffect: str | None = None
+  overlayQuantityBefore: int | None = None
+  overlayQuantityAfter: int | None = None
+  accountRealizedPnl: float | None = None
+  realizedOverlayPnl: float | None = None
+  totalFee: float | None = None
+  attributionSegments: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class BacktestChartTrade(BaseModel):
@@ -310,6 +340,15 @@ class DailyHoldingPoint(BaseModel):
   marketValue: float
   totalEquity: float
   dailyPnl: float
+  targetBaseQuantity: int | None = None
+  actualQuantity: int | None = None
+  overlayQuantity: int | None = None
+  sellableQuantity: int | None = None
+  dailyAccountPnl: float | None = None
+  dailyBaseBenchmarkPnl: float | None = None
+  dailyOverlayPnl: float | None = None
+  dailyRealizedOverlayPnl: float | None = None
+  unrealizedOverlayPnl: float | None = None
 
 
 class BacktestRunResponse(BaseModel):
@@ -318,27 +357,38 @@ class BacktestRunResponse(BaseModel):
   configId: str | None = None
   configVersionId: str | None = None
   scriptId: str | None = None
+  strategyCategory: Literal["core_position_overlay", "directional_holding"] | None = None
+  resultSchemaVersion: int | None = None
+  strategyMetrics: dict[str, Any] = Field(default_factory=dict)
   outputDir: str
   summary: BacktestSummary
   equity: list[EquityPoint]
   dailyHoldings: list[DailyHoldingPoint] = []
+  cycles: list[dict[str, Any]] = Field(default_factory=list)
+  executionPlans: list[dict[str, Any]] = Field(default_factory=list)
   benchmarkSymbol: str | None
   benchmarkEquity: list[BenchmarkPoint]
   benchmarkReturn: float | None
   excessReturn: float | None
   trades: list[BacktestTrade]
   skippedSignals: list[BacktestTrade] = Field(default_factory=list)
+  experimentManifest: dict[str, Any] = Field(default_factory=dict)
+  dataSnapshot: dict[str, Any] = Field(default_factory=dict)
   warnings: list[str]
 
 
 class StrategyScript(BaseModel):
   id: str
+  versionId: str | None = None
+  versionNo: int = 1
   name: str
   description: str
   language: str
   code: str
   entryType: str
+  signalRequired: bool = False
   status: str
+  contentFingerprint: str = ""
   createdAt: str
   updatedAt: str
 
@@ -348,6 +398,7 @@ class StrategyScriptCreate(BaseModel):
   description: str = ""
   code: str = Field(min_length=1)
   entryType: str = "on_bar"
+  signalRequired: bool = False
   status: str = "draft"
 
 
@@ -356,6 +407,7 @@ class StrategyScriptUpdate(BaseModel):
   description: str = ""
   code: str = Field(min_length=1)
   entryType: str = "on_bar"
+  signalRequired: bool = False
   status: str = "draft"
 
 
@@ -363,6 +415,12 @@ class StrategyConfig(BaseModel):
   id: str
   name: str
   scriptId: str | None
+  strategyVersionId: str | None = None
+  scriptVersionNo: int = 1
+  description: str = ""
+  code: str = ""
+  entryType: str = "on_bar"
+  signalRequired: bool = False
   strategy: str
   mode: str
   symbol: str
@@ -372,6 +430,8 @@ class StrategyConfig(BaseModel):
   paramsJson: dict[str, Any]
   enabled: bool
   published: bool = True
+  publishedVersionId: str | None = None
+  revision: int = 1
   createdAt: str
   updatedAt: str
 
@@ -379,6 +439,7 @@ class StrategyConfig(BaseModel):
 class StrategyConfigVersion(BaseModel):
   id: str
   configId: str
+  strategyVersionId: str | None = None
   versionNo: int
   name: str
   scriptId: str | None
@@ -416,6 +477,9 @@ class BacktestRunHistory(BaseModel):
   outputDir: str
   note: str
   tags: list[str]
+  queuedAt: str = ""
+  startedAt: str = ""
+  cancelRequested: bool = False
   createdAt: str
   finishedAt: str
 
@@ -427,6 +491,12 @@ class BacktestRunMetaUpdate(BaseModel):
 
 class BacktestRunBatchDeleteRequest(BaseModel):
   runIds: list[str] = Field(min_length=1, max_length=100)
+
+
+class BacktestCapacityOverrideRequest(BaseModel):
+  limit: int = Field(ge=8, le=12)
+  ttlSeconds: int = Field(ge=60, le=86400)
+  reason: str = Field(min_length=1, max_length=500)
 
 
 class StrategyConfigCreate(BaseModel):
@@ -466,6 +536,7 @@ class CompleteStrategySave(BaseModel):
   config: StrategyConfigCreate
   scriptId: str | None = None
   configId: str | None = None
+  expectedRevision: int | None = Field(default=None, ge=1)
 
 
 

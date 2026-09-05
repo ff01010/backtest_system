@@ -1,5 +1,6 @@
 import {
   BookOpen,
+  ChevronDown,
   Code2,
   Database,
   FileSliders,
@@ -15,11 +16,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createAccount,
   cancelBacktestRun,
-  createStrategyScript,
   deleteBacktestRun,
   deleteBacktestRuns,
   deleteStrategyConfig,
-  deleteStrategyScript,
   fetchAccounts,
   fetchBacktestRuns,
   fetchBacktestRun,
@@ -30,20 +29,24 @@ import {
   fetchStrategyParameterSchema,
   fetchStrategySource,
   fetchStrategyConfigs,
-  fetchStrategyScripts,
+  fetchStrategyConfigVersions,
   BacktestRequestError,
   runBacktest,
   saveCompleteStrategy,
   updateBacktestRunMeta,
-  updateStrategyScript,
 } from '../api/client';
-import type { BacktestRunPayload, BacktestTimeframeAvailability } from '../api/client';
+import type {
+  BacktestRunPayload,
+  BacktestTimeframeAvailability,
+  ResearchSignalDataset,
+} from '../api/client';
 import type {
   BacktestAccount,
   BacktestErrorDetail,
   BacktestRunHistory,
   BacktestRunResponse,
   BacktestSummary,
+  BacktestTrade,
   BenchmarkPoint,
   DataStatus,
   EquityPoint,
@@ -51,7 +54,6 @@ import type {
   StrategyConfig,
   StrategyParameterSchema,
   StrategyConfigVersion,
-  StrategyScript,
   StrategySource,
 } from '../types';
 import { typography } from '../styles/typography';
@@ -97,6 +99,9 @@ const fieldStyle = {
   fontSize: typography.base,
 } as const;
 
+const OVERLAY_HOLDING_GRID_COLUMNS = 'minmax(110px, 1fr) repeat(3, minmax(88px, 0.8fr)) repeat(5, minmax(116px, 1.15fr))';
+const STANDARD_HOLDING_GRID_COLUMNS = 'minmax(110px, 1fr) repeat(3, minmax(88px, 0.8fr)) repeat(4, minmax(116px, 1.15fr))';
+
 const DEFAULT_PARAMS = {
   startDate: '2026-06-01',
   endDate: '2026-06-26',
@@ -107,6 +112,7 @@ const DEFAULT_PARAMS = {
   allowShort: true,
   strategyCategory: 'directional_holding',
   holdingPolicy: 'overnight',
+  overlaySettlementPolicy: 'intraday_restore',
   fillModel: 'bar_next_open',
   executionAlgorithm: 'immediate',
   twapDurationSeconds: '300',
@@ -183,6 +189,7 @@ function getFillCount(summary: Partial<BacktestSummary> | null | undefined): num
 type BacktestParamValue = string | boolean;
 type BacktestParams = typeof DEFAULT_PARAMS & Record<string, BacktestParamValue>;
 type WorkbenchPanel = 'overview' | 'params' | 'code' | 'trades' | 'positions' | 'logs' | 'history';
+export type ConfigSectionKey = 'scope' | 'strategy' | 'inputs' | 'execution' | 'capital';
 type ChartRange = '1m' | '1y' | 'all';
 type TradeSideFilter = 'all' | 'BUY' | 'SELL';
 type TradePnlFilter = 'all' | 'win' | 'loss';
@@ -207,6 +214,7 @@ type HistoryParamKey =
   | 'allowShort'
   | 'strategyCategory'
   | 'holdingPolicy'
+  | 'overlaySettlementPolicy'
   | 'fillModel'
   | 'executionAlgorithm'
   | 'baseQuantity'
@@ -232,6 +240,7 @@ const HISTORY_PARAM_LABELS: Record<HistoryParamKey, string> = {
   allowShort: '允许做空',
   strategyCategory: '策略类别',
   holdingPolicy: '持仓规则',
+  overlaySettlementPolicy: '增强仓结算规则',
   fillModel: '成交模式',
   executionAlgorithm: '执行方式',
   baseQuantity: '底仓数量',
@@ -256,6 +265,44 @@ interface NetSeries {
   dashed?: boolean;
 }
 
+interface ConfigSectionCardProps {
+  title: string;
+  summary: string;
+  defaultOpen?: boolean;
+  sectionRef: (element: HTMLDetailsElement | null) => void;
+  children: ReactNode;
+}
+
+function ConfigSectionCard({
+  title,
+  summary,
+  defaultOpen = false,
+  sectionRef,
+  children,
+}: ConfigSectionCardProps): ReactNode {
+  return (
+    <details
+      ref={(element) => {
+        if (element && element.dataset.initialized !== 'true') {
+          element.open = defaultOpen;
+          element.dataset.initialized = 'true';
+        }
+        sectionRef(element);
+      }}
+      className="strategy-config-section"
+    >
+      <summary className="strategy-config-section-heading">
+        <span>
+          <strong>{title}</strong>
+          <small>{summary}</small>
+        </span>
+        <ChevronDown className="strategy-config-section-chevron" size={15} aria-hidden="true" />
+      </summary>
+      <div className="strategy-config-section-body">{children}</div>
+    </details>
+  );
+}
+
 function getDefaultScriptCode(timeframe: string): string {
   return `# on_bar(bar, state) 会在每根已完成的 ${timeframe} K 线调用一次。
 # 当前规则：本 Bar 收盘产生信号，并按下一根可交易 Bar 开盘价加滑点虚拟成交。
@@ -277,6 +324,7 @@ function createEmptyScriptForm(timeframe = '5m') {
     description: '',
     code: getDefaultScriptCode(timeframe),
     entryType: 'on_bar',
+    signalRequired: false,
   };
 }
 
@@ -286,6 +334,10 @@ function isValidDate(value: string) {
 
 function normalizeFillModel(value: unknown): 'bar_next_open' | 'l2_quote' {
   return value === 'l2_quote' ? 'l2_quote' : 'bar_next_open';
+}
+
+function normalizeOverlaySettlementPolicy(value: unknown): 'intraday_restore' | 'cross_day_carry' {
+  return value === 'cross_day_carry' ? 'cross_day_carry' : 'intraday_restore';
 }
 
 function calendarMonthRange(month: string): { startDate: string; endDate: string } {
@@ -332,6 +384,53 @@ export function hasEnabledTradeDirection(allowLong: boolean, allowShort: boolean
   return allowLong || allowShort;
 }
 
+export function getResearchSignalSelectionError(
+  signalRequired: boolean,
+  signalDatasetId: string
+): string | null {
+  if (signalRequired && !signalDatasetId) {
+    return '当前策略必须选择研究信号后才能运行';
+  }
+  if (!signalRequired && signalDatasetId) {
+    return '当前策略未声明为研究信号驱动策略，不能附加研究信号';
+  }
+  return null;
+}
+
+const RESEARCH_TIMEFRAME_MINUTES: Record<string, number> = {
+  '1m': 1,
+  '3m': 3,
+  '5m': 5,
+  '15m': 15,
+  '30m': 30,
+  '45m': 45,
+  '60m': 60,
+  '1d': 24 * 60,
+};
+
+export function getResearchSignalTimeframeError(
+  signalTimeframe: string | null | undefined,
+  backtestTimeframe: string
+): string | null {
+  if (!signalTimeframe) return null;
+  const signalMinutes = RESEARCH_TIMEFRAME_MINUTES[signalTimeframe];
+  const backtestMinutes = RESEARCH_TIMEFRAME_MINUTES[backtestTimeframe];
+  if (signalMinutes == null) return `研究信号周期 ${signalTimeframe} 暂不受支持`;
+  if (backtestMinutes == null) return `回测周期 ${backtestTimeframe} 暂不支持研究信号对齐`;
+  if (signalMinutes < backtestMinutes) {
+    return `研究信号周期 ${signalTimeframe} 细于回测周期 ${backtestTimeframe}，不能无损对齐`;
+  }
+  return null;
+}
+
+export function getConfigSectionForError(message: string): ConfigSectionKey {
+  if (/数据|日期|周期|标的/.test(message)) return 'scope';
+  if (/研究信号/.test(message)) return 'inputs';
+  if (/TWAP|执行时长|子单|成交模式|执行方式/.test(message)) return 'execution';
+  if (/初始资金|手续费|滑点|费用/.test(message)) return 'capital';
+  return 'strategy';
+}
+
 const TRADE_ACTION_LABELS: Record<string, string> = {
   BUY_OPEN: '买入开多',
   SELL_OPEN: '卖出开空',
@@ -374,6 +473,47 @@ export function formatTradeNote(direction: string, note: string, fundingLimited 
   return fundingLimited ? baseNote + '；资金不足限制，已成交可负担部分' : baseNote;
 }
 
+const CLOSED_TRADE_ACTION_PATTERN = /(CLOSE|COVER|STOP|FORCE)/;
+const OVERLAY_CLOSE_EFFECTS = new Set(['partial_close', 'close', 'reverse']);
+
+export function getClosedLoopTradePnl(trade: BacktestTrade, isOverlayResult: boolean): number | null {
+  if (trade.status && trade.status !== 'filled') return null;
+  if (isOverlayResult) {
+    if (!OVERLAY_CLOSE_EFFECTS.has(trade.cycleEffect || '')) return null;
+    return typeof trade.realizedOverlayPnl === 'number' && Number.isFinite(trade.realizedOverlayPnl)
+      ? trade.realizedOverlayPnl
+      : null;
+  }
+  const action = String(trade.action || trade.direction).toUpperCase();
+  if (!CLOSED_TRADE_ACTION_PATTERN.test(action) && trade.pnl === 0) return null;
+  return Number.isFinite(trade.pnl) ? trade.pnl : null;
+}
+
+function getOverlayCycleEffectLabel(value: string): string {
+  const labels: Record<string, string> = {
+    open: '开启周期',
+    increase: '增加增强仓',
+    partial_close: '部分恢复',
+    close: '完成周期',
+    reverse: '反向成交',
+  };
+  return labels[value] || value || '--';
+}
+
+function getOverlayCycleTradeDisplay(trade: BacktestTrade, cycleId: string) {
+  const segment = trade.attributionSegments?.find((item) => item.cycleId === cycleId);
+  const effect = String(segment?.cycleEffect || trade.cycleEffect || '');
+  const quantity = Number(segment?.quantity ?? trade.quantity);
+  const realizedPnl = Number(segment?.realizedOverlayPnl ?? trade.realizedOverlayPnl);
+  return {
+    effectLabel: getOverlayCycleEffectLabel(effect),
+    quantity: Number.isFinite(quantity) ? quantity : trade.quantity,
+    realizedPnl: ['partial_close', 'close', 'reverse'].includes(effect) && Number.isFinite(realizedPnl)
+      ? realizedPnl
+      : null,
+  };
+}
+
 function formatSignalTime(value: string): string {
   if (!value) return '-';
   const compact = value.replace(/\D/g, '');
@@ -384,6 +524,17 @@ function formatSignalTime(value: string): string {
     return `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
   }
   return value;
+}
+
+function formatElapsedTime(startedAt: string, now: number): string {
+  const started = Date.parse(startedAt);
+  if (!Number.isFinite(started)) return '';
+  const seconds = Math.max(0, Math.floor((now - started) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  if (hours > 0) return `${hours}小时${minutes % 60}分`;
+  if (minutes > 0) return `${minutes}分${seconds % 60}秒`;
+  return `${seconds}秒`;
 }
 
 function getTradeSource(direction: string): '策略信号' | '系统结算' {
@@ -602,6 +753,51 @@ function downloadCsv(filename: string, rows: Array<Record<string, string | numbe
   URL.revokeObjectURL(url);
 }
 
+const HISTORY_VALUE_LABELS: Record<string, string> = {
+  completed: '已完成',
+  succeeded: '已完成',
+  ok: '已完成',
+  running: '运行中',
+  queued: '排队中',
+  error: '运行失败',
+  failed: '运行失败',
+  cancelled: '已取消',
+  cancelling: '正在取消',
+  pending: '等待运行',
+  overnight: '允许跨日持仓',
+  intraday: '日内持仓',
+  intraday_restore: '日内恢复目标底仓',
+  cross_day_carry: '增强仓允许跨日',
+  bar_next_open: '下一根K线开盘成交',
+  l2_quote: 'L2盘口回放成交',
+  immediate: '立即成交',
+  twap: '时间加权拆单（TWAP）',
+  core_position_overlay: '底仓增强策略',
+  directional_holding: '方向性持仓策略',
+  on_bar_script: '策略脚本逐K线产生信号',
+  bar_close_signal: 'K线收盘产生信号',
+  bar_close_signal_fill: '收盘信号成交',
+  hit: '已命中缓存',
+  miss: '未命中缓存',
+  miss_unavailable: '缓存未命中，源数据不可用',
+  complete: '完整',
+  unknown: '未知',
+};
+
+const HISTORY_EXTRA_PARAM_LABELS: Record<string, string> = {
+  maxCandidates: '最大候选数量',
+  maxPositions: '最大持仓数量',
+  singleWeight: '单标的权重',
+  maxTotalPct: '最大总仓位',
+  rebalanceMonths: '调仓月份',
+  minHoldingDays: '最短持有天数',
+  stopLoss: '止损比例',
+  indexTrendFilter: '启用指数趋势过滤',
+  twapDurationSeconds: '拆单执行时长（秒）',
+  twapIntervalSeconds: '拆单间隔（秒）',
+  twapMinChildQuantity: '最小子单数量',
+};
+
 function formatHistoryParamValue(value: unknown) {
   if (value == null || value === '') return '--';
   if (typeof value === 'boolean') return value ? '是' : '否';
@@ -609,13 +805,8 @@ function formatHistoryParamValue(value: unknown) {
     return Number.isInteger(value) ? String(value) : value.toFixed(6);
   }
   if (typeof value === 'object') return JSON.stringify(value);
-  return String(value);
+  return HISTORY_VALUE_LABELS[String(value)] || String(value);
 }
-
-type HistorySnapshotEntry = {
-  label: string;
-  value: unknown;
-};
 
 function asHistoryRecord(value: unknown): Record<string, unknown> {
   if (value == null || typeof value !== 'object' || Array.isArray(value)) return {};
@@ -643,6 +834,7 @@ interface ResultContextBarProps {
   commissionRate: number | null;
   slippage: number | null;
   holdingPolicy: string | undefined;
+  overlaySettlementPolicy: string | undefined;
   strategyCategory: unknown;
 }
 
@@ -657,6 +849,7 @@ function ResultContextBar({
   commissionRate,
   slippage,
   holdingPolicy,
+  overlaySettlementPolicy,
   strategyCategory,
 }: ResultContextBarProps): ReactNode {
   return (
@@ -674,7 +867,10 @@ function ResultContextBar({
           <span>手续费：{commissionRate == null ? '--' : `${(commissionRate * 10_000).toFixed(2)} bp`}</span>
           <span>滑点：{slippage == null ? '--' : `${(slippage * 10_000).toFixed(2)} bp`}</span>
           <span>策略类别：{getStrategyCategoryLabel(strategyCategory)}</span>
-          <span>持仓规则：{strategyCategory === 'core_position_overlay' ? '日终恢复底仓' : holdingPolicy === 'overnight' ? '允许跨日' : '未记录'}</span>
+          <span>持仓规则：{strategyCategory === 'core_position_overlay'
+            ? overlaySettlementPolicy === 'cross_day_carry' ? '增强仓允许跨日' : '日内恢复目标底仓'
+            : holdingPolicy === 'overnight' ? '允许跨日' : '未记录'}
+          </span>
         </div>
       </details>
     </section>
@@ -690,138 +886,152 @@ function getHistoryDirectionLabel(run: BacktestRunHistory): string {
   return '未启用交易方向';
 }
 
-function shortenHistoryHash(value: unknown): string {
-  const hash = typeof value === 'string' ? value : '';
-  return hash ? hash.slice(0, 12) : '--';
+function formatHistoryBps(value: unknown): string {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? `${(numberValue * 10_000).toFixed(2)} bp` : '--';
 }
 
-function HistorySnapshotGroup({ title, entries }: { title: string; entries: HistorySnapshotEntry[] }): ReactNode {
+function formatHistoryCurrency(value: unknown): string {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue)
+    ? `¥${numberValue.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`
+    : '--';
+}
+
+function getHistoryParamLabel(key: string): string {
+  return HISTORY_PARAM_LABELS[key as HistoryParamKey] || HISTORY_EXTRA_PARAM_LABELS[key] || key;
+}
+
+function getHistoryParamDisplayValue(key: string, value: unknown): string {
+  if (key === 'commissionRate' || key === 'slippage') return formatHistoryBps(value);
+  if (key === 'initialCapital' || key === 'baseCostPrice') return formatHistoryCurrency(value);
+  return formatHistoryParamValue(value);
+}
+
+function getHistoryResearchSignal(run: BacktestRunHistory): Record<string, unknown> {
+  const manifest = run.resultJson?.experimentManifest;
+  const strategyParams = asHistoryRecord(run.paramsSnapshot);
+  const manifestSignal = asHistoryRecord(asHistoryRecord(manifest).researchSignal);
+  return Object.keys(manifestSignal).length > 0 ? manifestSignal : asHistoryRecord(strategyParams.researchSignal);
+}
+
+function HistoryKeySettings({ run, configName }: { run: BacktestRunHistory; configName: string }): ReactNode {
+  const manifest = run.resultJson?.experimentManifest;
+  const researchSignal = getHistoryResearchSignal(run);
+  const strategyCategory = run.strategyCategory || getHistoryRunParam(run, 'strategyCategory');
+  const holdingRule = strategyCategory === 'core_position_overlay'
+    ? getHistoryRunParam(run, 'overlaySettlementPolicy')
+    : getHistoryRunParam(run, 'holdingPolicy');
+  const signalVersion = researchSignal.datasetVersion == null
+    ? '未使用研究信号'
+    : `研究信号版本 ${formatHistoryParamValue(researchSignal.datasetVersion)}`;
+  const entries = [
+    ['策略方案', configName],
+    ['策略类别', getStrategyCategoryLabel(strategyCategory)],
+    ['交易方向', getHistoryDirectionLabel(run)],
+    ['持仓规则', formatHistoryParamValue(holdingRule)],
+    ['成交方式', formatHistoryParamValue(run.fillModel || manifest?.fillModel)],
+    ['执行方式', formatHistoryParamValue(getHistoryRunParam(run, 'executionAlgorithm') || 'immediate')],
+    ['初始资金', formatHistoryCurrency(getHistoryRunParam(run, 'initialCapital'))],
+    ['交易成本', `手续费 ${formatHistoryBps(getHistoryRunParam(run, 'commissionRate'))}，滑点 ${formatHistoryBps(getHistoryRunParam(run, 'slippage'))}`],
+    ['研究信号', signalVersion],
+  ];
+
   return (
-    <div style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: 10, minWidth: 0 }}>
-      <div style={{ color: '#475569', fontWeight: 700, marginBottom: 6 }}>{title}</div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '5px 10px' }}>
-        {entries.map((entry) => (
-          <div key={entry.label} style={{ minWidth: 0 }}>
-            <span style={{ color: '#64748b' }}>{entry.label}：</span>
-            <span style={{ overflowWrap: 'anywhere' }}>{formatHistoryParamValue(entry.value)}</span>
+    <section className="history-key-settings">
+      <div className="history-section-title">关键设置</div>
+      <div className="history-key-grid">
+        {entries.map(([label, value]) => (
+          <div key={label}>
+            <span>{label}</span>
+            <strong>{value}</strong>
           </div>
         ))}
       </div>
-    </div>
+    </section>
   );
 }
 
-function HistoryRunSnapshot({ run }: { run: BacktestRunHistory }): ReactNode {
+function HistoryFullParameters({ run }: { run: BacktestRunHistory }): ReactNode {
+  const strategyParams = asHistoryRecord(run.paramsSnapshot);
+  const snapshotEntries = Object.entries(strategyParams)
+    .filter(([key]) => !EXPERIMENT_PARAM_KEYS.has(key) && key !== 'researchSignal')
+    .map(([key, value]) => ({ key, label: getHistoryParamLabel(key), value }));
+
+  return (
+    <details className="history-disclosure">
+      <summary>查看完整参数（{snapshotEntries.length}项）</summary>
+      {snapshotEntries.length > 0 ? (
+        <div className="history-parameter-grid">
+          {snapshotEntries.map((entry) => (
+            <div key={entry.key}>
+              <span>{entry.label}</span>
+              <strong>{getHistoryParamDisplayValue(entry.key, entry.value)}</strong>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="history-disclosure-empty">该旧记录未保存策略参数快照。</div>
+      )}
+    </details>
+  );
+}
+
+function HistoryTechnicalDetails({ run }: { run: BacktestRunHistory }): ReactNode {
   const manifest = run.resultJson?.experimentManifest;
   const scriptSnapshot = asHistoryRecord(run.scriptSnapshot);
   const dataVersion = asHistoryRecord(run.dataVersion);
   const barSnapshot = asHistoryRecord(dataVersion.barSnapshot);
-  const strategyParams = asHistoryRecord(run.paramsSnapshot);
-  const researchSignal = asHistoryRecord(strategyParams.researchSignal);
+  const researchSignal = getHistoryResearchSignal(run);
   const dataSnapshot = asHistoryRecord(run.resultJson?.dataSnapshot);
   const temporaryAggregation = asHistoryRecord(dataSnapshot.temporaryBarAggregation);
   const temporaryDays = Array.isArray(temporaryAggregation.days) ? temporaryAggregation.days : [];
   const cacheSummary = temporaryDays.map((item) => {
     const day = asHistoryRecord(item);
-    return `${String(day.tradeDate ?? '--')}: ${String(day.cacheStatus ?? '--')}`;
+    return `${String(day.tradeDate ?? '--')}：${formatHistoryParamValue(day.cacheStatus)}`;
   }).join('；');
   const qualitySummary = temporaryDays.map((item) => {
     const day = asHistoryRecord(item);
-    return `${String(day.tradeDate ?? '--')}: ${String(day.quality ?? '--')}`;
+    return `${String(day.tradeDate ?? '--')}：${formatHistoryParamValue(day.quality)}`;
   }).join('；');
-  const snapshotEntries = Object.entries(strategyParams)
-    .filter(([key]) => !EXPERIMENT_PARAM_KEYS.has(key))
-    .map(([key, value]) => ({ label: key, value }));
-  const dataFiles = Array.isArray(dataVersion.files) ? dataVersion.files.length : null;
-  const sourceLabel = barSnapshot.derivation
-    ? '由完整 1m 数据派生日线'
-    : barSnapshot.sourcePeriod ? 'QMT 原始数据' : null;
+  const sourceLabel = barSnapshot.derivation ? '由完整1分钟数据派生' : barSnapshot.sourcePeriod ? 'QMT原始数据' : null;
+  const entries = [
+    ['任务唯一编号', run.id],
+    ['方案版本编号', run.configVersionId],
+    ['脚本编号', run.scriptId],
+    ['实验指纹', manifest?.experimentHash],
+    ['代码指纹', scriptSnapshot.codeHash ?? manifest?.strategyCodeHash],
+    ['数据指纹', dataVersion.dataHash ?? manifest?.dataHash],
+    ['研究信号数据集编号', researchSignal.datasetId],
+    ['研究信号快照指纹', researchSignal.snapshotHash],
+    ['信号生成规则', manifest?.signalModel],
+    ['K线数据范围', manifest?.barRange ? `${manifest.barRange.start} - ${manifest.barRange.end}` : null],
+    ['K线数量', manifest?.barCount],
+    ['数据来源', sourceLabel],
+    ['数据文件', Array.isArray(dataVersion.files) ? `${dataVersion.files.length}个` : null],
+    ['L2聚合版本', temporaryAggregation.aggregationVersion],
+    ['L2映射版本', temporaryAggregation.mappingVersion],
+    ['L2缓存状态', cacheSummary || null],
+    ['L2数据质量', qualitySummary || null],
+  ].filter((entry) => entry[1] != null && entry[1] !== '');
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <div style={{ color: '#0f172a', fontWeight: 700 }}>本次实际参数</div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 }}>
-        <HistorySnapshotGroup
-          title="方案与方向"
-          entries={[
-            { label: '策略', value: formatStrategyName(run.strategy) },
-            { label: '方案版本', value: run.configVersionId == null ? null : `#${run.configVersionId}` },
-            { label: '脚本', value: run.scriptId == null ? null : `#${run.scriptId}` },
-            { label: '运行周期', value: `${run.timeframe || '5m'} K 线` },
-            { label: '交易方向', value: getHistoryDirectionLabel(run) },
-            { label: '持仓规则', value: getHistoryRunParam(run, 'holdingPolicy') },
-            { label: '成交规则', value: run.fillModel || manifest?.fillModel },
-            { label: '执行方式', value: run.paramsJson.executionAlgorithm === 'twap' ? 'TWAP（L2）' : '立即成交' },
-            { label: '代码指纹', value: shortenHistoryHash(scriptSnapshot.codeHash ?? manifest?.strategyCodeHash) },
-          ]}
-        />
-        <HistorySnapshotGroup
-          title="本次实验"
-          entries={[
-            { label: '标的', value: run.symbol },
-            { label: '基准', value: run.benchmarkSymbol },
-            { label: '回测区间', value: `${run.startDate}-${run.endDate}` },
-            { label: '初始资金', value: getHistoryRunParam(run, 'initialCapital') },
-            { label: '手续费率', value: getHistoryRunParam(run, 'commissionRate') },
-            { label: '滑点', value: getHistoryRunParam(run, 'slippage') },
-          ]}
-        />
-        {Object.keys(researchSignal).length > 0 && (
-          <HistorySnapshotGroup
-            title="研究信号快照"
-            entries={[
-              { label: '数据集', value: researchSignal.datasetId },
-              { label: '版本', value: researchSignal.datasetVersion },
-              { label: '源周期', value: researchSignal.sourceTimeframe },
-              { label: '回测周期', value: researchSignal.backtestTimeframe },
-              { label: '冻结行数', value: researchSignal.rowCount },
-              { label: '快照指纹', value: shortenHistoryHash(researchSignal.snapshotHash) },
-            ]}
-          />
-        )}
-        <HistorySnapshotGroup
-          title="执行与数据"
-          entries={[
-            { label: '信号规则', value: manifest?.signalModel },
-            { label: 'K 线数量', value: manifest?.barCount },
-            { label: '数据范围', value: manifest?.barRange ? `${manifest.barRange.start} - ${manifest.barRange.end}` : null },
-            { label: '数据周期', value: manifest?.barRange?.timeframe },
-            { label: '数据来源', value: sourceLabel },
-            { label: '数据文件', value: dataFiles == null ? null : `${dataFiles} 个` },
-            { label: '数据指纹', value: shortenHistoryHash(dataVersion.dataHash ?? manifest?.dataHash) },
-          ]}
-        />
-        {Object.keys(temporaryAggregation).length > 0 && (
-          <HistorySnapshotGroup
-            title="L2 临时聚合"
-            entries={[
-              { label: 'Bar 来源', value: temporaryAggregation.inputTable },
-              { label: '聚合版本', value: temporaryAggregation.aggregationVersion },
-              { label: '映射版本', value: temporaryAggregation.mappingVersion },
-              { label: '缓存状态', value: cacheSummary || '--' },
-              { label: 'Bar 质量', value: qualitySummary || '--' },
-            ]}
-          />
-        )}
-      </div>
-      <details open style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: '8px 10px' }}>
-        <summary style={{ color: '#475569', cursor: 'pointer', fontWeight: 700 }}>
-          策略参数快照（{snapshotEntries.length} 项）
-        </summary>
-        {snapshotEntries.length > 0 ? (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: '6px 12px', marginTop: 8 }}>
-            {snapshotEntries.map((entry) => (
-              <div key={entry.label} style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
-                <span style={{ color: '#64748b' }}>{entry.label}：</span>
-                <span>{formatHistoryParamValue(entry.value)}</span>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div style={{ color: '#b45309', marginTop: 8 }}>该旧记录未保存策略参数快照。</div>
-        )}
-      </details>
-    </div>
+    <details className="history-disclosure history-technical-disclosure">
+      <summary>复现与技术信息</summary>
+      {entries.length > 0 ? (
+        <div className="history-technical-list">
+          {entries.map(([label, value]) => (
+            <div className="history-technical-row" key={String(label)}>
+              <span>{String(label)}</span>
+              <code>{formatHistoryParamValue(value)}</code>
+              <button type="button" onClick={() => void navigator.clipboard?.writeText(String(value))}>复制</button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="history-disclosure-empty">该记录没有可用的技术快照。</div>
+      )}
+    </details>
   );
 }
 
@@ -872,20 +1082,31 @@ function getHistoryParamPairs(run: BacktestRunHistory) {
     ['timeframe', run.timeframe],
     ['startDate', run.startDate],
     ['endDate', run.endDate],
-    ['initialCapital', params.initialCapital],
-    ['commissionRate', params.commissionRate],
-    ['slippage', params.slippage],
-    ['allowLong', params.allowLong],
-    ['allowShort', params.allowShort],
+    ['initialCapital', getHistoryRunParam(run, 'initialCapital')],
+    ['commissionRate', getHistoryRunParam(run, 'commissionRate')],
+    ['slippage', getHistoryRunParam(run, 'slippage')],
+    ['allowLong', getHistoryRunParam(run, 'allowLong')],
+    ['allowShort', getHistoryRunParam(run, 'allowShort')],
+    ['strategyCategory', getHistoryRunParam(run, 'strategyCategory')],
+    ['holdingPolicy', getHistoryRunParam(run, 'holdingPolicy')],
+    ['overlaySettlementPolicy', getHistoryRunParam(run, 'overlaySettlementPolicy')],
+    ['fillModel', run.fillModel],
+    ['executionAlgorithm', params.executionAlgorithm],
+    ['baseQuantity', getHistoryRunParam(run, 'baseQuantity')],
+    ['baseCostPrice', getHistoryRunParam(run, 'baseCostPrice')],
+    ['initialPositionEnabled', getHistoryRunParam(run, 'initialPositionEnabled')],
+    ['t0Enabled', getHistoryRunParam(run, 't0Enabled')],
   ];
   return pairs;
 }
 
 function compareHistoryRuns(left: BacktestRunHistory | null, right: BacktestRunHistory | null) {
   if (!left || !right) return [];
+  const hiddenKeys = new Set<HistoryParamKey>(['configId', 'configVersionId', 'scriptId', 'accountId']);
   const leftPairs = new Map(getHistoryParamPairs(left));
   const rightPairs = new Map(getHistoryParamPairs(right));
   return (Object.keys(HISTORY_PARAM_LABELS) as HistoryParamKey[])
+    .filter((key) => !hiddenKeys.has(key))
     .map((key) => {
       const leftValue = leftPairs.get(key);
       const rightValue = rightPairs.get(key);
@@ -912,7 +1133,7 @@ function sortFingerprintValue(value: unknown): unknown {
   return value;
 }
 
-function buildStrategyDraftFingerprint(input: {
+export function buildStrategyDraftFingerprint(input: {
   strategy: string;
   mode: string;
   symbol: string;
@@ -920,7 +1141,7 @@ function buildStrategyDraftFingerprint(input: {
   benchmarkSymbol: string;
   accountId: number | '';
   params: Record<string, unknown>;
-  script: { code: string; entryType: string };
+  script: { code: string; entryType: string; signalRequired: boolean };
 }): string {
   return JSON.stringify(sortFingerprintValue({
     strategy: input.strategy,
@@ -932,6 +1153,26 @@ function buildStrategyDraftFingerprint(input: {
     params: input.params,
     script: input.script,
   }));
+}
+
+export function buildSavedStrategyFingerprint(config: StrategyConfig): string {
+  const savedParams = config.paramsJson.params as Record<string, unknown> | undefined;
+  return buildStrategyDraftFingerprint({
+    strategy: config.strategy,
+    mode: config.mode,
+    symbol: config.symbol,
+    timeframe: config.timeframe,
+    benchmarkSymbol: config.benchmarkSymbol || config.symbol,
+    accountId: config.accountId || '',
+    params: Object.fromEntries(
+      Object.entries(savedParams || {}).filter(([key]) => key !== 'warmupTradingDays')
+    ),
+    script: {
+      code: config.code,
+      entryType: config.entryType,
+      signalRequired: config.signalRequired,
+    },
+  });
 }
 
 export default function BacktestPage({
@@ -967,21 +1208,16 @@ export default function BacktestPage({
   const [loadingDataStatus, setLoadingDataStatus] = useState(false);
   const [loadingBenchmarkDataStatus, setLoadingBenchmarkDataStatus] = useState(false);
   const [params, setParams] = useState<BacktestParams>(DEFAULT_PARAMS);
+  const configSectionRefs = useRef<Partial<Record<ConfigSectionKey, HTMLDetailsElement | null>>>({});
   const [calendarMonth, setCalendarMonth] = useState(DEFAULT_PARAMS.startDate.slice(0, 7));
   const [calendarPreflight, setCalendarPreflight] = useState<Awaited<ReturnType<typeof fetchBacktestPreflight>> | null>(null);
   const [strategyParameterSchema, setStrategyParameterSchema] = useState<StrategyParameterSchema | null>(null);
   const [strategySchemaError, setStrategySchemaError] = useState('');
   const [loadingStrategySchema, setLoadingStrategySchema] = useState(false);
-  const [strategyScripts, setStrategyScripts] = useState<StrategyScript[]>([]);
   const [strategyConfigs, setStrategyConfigs] = useState<StrategyConfig[]>([]);
-  const [researchSignalDatasets, setResearchSignalDatasets] = useState<Array<{
-    id: string;
-    name: string;
-    datasetKey: string | null;
-    version: number | null;
-    timeframe: string | null;
-    recordCount: number;
-  }>>([]);
+  const [researchSignalDatasets, setResearchSignalDatasets] = useState<ResearchSignalDataset[]>([]);
+  const [researchSignalLoadError, setResearchSignalLoadError] = useState('');
+  const [loadingResearchSignals, setLoadingResearchSignals] = useState(false);
   const [selectedSignalDatasetId, setSelectedSignalDatasetId] = useState('');
   const [strategySource, setStrategySource] = useState<StrategySource | null>(null);
   const [strategySourceError, setStrategySourceError] = useState('');
@@ -1003,7 +1239,6 @@ export default function BacktestPage({
   const [configName, setConfigName] = useState('');
   const [scriptForm, setScriptForm] = useState(createEmptyScriptForm());
   const [strategyGuideOpen, setStrategyGuideOpen] = useState(false);
-  const hasSelectedScript = hasSavedStrategyId(selectedScriptId);
   const hasSelectedConfig = hasSavedStrategyId(selectedConfigId);
   const [activePanel, setActivePanel] = useState<WorkbenchPanel>('overview');
   const [chartRange, setChartRange] = useState<ChartRange>('all');
@@ -1020,6 +1255,8 @@ export default function BacktestPage({
   const [holdingStatusFilter, setHoldingStatusFilter] = useState<HoldingStatusFilter>('all');
   const [holdingStartDate, setHoldingStartDate] = useState('');
   const [holdingEndDate, setHoldingEndDate] = useState('');
+  const [holdingPage, setHoldingPage] = useState(1);
+  const [holdingPageSize, setHoldingPageSize] = useState(20);
   const [tradeColumns, setTradeColumns] = useState<Record<TradeColumnKey, boolean>>({
     time: true,
     executionTime: true,
@@ -1034,6 +1271,14 @@ export default function BacktestPage({
   const strategyParameterFields = useMemo(
     () => Object.entries(strategyParameterSchema || {}),
     [strategyParameterSchema]
+  );
+  const selectedResearchSignal = useMemo(
+    () => researchSignalDatasets.find((item) => item.id === selectedSignalDatasetId) ?? null,
+    [researchSignalDatasets, selectedSignalDatasetId]
+  );
+  const researchSignalTimeframeError = getResearchSignalTimeframeError(
+    selectedResearchSignal?.timeframe,
+    selectedTimeframe
   );
   const strategySourceCode = useMemo(() => (
     strategySource?.sources
@@ -1053,11 +1298,13 @@ export default function BacktestPage({
     script: {
       code: scriptForm.code,
       entryType: scriptForm.entryType,
+      signalRequired: scriptForm.signalRequired,
     },
   }), [
     params,
     scriptForm.code,
     scriptForm.entryType,
+    scriptForm.signalRequired,
     selectedAccountId,
     selectedBenchmarkSymbol,
     selectedStrategy,
@@ -1072,9 +1319,24 @@ export default function BacktestPage({
   useEffect(() => {
     refreshStrategyAssets();
     refreshBacktestRuns();
-    fetchResearchSignalDatasets().then(setResearchSignalDatasets).catch(() => setResearchSignalDatasets([]));
     const signalDatasetId = new URLSearchParams(window.location.search).get('signalDatasetId');
     if (signalDatasetId) setSelectedSignalDatasetId(signalDatasetId);
+    setLoadingResearchSignals(true);
+    setResearchSignalLoadError('');
+    fetchResearchSignalDatasets()
+      .then((items) => {
+        setResearchSignalDatasets(items);
+        if (signalDatasetId && !items.some((item) => item.id === signalDatasetId)) {
+          setResearchSignalLoadError('链接中的研究信号不存在、尚未发布或当前账号无权访问');
+        }
+      })
+      .catch((loadError: unknown) => {
+        setResearchSignalDatasets([]);
+        setResearchSignalLoadError(
+          loadError instanceof Error ? loadError.message : '研究信号列表加载失败'
+        );
+      })
+      .finally(() => setLoadingResearchSignals(false));
   }, []);
 
   useEffect(() => {
@@ -1084,6 +1346,7 @@ export default function BacktestPage({
       try {
         const run = await fetchBacktestRun(pendingRun.runId);
         if (disposed) return;
+        setBacktestRuns((prev) => prev.map((item) => (item.id === run.id ? run : item)));
         if (run.status === 'ok' && run.resultJson) {
           setResult({
             ...run.resultJson,
@@ -1122,6 +1385,37 @@ export default function BacktestPage({
       window.clearInterval(timer);
     };
   }, [pendingRun]);
+
+  const backgroundActiveRunIds = backtestRuns
+    .filter((run) => (
+      run.id !== pendingRun?.runId
+      && (run.status === 'queued' || run.status === 'running' || run.status === 'cancelling')
+    ))
+    .map((run) => run.id)
+    .join(',');
+
+  useEffect(() => {
+    if (!backgroundActiveRunIds) return undefined;
+    let disposed = false;
+    const poll = async () => {
+      const settled = await Promise.allSettled(
+        backgroundActiveRunIds.split(',').map((runId) => fetchBacktestRun(runId)),
+      );
+      if (disposed) return;
+      const updates = new Map(
+        settled.flatMap((item) => item.status === 'fulfilled' ? [[item.value.id, item.value] as const] : []),
+      );
+      if (updates.size > 0) {
+        setBacktestRuns((prev) => prev.map((item) => updates.get(item.id) || item));
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 2000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [backgroundActiveRunIds]);
 
   useEffect(() => {
     if (!hasSelectedConfig || !publishedFingerprint) return;
@@ -1224,7 +1518,23 @@ export default function BacktestPage({
   }, [tradeSideFilter, tradePnlFilter, tradeStatusFilter, tradePageSize, result]);
 
   useEffect(() => {
-    setConfigVersions([]);
+    setHoldingPage(1);
+  }, [holdingStartDate, holdingEndDate, holdingStatusFilter, holdingPageSize, result]);
+
+  useEffect(() => {
+    if (!selectedConfigId) {
+      setConfigVersions([]);
+      return;
+    }
+    let cancelled = false;
+    fetchStrategyConfigVersions(selectedConfigId)
+      .then((versions) => {
+        if (!cancelled) setConfigVersions(versions);
+      })
+      .catch(() => {
+        if (!cancelled) setConfigVersions([]);
+      });
+    return () => { cancelled = true; };
   }, [selectedConfigId]);
 
   useEffect(() => {
@@ -1303,11 +1613,7 @@ export default function BacktestPage({
   };
 
   const refreshStrategyAssets = async () => {
-    const [scripts, configs] = await Promise.all([
-      fetchStrategyScripts(),
-      fetchStrategyConfigs(),
-    ]);
-    setStrategyScripts(scripts);
+    const configs = await fetchStrategyConfigs();
     setStrategyConfigs(configs);
   };
 
@@ -1376,25 +1682,15 @@ export default function BacktestPage({
       });
     }
     setVersionDirty(false);
-    const script = strategyScripts.find((item) => item.id === config.scriptId);
-    if (script) {
-      setScriptForm({
-        name: script.name,
-        description: script.description,
-        code: script.code,
-        entryType: script.entryType,
-      });
-      setPublishedFingerprint(buildStrategyDraftFingerprint({
-        strategy: config.strategy,
-        mode: 'backtest',
-        symbol: config.symbol,
-        timeframe: config.timeframe,
-        benchmarkSymbol: config.benchmarkSymbol || config.symbol,
-        accountId: config.accountId || '',
-        params: Object.fromEntries(Object.entries(savedParams || {}).filter(([key]) => key !== 'warmupTradingDays')),
-        script: { code: script.code, entryType: script.entryType },
-      }));
-    }
+    setScriptForm({
+      name: config.name,
+      description: config.description,
+      code: config.code,
+      entryType: config.entryType,
+      signalRequired: config.signalRequired,
+    });
+    if (!config.signalRequired) setSelectedSignalDatasetId('');
+    setPublishedFingerprint(buildSavedStrategyFingerprint(config));
     setStatus(`已加载策略 ${config.name}`);
     setError('');
   };
@@ -1423,9 +1719,25 @@ export default function BacktestPage({
     setParams((prev) => ({ ...prev, [key]: value }));
   };
 
+  const revealConfigSection = (section: ConfigSectionKey) => {
+    const element = configSectionRefs.current[section];
+    if (!element) return;
+    element.open = true;
+    window.requestAnimationFrame(() => {
+      element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+  };
+
   const setStrategyCategory = (strategyCategory: 'core_position_overlay' | 'directional_holding') => {
     setParams((prev) => strategyCategory === 'core_position_overlay'
-      ? { ...prev, strategyCategory, holdingPolicy: 'intraday', initialPositionEnabled: true, t0Enabled: true }
+      ? {
+        ...prev,
+        strategyCategory,
+        holdingPolicy: 'intraday',
+        overlaySettlementPolicy: normalizeOverlaySettlementPolicy(prev.overlaySettlementPolicy),
+        initialPositionEnabled: true,
+        t0Enabled: true,
+      }
       : {
         ...prev,
         strategyCategory,
@@ -1612,20 +1924,6 @@ export default function BacktestPage({
     if (account) applyAccount(account);
   };
 
-  const handleScriptSelect = (value: string) => {
-    const scriptId = value || '';
-    setSelectedScriptId(scriptId);
-    const script = strategyScripts.find((item) => item.id === scriptId);
-    if (!script) return;
-    setScriptForm({
-      name: script.name,
-      description: script.description,
-      code: script.code,
-      entryType: script.entryType,
-    });
-    if (script.entryType === 'on_bar') setSelectedStrategy('user_script');
-  };
-
   const handleConfigSelect = (value: string) => {
     if (!value) {
       setSelectedConfigId('');
@@ -1636,7 +1934,7 @@ export default function BacktestPage({
     if (config) applyStrategyConfig(config);
   };
 
-  const handleNewScript = () => {
+  const handleNewStrategy = () => {
     setSelectedConfigId('');
     setSelectedScriptId('');
     setConfigName('');
@@ -1649,54 +1947,25 @@ export default function BacktestPage({
     setError('');
   };
 
-  const handleSaveScript = async () => {
+  const handleCopyStrategy = () => {
+    if (!hasSelectedConfig) return;
+    const sourceName = configName.trim() || scriptForm.name.trim() || '未命名策略';
+    const existingNames = new Set(strategyConfigs.map((item) => item.name));
+    let copyNumber = 1;
+    let copiedName = `${sourceName} 副本`;
+    while (existingNames.has(copiedName)) {
+      copyNumber += 1;
+      copiedName = `${sourceName} 副本 ${copyNumber}`;
+    }
+    setSelectedConfigId('');
+    setSelectedScriptId('');
+    setConfigVersions([]);
+    setConfigName(copiedName);
+    setScriptForm((previous) => ({ ...previous, name: copiedName }));
+    setPublishedFingerprint('');
+    setVersionDirty(true);
+    setStatus('已复制为新策略草稿；保存后会创建独立脚本和独立版本链');
     setError('');
-    setStatus('');
-    if (!scriptForm.name.trim()) {
-      setError('策略脚本名称不能为空');
-      return;
-    }
-    try {
-      const payload = {
-        name: scriptForm.name.trim(),
-        description: scriptForm.description.trim(),
-        code: scriptForm.code,
-        entryType: scriptForm.entryType,
-      };
-      const script = hasSelectedScript
-        ? await updateStrategyScript(selectedScriptId, payload)
-        : await createStrategyScript(payload);
-      await refreshStrategyAssets();
-      setSelectedScriptId(script.id);
-      setScriptForm({
-        name: script.name,
-        description: script.description,
-        code: script.code,
-        entryType: script.entryType,
-      });
-      if (hasSelectedConfig) {
-        setStatus(`已保存策略代码 ${script.name}，请继续保存策略配置`);
-      } else {
-        setStatus(`已保存策略脚本 ${script.name}`);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '保存策略脚本失败');
-    }
-  };
-
-  const handleDeleteScript = async () => {
-    if (!hasSelectedScript) return;
-    setError('');
-    setStatus('');
-    try {
-      await deleteStrategyScript(selectedScriptId);
-      await refreshStrategyAssets();
-      setSelectedScriptId('');
-      setScriptForm(createEmptyScriptForm(selectedTimeframe));
-      setStatus('已删除策略脚本');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '删除策略脚本失败');
-    }
   };
 
   const showPreflightNotice = (message: string): void => {
@@ -1739,6 +2008,7 @@ export default function BacktestPage({
         entryType: isCustomScript
           ? 'on_bar'
           : (strategySource ? `catalog:${strategySource.id}` : scriptForm.entryType),
+        signalRequired: isCustomScript ? scriptForm.signalRequired : false,
       };
       const strategyId = isCustomScript ? 'user_script' : selectedStrategy;
       const configPayload = {
@@ -1749,12 +2019,14 @@ export default function BacktestPage({
         ),
         publish: false,
       };
-      const existingConfig = strategyConfigs.find((item) => item.name === strategyName);
-      const targetConfigId = hasSelectedConfig
-        ? selectedConfigId
-        : existingConfig?.id;
+      const currentConfig = strategyConfigs.find((item) => item.id === selectedConfigId);
+      const targetConfigId = hasSelectedConfig ? selectedConfigId : null;
       const { script: savedScript, config } = await saveCompleteStrategy(
-        scriptPayload, configPayload, hasSelectedScript ? selectedScriptId : null, targetConfigId || null,
+        scriptPayload,
+        configPayload,
+        hasSelectedConfig ? selectedScriptId : null,
+        targetConfigId,
+        currentConfig?.revision ?? null,
       );
       await refreshStrategyAssets();
       setSelectedConfigId(config.id);
@@ -1766,8 +2038,9 @@ export default function BacktestPage({
         description: savedScript.description,
         code: savedScript.code,
         entryType: savedScript.entryType,
+        signalRequired: savedScript.signalRequired,
       });
-      setPublishedFingerprint(draftFingerprint);
+      setPublishedFingerprint(buildSavedStrategyFingerprint(config));
       setVersionDirty(false);
       setStatus(`已保存策略 ${config.name}`);
       return config.id;
@@ -1782,16 +2055,7 @@ export default function BacktestPage({
     setError('');
     setStatus('');
     try {
-      const deletedConfig = strategyConfigs.find((item) => item.id === selectedConfigId) || null;
       await deleteStrategyConfig(selectedConfigId);
-      if (deletedConfig?.scriptId != null) {
-        const stillUsed = strategyConfigs.some(
-          (item) => item.id !== selectedConfigId && item.scriptId === deletedConfig.scriptId
-        );
-        if (!stillUsed) {
-          await deleteStrategyScript(deletedConfig.scriptId);
-        }
-      }
       await refreshStrategyAssets();
       setSelectedConfigId('');
       setSelectedScriptId('');
@@ -1839,20 +2103,35 @@ export default function BacktestPage({
     setBacktestErrorDetail(null);
     if (!hasSelectedConfig) {
       setError('请先选择策略方案，再运行回测');
+      revealConfigSection('strategy');
       return;
     }
     if (versionDirty) {
       setError('策略内容已修改，请先保存策略');
+      revealConfigSection('strategy');
+      return;
+    }
+    const researchSignalError = getResearchSignalSelectionError(scriptForm.signalRequired, selectedSignalDatasetId);
+    if (researchSignalError) {
+      setError(researchSignalError);
+      revealConfigSection('inputs');
+      return;
+    }
+    if (researchSignalTimeframeError) {
+      setError(researchSignalTimeframeError);
+      revealConfigSection('inputs');
       return;
     }
     const selectedPreflight = preflight?.timeframes.find((item) => item.timeframe === selectedTimeframe);
     if (!selectedPreflight?.available) {
       showPreflightNotice(selectedPreflight?.reason || '正在检查当前策略的数据可用性');
+      revealConfigSection('scope');
       return;
     }
     const validationErrors = validateParams(params);
     if (validationErrors.length > 0) {
       setError(validationErrors.join('；'));
+      revealConfigSection(getConfigSectionForError(validationErrors[0]));
       return;
     }
     setRunning(true);
@@ -1877,6 +2156,7 @@ export default function BacktestPage({
         slippage: Number(params.slippage),
         allowLong: params.allowLong,
         allowShort: params.allowShort,
+        overlaySettlementPolicy: normalizeOverlaySettlementPolicy(params.overlaySettlementPolicy),
         strategyCategory: params.strategyCategory === 'core_position_overlay' ? 'core_position_overlay' : 'directional_holding',
         holdingPolicy: params.strategyCategory === 'core_position_overlay' ? 'intraday' : 'overnight',
         fillModel: normalizeFillModel(params.fillModel),
@@ -2051,22 +2331,40 @@ export default function BacktestPage({
 
   const activeRun = useMemo(() => {
     const pending = pendingRun ? backtestRuns.find((run) => run.id === pendingRun.runId) : null;
-    if (pending && (pending.status === 'queued' || pending.status === 'running')) return pending;
-    return backtestRuns.find((run) => run.status === 'running')
+    if (pending && (pending.status === 'queued' || pending.status === 'running' || pending.status === 'cancelling')) return pending;
+    return backtestRuns.find((run) => run.status === 'cancelling')
+      || backtestRuns.find((run) => run.status === 'running')
       || backtestRuns.find((run) => run.status === 'queued')
       || null;
   }, [backtestRuns, pendingRun]);
+  const [activeRunClock, setActiveRunClock] = useState(Date.now());
+
+  useEffect(() => {
+    if (!activeRun || activeRun.status === 'queued') return undefined;
+    setActiveRunClock(Date.now());
+    const timer = window.setInterval(() => setActiveRunClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [activeRun?.id, activeRun?.status]);
+  const activeRunElapsed = activeRun?.startedAt
+    ? formatElapsedTime(activeRun.startedAt, activeRunClock)
+    : '';
 
   const handleCancelRun = async () => {
     if (!activeRun) return;
     setCancellingRun(true);
     setError('');
     try {
-      await cancelBacktestRun(activeRun.id);
-      setStatus(`回测 ${formatRunReference(activeRun.displayNo)} 正在取消，当前处理块结束后停止`);
-      await refreshBacktestRuns();
+      const response = await cancelBacktestRun(activeRun.id);
+      const run = await fetchBacktestRun(activeRun.id);
+      setBacktestRuns((prev) => prev.map((item) => (item.id === run.id ? run : item)));
+      setStatus(
+        response.status === 'cancelling'
+          ? `回测 ${formatRunReference(activeRun.displayNo)} 正在取消`
+          : `回测 ${formatRunReference(activeRun.displayNo)} ${response.status === 'cancelled' ? '已取消' : '已结束'}`,
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : '取消回测失败');
+      await refreshBacktestRuns().catch(() => undefined);
     } finally {
       setCancellingRun(false);
     }
@@ -2079,19 +2377,32 @@ export default function BacktestPage({
   const latestHolding = filteredDailyHoldings[filteredDailyHoldings.length - 1];
   const longHoldingDays = filteredDailyHoldings.filter((holding) => getHoldingStatus(holding) === 'long').length;
   const shortHoldingDays = filteredDailyHoldings.filter((holding) => getHoldingStatus(holding) === 'short').length;
+  const holdingPageCount = Math.max(1, Math.ceil(filteredDailyHoldings.length / holdingPageSize));
+  const safeHoldingPage = Math.min(holdingPage, holdingPageCount);
+  const holdingPageStart = filteredDailyHoldings.length > 0 ? (safeHoldingPage - 1) * holdingPageSize + 1 : 0;
+  const holdingPageEnd = Math.min(safeHoldingPage * holdingPageSize, filteredDailyHoldings.length);
+  const pagedDailyHoldings = filteredDailyHoldings.slice(
+    holdingPageStart > 0 ? holdingPageStart - 1 : 0,
+    holdingPageEnd,
+  );
   const allSignals = result
     ? [...result.trades, ...(result.skippedSignals || [])].sort((left, right) => (
       (left.signalTime || left.time).localeCompare(right.signalTime || right.time)
     ))
     : [];
+  const tradeByFillId = new Map<string, BacktestTrade>();
+  for (const trade of result?.trades || []) {
+    if (trade.fillId) tradeByFillId.set(trade.fillId, trade);
+  }
   const filledSignalCount = allSignals.filter((trade) => trade.status !== 'skipped').length;
   const skippedSignalCount = allSignals.length - filledSignalCount;
   const filteredTrades = allSignals.filter((trade) => {
     if (tradeSideFilter !== 'all' && trade.side !== tradeSideFilter) return false;
     if (tradeStatusFilter === 'filled' && trade.status === 'skipped') return false;
     if (tradeStatusFilter === 'skipped' && trade.status !== 'skipped') return false;
-    if (tradePnlFilter === 'win' && trade.pnl <= 0) return false;
-    if (tradePnlFilter === 'loss' && trade.pnl >= 0) return false;
+    const closedLoopPnl = getClosedLoopTradePnl(trade, isOverlayResult);
+    if (tradePnlFilter === 'win' && (closedLoopPnl === null || closedLoopPnl <= 0)) return false;
+    if (tradePnlFilter === 'loss' && (closedLoopPnl === null || closedLoopPnl >= 0)) return false;
     return true;
   });
   const tradePageCount = Math.max(1, Math.ceil(filteredTrades.length / tradePageSize));
@@ -2161,9 +2472,12 @@ export default function BacktestPage({
           : trade.strategyModule === 'B'
             ? 'B 均值'
             : '策略信号';
-        const source = isSystem ? systemSource : moduleName;
+        const researchContext = trade.researchSignalId
+          ? ` · ${trade.researchSignalAction || '研究信号'}`
+          : '';
+        const source = isSystem ? systemSource : `${moduleName}${researchContext}`;
         return (
-          <span style={{
+          <span title={trade.researchSignalId ? `研究信号 ${trade.researchSignalId}` : undefined} style={{
             display: 'inline-flex', alignItems: 'center', height: 22, padding: '0 7px',
             borderRadius: 11, fontSize: 11, fontWeight: 700,
             color: isSystem ? '#9a3412' : '#0369a1',
@@ -2199,11 +2513,15 @@ export default function BacktestPage({
       label: '收益',
       width: 'minmax(90px, 0.9fr)',
       align: 'right',
-      render: (trade) => (
-        <span className={`trade-pnl-value ${trade.pnl > 0 ? 'is-profit' : trade.pnl < 0 ? 'is-loss' : ''}`} style={{ color: getPnlColor(trade.pnl), fontWeight: 600 }}>
-          {trade.pnl.toFixed(2)}
-        </span>
-      ),
+      render: (trade) => {
+        const closedLoopPnl = getClosedLoopTradePnl(trade, isOverlayResult);
+        if (closedLoopPnl === null) return <span title="本次成交尚未形成闭环">--</span>;
+        return (
+          <span className={`trade-pnl-value ${closedLoopPnl > 0 ? 'is-profit' : closedLoopPnl < 0 ? 'is-loss' : ''}`} style={{ color: getPnlColor(closedLoopPnl), fontWeight: 600 }}>
+            {closedLoopPnl.toFixed(2)}
+          </span>
+        );
+      },
     },
   ];
   const visibleTradeColumns = tradeColumnDefs.filter((column) => tradeColumns[column.key]);
@@ -2232,30 +2550,31 @@ export default function BacktestPage({
     };
   }, [dailyHoldings, isOverlayResult, result, resultBaseCostPrice, resultBaseQuantity, resultInitialCash]);
   const coreMetrics = isOverlayResult ? [
-    ['做T超额收益', overlaySummary ? formatMoney(overlaySummary.t0ExcessPnl) : '--'],
-    ['做T超额收益率', overlaySummary ? formatPct(overlaySummary.t0ExcessReturn) : '--'],
-    ['底仓持有收益率', overlaySummary ? formatPct(overlaySummary.baseHoldingReturn) : '--'],
-    ['总账户收益率', overlaySummary ? formatPct(overlaySummary.totalReturn) : '--'],
-    ['最大回撤', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
-    ['成交 / 胜率', result ? `${formatNumber(getFillCount(result.summary))} / ${formatPct(result.summary.winRate)}` : '--'],
+    ['账户总收益', overlaySummary ? formatMoney(overlaySummary.accountPnl ?? overlaySummary.totalPnl) : '--'],
+    ['底仓基准收益', overlaySummary ? formatMoney(overlaySummary.baseBenchmarkPnl ?? overlaySummary.baseHoldingPnl) : '--'],
+    ['增强收益', overlaySummary ? formatMoney(overlaySummary.overlayPnl ?? overlaySummary.t0ExcessPnl) : '--'],
+    ['已实现增强收益', overlaySummary ? formatMoney(overlaySummary.realizedOverlayPnl) : '--'],
+    ['未实现增强收益', overlaySummary ? formatMoney(overlaySummary.unrealizedOverlayPnl) : '--'],
+    ['成交 / 完整周期胜率', result ? `${formatNumber(getFillCount(result.summary))} / ${formatPct(result.summary.cycleWinRate)}` : '--'],
   ] : [
     ['总收益', result ? formatPct(result.summary.totalReturn) : '--'],
     ['年化收益', result ? formatPct(result.summary.annualReturn) : '--'],
     ['超额收益', result ? formatPct(result.excessReturn) : '--'],
     ['最大回撤', result ? formatPct(result.summary.maxDrawdownRate) : '--'],
     ['Sharpe', result ? formatNumber(result.summary.annualSharpe) : '--'],
-    ['成交 / 胜率', result ? `${formatNumber(getFillCount(result.summary))} / ${formatPct(result.summary.winRate)}` : '--'],
+    ['完整交易 / 胜率', result ? `${formatNumber(result.summary.completedTradeCount ?? getFillCount(result.summary))} / ${formatPct(result.summary.winRate)}` : '--'],
   ];
   const metricGroups = [
     {
       title: '收益',
       rows: isOverlayResult ? [
-        ['总收益', overlaySummary ? formatMoney(overlaySummary.totalPnl) : '--'],
+        ['账户总收益', overlaySummary ? formatMoney(overlaySummary.accountPnl ?? overlaySummary.totalPnl) : '--'],
         ['最终权益', overlaySummary ? formatMoney(overlaySummary.finalEquity) : '--'],
         ['总收益率', overlaySummary ? formatPct(overlaySummary.totalReturn) : '--'],
-        ['底仓持有收益率', overlaySummary ? formatPct(overlaySummary.baseHoldingReturn) : '--'],
-        ['做T超额收益', overlaySummary ? formatMoney(overlaySummary.t0ExcessPnl) : '--'],
-        ['做T超额收益率', overlaySummary ? formatPct(overlaySummary.t0ExcessReturn) : '--'],
+        ['底仓基准收益', overlaySummary ? formatMoney(overlaySummary.baseBenchmarkPnl ?? overlaySummary.baseHoldingPnl) : '--'],
+        ['增强收益', overlaySummary ? formatMoney(overlaySummary.overlayPnl ?? overlaySummary.t0ExcessPnl) : '--'],
+        ['已实现增强收益', overlaySummary ? formatMoney(overlaySummary.realizedOverlayPnl) : '--'],
+        ['未实现增强收益', overlaySummary ? formatMoney(overlaySummary.unrealizedOverlayPnl) : '--'],
         ['年化收益', result ? formatPct(result.summary.annualReturn) : '--'],
       ] : [
         ['总收益', result ? formatMoney(result.summary.totalPnl) : '--'],
@@ -2279,12 +2598,14 @@ export default function BacktestPage({
     {
       title: '交易质量',
       rows: [
-        ['胜率', result ? formatPct(result.summary.winRate) : '--'],
+        [isOverlayResult ? '完整周期胜率' : '完整交易胜率', result ? formatPct(isOverlayResult ? result.summary.cycleWinRate : result.summary.winRate) : '--'],
         ['日胜率', result ? formatPct(result.summary.dailyWinRate) : '--'],
         ['盈亏比', result ? formatNumber(result.summary.profitLossRatio) : '--'],
         ['成交笔数', result ? formatNumber(getFillCount(result.summary)) : '--'],
-        ['盈利次数', result ? String(result.summary.winningTrades) : '--'],
-        ['亏损次数', result ? String(result.summary.losingTrades) : '--'],
+        [isOverlayResult ? '完整周期数' : '完整交易数', result ? String(isOverlayResult ? result.summary.completedCycleCount ?? 0 : result.summary.completedTradeCount ?? 0) : '--'],
+        [isOverlayResult ? '盈利周期' : '盈利交易', result ? String(isOverlayResult ? result.summary.winningCycles ?? 0 : result.summary.winningTrades) : '--'],
+        [isOverlayResult ? '亏损周期' : '亏损交易', result ? String(isOverlayResult ? result.summary.losingCycles ?? 0 : result.summary.losingTrades) : '--'],
+        [isOverlayResult ? '未完成周期' : '未完成交易', result ? String(isOverlayResult ? result.summary.openCycleCount ?? 0 : result.summary.openTradeCount ?? 0) : '--'],
         ['平均盈利', result ? formatMoney(result.summary.avgWin) : '--'],
         ['平均亏损', result ? formatMoney(result.summary.avgLoss) : '--'],
       ],
@@ -2295,14 +2616,33 @@ export default function BacktestPage({
     { id: 'code' as WorkbenchPanel, label: '策略代码', icon: Code2 },
     { id: 'overview' as WorkbenchPanel, label: '概览', icon: FileSliders },
     { id: 'trades' as WorkbenchPanel, label: '信号明细', icon: History },
-    { id: 'positions' as WorkbenchPanel, label: isOverlayResult ? '底仓增强收益' : '持仓收益', icon: Database },
+    { id: 'positions' as WorkbenchPanel, label: '持仓收益', icon: Database },
     { id: 'history' as WorkbenchPanel, label: '历史回测', icon: History },
   ];
   const activeConfig = strategyConfigs.find((item) => item.id === selectedConfigId);
-  const activeScript = strategyScripts.find((item) => item.id === selectedScriptId);
   const configNameById = new Map(strategyConfigs.map((item) => [item.id, item.name]));
   const selectedHistoryRun = backtestRuns.find((item) => item.id === selectedHistoryRunId) || null;
   const compareHistoryRun = backtestRuns.find((item) => item.id === compareHistoryRunId) || null;
+  const selectedHistoryConfigName = selectedHistoryRun?.configId
+    ? configNameById.get(selectedHistoryRun.configId) || '已保存方案'
+    : '未绑定方案';
+  const selectedHistoryCategory = selectedHistoryRun?.strategyCategory
+    || (selectedHistoryRun ? getHistoryRunParam(selectedHistoryRun, 'strategyCategory') : null);
+  const selectedHistoryIsOverlay = selectedHistoryCategory === 'core_position_overlay';
+  const selectedHistoryMetrics: Array<[string, string]> = selectedHistoryRun ? [
+    ['总收益率', formatOptionalPct(selectedHistoryRun.summaryJson.totalReturn)],
+    ['最大回撤', formatOptionalPct(selectedHistoryRun.summaryJson.maxDrawdownRate)],
+    ['夏普比率', formatOptionalNumber(selectedHistoryRun.summaryJson.annualSharpe)],
+    ...(selectedHistoryIsOverlay
+      ? [
+        ['增强收益', formatOptionalNumber(selectedHistoryRun.summaryJson.overlayPnl ?? selectedHistoryRun.summaryJson.t0ExcessPnl)],
+        ['完整周期胜率', formatOptionalPct(selectedHistoryRun.summaryJson.cycleWinRate)],
+      ] as Array<[string, string]>
+      : [
+        ['交易胜率', formatOptionalPct(selectedHistoryRun.summaryJson.winRate)],
+        ['完整交易数', formatOptionalNumber(selectedHistoryRun.summaryJson.completedTradeCount)],
+      ] as Array<[string, string]>),
+  ] : [];
   const historyComparisonScope = selectedHistoryRun && compareHistoryRun
     ? [
       selectedHistoryRun.symbol === compareHistoryRun.symbol ? '同标的' : '标的不同',
@@ -2326,6 +2666,7 @@ export default function BacktestPage({
     endDate: resultHistoryRun?.endDate || params.endDate,
     commissionRate: resultCostModel?.commissionRate ?? Number(params.commissionRate),
     slippage: resultCostModel?.slippage ?? Number(params.slippage),
+    overlaySettlementPolicy: resultManifest?.overlaySettlementPolicy || String(params.overlaySettlementPolicy),
     holdingPolicy: resultManifest?.holdingPolicy || String(params.holdingPolicy),
     strategyCategory: result?.strategyCategory || resultManifest?.strategyCategory || resultHistoryRun?.strategyCategory || params.strategyCategory,
   };
@@ -2344,7 +2685,7 @@ export default function BacktestPage({
     });
   }, [backtestRuns, configNameById, historyQuery, historySymbolFilter]);
   const deletableFilteredHistoryRuns = filteredHistoryRuns.filter(
-    (run) => run.status !== 'queued' && run.status !== 'running',
+    (run) => run.status !== 'queued' && run.status !== 'running' && run.status !== 'cancelling',
   );
   const selectedDeletableHistoryRunIds = deletableFilteredHistoryRuns
     .filter((run) => selectedHistoryRunIds.has(run.id))
@@ -2378,7 +2719,10 @@ export default function BacktestPage({
         price: trade.price,
         priceSource: trade.priceSource || '成交模型价格',
         quantity: trade.quantity,
-        pnl: trade.pnl,
+        pnl: getClosedLoopTradePnl(trade, isOverlayResult) ?? '',
+        researchSignalId: trade.researchSignalId || '',
+        researchSignalAction: trade.researchSignalAction || '',
+        researchSignalEffectiveAt: trade.researchSignalEffectiveAt || '',
         note: trade.note,
       }))
     );
@@ -2438,6 +2782,7 @@ export default function BacktestPage({
       slippage: textValue('slippage', DEFAULT_PARAMS.slippage),
       allowLong: boolValue('allowLong', DEFAULT_PARAMS.allowLong),
       allowShort: boolValue('allowShort', DEFAULT_PARAMS.allowShort),
+      overlaySettlementPolicy: normalizeOverlaySettlementPolicy(saved.overlaySettlementPolicy ?? savedStrategyParams.overlaySettlementPolicy),
       strategyCategory: restoredStrategyCategory,
       holdingPolicy: restoredStrategyCategory === 'core_position_overlay' ? 'intraday' : 'overnight',
       fillModel: normalizeFillModel(savedStrategyParams.fillModel || run.fillModel),
@@ -2509,6 +2854,7 @@ export default function BacktestPage({
         slippage: Number(saved.slippage ?? 0),
         allowLong: saved.allowLong !== false,
         allowShort: saved.allowShort !== false,
+        overlaySettlementPolicy: normalizeOverlaySettlementPolicy(saved.overlaySettlementPolicy),
         strategyCategory: rerunStrategyCategory,
         holdingPolicy: rerunStrategyCategory === 'core_position_overlay' ? 'intraday' : 'overnight',
         fillModel: normalizeFillModel(run.fillModel),
@@ -2567,7 +2913,7 @@ export default function BacktestPage({
   };
 
   const handleDeleteBacktestRun = async (run: BacktestRunHistory) => {
-    if (run.status === 'queued' || run.status === 'running') {
+    if (run.status === 'queued' || run.status === 'running' || run.status === 'cancelling') {
       setError('排队或运行中的回测不能删除，请先取消任务。');
       return;
     }
@@ -2701,15 +3047,18 @@ export default function BacktestPage({
         {activeRun ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ color: '#a16207', fontSize: 12 }}>
-              {activeRun.fillModel === 'l2_quote' ? 'L2 盘口回放' : '标准 Bar 回放'} {formatRunReference(activeRun.displayNo)} {activeRun.status === 'queued' ? '排队中' : '运行中'}
+              {activeRun.fillModel === 'l2_quote' ? 'L2 盘口回放' : '标准 Bar 回放'} {formatRunReference(activeRun.displayNo)} {activeRun.status === 'queued' ? '排队中' : activeRun.status === 'cancelling' ? '取消中' : '运行中'}
+              {activeRun.status !== 'queued' && activeRunElapsed ? ` · ${activeRunElapsed}` : ''}
             </span>
-            <button
-              onClick={handleCancelRun}
-              disabled={cancellingRun}
-              style={{ height: 36, borderRadius: 4, border: '1px solid #dc2626', background: '#fef2f2', color: '#b91c1c', padding: '0 14px', cursor: cancellingRun ? 'wait' : 'pointer', fontWeight: 700, fontSize: 14 }}
-            >
-              {cancellingRun ? '正在取消...' : '取消回测'}
-            </button>
+            {activeRun.status !== 'cancelling' && (
+              <button
+                onClick={handleCancelRun}
+                disabled={cancellingRun}
+                style={{ height: 36, borderRadius: 4, border: '1px solid #dc2626', background: '#fef2f2', color: '#b91c1c', padding: '0 14px', cursor: cancellingRun ? 'wait' : 'pointer', fontWeight: 700, fontSize: 14 }}
+              >
+                {cancellingRun ? '正在取消...' : '取消回测'}
+              </button>
+            )}
           </div>
         ) : (
           <button
@@ -2802,7 +3151,7 @@ export default function BacktestPage({
                 <div style={{ color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
                   <div>名称：{activeConfig?.name || configName || '未选择策略方案'}</div>
                   <div>模式：回测</div>
-                  <div>脚本：{activeScript?.name || '未绑定'}</div>
+                  <div>脚本版本：{activeConfig ? `v${activeConfig.scriptVersionNo}` : '未绑定'}</div>
                   <div>标的：{selectedSymbol}</div>
                   <div>基准：{selectedBenchmarkSymbol}</div>
                 </div>
@@ -2835,7 +3184,7 @@ export default function BacktestPage({
                     <option value="core_position_overlay">底仓增强策略</option>
                   </select>
                   <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.55, marginTop: 6 }}>
-                    {isCorePositionOverlay ? '围绕固定底仓做T；日终恢复到底仓，核心评价做T超额收益。' : '在信号触发时开仓、平仓并跨日持有；核心评价持仓与方向收益。'}
+                    {isCorePositionOverlay ? '围绕固定目标底仓交易；可选择日内恢复或跨日延续增强仓。' : '在信号触发时开仓、平仓并跨日持有；核心评价持仓与方向收益。'}
                   </div>
                 </label>
                 {!isCorePositionOverlay && (
@@ -2865,8 +3214,21 @@ export default function BacktestPage({
                         <input value={params.baseCostPrice} onChange={(e) => setParam('baseCostPrice', e.target.value)} style={fieldStyle} />
                       </label>
                     </div>
+                    {isCorePositionOverlay && (
+                      <label>
+                        <div style={labelStyle}>增强仓结算规则</div>
+                        <select value={params.overlaySettlementPolicy} onChange={(e) => setParam('overlaySettlementPolicy', normalizeOverlaySettlementPolicy(e.target.value))} style={fieldStyle}>
+                          <option value="intraday_restore">日内恢复目标底仓</option>
+                          <option value="cross_day_carry">允许跨日延续</option>
+                        </select>
+                      </label>
+                    )}
                     <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.55 }}>
-                      {isCorePositionOverlay ? '已启用底仓做 T 额度限制，日终会恢复至底仓。' : '首个交易日的初始持仓可卖；当日新买入股票仍不可卖出。'}
+                      {isCorePositionOverlay
+                        ? params.overlaySettlementPolicy === 'cross_day_carry'
+                          ? '日终不自动补回；未完成周期跨日延续并按期末行情估值。允许跨日不会放宽 T+1。'
+                          : '日终恢复目标底仓；所有成交仍受真实持仓、资金和 T+1 约束。'
+                        : '首个交易日的初始持仓可卖；当日新买入股票仍不可卖出。'}
                     </div>
                   </div>
                 )}
@@ -2886,6 +3248,7 @@ export default function BacktestPage({
                   策略方向：{params.allowLong ? '允许做多' : '不做多'} · {params.allowShort ? '允许做空' : '不做空'}；请在“策略管理”中修改并保存策略。
                 </div>
               </section>
+
 
               <section style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 8 }}>
@@ -2947,7 +3310,7 @@ export default function BacktestPage({
                 <div>历史回测：{backtestRuns.length}</div>
                 <div>当前方案：{activeConfig?.name || '未选择'}</div>
                 <div>方案版本：{configVersions.length}</div>
-                <div>当前脚本：{activeScript?.name || '未选择'}</div>
+                <div>当前脚本版本：{activeConfig?.scriptVersionNo ?? '未选择'}</div>
               </div>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 10 }}>
@@ -2993,7 +3356,7 @@ export default function BacktestPage({
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
                 <div>已保存策略：{strategyConfigs.length}</div>
-                <div>关联脚本：{strategyScripts.length}</div>
+                <div>独立脚本：{strategyConfigs.length}</div>
                 <div>当前回测：{result ? formatRunReference(result.displayNo) : '暂无'}</div>
               </div>
               <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
@@ -3099,7 +3462,7 @@ export default function BacktestPage({
                   <div className="strategy-asset-actions" style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}>
                     <button
                       className="strategy-save-action"
-                      onClick={handleNewScript}
+                      onClick={handleNewStrategy}
                       style={{
                         height: 34,
                         borderRadius: 4,
@@ -3110,6 +3473,21 @@ export default function BacktestPage({
                       }}
                     >
                       新建策略
+                    </button>
+                    <button
+                      onClick={handleCopyStrategy}
+                      disabled={!hasSelectedConfig}
+                      style={{
+                        height: 34,
+                        borderRadius: 4,
+                        border: '1px solid #cbd5e1',
+                        background: '#ffffff',
+                        color: '#334155',
+                        cursor: hasSelectedConfig ? 'pointer' : 'not-allowed',
+                        opacity: hasSelectedConfig ? 1 : 0.55,
+                      }}
+                    >
+                      复制策略
                     </button>
                     <button
                       onClick={handleSaveConfig}
@@ -3146,7 +3524,7 @@ export default function BacktestPage({
                     </button>
                   </div>
                   <div className="strategy-asset-note" style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
-                    保存会同时更新代码和参数。每次回测会保存当时快照，可在历史回测中回溯。
+                    保存会同时更新代码和参数，并生成不可变版本。每次回测都绑定当时的精确版本。
                   </div>
                 </section>
 
@@ -3182,7 +3560,7 @@ export default function BacktestPage({
                     )}
                   </div>
                   {selectedStrategy === 'user_script' ? (
-                    <div className="strategy-editor-body" style={{ display: 'grid', gridTemplateRows: 'auto auto minmax(0, 1fr) auto', gap: 10, minHeight: 0 }}>
+                    <div className="strategy-editor-body" style={{ display: 'grid', gridTemplateRows: 'auto auto auto minmax(0, 1fr) auto', gap: 10, minHeight: 0 }}>
                       <input
                         value={scriptForm.name}
                         onChange={(e) => updateScriptForm({ name: e.target.value })}
@@ -3195,6 +3573,23 @@ export default function BacktestPage({
                         placeholder="策略说明（选填）"
                         style={fieldStyle}
                       />
+                      <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, color: '#334155', fontSize: 12 }}>
+                        <input
+                          type="checkbox"
+                          checked={scriptForm.signalRequired}
+                          onChange={(event) => {
+                            const enabled = event.target.checked;
+                            updateScriptForm({ signalRequired: enabled });
+                            if (!enabled) setSelectedSignalDatasetId('');
+                          }}
+                        />
+                        <span>
+                          <strong>研究信号驱动策略</strong>
+                          <span style={{ display: 'block', color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>
+                            启用后必须选择研究信号，代码也必须显式读取 bar['researchSignal']。
+                          </span>
+                        </span>
+                      </label>
                       <textarea
                         className="strategy-code-editor"
                         value={scriptForm.code}
@@ -3235,19 +3630,73 @@ export default function BacktestPage({
 
                 <section className="strategy-config-panel" style={{
                   ...panelStyle,
-                  padding: 12,
+                  padding: 0,
                   background: '#f8fafc',
                   display: 'flex',
                   flexDirection: 'column',
-                  gap: 12,
                   minHeight: 0,
-                  overflow: 'auto',
+                  overflow: 'hidden',
                 }}>
-                  <div className="strategy-panel-heading">
-                    <span>回测配置</span>
-                    <span>运行前检查</span>
+                  <div className="strategy-config-header">
+                    <div className="strategy-panel-heading">
+                      <span>回测配置</span>
+                      <span>按组展开</span>
+                    </div>
+                    <div className="strategy-config-context">
+                      {selectedSymbol} · {selectedTimeframe} · {isCorePositionOverlay ? '底仓增强' : '方向持仓'}
+                    </div>
                   </div>
-                  <InstrumentSearchField label="运行标的" value={selectedSymbol} onChange={setSelectedSymbol} />
+                  <div className="strategy-config-scroll">
+                  <ConfigSectionCard
+                    title="回测范围"
+                    summary={`${selectedSymbol} · ${selectedTimeframe} · ${dataCoverage.tone === 'ok' ? '数据就绪' : '需检查'}`}
+                    defaultOpen
+                    sectionRef={(element) => { configSectionRefs.current.scope = element; }}
+                  >
+                    <InstrumentSearchField label="运行标的" value={selectedSymbol} onChange={setSelectedSymbol} />
+                    <label>
+                      <div style={labelStyle}>运行周期</div>
+                      <select
+                        value={selectedTimeframe}
+                        onChange={(e) => setVersionTimeframe(e.target.value)}
+                        style={fieldStyle}
+                      >
+                        {timeframeOptions.map((item) => (
+                          <option key={item.timeframe} value={item.timeframe}>
+                            {item.timeframe}（{item.available ? '数据完整' : item.reason || '数据不完整'}）
+                          </option>
+                        ))}
+                      </select>
+                      {!isL2Quote && backtestTimeframes.length === 0 && (
+                        <div className="strategy-config-warning">正在读取回测引擎支持的周期。</div>
+                      )}
+                      {!isL2Quote && selectedTimeframe === '1d' && selectedPreflight?.available && (
+                        <div className="strategy-config-help">
+                          {selectedPreflight.derivation ? '日线由完整 1m 数据派生' : '使用 QMT 原始日线'}
+                        </div>
+                      )}
+                    </label>
+                    <InstrumentSearchField label="基准标的" value={selectedBenchmarkSymbol} onChange={setSelectedBenchmarkSymbol} />
+                    <div>
+                      <div style={labelStyle}>回测区间</div>
+                      <BacktestDateRangePicker
+                        startDate={params.startDate} endDate={params.endDate} days={calendarPreflight?.calendarDays || []}
+                        onChange={(key, value) => setParam(key, value)} onMonthChange={setCalendarMonth}
+                      />
+                    </div>
+                    <div className={`strategy-config-check ${dataCoverage.tone === 'ok' ? 'is-ready' : 'is-warning'}`}>
+                      {dataCoverage.text}
+                    </div>
+                    <div className={`strategy-config-check ${benchmarkCoverage.tone === 'ok' ? 'is-ready' : 'is-warning'}`}>
+                      {benchmarkCoverage.text}
+                    </div>
+                  </ConfigSectionCard>
+                  <ConfigSectionCard
+                    title="策略与仓位"
+                    summary={isCorePositionOverlay ? '底仓增强策略' : '方向性持仓策略'}
+                    defaultOpen
+                    sectionRef={(element) => { configSectionRefs.current.strategy = element; }}
+                  >
                   <label>
                     <div style={labelStyle}>策略类别</div>
                     <select value={params.strategyCategory} onChange={(e) => setStrategyCategory(e.target.value === 'core_position_overlay' ? 'core_position_overlay' : 'directional_holding')} style={fieldStyle}>
@@ -3255,9 +3704,68 @@ export default function BacktestPage({
                       <option value="core_position_overlay">底仓增强策略</option>
                     </select>
                     <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5, marginTop: 5 }}>
-                      {isCorePositionOverlay ? '底仓增强固定使用 L2，并在日终恢复底仓。' : '方向性持仓允许跨日保留实际仓位。'}
+                      {isCorePositionOverlay ? '底仓增强围绕固定目标底仓，可按配置日内恢复或跨日延续。' : '方向性持仓允许跨日保留实际仓位。'}
                     </div>
                   </label>
+                  {!isCorePositionOverlay && (
+                    <label className="strategy-position-toggle">
+                      <input
+                        type="checkbox"
+                        checked={params.initialPositionEnabled}
+                        onChange={(e) => setInitialPositionEnabled(e.target.checked)}
+                      />
+                      <span>
+                        <strong>启用初始底仓</strong>
+                        <small>关闭时以现金开始；启用后初始持仓参与收益。</small>
+                      </span>
+                    </label>
+                  )}
+                  {(isCorePositionOverlay || params.initialPositionEnabled) && (
+                    <div className="strategy-position-settings">
+                      <div className="strategy-position-grid">
+                        <label>
+                          <div style={labelStyle}>底仓数量</div>
+                          <input value={params.baseQuantity} onChange={(e) => setParam('baseQuantity', e.target.value)} style={fieldStyle} />
+                        </label>
+                        <label>
+                          <div style={labelStyle}>底仓成本价</div>
+                          <input value={params.baseCostPrice} onChange={(e) => setParam('baseCostPrice', e.target.value)} style={fieldStyle} />
+                        </label>
+                      </div>
+                      {isCorePositionOverlay && (
+                        <label>
+                          <div style={labelStyle}>增强仓结算规则</div>
+                          <select value={params.overlaySettlementPolicy} onChange={(e) => setParam('overlaySettlementPolicy', normalizeOverlaySettlementPolicy(e.target.value))} style={fieldStyle}>
+                            <option value="intraday_restore">日内恢复目标底仓</option>
+                            <option value="cross_day_carry">允许跨日延续</option>
+                          </select>
+                        </label>
+                      )}
+                      {isCorePositionOverlay ? (
+                        <>
+                          <div className="strategy-position-limit">已启用底仓做 T 额度限制</div>
+                          <div className="strategy-config-help">{params.overlaySettlementPolicy === 'cross_day_carry'
+                            ? '日终撤销未成交委托但不补回；周期跨日延续。任务结束未恢复部分计入未实现增强收益，不计入周期胜率。'
+                            : '日终恢复目标底仓；当日买入股票不可卖出，必要的系统结算会保留可审计告警。'}
+                          </div>
+                        </>
+                      ) : (
+                        <div className="strategy-config-help">初始持仓在首个交易日可卖；当日新买入股票仍按 A 股 T+1 限制，策略不会在日终自动恢复底仓。</div>
+                      )}
+                    </div>
+                  )}
+                  <div>
+                    <div style={labelStyle}>策略</div>
+                    <div className="strategy-readonly-field" style={fieldStyle}>
+                      {formatStrategyName(selectedStrategy)}
+                    </div>
+                  </div>
+                  </ConfigSectionCard>
+                  <ConfigSectionCard
+                    title="成交与执行"
+                    summary={`${isL2Quote ? 'L2 盘口' : '标准 Bar'} · ${params.executionAlgorithm === 'twap' ? 'TWAP' : '立即成交'}`}
+                    sectionRef={(element) => { configSectionRefs.current.execution = element; }}
+                  >
                   <label>
                     <div style={labelStyle}>成交模式</div>
                     <select
@@ -3314,59 +3822,72 @@ export default function BacktestPage({
                       </div>
                     )}
                   </label>
-                  <label>
-                    <div style={labelStyle}>运行周期</div>
+                  </ConfigSectionCard>
+                  <ConfigSectionCard
+                    title="策略参数与信号"
+                    summary={scriptForm.signalRequired ? '需要研究信号' : `${strategyParameterFields.length} 个自定义参数`}
+                    defaultOpen={scriptForm.signalRequired}
+                    sectionRef={(element) => { configSectionRefs.current.inputs = element; }}
+                  >
+                  <section style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700 }}>研究信号</div>
                     <select
-                      value={selectedTimeframe}
-                      onChange={(e) => setVersionTimeframe(e.target.value)}
+                      value={selectedSignalDatasetId}
+                      onChange={(event) => {
+                        setSelectedSignalDatasetId(event.target.value);
+                        setResearchSignalLoadError('');
+                      }}
+                      disabled={isL2Quote || !scriptForm.signalRequired || loadingResearchSignals}
                       style={fieldStyle}
                     >
-                      {timeframeOptions.map((item) => (
-                        <option key={item.timeframe} value={item.timeframe}>
-                          {item.timeframe}（{item.available ? '数据完整' : item.reason || '数据不完整'}）
+                      <option value="">{loadingResearchSignals ? '正在加载研究信号…' : '不使用研究信号'}</option>
+                      {researchSignalDatasets.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name} · v{item.version ?? '—'} · {item.timeframe ?? '—'} · {item.recordCount} 条
                         </option>
                       ))}
                     </select>
-                    {!isL2Quote && backtestTimeframes.length === 0 && (
-                      <div style={{ color: '#b45309', fontSize: 12, marginTop: 5 }}>
-                        正在读取回测引擎支持的周期。
-                      </div>
-                    )}
-                    {!isL2Quote && selectedTimeframe === '1d' && selectedPreflight?.available && (
-                      <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.45, marginTop: 5 }}>
-                        {selectedPreflight.derivation ? '日线由完整 1m 数据派生' : '使用 QMT 原始日线'}
-                      </div>
-                    )}
-                  </label>
-                  <InstrumentSearchField label="基准标的" value={selectedBenchmarkSymbol} onChange={setSelectedBenchmarkSymbol} />
-                  <div>
-                    <div style={labelStyle}>策略</div>
-                    <div style={{
-                      ...fieldStyle,
-                      display: 'flex',
-                      alignItems: 'center',
-                      background: '#f1f5f9',
-                      color: '#334155',
-                    }}>
-                      {formatStrategyName(selectedStrategy)}
+                    <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>
+                      {scriptForm.signalRequired
+                        ? "当前有效信号会持续注入 bar['researchSignal']；策略负责仓位、底仓与风控。"
+                        : '当前策略未声明为研究信号驱动策略。'}
                     </div>
-                  </div>
+                    {researchSignalLoadError && (
+                      <div style={{ color: '#b91c1c', fontSize: 11, lineHeight: 1.5 }}>
+                        {researchSignalLoadError}
+                      </div>
+                    )}
+                    {selectedResearchSignal && (
+                      <div style={{
+                        display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8,
+                        padding: 10, border: '1px solid #cbd5e1', borderRadius: 4, background: '#f8fafc',
+                      }}>
+                        <div><div style={labelStyle}>数据集</div><strong>{selectedResearchSignal.name}</strong></div>
+                        <div><div style={labelStyle}>不可变版本</div><strong>v{selectedResearchSignal.version ?? '—'}</strong></div>
+                        <div><div style={labelStyle}>信号周期</div><strong>{selectedResearchSignal.timeframe ?? '—'}</strong></div>
+                        <div><div style={labelStyle}>信号记录</div><strong>{selectedResearchSignal.recordCount.toLocaleString()} 条</strong></div>
+                        <div style={{ gridColumn: '1 / -1', color: researchSignalTimeframeError ? '#b91c1c' : '#047857', fontSize: 11 }}>
+                          {researchSignalTimeframeError || `可对齐到当前 ${selectedTimeframe} 回测；运行时将冻结版本和生效时点。`}
+                        </div>
+                      </div>
+                    )}
+                    {isL2Quote && (
+                      <div style={{ color: '#b45309', fontSize: 11, lineHeight: 1.5 }}>
+                        研究信号联动首期仅支持标准 Bar 回放。
+                      </div>
+                    )}
+                  </section>
                   {(loadingStrategySchema || strategySchemaError || strategyParameterFields.length > 0) && (
-                    <div style={{
-                      ...panelStyle,
-                      padding: '10px',
-                      background: '#ffffff',
-                    }}>
+                    <div className="strategy-parameter-box">
                       {renderStrategyParameterForm()}
                     </div>
                   )}
-                  <div>
-                    <div style={labelStyle}>回测区间</div>
-                    <BacktestDateRangePicker
-                      startDate={params.startDate} endDate={params.endDate} days={calendarPreflight?.calendarDays || []}
-                      onChange={(key, value) => setParam(key, value)} onMonthChange={setCalendarMonth}
-                    />
-                  </div>
+                  </ConfigSectionCard>
+                  <ConfigSectionCard
+                    title="资金与成本"
+                    summary={`初始资金 ${params.initialCapital}`}
+                    sectionRef={(element) => { configSectionRefs.current.capital = element; }}
+                  >
                   <label>
                     <div style={labelStyle}>初始资金</div>
                     <input value={params.initialCapital} onChange={(e) => setParam('initialCapital', e.target.value)} style={fieldStyle} />
@@ -3382,65 +3903,9 @@ export default function BacktestPage({
                       固定比例；0.001 表示 0.1%，买入上调、卖出下调。
                     </div>
                   </label>
-                  {!isCorePositionOverlay && (
-                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, color: '#334155', fontSize: 12, cursor: 'pointer', borderTop: '1px solid #dbe3ef', paddingTop: 10 }}>
-                      <input
-                        type="checkbox"
-                        checked={params.initialPositionEnabled}
-                        onChange={(e) => setInitialPositionEnabled(e.target.checked)}
-                        style={{ marginTop: 1 }}
-                      />
-                      <span>
-                        <span style={{ fontWeight: 700 }}>启用初始底仓</span>
-                        <span style={{ display: 'block', color: '#64748b', fontSize: 11, lineHeight: 1.5, marginTop: 3 }}>关闭时以现金开始；启用后初始持仓参与收益。</span>
-                      </span>
-                    </label>
-                  )}
-                  {(isCorePositionOverlay || params.initialPositionEnabled) && (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, borderTop: '1px solid #dbe3ef', paddingTop: 10 }}>
-                      <div style={{ color: '#0f172a', fontSize: 12, fontWeight: 700 }}>{isCorePositionOverlay ? '底仓增强' : '初始底仓'}</div>
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                        <label>
-                          <div style={labelStyle}>底仓数量</div>
-                          <input value={params.baseQuantity} onChange={(e) => setParam('baseQuantity', e.target.value)} style={fieldStyle} />
-                        </label>
-                        <label>
-                          <div style={labelStyle}>底仓成本价</div>
-                          <input value={params.baseCostPrice} onChange={(e) => setParam('baseCostPrice', e.target.value)} style={fieldStyle} />
-                        </label>
-                      </div>
-                      {isCorePositionOverlay ? (
-                        <>
-                          <div style={{ color: '#0f766e', fontSize: 12, fontWeight: 700 }}>已启用底仓做 T 额度限制</div>
-                          <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>当日买入股票不可卖出；做 T 额度只允许底仓参与有限次成交。日终会恢复至底仓，必要时按最后十档快照强制结算。</div>
-                        </>
-                      ) : (
-                        <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>初始持仓在首个交易日可卖；当日新买入股票仍按 A 股 T+1 限制，策略不会在日终自动恢复底仓。</div>
-                      )}
-                    </div>
-                  )}
-                  <div style={{
-                    color: dataCoverageColor,
-                    background: dataCoverage.tone === 'ok' ? '#ecfdf5' : '#fffbeb',
-                    border: `1px solid ${dataCoverage.tone === 'ok' ? '#99f6e4' : '#f59e0b'}`,
-                    borderRadius: 4,
-                    padding: '8px 10px',
-                    fontSize: 12,
-                    lineHeight: 1.5,
-                  }}>
-                    {dataCoverage.text}
+                  </ConfigSectionCard>
                   </div>
-                  <div style={{
-                    color: benchmarkCoverage.tone === 'ok' ? '#0f766e' : '#b45309',
-                    background: benchmarkCoverage.tone === 'ok' ? '#ecfdf5' : '#fffbeb',
-                    border: `1px solid ${benchmarkCoverage.tone === 'ok' ? '#99f6e4' : '#f59e0b'}`,
-                    borderRadius: 4,
-                    padding: '8px 10px',
-                    fontSize: 12,
-                    lineHeight: 1.5,
-                  }}>
-                    {benchmarkCoverage.text}
-                  </div>
+                  <div className="strategy-config-footer">
                   {(status || error) && (
                     <div className={`strategy-runtime-message ${error ? 'is-error' : ''}`} style={{
                       color: error ? '#b91c1c' : '#0f766e',
@@ -3485,6 +3950,7 @@ export default function BacktestPage({
                     }} onClick={handleResetParams} title="恢复当前账号参数">
                       <RotateCcw size={14} />
                     </button>
+                  </div>
                   </div>
                 </section>
               </div>
@@ -3548,7 +4014,7 @@ export default function BacktestPage({
                       <div><span>有效委托</span><strong>{result ? formatNumber(getOrderCount(result.summary)) : '--'}</strong></div>
                       <div><span>已成交</span><strong className="is-filled">{filledSignalCount}</strong></div>
                       <div><span>已跳过</span><strong className="is-skipped">{skippedSignalCount}</strong></div>
-                      <div><span>胜率</span><strong>{result ? formatPct(result.summary.winRate) : '--'}</strong></div>
+                      <div><span>{isOverlayResult ? '周期胜率' : '交易胜率'}</span><strong>{result ? formatPct(isOverlayResult ? result.summary.cycleWinRate : result.summary.winRate) : '--'}</strong></div>
                     </div>
                     <div className="trade-filter-controls">
                       <label style={{ minWidth: 110 }}>
@@ -3971,6 +4437,75 @@ export default function BacktestPage({
               </section>
               )}
 
+              {activePanel === 'overview' && isOverlayResult && result && result.resultSchemaVersion !== 3 && (
+                <div style={{ padding: '10px 12px', border: '1px solid #f59e0b', borderRadius: 6, background: '#fffbeb', color: '#92400e', fontSize: 12 }}>
+                  该任务使用历史收益口径，未重算增强周期；主动重新运行后才使用结果口径 v3。
+                </div>
+              )}
+
+              {activePanel === 'overview' && isOverlayResult && result?.resultSchemaVersion === 3 && (
+                <section style={{ ...panelStyle, padding: 16, background: '#ffffff' }}>
+                  <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>增强周期</div>
+                  <div style={{ color: '#64748b', fontSize: 12, marginTop: 4, marginBottom: 12 }}>
+                    增强仓从 0 离开并再次回到 0 才算一个完整周期；未完成周期不进入胜率。
+                  </div>
+                  {(result.cycles || []).length > 0 ? (
+                    <div style={{ display: 'grid', gap: 8 }}>
+                      {(result.cycles || []).map((cycle, cycleIndex) => (
+                        <details key={cycle.cycleId} style={{ border: '1px solid #d7dde8', borderRadius: 6, padding: '9px 12px', background: cycle.status === 'open' ? '#fffbeb' : '#f8fafc' }}>
+                          <summary style={{ cursor: 'pointer', color: '#334155', fontSize: 12, fontWeight: 700 }}>
+                            增强周期 {cycleIndex + 1} · {cycle.direction === 'long' ? '正增强' : '负增强'} · {cycle.status === 'completed' ? '已完成' : '未完成'} · 当前收益 {formatMoney(cycle.netPnl)}
+                          </summary>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(120px, 1fr))', gap: 8, marginTop: 10, color: '#475569', fontSize: 12 }}>
+                            <span>开始：{formatSignalTime(cycle.openedAt)}</span>
+                            <span>完成：{cycle.closedAt ? formatSignalTime(cycle.closedAt) : '--'}</span>
+                            <span>已恢复：{cycle.closedQuantity}</span>
+                            <span>剩余：{cycle.remainingQuantity}</span>
+                            <span>已实现：{formatMoney(cycle.realizedPnl)}</span>
+                            <span>未实现：{formatMoney(cycle.unrealizedPnl)}</span>
+                          </div>
+                          <div style={{ overflow: 'auto', marginTop: 10, border: '1px solid #e2e8f0', borderRadius: 4, background: '#ffffff' }}>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(150px, 1.25fr) 70px 90px 100px minmax(110px, 1fr) 120px', minWidth: 720, padding: '7px 10px', color: '#64748b', fontSize: 11, fontWeight: 700, background: '#f8fafc' }}>
+                              <span>成交时间</span>
+                              <span>方向</span>
+                              <span>数量</span>
+                              <span>成交价</span>
+                              <span>周期作用</span>
+                              <span>实现增强收益</span>
+                            </div>
+                            {cycle.fillIds.map((fillId) => {
+                              const trade = tradeByFillId.get(fillId);
+                              if (!trade) {
+                                return (
+                                  <div key={fillId} style={{ padding: '8px 10px', borderTop: '1px solid #e2e8f0', color: '#b45309', fontSize: 11 }}>
+                                    成交记录关联失败：{fillId}
+                                  </div>
+                                );
+                              }
+                              const display = getOverlayCycleTradeDisplay(trade, cycle.cycleId);
+                              return (
+                                <div key={fillId} style={{ display: 'grid', gridTemplateColumns: 'minmax(150px, 1.25fr) 70px 90px 100px minmax(110px, 1fr) 120px', minWidth: 720, padding: '8px 10px', borderTop: '1px solid #e2e8f0', color: '#334155', fontSize: 11 }}>
+                                  <span>{formatSignalTime(trade.executionTime || trade.time)}</span>
+                                  <span>{trade.side === 'BUY' ? '买入' : trade.side === 'SELL' ? '卖出' : trade.side}</span>
+                                  <span>{formatNumber(display.quantity)}</span>
+                                  <span>{formatNumber(trade.price)}</span>
+                                  <span>{display.effectLabel}</span>
+                                  <span style={{ color: display.realizedPnl === null ? '#94a3b8' : getPnlColor(display.realizedPnl) }}>
+                                    {display.realizedPnl === null ? '--' : formatMoney(display.realizedPnl)}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </details>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ color: '#64748b', fontSize: 12 }}>本次回测没有增强周期。</div>
+                  )}
+                </section>
+              )}
+
               {activePanel === 'history' && (
                 <section className="history-ledger-card" style={{ ...panelStyle, padding: 16, background: '#ffffff', minHeight: 320 }}>
                   <div className="history-ledger-heading" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 12 }}>
@@ -4032,20 +4567,20 @@ export default function BacktestPage({
                     <div className="history-experiment-table" style={{ minWidth: 0 }}>
                       <div className="history-experiment-head" style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', padding: '0 10px 8px' }}>
                         <input type="checkbox" checked={allDeletableHistoryRunsSelected} disabled={deletableFilteredHistoryRuns.length === 0} onChange={(event) => toggleAllHistoryRunSelections(event.target.checked)} aria-label="选择当前筛选结果中的全部可删除回测" />
-                        <span>ID</span>
+                        <span>编号</span>
                         <span>策略</span>
                         <span>标的/基准</span>
                         <span>区间</span>
                         <span>收益</span>
                         <span>回撤</span>
-                        <span>Sharpe</span>
+                        <span>夏普比率</span>
                         <span>完成时间</span>
                         <span>操作</span>
                       </div>
                       {filteredHistoryRuns.length > 0 ? (
                         pagedHistoryRuns.map((run) => {
                           const isSelected = run.id === selectedHistoryRunId;
-                          const deletable = run.status !== 'queued' && run.status !== 'running';
+                          const deletable = run.status !== 'queued' && run.status !== 'running' && run.status !== 'cancelling';
                           return (
                             <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} onDoubleClick={() => handleViewHistoryResult(run)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
                               <input type="checkbox" checked={selectedHistoryRunIds.has(run.id)} disabled={!deletable} onClick={(event) => event.stopPropagation()} onChange={(event) => toggleHistoryRunSelection(run.id, event.target.checked)} aria-label={`选择历史回测 ${formatRunReference(run.displayNo)}`} />
@@ -4054,7 +4589,7 @@ export default function BacktestPage({
                               </button>
                               <span style={{ minWidth: 0 }}>
                                 <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                  {run.configId ? (configNameById.get(run.configId) || `方案 ${run.configId}`) : '未绑定方案'}
+                                  {run.configId ? (configNameById.get(run.configId) || '已保存方案') : '未绑定方案'}
                                 </div>
                                 <div style={{ color: '#64748b', marginTop: 2 }}>
                                   {getStrategyCategoryLabel(run.strategyCategory)} · {run.configId ? '已保存策略快照' : '未关联策略'}
@@ -4071,7 +4606,7 @@ export default function BacktestPage({
                               <span>{formatOptionalPct(run.summaryJson.maxDrawdownRate)}</span>
                               <span>{formatOptionalNumber(run.summaryJson.annualSharpe)}</span>
                               <span>
-                                <div>{run.status}</div>
+                                <div>{formatHistoryParamValue(run.status)}</div>
                                 <div style={{ color: '#64748b', marginTop: 2 }}>{run.finishedAt || run.createdAt}</div>
                                 {run.tags.length > 0 && (
                                   <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 4 }}>
@@ -4112,15 +4647,15 @@ export default function BacktestPage({
                                     event.stopPropagation();
                                     void handleDeleteBacktestRun(run);
                                   }}
-                                  disabled={run.status === 'queued' || run.status === 'running'}
+                                  disabled={run.status === 'queued' || run.status === 'running' || run.status === 'cancelling'}
                                   style={{
                                     height: 28,
                                     borderRadius: 4,
                                     border: '1px solid #fecaca',
                                     background: '#fff1f2',
                                     color: '#be123c',
-                                    cursor: run.status === 'queued' || run.status === 'running' ? 'not-allowed' : 'pointer',
-                                    opacity: run.status === 'queued' || run.status === 'running' ? 0.55 : 1,
+                                    cursor: run.status === 'queued' || run.status === 'running' || run.status === 'cancelling' ? 'not-allowed' : 'pointer',
+                                    opacity: run.status === 'queued' || run.status === 'running' || run.status === 'cancelling' ? 0.55 : 1,
                                   }}
                                 >
                                   删除
@@ -4153,137 +4688,80 @@ export default function BacktestPage({
 
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0 }}>
                       <div className="history-summary-card history-detail-card" style={{ ...panelStyle, padding: 14, background: '#ffffff' }}>
-                      <div style={{ color: '#0f172a', fontSize: typography.md, fontWeight: 700, marginBottom: 4 }}>
-                        {selectedHistoryRun ? `回测 #${selectedHistoryRun.id} · 实验摘要` : '实验摘要'}
-                      </div>
-                      <div style={{ color: '#64748b', fontSize: 12, marginBottom: 12 }}>
-                        只读查看本次实验的参数快照与结论；复制后可作为新的实验继续研究。
+                      <div className="history-summary-hero">
+                        <div>
+                          <div className="history-summary-title">
+                            {selectedHistoryRun ? `回测 ${formatRunReference(selectedHistoryRun.displayNo)}` : '实验摘要'}
+                            {selectedHistoryRun && <span className={`history-status-badge is-${selectedHistoryRun.status}`}>{formatHistoryParamValue(selectedHistoryRun.status)}</span>}
+                            {selectedHistoryRun && <span className="history-category-badge">{getStrategyCategoryLabel(selectedHistoryCategory)}</span>}
+                          </div>
+                          <div className="history-summary-subtitle">
+                            {selectedHistoryRun
+                              ? `${selectedHistoryConfigName} · ${selectedHistoryRun.symbol} · ${selectedHistoryRun.timeframe || '5m'} K线 · ${selectedHistoryRun.startDate} 至 ${selectedHistoryRun.endDate}`
+                              : '选择一条历史记录，查看实验结论和关键设置。'}
+                          </div>
+                        </div>
                       </div>
                         {selectedHistoryRun ? (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, color: '#334155', fontSize: 12, lineHeight: 1.6 }}>
+                          <div className="history-summary-content">
                             {getRunErrorDetail(selectedHistoryRun) && <BacktestErrorCard detail={getRunErrorDetail(selectedHistoryRun)!} />}
-                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                              <div>方案：{selectedHistoryRun.configId ? (configNameById.get(selectedHistoryRun.configId) || `方案 ${selectedHistoryRun.configId}`) : '未绑定'}</div>
-                              <div>策略快照：{selectedHistoryRun.scriptSnapshot ? '已保存' : '--'}</div>
-                              <div>脚本：{selectedHistoryRun.scriptId ?? '--'}</div>
-                              <div>标的：{selectedHistoryRun.symbol}</div>
-                              <div>运行周期：{selectedHistoryRun.timeframe || '5m'} K 线</div>
-                              <div>基准：{selectedHistoryRun.benchmarkSymbol || '-'}</div>
-                              <div>区间：{selectedHistoryRun.startDate}-{selectedHistoryRun.endDate}</div>
-                              <div>状态：{selectedHistoryRun.status}</div>
+                            <div className="history-result-metrics">
+                              {selectedHistoryMetrics.map(([label, value]) => (
+                                <div key={label}>
+                                  <span>{label}</span>
+                                  <strong>{value}</strong>
+                                </div>
+                              ))}
                             </div>
-                            {selectedHistoryRun.resultJson?.experimentManifest?.experimentHash ? (
-                              <div style={{ padding: '8px 10px', borderRadius: 4, background: '#f1f5f9', color: '#475569' }}>
-                                实验指纹：{selectedHistoryRun.resultJson.experimentManifest.experimentHash.slice(0, 12)} · {selectedHistoryRun.resultJson.experimentManifest.barCount} 根 {selectedHistoryRun.resultJson.experimentManifest.barRange.timeframe} K 线
-                              </div>
-                            ) : (
-                              <div style={{ color: '#b45309' }}>该记录的实验清单不完整，无法完整复现。</div>
+                            <HistoryKeySettings run={selectedHistoryRun} configName={selectedHistoryConfigName} />
+                            {!selectedHistoryRun.resultJson?.experimentManifest?.experimentHash && (
+                              <div className="history-repro-warning">该记录的实验清单不完整，无法完整复现。</div>
                             )}
-                            <HistoryRunSnapshot run={selectedHistoryRun} />
-                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))', gap: 8, marginTop: 4 }}>
-                              <div style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: 8 }}>
-                                <div style={{ color: '#64748b', fontSize: 11 }}>总收益率</div>
-                                <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalPct(selectedHistoryRun.summaryJson.totalReturn)}</div>
+                            <section className="history-research-note">
+                              <div className="history-section-title">研究备注与标签</div>
+                              <div className="history-note-grid">
+                                <label>
+                                  <span>备注</span>
+                                  <textarea
+                                    value={historyNoteDraft}
+                                    onChange={(e) => setHistoryNoteDraft(e.target.value)}
+                                    rows={3}
+                                    placeholder="记录本次实验的结论、异常与后续方向"
+                                  />
+                                </label>
+                                <label>
+                                  <span>标签</span>
+                                  <input
+                                    value={historyTagsDraft}
+                                    onChange={(e) => setHistoryTagsDraft(e.target.value)}
+                                    placeholder="候选, 调参, 保留"
+                                  />
+                                  <small>使用逗号分隔多个标签</small>
+                                </label>
                               </div>
-                              <div style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: 8 }}>
-                                <div style={{ color: '#64748b', fontSize: 11 }}>最大回撤</div>
-                                <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalPct(selectedHistoryRun.summaryJson.maxDrawdownRate)}</div>
-                              </div>
-                              <div style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: 8 }}>
-                                <div style={{ color: '#64748b', fontSize: 11 }}>Sharpe</div>
-                                <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalNumber(selectedHistoryRun.summaryJson.annualSharpe)}</div>
-                              </div>
-                              <div style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: 8 }}>
-                                <div style={{ color: '#64748b', fontSize: 11 }}>有效委托数</div>
-                                <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalNumber(getOrderCount(selectedHistoryRun.summaryJson))}</div>
-                              </div>
-                              <div style={{ border: '1px solid #e2e8f0', borderRadius: 4, padding: 8 }}>
-                                <div style={{ color: '#64748b', fontSize: 11 }}>成交笔数</div>
-                                <div style={{ fontWeight: 700, marginTop: 4 }}>{formatOptionalNumber(getFillCount(selectedHistoryRun.summaryJson))}</div>
-                              </div>
-                            </div>
-                            <label>
-                              <div style={labelStyle}>备注</div>
-                              <textarea
-                                value={historyNoteDraft}
-                                onChange={(e) => setHistoryNoteDraft(e.target.value)}
-                                rows={3}
-                                style={{
-                                  ...fieldStyle,
-                                  height: 'auto',
-                                  minHeight: 76,
-                                  padding: 10,
-                                  resize: 'vertical',
-                                  lineHeight: 1.5,
-                                }}
-                              />
-                            </label>
-                            <label>
-                              <div style={labelStyle}>标签</div>
-                              <input
-                                value={historyTagsDraft}
-                                onChange={(e) => setHistoryTagsDraft(e.target.value)}
-                                placeholder="候选, 调参, 保留"
-                                style={fieldStyle}
-                              />
-                            </label>
-                            <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5 }}>
-                              用逗号分隔多个标签，保存后会写回数据库。
-                            </div>
-                            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                            <button
-                              onClick={() => handleViewHistoryResult(selectedHistoryRun)}
-                              style={{
-                                height: 34,
-                                padding: '0 12px',
-                                borderRadius: 4,
-                                border: '1px solid #0f766e',
-                                background: '#ccfbf1',
-                                color: '#0f766e',
-                                cursor: 'pointer',
-                              }}
-                            >
-                              查看完整结果
-                            </button>
-                            <button
-                              onClick={() => handleRerunHistory(selectedHistoryRun)}
-                              disabled={running}
-                              style={{ height: 34, padding: '0 12px', borderRadius: 4, border: '1px solid #0f766e', background: '#ffffff', color: '#0f766e', cursor: running ? 'wait' : 'pointer', opacity: running ? 0.65 : 1 }}
-                            >
-                              {running ? '运行中...' : '重新运行此回测'}
-                            </button>
-                            <button
-                              onClick={() => {
+                            </section>
+                            <div className="history-action-bar">
+                              <button className="is-primary" onClick={() => handleViewHistoryResult(selectedHistoryRun)}>查看完整结果</button>
+                              <button onClick={() => {
                                 handleApplyBacktestRun(selectedHistoryRun);
                                 setActivePanel('overview');
-                              }}
-                              style={{ height: 34, padding: '0 12px', borderRadius: 4, border: '1px solid #cbd5e1', background: '#f8fafc', color: '#334155', cursor: 'pointer' }}
-                            >
-                              新建回测（复制参数）
-                            </button>
-                            <button
-                              onClick={handleSaveHistoryMeta}
-                              style={{
-                                height: 34,
-                                width: 120,
-                                borderRadius: 4,
-                                border: '1px solid #cbd5e1',
-                                background: '#f8fafc',
-                                color: '#334155',
-                                cursor: 'pointer',
-                              }}
-                            >
-                              保存备注
-                            </button>
+                              }}>复制参数新建</button>
+                              <button onClick={() => handleRerunHistory(selectedHistoryRun)} disabled={running}>
+                                {running ? '运行中...' : '重新运行'}
+                              </button>
+                              <button onClick={handleSaveHistoryMeta}>保存备注</button>
                             </div>
+                            <HistoryFullParameters run={selectedHistoryRun} />
+                            <HistoryTechnicalDetails run={selectedHistoryRun} />
                           </div>
                         ) : (
                           <div style={{ color: '#64748b', fontSize: 12 }}>选择一条历史记录查看详情。</div>
                         )}
                       </div>
 
-                      <div className="history-compare-card" style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
-                        <div style={{ color: '#0f172a', fontSize: typography.md, fontWeight: 700, marginBottom: 10 }}>参数对比</div>
+                      <details className="history-compare-card history-disclosure">
+                        <summary>与另一条回测对比</summary>
+                        <div className="history-compare-content">
                         {backtestRuns.length > 1 ? (
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                             <label>
@@ -4297,7 +4775,7 @@ export default function BacktestPage({
                                   .filter((item) => item.id !== selectedHistoryRunId)
                                   .map((item) => (
                                     <option key={item.id} value={item.id}>
-                                      #{item.id} · {item.symbol} · {item.startDate}-{item.endDate}
+                                      回测 {formatRunReference(item.displayNo)} · {item.symbol} · {item.startDate}-{item.endDate}
                                     </option>
                                   ))}
                               </select>
@@ -4323,7 +4801,7 @@ export default function BacktestPage({
                                 {[
                                   ['总收益率', selectedHistoryRun.summaryJson.totalReturn, compareHistoryRun.summaryJson.totalReturn, formatOptionalPct],
                                   ['最大回撤', selectedHistoryRun.summaryJson.maxDrawdownRate, compareHistoryRun.summaryJson.maxDrawdownRate, formatOptionalPct],
-                                  ['Sharpe', selectedHistoryRun.summaryJson.annualSharpe, compareHistoryRun.summaryJson.annualSharpe, formatOptionalNumber],
+                                  ['夏普比率', selectedHistoryRun.summaryJson.annualSharpe, compareHistoryRun.summaryJson.annualSharpe, formatOptionalNumber],
                                   ['有效委托数', getOrderCount(selectedHistoryRun.summaryJson), getOrderCount(compareHistoryRun.summaryJson), formatOptionalNumber],
                                   ['成交笔数', getFillCount(selectedHistoryRun.summaryJson), getFillCount(compareHistoryRun.summaryJson), formatOptionalNumber],
                                 ].map(([label, current, compared, formatter]) => {
@@ -4363,7 +4841,8 @@ export default function BacktestPage({
                         ) : (
                           <div style={{ color: '#64748b', fontSize: 12 }}>至少需要两条历史回测记录才能对比。</div>
                         )}
-                      </div>
+                        </div>
+                      </details>
                     </div>
                   </div>
                 </section>
@@ -4373,8 +4852,8 @@ export default function BacktestPage({
                 <section className="holding-ledger-card" style={{ ...panelStyle, padding: 16, background: '#ffffff', minHeight: 320 }}>
                   <div className="holding-ledger-heading">
                     <div>
-                      <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>{isOverlayResult ? '底仓增强收益' : '持仓收益'}</div>
-                      <div>{isOverlayResult ? '用于核对日终底仓恢复、现金和做T增厚；不作为选股能力评价。' : '基于本次回测的每日收盘快照，不代表实时账户。'}</div>
+                      <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>持仓收益</div>
+                      <div>{isOverlayResult ? '基于每日收盘快照核对账户、实际持仓与做T增厚；不作为选股能力评价。' : '基于本次回测的每日收盘快照，不代表实时账户。'}</div>
                     </div>
                     <span>{filteredDailyHoldings.length} / {dailyHoldings.length} 个交易日</span>
                   </div>
@@ -4385,7 +4864,6 @@ export default function BacktestPage({
                           ['初始总资产', formatMoney(initialTotalEquity), ''],
                           ['期末总资产', latestHolding ? formatMoney(latestHolding.totalEquity) : '--', 'is-equity'],
                           ['期末现金', latestHolding ? formatMoney(latestHolding.cash) : '--', ''],
-                          ['期末净市值', latestHolding ? formatMoney(latestHolding.marketValue) : '--', ''],
                           ['筛选期盈亏', latestHolding ? formatMoney(filteredDailyHoldings.reduce((total, item) => total + item.dailyPnl, 0)) : '--', latestHolding && filteredDailyHoldings.reduce((total, item) => total + item.dailyPnl, 0) < 0 ? 'is-loss' : 'is-profit'],
                           ['持仓天数', `${longHoldingDays + shortHoldingDays} 天`, ''],
                         ].map(([label, value, tone]) => (
@@ -4423,30 +4901,92 @@ export default function BacktestPage({
                         <span>空仓 {filteredDailyHoldings.length - longHoldingDays - shortHoldingDays} 天</span>
                         <span>收盘快照按 {selectedTimeframe} K 线回测结果汇总</span>
                       </div>
-                    <div className="holding-table-wrap" style={{ overflow: 'auto', border: '1px solid #d7dde8', borderRadius: 6 }}>
-                      <div className="holding-table-head" style={{ display: 'grid', gridTemplateColumns: '110px 90px 80px 80px 110px 120px 120px 120px 120px 110px', gap: 0, minWidth: 1040, background: '#f8fafc', color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8' }}>
-                        {['日期', '收盘', '多仓', '空仓', '现金', '多头市值', '空头市值', '净市值', '总资产', '日盈亏'].map((label) => (
-                          <div key={label} style={{ padding: '10px 12px', fontWeight: 700 }}>{label}</div>
-                        ))}
-                      </div>
-                      {filteredDailyHoldings.map((item) => (
-                        <div className={`holding-table-row is-${getHoldingStatus(item)}`} key={item.date} style={{ display: 'grid', gridTemplateColumns: '110px 90px 80px 80px 110px 120px 120px 120px 120px 110px', minWidth: 1040, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0' }}>
-                          <div style={{ padding: '9px 12px' }}>{normalizeApiDate(item.date)}</div>
-                          <div style={{ padding: '9px 12px' }}>{formatNumber(item.close)}</div>
-                          <div style={{ padding: '9px 12px' }}><span className="holding-quantity is-long">{item.longQty}</span></div>
-                          <div style={{ padding: '9px 12px' }}><span className="holding-quantity is-short">{item.shortQty}</span></div>
-                          <div style={{ padding: '9px 12px' }}>{formatMoney(item.cash)}</div>
-                          <div style={{ padding: '9px 12px' }}>{formatMoney(item.longMarketValue)}</div>
-                          <div style={{ padding: '9px 12px' }}>{formatMoney(item.shortMarketValue)}</div>
-                          <div style={{ padding: '9px 12px' }}>{formatMoney(item.marketValue)}</div>
-                          <div style={{ padding: '9px 12px', fontWeight: 600 }}>{formatMoney(item.totalEquity)}</div>
-                          <div style={{ padding: '9px 12px', color: getPnlColor(item.dailyPnl) }}>{formatMoney(item.dailyPnl)}</div>
+                      {isOverlayResult && result?.resultSchemaVersion !== 3 && (
+                        <div style={{ marginTop: 12, border: '1px solid #f59e0b', borderRadius: 6, padding: '12px 14px', background: '#fffbeb', color: '#92400e', fontSize: 12 }}>
+                          该历史任务没有保存逐日增强归因数据，请重新运行回测后查看底仓增强收益明细。
                         </div>
-                      ))}
-                      {filteredDailyHoldings.length === 0 && (
-                        <div className="holding-empty-row">当前筛选条件下没有持仓快照。</div>
                       )}
-                    </div>
+                      {(!isOverlayResult || result?.resultSchemaVersion === 3) && (
+                        <div className="holding-table-wrap" style={{ overflow: 'auto', border: '1px solid #d7dde8', borderRadius: 6 }}>
+                          <div className="holding-table-head" style={{ display: 'grid', gridTemplateColumns: isOverlayResult ? OVERLAY_HOLDING_GRID_COLUMNS : STANDARD_HOLDING_GRID_COLUMNS, width: '100%', minWidth: isOverlayResult ? 900 : 780, gap: 0, background: '#f8fafc', color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8' }}>
+                            {['日期', '收盘价', '多头持仓', '空头持仓', '现金', '持仓净市值', '总资产', '账户日收益', ...(isOverlayResult ? ['增强日收益'] : [])].map((label) => (
+                              <div key={label} style={{ padding: '10px 12px', fontWeight: 700 }}>{label}</div>
+                            ))}
+                          </div>
+                          {pagedDailyHoldings.map((item) => (
+                            <div className={`holding-table-row is-${getHoldingStatus(item)}`} key={item.date} style={{ display: 'grid', gridTemplateColumns: isOverlayResult ? OVERLAY_HOLDING_GRID_COLUMNS : STANDARD_HOLDING_GRID_COLUMNS, width: '100%', minWidth: isOverlayResult ? 900 : 780, color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0' }}>
+                              <div style={{ padding: '9px 12px' }}>{normalizeApiDate(item.date)}</div>
+                              <div style={{ padding: '9px 12px' }}>{formatNumber(item.close)}</div>
+                              <div style={{ padding: '9px 12px' }}><span className="holding-quantity is-long">{item.longQty}</span></div>
+                              <div style={{ padding: '9px 12px' }}><span className="holding-quantity is-short">{item.shortQty}</span></div>
+                              <div style={{ padding: '9px 12px' }}>{formatMoney(item.cash)}</div>
+                              <div style={{ padding: '9px 12px' }}>{formatMoney(item.marketValue)}</div>
+                              <div style={{ padding: '9px 12px', fontWeight: 600 }}>{formatMoney(item.totalEquity)}</div>
+                              <div style={{ padding: '9px 12px', color: getPnlColor(item.dailyPnl) }}>{formatMoney(item.dailyPnl)}</div>
+                              {isOverlayResult && (
+                                <div style={{ padding: '9px 12px', color: getPnlColor(Number(item.dailyOverlayPnl ?? 0)) }}>{formatMoney(item.dailyOverlayPnl)}</div>
+                              )}
+                            </div>
+                          ))}
+                          {filteredDailyHoldings.length === 0 && (
+                            <div className="holding-empty-row">当前筛选条件下没有持仓快照。</div>
+                          )}
+                        </div>
+                      )}
+                    {(!isOverlayResult || result?.resultSchemaVersion === 3) && (
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginTop: 12 }}>
+                      <div style={{ color: '#64748b', fontSize: 12 }}>
+                        展示 {holdingPageStart}-{holdingPageEnd} / {filteredDailyHoldings.length} 个交易日
+                      </div>
+                      <div className="trade-pagination" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ color: '#64748b', fontSize: 12 }}>每页</span>
+                        <select
+                          value={holdingPageSize}
+                          onChange={(event) => setHoldingPageSize(Number(event.target.value))}
+                          style={{ ...fieldStyle, width: 82, height: 30, padding: '4px 8px' }}
+                        >
+                          <option value={20}>20</option>
+                          <option value={50}>50</option>
+                          <option value={100}>100</option>
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => setHoldingPage((page) => Math.max(1, page - 1))}
+                          disabled={safeHoldingPage <= 1}
+                          style={{
+                            height: 30,
+                            padding: '0 10px',
+                            border: '1px solid #cbd5e1',
+                            borderRadius: 4,
+                            background: safeHoldingPage <= 1 ? '#f1f5f9' : '#ffffff',
+                            color: safeHoldingPage <= 1 ? '#94a3b8' : '#334155',
+                            cursor: safeHoldingPage <= 1 ? 'not-allowed' : 'pointer',
+                          }}
+                        >
+                          上一页
+                        </button>
+                        <span style={{ color: '#64748b', fontSize: 12, minWidth: 54, textAlign: 'center' }}>
+                          {safeHoldingPage} / {holdingPageCount}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setHoldingPage((page) => Math.min(holdingPageCount, page + 1))}
+                          disabled={safeHoldingPage >= holdingPageCount}
+                          style={{
+                            height: 30,
+                            padding: '0 10px',
+                            border: '1px solid #cbd5e1',
+                            borderRadius: 4,
+                            background: safeHoldingPage >= holdingPageCount ? '#f1f5f9' : '#ffffff',
+                            color: safeHoldingPage >= holdingPageCount ? '#94a3b8' : '#334155',
+                            cursor: safeHoldingPage >= holdingPageCount ? 'not-allowed' : 'pointer',
+                          }}
+                        >
+                          下一页
+                        </button>
+                      </div>
+                      </div>
+                    )}
                     </>
                   ) : (
                     <div style={{ color: '#64748b', fontSize: 13, lineHeight: 1.8 }}>
@@ -4687,32 +5227,30 @@ export default function BacktestPage({
             flexDirection: 'column',
             gap: 10,
           }}>
-            <label>
-              <div style={labelStyle}>策略代码</div>
-              <select
-                value={selectedScriptId}
-                onChange={(e) => handleScriptSelect(e.target.value)}
-                style={fieldStyle}
-              >
-                {selectedScriptId === '' && (
-                  <option value="" disabled>新建策略（未保存）</option>
-                )}
-                {strategyScripts.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name} · {item.status}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+            <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
+              策略代码归属于当前完整策略，不能单独切换或复用其他策略的脚本。
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
               <button
-                onClick={handleNewScript}
+                onClick={handleNewStrategy}
                 style={{
                   height: 32, borderRadius: 4, border: '1px solid #cbd5e1',
                   background: '#f8fafc', color: '#334155', cursor: 'pointer',
                 }}
               >
                 新建
+              </button>
+              <button
+                onClick={handleCopyStrategy}
+                disabled={!hasSelectedConfig}
+                style={{
+                  height: 32, borderRadius: 4, border: '1px solid #cbd5e1',
+                  background: '#f8fafc', color: '#334155',
+                  cursor: hasSelectedConfig ? 'pointer' : 'not-allowed',
+                  opacity: hasSelectedConfig ? 1 : 0.55,
+                }}
+              >
+                复制
               </button>
               <button
                 onClick={handleSaveConfig}
@@ -4862,15 +5400,6 @@ export default function BacktestPage({
             </div>
           )}
 
-          <section style={{ borderTop: '1px solid #e2e8f0', paddingTop: 10 }}>
-            <div style={{ ...labelStyle, marginBottom: 7 }}>研究信号（可选）</div>
-            <select value={selectedSignalDatasetId} onChange={(event) => setSelectedSignalDatasetId(event.target.value)} disabled={params.fillModel !== 'bar_next_open'} style={fieldStyle}>
-              <option value="">不使用研究信号</option>
-              {researchSignalDatasets.map((item) => <option key={item.id} value={item.id}>{item.name} · v{item.version ?? '—'} · {item.timeframe ?? '—'} · {item.recordCount} 条</option>)}
-            </select>
-            <div style={{ color: '#64748b', fontSize: 11, lineHeight: 1.5, marginTop: 6 }}>信号在回测启动前冻结，并以 effectiveAt 对齐到第一根可执行 Bar；脚本从 bar['researchSignal'] 读取，不决定仓位。</div>
-            {params.fillModel !== 'bar_next_open' && <div style={{ color: '#b45309', fontSize: 11, marginTop: 4 }}>研究信号联动首期仅支持标准 Bar 回放。</div>}
-          </section>
 
           <div style={{
             color: dataCoverageColor,

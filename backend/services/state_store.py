@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -27,7 +28,14 @@ class ConflictError(DatabaseError):
   """违反唯一约束等写入冲突。"""
 
 
-_L2_FAIR_CLAIM_LOCK_KEY = 314159265
+class RunnerUnavailableError(DatabaseError):
+  """指定类型的回测执行器暂时不可用。"""
+
+
+_BACKTEST_SCHEDULER_LOCK_KEY = 314159265
+# 保留旧名称，避免外部诊断脚本在迁移期间失效。
+_L2_FAIR_CLAIM_LOCK_KEY = _BACKTEST_SCHEDULER_LOCK_KEY
+logger = logging.getLogger(__name__)
 
 
 def _translate_error(error: Exception) -> DatabaseError:
@@ -70,9 +78,27 @@ def ensure_schema() -> None:
   """确认数据库和迁移已经准备好；DDL 只允许由部署迁移执行。"""
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("SELECT to_regclass('public.backtest_run') AS table_name")
-      if cur.fetchone()["table_name"] is None:
+      cur.execute("""
+        SELECT to_regclass('public.backtest_run') AS run_table,
+          to_regclass('public.backtest_execution_slot') AS slot_table
+      """)
+      row = cur.fetchone()
+      if row["run_table"] is None:
         raise DatabaseError("数据库迁移尚未执行，请先运行 deploy 的 migrate 服务")
+      if row["slot_table"] is None:
+        raise DatabaseError("数据库缺少统一回测调度迁移 021，请先运行 deploy 的 migrate 服务")
+      cur.execute("SELECT to_regclass('public.backtest_runner_health') AS health_table")
+      if cur.fetchone()["health_table"] is None:
+        raise DatabaseError("数据库缺少 Runner 健康迁移 022，请先运行 deploy 的 migrate 服务")
+      cur.execute("""
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='strategy_config'
+            AND column_name='strategy_version_id'
+        ) AS has_strategy_ownership
+      """)
+      if not cur.fetchone()["has_strategy_ownership"]:
+        raise DatabaseError("数据库缺少策略归属迁移 023，请先运行 deploy 的 migrate 服务")
 
 
 def replace_trade_calendar(
@@ -342,22 +368,33 @@ def _normalize_script(row: dict[str, Any]) -> dict[str, Any]:
   runtime = _json(row.get("runtime_config"), {})
   return {
     "id": _uuid(row["id"]),
+    "versionId": _uuid(row.get("version_id")),
+    "versionNo": int(row.get("version_no") or 1),
     "name": row["name"],
     "description": row["description"],
     "language": "python",
     "code": row["source_code"],
     "entryType": runtime.get("entryType", "on_bar"),
+    "signalRequired": bool(runtime.get("signalRequired", False)),
     "status": runtime.get("status", "draft"),
+    "contentFingerprint": row.get("content_fingerprint", ""),
     "createdAt": _format_time(row["created_at"]),
     "updatedAt": _format_time(row["updated_at"]),
   }
 
 
 def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
+  runtime = _json(row.get("runtime_config"), {})
   return {
     "id": _uuid(row["id"]),
     "name": row["name"],
     "scriptId": _uuid(row["strategy_id"]),
+    "strategyVersionId": _uuid(row.get("strategy_version_id")),
+    "scriptVersionNo": int(row.get("script_version_no") or 1),
+    "description": row.get("script_description", ""),
+    "code": row.get("source_code", ""),
+    "entryType": runtime.get("entryType", "on_bar"),
+    "signalRequired": bool(runtime.get("signalRequired", False)),
     "strategy": row["strategy_key"],
     "mode": row["mode"],
     "symbol": f"{row['symbol']}.{row['exchange']}",
@@ -367,6 +404,8 @@ def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
     "paramsJson": _json(row["params"], {}),
     "enabled": bool(row["enabled"]),
     "published": bool(row["published"]),
+    "publishedVersionId": _uuid(row.get("published_version_id")),
+    "revision": int(row.get("revision") or 1),
     "createdAt": _format_time(row["created_at"]),
     "updatedAt": _format_time(row["updated_at"]),
   }
@@ -379,6 +418,7 @@ def _normalize_version(row: dict[str, Any]) -> dict[str, Any]:
   return {
     "id": _uuid(row["id"]),
     "configId": _uuid(row["config_id"]),
+    "strategyVersionId": _uuid(row.get("strategy_version_id")) or _uuid(snapshot.get("strategyVersionId")),
     "versionNo": int(row["version_no"]),
     "name": snapshot["name"],
     "scriptId": _uuid(snapshot.get("scriptId")),
@@ -434,6 +474,9 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
     "note": row.get("note", ""),
     "tags": _json(row.get("tags"), []),
     "resultJson": result,
+    "queuedAt": _format_time(row.get("queued_at")),
+    "startedAt": _format_time(row.get("started_at")),
+    "cancelRequested": bool(row.get("cancel_requested", False)),
     "createdAt": _format_time(row["created_at"]),
     "finishedAt": _format_time(row.get("finished_at")),
   }
@@ -522,10 +565,11 @@ def delete_account(account_id: int) -> bool:
 def _script_query(where: str = "") -> str:
   return f"""
     SELECT s.id, s.name, s.description, s.created_at, s.updated_at,
-      v.source_code, v.runtime_config
+      v.id AS version_id, v.version_no, v.source_code, v.runtime_config,
+      v.content_fingerprint
     FROM user_strategy s
     JOIN user_strategy_version v ON v.strategy_id=s.id AND v.version_no=s.current_version_no
-    WHERE s.owner_user_id=%s {where}
+    WHERE s.owner_user_id=%s AND s.status='active' {where}
   """
 
 
@@ -536,57 +580,99 @@ def list_strategy_scripts() -> list[dict[str, Any]]:
       return [_normalize_script(row) for row in cur.fetchall()]
 
 
-def _insert_script_version(cur: Any, script_id: str, version_no: int, payload: dict[str, Any]) -> None:
-  source = payload["code"]
+def _script_runtime_config(payload: dict[str, Any], status: str = "active") -> dict[str, Any]:
+  return {
+    "entryType": payload.get("entryType", "on_bar"),
+    "signalRequired": bool(payload.get("signalRequired", False)),
+    "status": status,
+  }
+
+
+def _script_content_fingerprint(source: str, runtime: dict[str, Any]) -> str:
+  entry_type = str(runtime.get("entryType", "on_bar"))
+  signal_required = "1" if bool(runtime.get("signalRequired", False)) else "0"
+  value = f"{len(source)}:{source}{len(entry_type)}:{entry_type}{signal_required}"
+  return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _insert_script_version(
+  cur: Any,
+  script_id: str,
+  version_no: int,
+  payload: dict[str, Any],
+  status: str = "active",
+) -> tuple[str, str]:
+  source = str(payload["code"])
+  runtime = _script_runtime_config(payload, status)
+  fingerprint = _script_content_fingerprint(source, runtime)
   cur.execute("""
     INSERT INTO user_strategy_version (
-      id, strategy_id, version_no, source_code, source_checksum, runtime_config, created_by_user_id
-    ) VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s)
+      id, strategy_id, version_no, source_code, source_checksum, runtime_config,
+      content_fingerprint, created_by_user_id
+    ) VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s)
+    RETURNING id
   """, (script_id, version_no, source, hashlib.sha256(source.encode("utf-8")).hexdigest(),
-         Jsonb({"entryType": payload.get("entryType", "on_bar"), "status": payload.get("status", "draft")}),
-         current_user_id()))
+         Jsonb(runtime), fingerprint, current_user_id()))
+  return _uuid(cur.fetchone()["id"]) or "", fingerprint
 
 
-def _write_strategy_script(cur: Any, script_id: str | None, payload: dict[str, Any]) -> str:
+def _write_strategy_script(
+  cur: Any,
+  script_id: str | None,
+  payload: dict[str, Any],
+) -> tuple[str, str, int]:
   if script_id is None:
     cur.execute("""
       INSERT INTO user_strategy (id, owner_user_id, name, description, strategy_type, status)
       VALUES (gen_random_uuid(), %s, %s, %s, 'python', 'active') RETURNING id
     """, (current_user_id(), payload["name"], payload.get("description", "")))
     saved_id = _uuid(cur.fetchone()["id"]) or ""
-    _insert_script_version(cur, saved_id, 1, payload)
-    return saved_id
-  cur.execute("SELECT current_version_no FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, current_user_id()))
+    version_id, _ = _insert_script_version(cur, saved_id, 1, payload)
+    return saved_id, version_id, 1
+  cur.execute("""
+    SELECT strategy.current_version_no, version.id AS version_id,
+      version.content_fingerprint
+    FROM user_strategy strategy
+    JOIN user_strategy_version version
+      ON version.strategy_id=strategy.id
+      AND version.version_no=strategy.current_version_no
+    WHERE strategy.id=%s AND strategy.owner_user_id=%s
+    FOR UPDATE OF strategy
+  """, (script_id, current_user_id()))
   row = cur.fetchone()
   if not row:
     raise KeyError(script_id)
+  runtime = _script_runtime_config(payload)
+  fingerprint = _script_content_fingerprint(str(payload["code"]), runtime)
+  version_no = int(row["current_version_no"])
+  version_id = _uuid(row["version_id"]) or ""
+  if row.get("content_fingerprint") != fingerprint:
+    version_no += 1
+    version_id, _ = _insert_script_version(cur, script_id, version_no, payload)
   cur.execute("""
-    UPDATE user_strategy SET name=%s, description=%s, updated_at=now()
+    UPDATE user_strategy
+    SET name=%s, description=%s, current_version_no=%s, status='active', updated_at=now()
     WHERE id=%s AND owner_user_id=%s
-  """, (payload["name"], payload.get("description", ""), script_id, current_user_id()))
-  cur.execute("""
-    UPDATE user_strategy_version SET source_code=%s, source_checksum=%s, runtime_config=%s
-    WHERE strategy_id=%s AND version_no=%s
   """, (
-    payload["code"], hashlib.sha256(payload["code"].encode("utf-8")).hexdigest(),
-    Jsonb({"entryType": payload.get("entryType", "on_bar"), "status": "active"}),
-    script_id, int(row["current_version_no"]),
+    payload["name"], payload.get("description", ""), version_no,
+    script_id, current_user_id(),
   ))
-  if cur.rowcount == 0:
-    _insert_script_version(cur, script_id, int(row["current_version_no"]), payload)
-  return script_id
+  return script_id, version_id, version_no
 
 
 def create_strategy_script(payload: dict[str, Any]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      script_id = _write_strategy_script(cur, None, payload)
+      script_id, _, _ = _write_strategy_script(cur, None, payload)
   return get_strategy_script(script_id)
 
 
 def update_strategy_script(script_id: str, payload: dict[str, Any]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
+      cur.execute("SELECT 1 FROM strategy_config WHERE strategy_id=%s", (script_id,))
+      if cur.fetchone():
+        raise ConflictError("该脚本已归属完整策略，请通过策略方案保存")
       _write_strategy_script(cur, script_id, payload)
   return get_strategy_script(script_id)
 
@@ -601,21 +687,62 @@ def get_strategy_script(script_id: str) -> dict[str, Any]:
       return _normalize_script(row)
 
 
+def get_strategy_script_version(version_id: str, script_id: str | None = None) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT strategy.id, strategy.name, strategy.description,
+          strategy.created_at, strategy.updated_at,
+          version.id AS version_id, version.version_no, version.source_code,
+          version.runtime_config, version.content_fingerprint
+        FROM user_strategy_version version
+        JOIN user_strategy strategy ON strategy.id=version.strategy_id
+        WHERE version.id=%s AND strategy.owner_user_id=%s
+          AND (%s::uuid IS NULL OR strategy.id=%s::uuid)
+      """, (version_id, current_user_id(), script_id, script_id))
+      row = cur.fetchone()
+      if not row:
+        raise KeyError(version_id)
+      return _normalize_script(row)
+
+
 def delete_strategy_script(script_id: str) -> bool:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("DELETE FROM user_strategy WHERE id=%s AND owner_user_id=%s", (script_id, current_user_id()))
+      cur.execute("""
+        UPDATE user_strategy SET status='archived', updated_at=now()
+        WHERE id=%s AND owner_user_id=%s
+          AND NOT EXISTS (SELECT 1 FROM strategy_config WHERE strategy_id=%s)
+      """, (script_id, current_user_id(), script_id))
       return cur.rowcount > 0
 
 
 def _config_query(where: str = "") -> str:
   return f"""
     SELECT c.*, i.symbol, i.exchange,
-      CASE WHEN b.id IS NULL THEN NULL ELSE b.symbol || '.' || b.exchange END AS benchmark_symbol
+      CASE WHEN b.id IS NULL THEN NULL ELSE b.symbol || '.' || b.exchange END AS benchmark_symbol,
+      strategy.description AS script_description,
+      version.version_no AS script_version_no,
+      version.source_code, version.runtime_config,
+      version.content_fingerprint,
+      latest_version.id AS published_version_id
     FROM strategy_config c
     JOIN market_instrument i ON i.id=c.instrument_id
     LEFT JOIN market_instrument b ON b.id=c.benchmark_instrument_id
-    WHERE c.owner_user_id=%s {where}
+    LEFT JOIN user_strategy strategy ON strategy.id=c.strategy_id
+    LEFT JOIN user_strategy_version current_version
+      ON current_version.strategy_id=strategy.id
+      AND current_version.version_no=strategy.current_version_no
+    LEFT JOIN user_strategy_version version
+      ON version.id=COALESCE(c.strategy_version_id, current_version.id)
+    LEFT JOIN LATERAL (
+      SELECT config_version.id
+      FROM strategy_config_version config_version
+      WHERE config_version.config_id=c.id
+      ORDER BY config_version.version_no DESC
+      LIMIT 1
+    ) latest_version ON true
+    WHERE c.owner_user_id=%s AND c.archived_at IS NULL {where}
   """
 
 
@@ -626,50 +753,57 @@ def list_strategy_configs() -> list[dict[str, Any]]:
       return [_normalize_config(row) for row in cur.fetchall()]
 
 
-def _config_snapshot(config: dict[str, Any], strategy_version_id: str | None) -> dict[str, Any]:
+def _config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+  params_json = dict(config.get("paramsJson") or {})
+  code = str(config.get("code") or "")
+  params_json["scriptCodeHash"] = hashlib.sha256(code.encode("utf-8")).hexdigest()
+  params_json["scriptSnapshot"] = {
+    "id": config.get("scriptId"),
+    "versionId": config.get("strategyVersionId"),
+    "name": config["name"],
+    "description": config.get("description", ""),
+    "code": code,
+    "entryType": config.get("entryType", "on_bar"),
+    "signalRequired": bool(config.get("signalRequired", False)),
+  }
   return {
-    "name": config["name"], "scriptId": config.get("scriptId"), "strategyVersionId": strategy_version_id,
+    "name": config["name"], "scriptId": config.get("scriptId"),
+    "strategyVersionId": config.get("strategyVersionId"),
     "strategy": config["strategy"], "mode": config["mode"], "symbol": config["symbol"],
     "timeframe": config.get("timeframe", "5m"), "benchmarkSymbol": config.get("benchmarkSymbol"),
-    "accountId": config.get("accountId"), "paramsJson": _with_script_code_hash(config).get("paramsJson", {}),
+    "accountId": config.get("accountId"), "paramsJson": params_json,
   }
 
 
-def _script_version_id(cur: Any, script_id: str | None) -> str | None:
-  if not script_id:
-    return None
-  cur.execute("""
-    SELECT v.id FROM user_strategy s JOIN user_strategy_version v
-      ON v.strategy_id=s.id AND v.version_no=s.current_version_no
-    WHERE s.id=%s AND s.owner_user_id=%s
-  """, (script_id, current_user_id()))
-  row = cur.fetchone()
-  if not row:
-    raise KeyError(script_id)
-  return _uuid(row["id"])
-
-
-def _write_config(cur: Any, config_id: str | None, payload: dict[str, Any]) -> str:
+def _write_config(
+  cur: Any,
+  config_id: str | None,
+  payload: dict[str, Any],
+  strategy_id: str,
+  strategy_version_id: str,
+) -> str:
   instrument_id = _instrument_id(cur, payload["symbol"])
   benchmark_id = _instrument_id(cur, payload["benchmarkSymbol"]) if payload.get("benchmarkSymbol") else None
   if config_id is None:
     cur.execute("""
       INSERT INTO strategy_config (
-        owner_user_id, name, strategy_id, strategy_key, mode, instrument_id, timeframe,
+        owner_user_id, name, strategy_id, strategy_version_id, strategy_key, mode, instrument_id, timeframe,
         benchmark_instrument_id, account_id, params, enabled, published
-      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true) RETURNING id
-    """, (current_user_id(), payload["name"], payload.get("scriptId"), payload.get("strategy", "user_script"),
+      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true) RETURNING id
+    """, (current_user_id(), payload["name"], strategy_id, strategy_version_id,
+           payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
            payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True)))
   else:
     cur.execute("""
-      UPDATE strategy_config SET name=%s, strategy_id=%s, strategy_key=%s, mode=%s,
+      UPDATE strategy_config SET name=%s, strategy_version_id=%s, strategy_key=%s, mode=%s,
         instrument_id=%s, timeframe=%s, benchmark_instrument_id=%s, account_id=%s, params=%s,
-        enabled=%s, published=true, updated_at=now() WHERE id=%s AND owner_user_id=%s RETURNING id
-    """, (payload["name"], payload.get("scriptId"), payload.get("strategy", "user_script"),
+        enabled=%s, published=true, revision=revision + 1, updated_at=now()
+      WHERE id=%s AND owner_user_id=%s AND strategy_id=%s RETURNING id
+    """, (payload["name"], strategy_version_id, payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
            payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True),
-           config_id, current_user_id()))
+           config_id, current_user_id(), strategy_id))
   row = cur.fetchone()
   if not row:
     raise KeyError(config_id)
@@ -677,71 +811,112 @@ def _write_config(cur: Any, config_id: str | None, payload: dict[str, Any]) -> s
 
 
 def create_strategy_config(payload: dict[str, Any]) -> dict[str, Any]:
-  with _db() as conn:
-    with conn.cursor() as cur:
-      config_id = _write_config(cur, None, payload)
-  config = get_strategy_config(config_id)
-  if payload.get("publish", True):
-    publish_strategy_config(config_id)
-    return get_strategy_config(config_id)
-  return config
+  raise ConflictError("请使用完整策略保存接口创建策略，不能单独绑定脚本")
 
 
 def update_strategy_config(config_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-  with _db() as conn:
-    with conn.cursor() as cur:
-      _write_config(cur, config_id, payload)
-  return get_strategy_config(config_id)
+  raise ConflictError("请使用完整策略保存接口修改策略，不能单独改绑脚本")
+
+
+def _get_strategy_config_with_cursor(
+  cur: Any,
+  config_id: str,
+  for_update: bool = False,
+) -> dict[str, Any]:
+  suffix = "AND c.id=%s FOR UPDATE OF c" if for_update else "AND c.id=%s"
+  cur.execute(_config_query(suffix), (current_user_id(), config_id))
+  row = cur.fetchone()
+  if not row:
+    raise KeyError(config_id)
+  return _normalize_config(row)
 
 
 
 def save_complete_strategy(
-  script_payload: dict[str, Any], config_payload: dict[str, Any], script_id: str | None, config_id: str | None,
+  script_payload: dict[str, Any],
+  config_payload: dict[str, Any],
+  script_id: str | None,
+  config_id: str | None,
+  expected_revision: int | None = None,
 ) -> dict[str, dict[str, Any]]:
-  """在同一事务中保存脚本与完整回测策略，避免预检通过后出现半完成数据。"""
+  """原子保存一对一完整策略，并自动创建精确的发布版本。"""
   with _db() as conn:
     with conn.cursor() as cur:
-      saved_script_id = _write_strategy_script(cur, script_id, script_payload)
+      owned_script_id: str | None = None
+      if config_id is not None:
+        cur.execute("""
+          SELECT strategy_id, revision FROM strategy_config
+          WHERE id=%s AND owner_user_id=%s FOR UPDATE
+        """, (config_id, current_user_id()))
+        current = cur.fetchone()
+        if not current:
+          raise KeyError(config_id)
+        owned_script_id = _uuid(current["strategy_id"])
+        if script_id and script_id != owned_script_id:
+          raise ConflictError("策略脚本归属不一致，禁止将方案改绑到其他脚本")
+        if expected_revision is None or int(current["revision"]) != expected_revision:
+          raise ConflictError("该策略已在其他会话中更新，请刷新后重试")
+      saved_script_id, strategy_version_id, _ = _write_strategy_script(
+        cur, owned_script_id, script_payload,
+      )
       config = {**config_payload, "scriptId": saved_script_id}
-      saved_config_id = _write_config(cur, config_id, config)
+      saved_config_id = _write_config(
+        cur, config_id, config, saved_script_id, strategy_version_id,
+      )
+      saved_config = _get_strategy_config_with_cursor(cur, saved_config_id)
+      _publish_strategy_config_with_cursor(cur, saved_config)
   return {
     "script": get_strategy_script(saved_script_id),
     "config": get_strategy_config(saved_config_id),
   }
+
+
 def _version_fingerprint(snapshot: dict[str, Any]) -> str:
   return hashlib.sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def _publish_strategy_config_with_cursor(
+  cur: Any,
+  config: dict[str, Any],
+) -> tuple[str, bool]:
+  config_id = str(config["id"])
+  strategy_version_id = str(config["strategyVersionId"])
+  snapshot = _config_snapshot(config)
+  cur.execute("""
+    SELECT id, snapshot FROM strategy_config_version
+    WHERE config_id=%s ORDER BY version_no DESC LIMIT 1
+  """, (config_id,))
+  previous = cur.fetchone()
+  if previous and _version_fingerprint(previous["snapshot"]) == _version_fingerprint(snapshot):
+    cur.execute("UPDATE strategy_config SET published=true WHERE id=%s", (config_id,))
+    return _uuid(previous["id"]) or "", False
+  cur.execute("""
+    SELECT COALESCE(MAX(version_no), 0) + 1 AS value
+    FROM strategy_config_version WHERE config_id=%s
+  """, (config_id,))
+  version_no = int(cur.fetchone()["value"])
+  cur.execute("""
+    INSERT INTO strategy_config_version (
+      config_id, version_no, strategy_version_id, snapshot
+    ) VALUES (%s, %s, %s, %s) RETURNING id
+  """, (config_id, version_no, strategy_version_id, Jsonb(snapshot)))
+  version_id = _uuid(cur.fetchone()["id"]) or ""
+  cur.execute("UPDATE strategy_config SET published=true WHERE id=%s", (config_id,))
+  return version_id, True
+
+
 def publish_strategy_config(config_id: str) -> tuple[dict[str, Any], bool]:
-  config = get_strategy_config(config_id)
   with _db() as conn:
     with conn.cursor() as cur:
-      strategy_version_id = _script_version_id(cur, config.get("scriptId"))
-      snapshot = _config_snapshot(config, strategy_version_id)
-      cur.execute("SELECT id, snapshot FROM strategy_config_version WHERE config_id=%s ORDER BY version_no DESC LIMIT 1", (config_id,))
-      previous = cur.fetchone()
-      if previous and _version_fingerprint(previous["snapshot"]) == _version_fingerprint(snapshot):
-        cur.execute("UPDATE strategy_config SET published=true, updated_at=now() WHERE id=%s", (config_id,))
-        return get_strategy_config_version(_uuid(previous["id"]) or ""), False
-      cur.execute("SELECT COALESCE(MAX(version_no), 0) + 1 AS value FROM strategy_config_version WHERE config_id=%s", (config_id,))
-      version_no = int(cur.fetchone()["value"])
-      cur.execute("""
-        INSERT INTO strategy_config_version (config_id, version_no, strategy_version_id, snapshot)
-        VALUES (%s, %s, %s, %s) RETURNING id
-      """, (config_id, version_no, strategy_version_id, Jsonb(snapshot)))
-      version_id = _uuid(cur.fetchone()["id"]) or ""
-      cur.execute("UPDATE strategy_config SET published=true, updated_at=now() WHERE id=%s", (config_id,))
-  return get_strategy_config_version(version_id), True
+      config = _get_strategy_config_with_cursor(cur, config_id, for_update=True)
+      version_id, created = _publish_strategy_config_with_cursor(cur, config)
+  return get_strategy_config_version(version_id), created
 
 
 def get_strategy_config(config_id: str) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(_config_query("AND c.id=%s"), (current_user_id(), config_id))
-      row = cur.fetchone()
-      if not row:
-        raise KeyError(config_id)
-      return _normalize_config(row)
+      return _get_strategy_config_with_cursor(cur, config_id)
 
 
 def get_strategy_config_version(version_id: str) -> dict[str, Any]:
@@ -785,8 +960,20 @@ def list_strategy_config_versions(config_id: str) -> list[dict[str, Any]]:
 def delete_strategy_config(config_id: str) -> bool:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("DELETE FROM strategy_config WHERE id=%s AND owner_user_id=%s", (config_id, current_user_id()))
-      return cur.rowcount > 0
+      cur.execute("""
+        UPDATE strategy_config
+        SET archived_at=now(), published=false, revision=revision + 1, updated_at=now()
+        WHERE id=%s AND owner_user_id=%s AND archived_at IS NULL
+        RETURNING strategy_id
+      """, (config_id, current_user_id()))
+      row = cur.fetchone()
+      if not row:
+        return False
+      cur.execute("""
+        UPDATE user_strategy SET status='archived', updated_at=now()
+        WHERE id=%s AND owner_user_id=%s
+      """, (row["strategy_id"], current_user_id()))
+      return True
 
 
 def _with_script_code_hash(payload: dict[str, Any]) -> dict[str, Any]:
@@ -794,10 +981,22 @@ def _with_script_code_hash(payload: dict[str, Any]) -> dict[str, Any]:
   params = dict(normalized.get("paramsJson") or {})
   script_id = normalized.get("scriptId")
   if script_id:
-    script = get_strategy_script(str(script_id))
+    version_id = normalized.get("strategyVersionId") or params.get("strategyVersionId")
+    script = (
+      get_strategy_script_version(str(version_id), str(script_id))
+      if version_id
+      else get_strategy_script(str(script_id))
+    )
     code_hash = hashlib.sha256(script["code"].encode("utf-8")).hexdigest()
     params["scriptCodeHash"] = code_hash
-    params["scriptSnapshot"] = {"id": script["id"], "name": script["name"], "code": script["code"], "entryType": script["entryType"]}
+    params["scriptSnapshot"] = {
+      "id": script["id"],
+      "versionId": script.get("versionId"),
+      "name": script["name"],
+      "code": script["code"],
+      "entryType": script["entryType"],
+      "signalRequired": bool(script.get("signalRequired", False)),
+    }
   normalized["paramsJson"] = params
   return normalized
 
@@ -836,8 +1035,9 @@ def _create_backtest_run_row(
       gen_random_uuid(), %s, %s, %s, %s, %s, %s,
       CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
     ) RETURNING id, display_no
-  """, (owner_user_id, display_no, None, db_status, Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
-         config_id, None, payload.get("accountId"), instrument_id, benchmark_id,
+  """, (owner_user_id, display_no, payload.get("strategyVersionId"), db_status,
+         Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
+         config_id, payload.get("configVersionId"), payload.get("accountId"), instrument_id, benchmark_id,
          payload.get("timeframe", "5m"), "bar_close_signal_fill", Jsonb(script_snapshot) if script_snapshot else None,
          Jsonb(params_snapshot), payload.get("executionKind", "published")))
   row = cur.fetchone()
@@ -885,10 +1085,20 @@ def _save_research_signal_snapshot(cur: Any, run_id: str, owner_user_id: str, sn
     """INSERT INTO artifact_file
       (id, owner_user_id, run_id, artifact_type, storage_key, original_filename, content_type, byte_size, content_sha256)
       VALUES (gen_random_uuid(), %s, %s, 'research_signal', %s, %s, 'application/x-ndjson', %s, %s)
+      ON CONFLICT (storage_key) DO UPDATE
+      SET storage_key=EXCLUDED.storage_key
+      WHERE artifact_file.artifact_type=EXCLUDED.artifact_type
+        AND artifact_file.original_filename=EXCLUDED.original_filename
+        AND artifact_file.content_type=EXCLUDED.content_type
+        AND artifact_file.byte_size=EXCLUDED.byte_size
+        AND artifact_file.content_sha256=EXCLUDED.content_sha256
       RETURNING id""",
     (owner_user_id, run_id, f"research_signals/{path.name}", path.name, path.stat().st_size, content_sha256),
   )
-  artifact_id = cur.fetchone()["id"]
+  artifact_row = cur.fetchone()
+  if artifact_row is None:
+    raise DatabaseError("研究信号冻结文件与已有存储记录冲突")
+  artifact_id = artifact_row["id"]
   cur.execute(
     """INSERT INTO research_signal_snapshot
       (run_id, dataset_id, dataset_version, snapshot_hash, artifact_file_id, manifest, source_partitions)
@@ -955,11 +1165,17 @@ def create_api_backtest_job(
           str(run["status"]),
           str(run["fill_model"] or payload.get("fillModel", "bar_next_open")),
         )
+      job_kind = "l2" if payload.get("fillModel") == "l2_quote" else "bar"
+      if (
+        settings.BACKTEST_RUNNER_AVAILABILITY_REQUIRED
+        and not _has_healthy_backtest_runner(cur, job_kind)
+      ):
+        raise RunnerUnavailableError("回测执行服务暂不可用，请稍后重试")
       cur.execute("""
         SELECT count(*) AS value
         FROM api_idempotency_record record
         JOIN backtest_run run ON run.id=record.run_id
-        WHERE record.api_key_id=%s AND run.status IN ('queued', 'running')
+        WHERE record.api_key_id=%s AND run.status IN ('queued', 'running', 'cancelling')
       """, (api_key_id,))
       if int(cur.fetchone()["value"]) >= settings.PUBLIC_API_MAX_INFLIGHT:
         raise ValueError("API Key 正在排队或运行的回测已达上限")
@@ -993,43 +1209,241 @@ def create_api_backtest_job(
       return run_id, display_no, False, "queued", str(payload.get("fillModel", "bar_next_open"))
 
 
-def _claim_fair_l2_job_row(cur: Any, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
-  """在短事务调度锁内按用户运行数领取一条 L2 任务。"""
-  cur.execute("SELECT pg_advisory_xact_lock(%s)", (_L2_FAIR_CLAIM_LOCK_KEY,))
+def _finalize_expired_backtest_jobs(cur: Any) -> None:
+  """回收过期槽位，并将已失去执行器的取消任务收敛到终态。"""
+  for table in ("bar_backtest_job", "l2_backtest_job"):
+    cur.execute(f"""
+      WITH expired_jobs AS (
+        UPDATE {table}
+        SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
+        WHERE status='cancelling' AND lease_expires_at < now()
+        RETURNING run_id
+      )
+      UPDATE backtest_run AS run
+      SET status='cancelled', error_message=NULL, finished_at=now()
+      FROM expired_jobs
+      WHERE run.id=expired_jobs.run_id AND run.status='cancelling'
+    """)
+  cur.execute("DELETE FROM backtest_execution_slot WHERE lease_expires_at < now()")
+
+
+def _next_backtest_candidate(cur: Any, job_kind: str | None = None) -> dict[str, Any] | None:
+  """在全局锁内按用户当前占用数、提交时间选择下一条任务。"""
   cur.execute("""
-    WITH candidate AS (
-      SELECT job.run_id
-      FROM l2_backtest_job AS job
-      WHERE (job.status='queued' AND NOT job.cancel_requested)
-         OR (job.status='running' AND job.lease_expires_at < now() AND NOT job.cancel_requested)
-      ORDER BY (
-        SELECT count(*)
-        FROM l2_backtest_job AS active
-        WHERE active.owner_user_id=job.owner_user_id
-          AND active.status='running'
-          AND active.lease_expires_at >= now()
-      ), job.created_at, job.run_id
-      FOR UPDATE OF job SKIP LOCKED
-      LIMIT 1
-    )
-    UPDATE l2_backtest_job AS job
-    SET status='running', attempt_no=attempt_no + 1, attempt_token=gen_random_uuid(),
-      lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
-      started_at=COALESCE(started_at, now()), updated_at=now()
-    FROM candidate
-    WHERE job.run_id=candidate.run_id
-    RETURNING job.run_id, job.owner_user_id, job.payload, job.attempt_no, job.attempt_token
-  """, (lease_seconds, worker_id))
+    SELECT candidate.*,
+      (SELECT count(*) FROM backtest_execution_slot slot
+       WHERE slot.owner_user_id=candidate.owner_user_id) AS owner_active_count
+    FROM (
+      SELECT 'bar' AS job_kind, run_id, owner_user_id, created_at
+      FROM bar_backtest_job
+      WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
+        AND NOT cancel_requested
+      UNION ALL
+      SELECT 'l2' AS job_kind, run_id, owner_user_id, created_at
+      FROM l2_backtest_job
+      WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
+        AND NOT cancel_requested
+    ) AS candidate
+    WHERE (%s::text IS NULL OR candidate.job_kind=%s::text)
+    ORDER BY owner_active_count, candidate.created_at, candidate.run_id
+    LIMIT 1
+  """, (job_kind, job_kind))
   return cur.fetchone()
 
 
+def _scheduler_capacity(cur: Any) -> tuple[int, int]:
+  cur.execute("""
+    SELECT count(*) AS active_count,
+      (SELECT override_limit FROM backtest_scheduler_capacity
+       WHERE singleton AND override_expires_at > now()) AS override_limit
+    FROM backtest_execution_slot
+  """)
+  row = cur.fetchone() or {}
+  return int(row.get("active_count", 0)), int(row["override_limit"]) if row.get("override_limit") else 0
+
+
+def _record_backtest_runner_heartbeat(
+  cur: Any,
+  worker_id: str,
+  job_kind: str,
+  status: str,
+  current_run_id: str | None = None,
+  error_code: str | None = None,
+) -> None:
+  """限频写入 Runner 心跳，不保存异常正文或敏感诊断。"""
+  cur.execute("""
+    INSERT INTO backtest_runner_health (
+      worker_id, job_kind, status, current_run_id, last_error_code
+    ) VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (worker_id) DO UPDATE SET
+      job_kind=EXCLUDED.job_kind, status=EXCLUDED.status,
+      current_run_id=EXCLUDED.current_run_id, last_error_code=EXCLUDED.last_error_code,
+      heartbeat_at=now()
+    WHERE backtest_runner_health.heartbeat_at
+        < now() - make_interval(secs => %s)
+      OR backtest_runner_health.status IS DISTINCT FROM EXCLUDED.status
+      OR backtest_runner_health.current_run_id IS DISTINCT FROM EXCLUDED.current_run_id
+      OR backtest_runner_health.last_error_code IS DISTINCT FROM EXCLUDED.last_error_code
+  """, (
+    worker_id, job_kind, status, current_run_id, error_code,
+    settings.BACKTEST_RUNNER_HEARTBEAT_WRITE_SECONDS,
+  ))
+
+
+def record_backtest_runner_heartbeat(
+  worker_id: str,
+  job_kind: str,
+  status: str,
+  current_run_id: str | None = None,
+  error_code: str | None = None,
+) -> None:
+  if job_kind not in {"bar", "l2"} or status not in {"ready", "running", "error"}:
+    raise ValueError("Runner 心跳类型或状态无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      _record_backtest_runner_heartbeat(
+        cur, worker_id, job_kind, status, current_run_id, error_code,
+      )
+
+
+def has_healthy_backtest_runner(job_kind: str) -> bool:
+  """判断指定类型是否至少有一个处于有效心跳期的执行器。"""
+  if not settings.BACKTEST_RUNNER_AVAILABILITY_REQUIRED:
+    return True
+  with _db() as conn:
+    with conn.cursor() as cur:
+      return _has_healthy_backtest_runner(cur, job_kind)
+
+
+def _has_healthy_backtest_runner(cur: Any, job_kind: str) -> bool:
+  cur.execute("""
+    SELECT EXISTS (
+      SELECT 1 FROM backtest_runner_health
+      WHERE job_kind=%s AND status IN ('ready', 'running')
+        AND heartbeat_at >= now() - make_interval(secs => %s)
+    ) AS available
+  """, (job_kind, settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS))
+  return bool(cur.fetchone()["available"])
+
+
+def get_backtest_runner_health() -> dict[str, Any]:
+  """返回健康接口使用的聚合信息，不暴露 worker 标识和内部错误。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        WITH kinds(job_kind) AS (VALUES ('bar'::text), ('l2'::text))
+        SELECT kinds.job_kind,
+          count(health.worker_id) FILTER (
+            WHERE health.status IN ('ready', 'running')
+              AND health.heartbeat_at >= now() - make_interval(secs => %s)
+          ) AS healthy_count,
+          count(health.worker_id) FILTER (
+            WHERE health.status='error'
+              AND health.heartbeat_at >= now() - make_interval(secs => %s)
+          ) AS error_count,
+          CASE WHEN kinds.job_kind='bar'
+            THEN (SELECT count(*) FROM bar_backtest_job WHERE status='queued')
+            ELSE (SELECT count(*) FROM l2_backtest_job WHERE status='queued')
+          END AS queued_count
+        FROM kinds
+        LEFT JOIN backtest_runner_health health ON health.job_kind=kinds.job_kind
+        GROUP BY kinds.job_kind
+        ORDER BY kinds.job_kind
+      """, (
+        settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS,
+        settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS,
+      ))
+      rows = cur.fetchall()
+  runners = {
+    str(row["job_kind"]): {
+      "healthy": int(row["healthy_count"]),
+      "errors": int(row["error_count"]),
+      "queued": int(row["queued_count"]),
+    }
+    for row in rows
+  }
+  return {
+    "status": (
+      "ok"
+      if not settings.BACKTEST_RUNNER_AVAILABILITY_REQUIRED
+      or all(item["healthy"] > 0 for item in runners.values())
+      else "degraded"
+    ),
+    "runners": runners,
+  }
+
+
+def _claim_backtest_job(
+  cur: Any,
+  job_kind: str,
+  worker_id: str,
+  lease_seconds: int,
+) -> dict[str, Any] | None:
+  """领取 Bar/L2 共用容量中的一个槽位。"""
+  if job_kind not in {"bar", "l2"}:
+    raise ValueError("回测任务类型无效")
+  cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BACKTEST_SCHEDULER_LOCK_KEY,))
+  _finalize_expired_backtest_jobs(cur)
+  candidate = _next_backtest_candidate(cur)
+  if not candidate:
+    return None
+  if candidate["job_kind"] != job_kind:
+    logger.info(
+      "全局最优先任务等待对应执行器: kind=%s reason=%s",
+      candidate["job_kind"], f"{candidate['job_kind']}_executor_wait",
+    )
+    candidate = _next_backtest_candidate(cur, job_kind)
+    if not candidate:
+      return None
+
+  active_count, override_limit = _scheduler_capacity(cur)
+  normal_limit = override_limit or settings.BACKTEST_BASE_CONCURRENCY
+  owner_active_count = int(candidate.get("owner_active_count", 0))
+  fairness_burst = (
+    override_limit == 0
+    and settings.BACKTEST_FAIRNESS_BURST_ENABLED
+    and active_count < settings.BACKTEST_BURST_MAX_CONCURRENCY
+    and owner_active_count < settings.BACKTEST_USER_GUARANTEED_CONCURRENCY
+  )
+  if active_count >= normal_limit and not fairness_burst:
+    reason = "burst_limit_wait" if active_count >= settings.BACKTEST_BURST_MAX_CONCURRENCY else "capacity_wait"
+    logger.info("回测任务等待统一槽位: kind=%s reason=%s", job_kind, reason)
+    return None
+
+  table = "bar_backtest_job" if job_kind == "bar" else "l2_backtest_job"
+  cur.execute(f"""
+    UPDATE {table}
+    SET status='running', attempt_no=attempt_no + 1, attempt_token=gen_random_uuid(),
+      lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
+      started_at=COALESCE(started_at, now()), updated_at=now()
+    WHERE run_id=%s AND NOT cancel_requested
+      AND (status='queued' OR (status='running' AND lease_expires_at < now()))
+    RETURNING run_id, owner_user_id, payload, attempt_no, attempt_token, lease_expires_at
+  """, (lease_seconds, worker_id, candidate["run_id"]))
+  row = cur.fetchone()
+  if not row:
+    return None
+  cur.execute("""
+    INSERT INTO backtest_execution_slot (
+      run_id, owner_user_id, job_kind, attempt_token, worker_id, is_burst, lease_expires_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (run_id) DO UPDATE SET
+      attempt_token=EXCLUDED.attempt_token, worker_id=EXCLUDED.worker_id,
+      is_burst=EXCLUDED.is_burst, acquired_at=now(), lease_expires_at=EXCLUDED.lease_expires_at
+  """, (
+    row["run_id"], row["owner_user_id"], job_kind, row["attempt_token"], worker_id,
+    active_count >= settings.BACKTEST_BASE_CONCURRENCY, row["lease_expires_at"],
+  ))
+  return row
+
+
 def claim_l2_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
-  """原子公平领取一个任务，并为本次尝试生成不可复用令牌。"""
+  """从统一容量中原子领取一个 L2 任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("L2 runner 标识和租约时长必须有效")
   with _db() as conn:
     with conn.cursor() as cur:
-      row = _claim_fair_l2_job_row(cur, worker_id, lease_seconds)
+      row = _claim_backtest_job(cur, "l2", worker_id, lease_seconds)
       if not row:
         return None
       cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
@@ -1043,31 +1457,12 @@ def claim_l2_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] 
 
 
 def claim_bar_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
-  """原子领取一个标准 Bar 回测任务。"""
+  """从统一容量中原子领取一个标准 Bar 回测任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("Bar runner 标识和租约时长必须有效")
   with _db() as conn:
     with conn.cursor() as cur:
-      _finalize_expired_bar_backtest_cancellations(cur)
-      cur.execute("""
-        WITH candidate AS (
-          SELECT run_id
-          FROM bar_backtest_job
-          WHERE (status='queued' AND NOT cancel_requested)
-             OR (status='running' AND lease_expires_at < now() AND NOT cancel_requested)
-          ORDER BY created_at
-          FOR UPDATE SKIP LOCKED
-          LIMIT 1
-        )
-        UPDATE bar_backtest_job AS job
-        SET status='running', attempt_no=attempt_no + 1, attempt_token=gen_random_uuid(),
-          lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
-          started_at=COALESCE(started_at, now()), updated_at=now()
-        FROM candidate
-        WHERE job.run_id=candidate.run_id
-        RETURNING job.run_id, job.owner_user_id, job.payload, job.attempt_no, job.attempt_token
-      """, (lease_seconds, worker_id))
-      row = cur.fetchone()
+      row = _claim_backtest_job(cur, "bar", worker_id, lease_seconds)
       if not row:
         return None
       cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
@@ -1081,43 +1476,59 @@ def claim_bar_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any]
 
 
 def _finalize_expired_bar_backtest_cancellations(cur: Any) -> None:
-  """收尾执行器已退出的取消任务，避免其永久停留在运行中。"""
-  cur.execute("""
-    WITH expired_jobs AS (
-      UPDATE bar_backtest_job
-      SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
-      WHERE status='running' AND cancel_requested AND lease_expires_at < now()
-      RETURNING run_id
-    )
-    UPDATE backtest_run AS run
-    SET status='cancelled', error_message=NULL, finished_at=now()
-    FROM expired_jobs
-    WHERE run.id=expired_jobs.run_id AND run.status='running'
-  """)
+  """兼容旧诊断调用，实际收尾已统一覆盖 Bar 与 L2。"""
+  _finalize_expired_backtest_jobs(cur)
 
 
-def heartbeat_l2_backtest_job(run_id: str, attempt_token: str, lease_seconds: int) -> bool:
+def heartbeat_l2_backtest_job(
+  run_id: str, attempt_token: str, lease_seconds: int, worker_id: str | None = None,
+) -> bool:
   """仅持有当前 attempt_token 的 runner 可以续租。"""
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE l2_backtest_job
-        SET lease_expires_at=now() + make_interval(secs => %s), updated_at=now()
-        WHERE run_id=%s AND attempt_token=%s AND status='running' AND NOT cancel_requested
-      """, (lease_seconds, run_id, attempt_token))
-      return cur.rowcount == 1
+      return _heartbeat_backtest_job(
+        cur, "l2_backtest_job", run_id, attempt_token, lease_seconds, worker_id,
+      )
 
 
-def heartbeat_bar_backtest_job(run_id: str, attempt_token: str, lease_seconds: int) -> bool:
+def heartbeat_bar_backtest_job(
+  run_id: str, attempt_token: str, lease_seconds: int, worker_id: str | None = None,
+) -> bool:
   """仅持有当前租约的 Bar runner 可以续租。"""
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE bar_backtest_job
-        SET lease_expires_at=now() + make_interval(secs => %s), updated_at=now()
-        WHERE run_id=%s AND attempt_token=%s AND status='running' AND NOT cancel_requested
-      """, (lease_seconds, run_id, attempt_token))
-      return cur.rowcount == 1
+      return _heartbeat_backtest_job(
+        cur, "bar_backtest_job", run_id, attempt_token, lease_seconds, worker_id,
+      )
+
+
+def _heartbeat_backtest_job(
+  cur: Any,
+  table: str,
+  run_id: str,
+  attempt_token: str,
+  lease_seconds: int,
+  worker_id: str | None = None,
+) -> bool:
+  cur.execute(f"""
+    WITH renewed_job AS (
+      UPDATE {table}
+      SET lease_expires_at=now() + make_interval(secs => %s), updated_at=now()
+      WHERE run_id=%s AND attempt_token=%s AND status='running' AND NOT cancel_requested
+      RETURNING run_id, attempt_token, lease_expires_at
+    )
+    UPDATE backtest_execution_slot AS slot
+    SET lease_expires_at=renewed_job.lease_expires_at
+    FROM renewed_job
+    WHERE slot.run_id=renewed_job.run_id AND slot.attempt_token=renewed_job.attempt_token
+    RETURNING slot.run_id
+  """, (lease_seconds, run_id, attempt_token))
+  renewed = cur.fetchone() is not None
+  if renewed and worker_id:
+    _record_backtest_runner_heartbeat(
+      cur, worker_id, "bar" if table == "bar_backtest_job" else "l2", "running", run_id,
+    )
+  return renewed
 
 
 def finish_l2_backtest_job(
@@ -1134,21 +1545,12 @@ def finish_l2_backtest_job(
     raise ValueError("L2 任务终态无效")
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE l2_backtest_job
-        SET status=%s, error_message=%s, lease_expires_at=NULL, finished_at=now(), updated_at=now()
-        WHERE run_id=%s AND attempt_token=%s AND status='running'
-        RETURNING run_id
-      """, (status, summary.get("error") if status != "succeeded" else None, run_id, attempt_token))
-      if cur.fetchone() is None:
+      effective_status = _finish_backtest_job(
+        cur, "l2_backtest_job", run_id, attempt_token, status, summary, result,
+      )
+      if effective_status is None:
         return False
-      cur.execute("""
-        UPDATE backtest_run
-        SET status=%s, result_summary=%s, result_json=%s, error_message=%s, finished_at=now()
-        WHERE id=%s
-      """, (status, Jsonb(summary), Jsonb(result) if result else None,
-             summary.get("error") if status != "succeeded" else None, run_id))
-      if status == "failed" and system_error and owner_user_id:
+      if effective_status == "failed" and system_error and owner_user_id:
         _insert_system_error(cur, run_id, owner_user_id, system_error)
       return True
 
@@ -1167,31 +1569,67 @@ def finish_bar_backtest_job(
     raise ValueError("Bar 任务终态无效")
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE bar_backtest_job
-        SET status=%s, error_message=%s, lease_expires_at=NULL, finished_at=now(), updated_at=now()
-        WHERE run_id=%s AND attempt_token=%s AND status='running'
-        RETURNING run_id
-      """, (status, summary.get("error") if status != "succeeded" else None, run_id, attempt_token))
-      if cur.fetchone() is None:
+      effective_status = _finish_backtest_job(
+        cur, "bar_backtest_job", run_id, attempt_token, status, summary, result,
+      )
+      if effective_status is None:
         return False
-      cur.execute("""
-        UPDATE backtest_run
-        SET status=%s, result_summary=%s, result_json=%s, error_message=%s, finished_at=now()
-        WHERE id=%s
-      """, (status, Jsonb(summary), Jsonb(result) if result else None,
-             summary.get("error") if status != "succeeded" else None, run_id))
-      _enqueue_research_signal_result(cur, run_id, status, summary)
-      if status == "failed" and system_error and owner_user_id:
+      _enqueue_research_signal_result(cur, run_id, effective_status, summary)
+      if effective_status == "failed" and system_error and owner_user_id:
         _insert_system_error(cur, run_id, owner_user_id, system_error)
       return True
 
 
+def _finish_backtest_job(
+  cur: Any,
+  table: str,
+  run_id: str,
+  attempt_token: str,
+  requested_status: str,
+  summary: dict[str, Any],
+  result: dict[str, Any] | None,
+) -> str | None:
+  """以数据库中的取消状态优先，防止迟到成功结果覆盖取消。"""
+  cur.execute(f"""
+    UPDATE {table}
+    SET status=CASE WHEN cancel_requested OR status='cancelling' THEN 'cancelled' ELSE %s END,
+      error_message=CASE WHEN cancel_requested OR status='cancelling' THEN NULL ELSE %s END,
+      lease_expires_at=NULL, finished_at=now(), updated_at=now()
+    WHERE run_id=%s AND attempt_token=%s AND status IN ('running', 'cancelling')
+    RETURNING status
+  """, (
+    requested_status, summary.get("error") if requested_status != "succeeded" else None,
+    run_id, attempt_token,
+  ))
+  row = cur.fetchone()
+  if row is None:
+    return None
+  effective_status = str(row["status"])
+  effective_result = result if effective_status == "succeeded" else None
+  effective_error = summary.get("error") if effective_status == "failed" else None
+  cur.execute("""
+    UPDATE backtest_run
+    SET status=%s, result_summary=%s, result_json=%s, error_message=%s, finished_at=now()
+    WHERE id=%s AND status IN ('running', 'cancelling')
+  """, (
+    effective_status, Jsonb(summary), Jsonb(effective_result) if effective_result else None,
+    effective_error, run_id,
+  ))
+  cur.execute(
+    "DELETE FROM backtest_execution_slot WHERE run_id=%s AND attempt_token=%s",
+    (run_id, attempt_token),
+  )
+  return effective_status
+
+
 def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary: dict[str, Any]) -> None:
   """仅为存在研究信号快照的回测写入结果回传队列。"""
+  if not settings.RESEARCH_RESULT_REPORT_ENABLED:
+    return
   cur.execute(
     """INSERT INTO research_signal_result_outbox (run_id, payload)
       SELECT snapshot.run_id, jsonb_build_object(
+        'backtestInstanceId', %s::text,
         'backtestRunId', snapshot.run_id::text,
         'signalDatasetId', snapshot.dataset_id::text,
         'signalDatasetVersion', snapshot.dataset_version,
@@ -1202,62 +1640,161 @@ def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary:
       FROM research_signal_snapshot AS snapshot
       WHERE snapshot.run_id = %s
       ON CONFLICT (run_id) DO NOTHING""",
-    (status, Jsonb(summary), run_id),
+    (settings.BACKTEST_INSTANCE_ID, status, Jsonb(summary), run_id),
   )
 
 
 def request_l2_backtest_cancel(run_id: str) -> bool:
-  """请求取消尚未结束的 L2 任务。"""
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE l2_backtest_job
-        SET cancel_requested=true,
-          status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
-          finished_at=CASE WHEN status='queued' THEN now() ELSE finished_at END,
-          updated_at=now()
-        WHERE run_id=%s AND status IN ('queued', 'running')
-        RETURNING status
-      """, (run_id,))
-      row = cur.fetchone()
-      if row is None:
-        return False
-      if row["status"] == "cancelled":
-        cur.execute("UPDATE backtest_run SET status='cancelled', finished_at=now() WHERE id=%s", (run_id,))
-      return True
+  """兼容旧调用：仅在该运行属于 L2 队列时请求取消。"""
+  return _request_backtest_cancel(run_id, "l2_backtest_job") is not None
 
 
 def request_bar_backtest_cancel(run_id: str) -> bool:
-  """请求取消标准 Bar 回测；运行中的任务会在当前策略调用返回后结束。"""
+  """兼容旧调用：仅在该运行属于 Bar 队列时请求取消。"""
+  return _request_backtest_cancel(run_id, "bar_backtest_job") is not None
+
+
+def request_backtest_cancel(run_id: str) -> str | None:
+  """幂等取消任意回测，返回数据库真实状态。"""
+  status = _request_backtest_cancel(run_id, "l2_backtest_job")
+  return status if status is not None else _request_backtest_cancel(run_id, "bar_backtest_job")
+
+
+def _request_backtest_cancel(run_id: str, table: str) -> str | None:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        UPDATE bar_backtest_job
+      cur.execute(f"""
+        UPDATE {table}
         SET cancel_requested=true,
-          status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
+          status=CASE WHEN status='queued' THEN 'cancelled' WHEN status='running' THEN 'cancelling' ELSE status END,
           finished_at=CASE WHEN status='queued' THEN now() ELSE finished_at END,
           updated_at=now()
-        WHERE run_id=%s AND status IN ('queued', 'running')
+        WHERE run_id=%s
         RETURNING status
       """, (run_id,))
       row = cur.fetchone()
       if row is None:
-        return False
-      if row["status"] == "cancelled":
-        cur.execute("UPDATE backtest_run SET status='cancelled', finished_at=now() WHERE id=%s", (run_id,))
-      return True
+        return None
+      status = str(row["status"])
+      cur.execute("""
+        UPDATE backtest_run
+        SET status=%s, finished_at=CASE WHEN %s='cancelled' THEN COALESCE(finished_at, now()) ELSE finished_at END
+        WHERE id=%s AND status IN ('queued', 'running', 'cancelling')
+      """, (status, status, run_id))
+      return status
+
+
+def get_backtest_scheduler_capacity() -> dict[str, Any]:
+  """返回管理员可见的统一容量与当前占用。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT
+          CASE WHEN capacity.override_expires_at > now() THEN capacity.override_limit END AS override_limit,
+          CASE WHEN capacity.override_expires_at > now() THEN capacity.override_expires_at END AS override_expires_at,
+          count(slot.run_id) AS active_count,
+          count(slot.run_id) FILTER (WHERE slot.job_kind='bar') AS bar_active_count,
+          count(slot.run_id) FILTER (WHERE slot.job_kind='l2') AS l2_active_count
+        FROM backtest_scheduler_capacity capacity
+        LEFT JOIN backtest_execution_slot slot ON slot.lease_expires_at >= now()
+        WHERE capacity.singleton
+        GROUP BY capacity.override_limit, capacity.override_expires_at
+      """)
+      row = cur.fetchone() or {}
+      override_limit = int(row["override_limit"]) if row.get("override_limit") else None
+      return {
+        "baseLimit": settings.BACKTEST_BASE_CONCURRENCY,
+        "burstLimit": settings.BACKTEST_BURST_MAX_CONCURRENCY,
+        "effectiveLimit": override_limit or settings.BACKTEST_BASE_CONCURRENCY,
+        "overrideLimit": override_limit,
+        "overrideExpiresAt": row.get("override_expires_at"),
+        "activeCount": int(row.get("active_count", 0)),
+        "barActiveCount": int(row.get("bar_active_count", 0)),
+        "l2ActiveCount": int(row.get("l2_active_count", 0)),
+      }
+
+
+def set_backtest_scheduler_capacity(limit: int, ttl_seconds: int, reason: str) -> dict[str, Any]:
+  """设置有时限的人工容量；到期只阻止新领取，不终止在途任务。"""
+  if not 8 <= limit <= settings.BACKTEST_BURST_MAX_CONCURRENCY:
+    raise ValueError(f"临时容量必须在 8 至 {settings.BACKTEST_BURST_MAX_CONCURRENCY} 之间")
+  if not 60 <= ttl_seconds <= settings.BACKTEST_CAPACITY_OVERRIDE_MAX_TTL_SECONDS:
+    raise ValueError("临时容量有效期超出部署允许范围")
+  if not reason.strip():
+    raise ValueError("临时扩容必须填写原因")
+  actor_user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BACKTEST_SCHEDULER_LOCK_KEY,))
+      cur.execute("SELECT override_limit FROM backtest_scheduler_capacity WHERE singleton FOR UPDATE")
+      row = cur.fetchone() or {}
+      snapshot = _scheduler_audit_snapshot(cur)
+      cur.execute("""
+        UPDATE backtest_scheduler_capacity
+        SET override_limit=%s, override_expires_at=now() + make_interval(secs => %s),
+          updated_by_user_id=%s, update_reason=%s, updated_at=now()
+        WHERE singleton
+        RETURNING override_expires_at
+      """, (limit, ttl_seconds, actor_user_id, reason.strip()))
+      expires_at = cur.fetchone()["override_expires_at"]
+      cur.execute("""
+        INSERT INTO backtest_scheduler_capacity_audit (
+          actor_user_id, old_limit, new_limit, expires_at, reason, scheduler_snapshot
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+      """, (
+        actor_user_id, row.get("override_limit"), limit, expires_at, reason.strip(), Jsonb(snapshot),
+      ))
+  return get_backtest_scheduler_capacity()
+
+
+def clear_backtest_scheduler_capacity(reason: str) -> dict[str, Any]:
+  """提前结束人工扩容并记录审计。"""
+  actor_user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BACKTEST_SCHEDULER_LOCK_KEY,))
+      cur.execute("SELECT override_limit FROM backtest_scheduler_capacity WHERE singleton FOR UPDATE")
+      row = cur.fetchone() or {}
+      snapshot = _scheduler_audit_snapshot(cur)
+      cur.execute("""
+        UPDATE backtest_scheduler_capacity
+        SET override_limit=NULL, override_expires_at=NULL, updated_by_user_id=%s,
+          update_reason=%s, updated_at=now()
+        WHERE singleton
+      """, (actor_user_id, reason.strip()))
+      cur.execute("""
+        INSERT INTO backtest_scheduler_capacity_audit (
+          actor_user_id, old_limit, new_limit, expires_at, reason, scheduler_snapshot
+        ) VALUES (%s, %s, NULL, NULL, %s, %s)
+      """, (actor_user_id, row.get("override_limit"), reason.strip(), Jsonb(snapshot)))
+  return get_backtest_scheduler_capacity()
+
+
+def _scheduler_audit_snapshot(cur: Any) -> dict[str, int]:
+  """记录数据库可验证的扩容现场；主机资源由发布监控系统留存。"""
+  cur.execute("""
+    SELECT
+      (SELECT count(*) FROM backtest_execution_slot WHERE lease_expires_at >= now()) AS active_count,
+      (SELECT count(*) FROM bar_backtest_job WHERE status='queued')
+        + (SELECT count(*) FROM l2_backtest_job WHERE status='queued') AS queued_count
+  """)
+  row = cur.fetchone() or {}
+  return {"activeCount": int(row.get("active_count", 0)), "queuedCount": int(row.get("queued_count", 0))}
 
 
 def _run_query(where: str = "") -> str:
   return f"""
     SELECT r.*, s.id AS strategy_id,
       i.symbol || '.' || i.exchange AS symbol,
-      b.symbol || '.' || b.exchange AS benchmark_symbol
+      b.symbol || '.' || b.exchange AS benchmark_symbol,
+      COALESCE(bar_job.cancel_requested, l2_job.cancel_requested, false) AS cancel_requested
     FROM backtest_run r
     LEFT JOIN user_strategy_version sv ON sv.id=r.strategy_version_id
     LEFT JOIN user_strategy s ON s.id=sv.strategy_id
     LEFT JOIN market_instrument i ON i.id=r.instrument_id
     LEFT JOIN market_instrument b ON b.id=r.benchmark_instrument_id
+    LEFT JOIN bar_backtest_job bar_job ON bar_job.run_id=r.id
+    LEFT JOIN l2_backtest_job l2_job ON l2_job.run_id=r.id
     WHERE r.owner_user_id=%s {where}
   """
 

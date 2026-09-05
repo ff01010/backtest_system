@@ -8,6 +8,31 @@ from backend import bar_runner
 from backend.services.backtest_errors import RemoteBacktestError
 
 
+def test_bar_runner_claim_failure_reports_error_without_false_ready(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class StopLoop(Exception):
+    pass
+
+  heartbeats: list[tuple[Any, ...]] = []
+  monkeypatch.setattr(
+    bar_runner.state_store,
+    "claim_bar_backtest_job",
+    lambda *_: (_ for _ in ()).throw(bar_runner.state_store.DatabaseError("claim failed")),
+  )
+  monkeypatch.setattr(
+    bar_runner.state_store,
+    "record_backtest_runner_heartbeat",
+    lambda *args: heartbeats.append(args),
+  )
+  monkeypatch.setattr(bar_runner.time, "sleep", lambda _: (_ for _ in ()).throw(StopLoop()))
+
+  with pytest.raises(StopLoop):
+    bar_runner.BarRunner("test-worker").run_forever()
+
+  assert heartbeats == [("test-worker", "bar", "error", None, "DatabaseError")]
+
+
 def test_bar_runner_finishes_queued_job(monkeypatch: pytest.MonkeyPatch) -> None:
   job = {
     "runId": "run-1",

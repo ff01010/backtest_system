@@ -140,6 +140,23 @@ export interface BacktestSummary {
   baseHoldingReturn?: NullableMetric;
   t0ExcessPnl?: NullableMetric;
   t0ExcessReturn?: NullableMetric;
+  accountPnl?: NullableMetric;
+  accountRealizedPnl?: NullableMetric;
+  baseBenchmarkPnl?: NullableMetric;
+  overlayPnl?: NullableMetric;
+  realizedOverlayPnl?: NullableMetric;
+  unrealizedOverlayPnl?: NullableMetric;
+  completedCyclePnl?: NullableMetric;
+  completedCycleCount?: number;
+  openCycleCount?: number;
+  winningCycles?: number;
+  losingCycles?: number;
+  breakevenCycles?: number;
+  cycleWinRate?: NullableMetric;
+  tradeMetricVersion?: number;
+  completedTradeCount?: number;
+  openTradeCount?: number;
+  breakevenTrades?: number;
   maxDrawdown: NullableMetric;
   maxDrawdownRate: NullableMetric;
   annualVolatility: NullableMetric;
@@ -190,11 +207,25 @@ export interface BacktestTrade {
   direction: string;
   side: string;
   anchor: number;
+  fillId?: string;
+  positionKey?: string;
+  inventorySource?: string;
+  cycleId?: string | null;
+  cycleEffect?: 'open' | 'increase' | 'partial_close' | 'close' | 'reverse' | string;
+  overlayQuantityBefore?: number;
+  overlayQuantityAfter?: number;
+  accountRealizedPnl?: number;
+  realizedOverlayPnl?: number;
+  totalFee?: number;
+  attributionSegments?: Array<Record<string, unknown>>;
   price: number;
   quantity: number;
   pnl: number;
   note: string;
   strategyModule?: string;
+  researchSignalId?: string;
+  researchSignalAction?: 'long' | 'short' | 'flat';
+  researchSignalEffectiveAt?: string;
 }
 
 export interface ExecutionPlan {
@@ -223,6 +254,31 @@ export interface DailyHoldingPoint {
   marketValue: number;
   totalEquity: number;
   dailyPnl: number;
+  targetBaseQuantity?: number | null;
+  actualQuantity?: number | null;
+  overlayQuantity?: number | null;
+  sellableQuantity?: number | null;
+  dailyAccountPnl?: number | null;
+  dailyBaseBenchmarkPnl?: number | null;
+  dailyOverlayPnl?: number | null;
+  dailyRealizedOverlayPnl?: number | null;
+  unrealizedOverlayPnl?: number | null;
+}
+
+export interface OverlayCycle {
+  cycleId: string;
+  symbol: string;
+  direction: 'long' | 'short';
+  openedAt: string;
+  closedAt: string | null;
+  openedQuantity: number;
+  closedQuantity: number;
+  remainingQuantity: number;
+  realizedPnl: number;
+  unrealizedPnl: number;
+  netPnl: number;
+  fillIds: string[];
+  status: 'open' | 'completed';
 }
 
 export interface BacktestRunResponse {
@@ -248,6 +304,7 @@ export interface BacktestRunResponse {
   trades: BacktestTrade[];
   executionPlans?: ExecutionPlan[];
   skippedSignals?: BacktestTrade[];
+  cycles?: OverlayCycle[];
   experimentManifest?: ExperimentManifest;
   dataSnapshot?: Record<string, unknown>;
   warnings: string[];
@@ -285,17 +342,22 @@ export interface ExperimentManifest {
     slippage: number;
   };
   holdingPolicy?: 'intraday' | 'overnight';
+  overlaySettlementPolicy?: 'intraday_restore' | 'cross_day_carry';
   strategyCategory?: 'core_position_overlay' | 'directional_holding';
   resultSchemaVersion?: number;
 }
 
 export interface StrategyScript {
   id: string;
+  versionId: string | null;
+  versionNo: number;
   name: string;
   description: string;
   language: string;
   code: string;
   entryType: string;
+  signalRequired: boolean;
+  contentFingerprint: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -330,6 +392,12 @@ export interface StrategyConfig {
   id: string;
   name: string;
   scriptId: string | null;
+  strategyVersionId: string | null;
+  scriptVersionNo: number;
+  description: string;
+  code: string;
+  entryType: string;
+  signalRequired: boolean;
   strategy: string;
   mode: 'backtest' | 'live' | string;
   symbol: string;
@@ -339,6 +407,8 @@ export interface StrategyConfig {
   paramsJson: Record<string, unknown>;
   enabled: boolean;
   published: boolean;
+  publishedVersionId: string | null;
+  revision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -346,6 +416,7 @@ export interface StrategyConfig {
 export interface StrategyConfigVersion {
   id: string;
   configId: string;
+  strategyVersionId: string | null;
   versionNo: number;
   name: string;
   scriptId: string | null;
@@ -384,6 +455,9 @@ export interface BacktestRunHistory {
   outputDir: string;
   note: string;
   tags: string[];
+  queuedAt: string;
+  startedAt: string;
+  cancelRequested: boolean;
   resultJson: BacktestRunResponse | null;
   createdAt: string;
   finishedAt: string;

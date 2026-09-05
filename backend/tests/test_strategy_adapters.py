@@ -3,6 +3,7 @@
 
 import copy
 import hashlib
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -498,3 +499,93 @@ def test_backtest_runner_dispatches_by_strategy(monkeypatch: pytest.MonkeyPatch)
   result = backtest_runner.run_backtest({"strategy": "fake"})
 
   assert result == {"strategy": "fake", "ok": True}
+
+
+def test_research_signal_lookup_normalizes_and_forward_fills(tmp_path: Path) -> None:
+  artifact_file = tmp_path / "signals.ndjson"
+  artifact_file.write_text(
+    '{"signalId":"sig-long","action":"long"}\n'
+    '{"signalId":"sig-flat","action":"flat"}\n',
+    encoding="utf-8",
+  )
+  snapshot = {
+    "artifactFile": str(artifact_file),
+    "datasetId": "dataset-1",
+    "manifest": {"version": 1},
+    "alignmentPlan": [
+      {"signalId": "sig-long", "executionBarTime": "202606020935"},
+      {"signalId": "sig-flat", "executionBarTime": "202606021000"},
+    ],
+  }
+
+  active = backtest_runner._research_signal_by_bar_time(
+    snapshot, ["202606020930", "202606020935", "202606020940", "202606021000", "202606021005"],
+  )
+
+  assert "20260602093000" not in active
+  assert active["20260602093500"]["action"] == "long"
+  assert active["20260602094000"]["signalId"] == "sig-long"
+  assert active["20260602100000"]["action"] == "flat"
+  assert active["20260602100500"]["signalId"] == "sig-flat"
+
+
+def test_research_signal_lookup_uses_last_transition_from_legacy_same_bar_plan(tmp_path: Path) -> None:
+  artifact_file = tmp_path / "signals.ndjson"
+  artifact_file.write_text(
+    '{"signalId":"sig-long","action":"long"}\n'
+    '{"signalId":"sig-flat","action":"flat"}\n',
+    encoding="utf-8",
+  )
+  snapshot = {
+    "artifactFile": str(artifact_file),
+    "datasetId": "dataset-1",
+    "manifest": {"version": 1},
+    "alignmentPlan": [
+      {"signalId": "sig-long", "executionBarTime": "202606020935"},
+      {"signalId": "sig-flat", "executionBarTime": "202606020935"},
+    ],
+  }
+
+  active = backtest_runner._research_signal_by_bar_time(
+    snapshot, ["202606020935", "202606020940"],
+  )
+
+  assert active["20260602093500"]["signalId"] == "sig-flat"
+  assert active["20260602094000"]["action"] == "flat"
+
+
+@pytest.mark.parametrize(
+  ("signal_required", "dataset_id", "message"),
+  [
+    (True, None, "当前策略必须选择研究信号后才能运行"),
+    (False, "dataset-1", "当前策略未声明为研究信号驱动策略"),
+  ],
+)
+def test_backtest_research_signal_selection_matches_script_declaration(
+  monkeypatch: pytest.MonkeyPatch,
+  signal_required: bool,
+  dataset_id: str | None,
+  message: str,
+) -> None:
+  monkeypatch.setattr(api_app.state_store, "get_strategy_config", lambda _: {"scriptId": "script-1"})
+  monkeypatch.setattr(api_app.state_store, "get_strategy_script", lambda _: {
+    "id": "script-1", "signalRequired": signal_required,
+  })
+
+  with pytest.raises(HTTPException, match=message):
+    api_app._prepare_saved_strategy_snapshot({
+      "configId": "config-1", "signalDatasetId": dataset_id,
+    })
+
+
+def test_signal_required_script_must_read_research_signal() -> None:
+  payload = {
+    "code": "def on_bar(bar, state):\n  return []\n",
+    "entryType": "on_bar", "signalRequired": True, "status": "draft",
+  }
+
+  with pytest.raises(HTTPException, match="必须显式读取"):
+    api_app._validate_strategy_script(payload)
+
+  payload["code"] = "def on_bar(bar, state):\n  return bar.get('researchSignal') or []\n"
+  api_app._validate_strategy_script(payload)

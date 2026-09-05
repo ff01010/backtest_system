@@ -534,6 +534,54 @@ def test_l2_base_position_is_sellable_and_visible_to_script() -> None:
   assert snapshot.sellable_quantity == 1_000
 
 
+
+def test_l2_close_long_is_limited_to_actual_sellable_quantity() -> None:
+  engine = L2ExecutionEngine(
+    BuyStrategy(),
+    100_000,
+    0,
+    InstrumentRules(),
+    holding_policy="overnight",
+    base_quantity=100,
+    base_cost_price=10,
+  )
+  engine.initialize_base_position("688981.SH")
+  engine.begin_day("20260102")
+
+  close = OrderIntent("688981.SH", OrderSide.SELL, 150, "平多", position_effect=PositionEffect.CLOSE_LONG)
+  engine._submit(close, parse_timestamp("2026-01-02 09:31:00"))
+
+  assert len(engine._orders) == 1
+  assert engine._orders[0].intent.quantity == 100
+
+
+def test_l2_overlay_sell_is_limited_by_position_and_t0_capacity() -> None:
+  engine = L2ExecutionEngine(
+    BuyStrategy(),
+    100_000,
+    0,
+    InstrumentRules(),
+    holding_policy="intraday",
+    base_quantity=100,
+    base_cost_price=10,
+    t0_enabled=True,
+    strategy_category="core_position_overlay",
+    overlay_settlement_policy="cross_day_carry",
+  )
+  engine.initialize_base_position("688981.SH")
+  engine.begin_day("20260102")
+
+  sell = OrderIntent(
+    "688981.SH", OrderSide.SELL, 150, "负增强", position_effect=PositionEffect.OPEN_SHORT,
+  )
+  engine._submit(sell, parse_timestamp("2026-01-02 09:31:00"))
+
+  assert len(engine._orders) == 1
+  assert engine._orders[0].intent.quantity == 100
+  assert engine._orders[0].intent.position_key == "base_position"
+
+
+
 def test_l2_t0_capacity_reserves_both_open_directions(monkeypatch: pytest.MonkeyPatch) -> None:
   engine = L2ExecutionEngine(BuyStrategy(), 100_000, 0, InstrumentRules(allow_short=True), holding_policy="intraday", base_quantity=5_000, base_cost_price=10, t0_enabled=True)
   engine.initialize_base_position("688981.SH")
@@ -669,6 +717,106 @@ def test_l2_normalized_history_result_converts_compact_holding_dates() -> None:
 
   assert result["equity"][0]["date"] == "2026-01-02"
   assert result["dailyHoldings"][0]["date"] == "2026-01-02"
+
+
+def test_l2_directional_result_uses_complete_position_cycles() -> None:
+  raw_result = {
+    "fills": [{
+      "time": "2026-01-02 09:31:03",
+      "symbol": "688981.SH",
+      "side": "BUY",
+      "quantity": 100,
+      "price": 10.0,
+      "fee": 0.0,
+      "realized_pnl": 0.0,
+      "position_effect": "open_long",
+      "position_key": "script:test",
+    }, {
+      "time": "2026-01-05 09:31:03",
+      "symbol": "688981.SH",
+      "side": "SELL",
+      "quantity": 100,
+      "price": 11.0,
+      "fee": 0.0,
+      "realized_pnl": 100.0,
+      "position_effect": "close_long",
+      "position_key": "script:test",
+    }],
+    "equity": [],
+    "orders": [],
+    "warnings": [],
+  }
+
+  result = normalize_l2_result(raw_result, {
+    "initialCapital": 10_000,
+    "strategyCategory": "directional_holding",
+  })
+
+  assert result["resultSchemaVersion"] == 3
+  assert result["summary"]["completedTradeCount"] == 1
+  assert result["summary"]["openTradeCount"] == 0
+  assert result["summary"]["winRate"] == 1.0
+  assert result["cycles"] == []
+
+
+def test_l2_overlay_result_keeps_cross_day_cycle_and_manifest_policy() -> None:
+  raw_result = {
+    "fills": [{
+      "time": "2026-01-02 09:31:03",
+      "symbol": "688981.SH",
+      "side": "SELL",
+      "quantity": 100,
+      "price": 11.0,
+      "fee": 0.0,
+      "realized_pnl": 100.0,
+      "position_effect": "close_long",
+      "position_key": "base_position",
+    }, {
+      "time": "2026-01-05 09:31:03",
+      "symbol": "688981.SH",
+      "side": "BUY",
+      "quantity": 100,
+      "price": 10.0,
+      "fee": 0.0,
+      "realized_pnl": 0.0,
+      "position_effect": "open_long",
+      "position_key": "base_position",
+    }],
+    "equity": [{
+      "time": "2026-01-02 14:57:00", "equity": 2_100, "cash": 2_100, "close": 11, "longQty": 0, "sellableQty": 0,
+    }, {
+      "time": "2026-01-05 14:57:00", "equity": 2_100, "cash": 1_100, "close": 10, "longQty": 100, "sellableQty": 100,
+    }],
+    "orders": [],
+    "warnings": [],
+  }
+
+  result = normalize_l2_result(raw_result, {
+    "initialCapital": 1_000,
+    "baseQuantity": 100,
+    "baseCostPrice": 10,
+    "t0Enabled": True,
+    "strategyCategory": "core_position_overlay",
+    "overlaySettlementPolicy": "cross_day_carry",
+  })
+
+  assert result["summary"]["completedCycleCount"] == 1
+  assert result["summary"]["realizedOverlayPnl"] == 100
+  assert result["trades"][0]["accountRealizedPnl"] == 100
+  assert result["trades"][0]["pnl"] == 0
+  assert result["trades"][1]["accountRealizedPnl"] == 0
+  assert result["trades"][1]["pnl"] == 100
+  assert result["cycles"][0]["status"] == "completed"
+  assert result["experimentManifest"]["overlaySettlementPolicy"] == "cross_day_carry"
+  assert result["dailyHoldings"][1]["sellableQuantity"] == 100
+  assert result["experimentManifest"]["resultSchemaVersion"] == 3
+
+
+def test_l2_legacy_manifest_keeps_result_schema_version_two() -> None:
+  result = normalize_l2_result({"fills": [], "equity": [], "orders": []}, {"initialCapital": 1_000})
+
+  assert result["resultSchemaVersion"] == 2
+  assert result["experimentManifest"]["resultSchemaVersion"] == 2
 
 
 def test_l2_intraday_closes_overlay_long_at_one_sided_limit_quote() -> None:

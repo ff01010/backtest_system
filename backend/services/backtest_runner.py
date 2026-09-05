@@ -12,6 +12,7 @@ import os
 import sys
 from contextlib import redirect_stdout
 from io import StringIO
+from collections.abc import Callable
 from typing import Any, Sequence
 
 import pandas as pd
@@ -19,8 +20,12 @@ import yaml
 
 from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel, RecordedPriceExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade
+from backend.backtesting.models import OrderSide, PositionEffect
+from backend.backtesting.overlay import OverlayFill, build_overlay_report
+from backend.backtesting.trade_metrics import ClosedTradeFill, build_closed_trade_metrics
 from backend.strategies.catalog import create_bar_strategy, get_strategy_source_snapshot
 from backend.strategies.external_engine import load_external_engine
+from backend.strategies.script_time_context import normalize_script_bar_time
 from backend.services import bar_data, market_data, state_store, strategy_worker
 
 _BACKTEST_SYSTEM_ROOT = os.path.dirname(
@@ -53,8 +58,15 @@ def __getattr__(name: str) -> Any:
   raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def run_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+def run_backtest(
+  payload: dict[str, Any],
+  script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
   """按策略 ID 分发到对应适配器。"""
+  if payload["strategy"] == "user_script":
+    return _sanitize_json_value(run_user_script_backtest(payload, script_executor))
+  if payload["strategy"] == "research_signal":
+    return _sanitize_json_value(run_research_signal_backtest(payload, script_executor))
   from backend.services.strategy_adapters import get_strategy_adapter
 
   adapter = get_strategy_adapter(payload["strategy"])
@@ -115,7 +127,10 @@ def run_trend_grid_backtest(payload: dict[str, Any]) -> dict[str, Any]:
   return response
 
 
-def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+def run_user_script_backtest(
+  payload: dict[str, Any],
+  script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
   """将脚本快照交给隔离容器运行，后端只持有数据和结果。"""
   script_id = payload.get("scriptId")
   if not isinstance(script_id, str) or not script_id:
@@ -148,8 +163,12 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
       "code": script["code"],
     }],
   }
-  research_signal_by_bar_time = _research_signal_by_bar_time(payload.get("researchSignalSnapshot"))
-  worker_result = strategy_worker.run_script({
+  research_signal_by_bar_time = _research_signal_by_bar_time(
+    payload.get("researchSignalSnapshot"),
+    [str(row.time) for row in bars.itertuples(index=False)],
+  )
+  execute_script = script_executor or strategy_worker.run_script
+  worker_result = execute_script({
     "scriptId": script_id,
     "code": script["code"],
     "params": {
@@ -170,6 +189,8 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     "feeProfile": dict(payload.get("feeProfile") or {}),
     "slippage": float(payload["slippage"]),
     "holdingPolicy": _holding_policy(payload),
+    "strategyCategory": _strategy_category(payload),
+    "overlaySettlementPolicy": _overlay_settlement_policy(payload),
     "fillModel": str(payload.get("fillModel", "bar_next_open")),
     "executionAlgorithm": str(payload.get("executionAlgorithm", "immediate")),
     "executionParameters": dict(payload.get("executionParameters") or {}),
@@ -190,6 +211,23 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     initial_cash, base_quantity, base_cost_price, bool(payload.get("t0Enabled", False)),
     worker_result["trades"], daily_holdings,
   )
+  cycles: list[dict[str, Any]] = []
+  if _strategy_category(payload) == "core_position_overlay":
+    _ensure_fill_ids(worker_result["trades"])
+    report = build_overlay_report(
+      _overlay_fills(worker_result.get("fills", [])),
+      daily_holdings,
+      initial_cash,
+      base_quantity,
+      base_cost_price,
+    )
+    _merge_overlay_report(worker_result["trades"], daily_holdings, summary, report)
+    cycles = report["cycles"]
+  else:
+    summary.update(build_closed_trade_metrics(
+      _directional_fills(worker_result.get("fills", [])),
+      base_quantity if bool(payload.get("initialPositionEnabled", False)) else 0,
+    ))
   benchmark_symbol = payload.get("benchmarkSymbol") or payload["symbol"]
   benchmark_equity, benchmark_warnings = _build_benchmark_equity(
     benchmark_symbol, payload.get("timeframe", "5m"), payload["startDate"], payload["endDate"],
@@ -198,7 +236,7 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
   benchmark_return = _compute_benchmark_return(benchmark_equity)
   response = {
     "strategyCategory": _strategy_category(payload),
-    "resultSchemaVersion": 2,
+    "resultSchemaVersion": 3,
     "strategyMetrics": _strategy_metrics(_strategy_category(payload), summary),
     "outputDir": _script_output_dir(payload),
     "summary": summary,
@@ -208,6 +246,7 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     "benchmarkReturn": benchmark_return,
     "excessReturn": round(summary["totalReturn"] - benchmark_return, 6),
     "dailyHoldings": daily_holdings,
+    "cycles": cycles,
     "trades": worker_result["trades"],
     "skippedSignals": worker_result["skippedSignals"] + worker_result.get("unexecutedOrders", []),
     "experimentManifest": manifest,
@@ -218,8 +257,11 @@ def run_user_script_backtest(payload: dict[str, Any]) -> dict[str, Any]:
   return response
 
 
-def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
-  """Build the worker-only Bar lookup from the immutable artifact and alignment plan."""
+def _research_signal_by_bar_time(
+  snapshot: object,
+  bar_times: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+  """从冻结切换点构建每根 Bar 对应的当前有效信号。"""
 
   if snapshot is None:
     return {}
@@ -238,7 +280,7 @@ def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
   plan = snapshot.get("alignmentPlan")
   if not isinstance(plan, list):
     raise ValueError("研究信号对齐计划不存在")
-  aligned: dict[str, dict[str, Any]] = {}
+  transitions: dict[str, dict[str, Any]] = {}
   for item in plan:
     if not isinstance(item, dict):
       raise ValueError("研究信号对齐计划无效")
@@ -247,9 +289,11 @@ def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
     row = rows_by_id.get(signal_id)
     if not isinstance(signal_id, str) or not isinstance(bar_time, str) or not isinstance(row, dict):
       raise ValueError("研究信号对齐计划引用无效")
-    if row.get("action") not in {"long", "short", "flat"} or bar_time in aligned:
-      raise ValueError("同一 Bar 不能注入多条研究信号")
-    aligned[bar_time] = {
+    canonical_time = normalize_script_bar_time(bar_time).time
+    if row.get("action") not in {"long", "short", "flat"}:
+      raise ValueError("研究信号动作无效")
+    # 兼容旧快照：旧版对齐计划可能把多个顺序事件映射到同一 Bar，按计划顺序以最后一条为准。
+    transitions[canonical_time] = {
       key: row[key]
       for key in (
         "signalId", "instrument", "timeframe", "signalTime", "availableAt", "effectiveAt",
@@ -257,10 +301,22 @@ def _research_signal_by_bar_time(snapshot: object) -> dict[str, dict[str, Any]]:
       )
       if key in row
     }
-  return aligned
+    transitions[canonical_time]["datasetId"] = snapshot.get("datasetId")
+    transitions[canonical_time]["datasetVersion"] = (snapshot.get("manifest") or {}).get("version")
+  active_by_bar_time: dict[str, dict[str, Any]] = {}
+  current_signal: dict[str, Any] | None = None
+  for raw_bar_time in bar_times:
+    canonical_time = normalize_script_bar_time(raw_bar_time).time
+    current_signal = transitions.get(canonical_time, current_signal)
+    if current_signal is not None:
+      active_by_bar_time[canonical_time] = dict(current_signal)
+  return active_by_bar_time
 
 
-def run_research_signal_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+def run_research_signal_backtest(
+  payload: dict[str, Any],
+  script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
   """Replay one frozen standard-signal snapshot through the existing Bar worker."""
   snapshot = payload.get("researchSignalSnapshot")
   if not isinstance(snapshot, dict) or not isinstance(snapshot.get("artifactFile"), str):
@@ -272,7 +328,7 @@ def run_research_signal_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     "name": "冻结研究信号", "entryType": "on_bar", "code": _RESEARCH_SIGNAL_SCRIPT,
   }
   worker_payload["strategyParams"] = {**dict(payload.get("strategyParams") or {}), "signalsByDate": signals}
-  result = run_user_script_backtest(worker_payload)
+  result = run_user_script_backtest(worker_payload, script_executor)
   result["researchSignalSnapshot"] = snapshot
   return result
 
@@ -363,12 +419,13 @@ def _build_script_experiment_manifest(
     "allowLong": payload.get("allowLong", True),
     "allowShort": payload.get("allowShort", True),
     "holdingPolicy": holding_policy,
+    "overlaySettlementPolicy": _overlay_settlement_policy(payload),
     "strategyCategory": _strategy_category(payload),
     "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
     "baseQuantity": int(payload.get("baseQuantity", 0)),
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
-    "resultSchemaVersion": 2,
+    "resultSchemaVersion": 3,
   })
   experiment_hash = _stable_hash({
     "engineVersion": "isolated-script-worker-v1",
@@ -401,12 +458,13 @@ def _build_script_experiment_manifest(
       **dict(payload.get("feeProfile") or {}),
     },
     "holdingPolicy": holding_policy,
+    "overlaySettlementPolicy": _overlay_settlement_policy(payload),
     "strategyCategory": _strategy_category(payload),
     "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
     "baseQuantity": int(payload.get("baseQuantity", 0)),
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
-    "resultSchemaVersion": 2,
+    "resultSchemaVersion": 3,
     "executionEnvironment": "strategy-worker",
   }
 
@@ -434,6 +492,7 @@ def _build_worker_daily_holdings(
       "shortMarketValue": round(short_qty * float(row.close), 2),
       "marketValue": round((long_qty - short_qty) * float(row.close), 2),
       "totalEquity": round(total_equity, 2), "dailyPnl": round(total_equity - previous_total, 2),
+      "sellableQuantity": int(snapshot.get("sellableQuantity") or 0),
     })
     previous_total = total_equity
   return items
@@ -473,6 +532,87 @@ def _build_worker_summary(
 
 def _initial_total_equity(initial_cash: float, base_quantity: int, base_cost_price: float) -> float:
   return initial_cash + max(0, base_quantity) * max(0.0, base_cost_price)
+
+
+def _ensure_fill_ids(trades: list[dict[str, Any]]) -> None:
+  for index, trade in enumerate(trades):
+    trade["fillId"] = str(trade.get("fillId") or f"fill-{index + 1}")
+
+
+def _overlay_fills(raw_fills: object) -> list[OverlayFill]:
+  if not isinstance(raw_fills, list):
+    raise ValueError("标准 Bar 回测缺少增强归属成交")
+  items: list[OverlayFill] = []
+  for index, raw in enumerate(raw_fills):
+    if not isinstance(raw, dict):
+      raise ValueError("标准 Bar 增强归属成交格式无效")
+    side_value = raw.get("side")
+    side = side_value if isinstance(side_value, OrderSide) else OrderSide(str(side_value).split(".")[-1])
+    items.append(OverlayFill(
+      fill_id=f"fill-{index + 1}",
+      time=str(raw.get("time") or ""),
+      symbol=str(raw.get("symbol") or ""),
+      side=side,
+      quantity=int(raw.get("quantity") or 0),
+      price=float(raw.get("price") or 0),
+      fee=float(raw.get("fee") or 0),
+      account_realized_pnl=float(raw.get("realized_pnl") or 0),
+    ))
+  return items
+
+
+
+def _directional_fills(raw_fills: object) -> list[ClosedTradeFill]:
+  if not isinstance(raw_fills, list):
+    raise ValueError("标准 Bar 回测缺少方向性成交")
+  items: list[ClosedTradeFill] = []
+  for raw in raw_fills:
+    if not isinstance(raw, dict):
+      raise ValueError("标准 Bar 方向性成交格式无效")
+    effect_value = raw.get("position_effect")
+    effect = effect_value if isinstance(effect_value, PositionEffect) else PositionEffect(
+      str(effect_value).split(".")[-1],
+    )
+    items.append(ClosedTradeFill(
+      symbol=str(raw.get("symbol") or ""),
+      position_key=str(raw.get("position_key") or "strategy_position"),
+      position_effect=effect,
+      quantity=int(raw.get("quantity") or 0),
+      realized_pnl=float(raw.get("realized_pnl") or 0),
+    ))
+  return items
+
+
+def _merge_overlay_report(
+  trades: list[dict[str, Any]],
+  daily_holdings: list[dict[str, Any]],
+  summary: dict[str, Any],
+  report: dict[str, Any],
+) -> None:
+  for trade in trades:
+    attribution = report["attributions"].get(trade["fillId"])
+    if attribution:
+      trade.update(attribution)
+      trade["pnl"] = float(attribution.get("realizedOverlayPnl") or 0)
+  for holding, daily in zip(daily_holdings, report["daily"], strict=True):
+    holding.update(daily)
+  metrics = report["metrics"]
+  account_pnl = float(summary["totalPnl"])
+  base_pnl = float(summary.get("baseHoldingPnl") or 0)
+  summary.update({
+    "accountPnl": account_pnl,
+    "accountRealizedPnl": round(sum(float(item.get("accountRealizedPnl") or 0) for item in trades), 2),
+    "baseBenchmarkPnl": base_pnl,
+    "overlayPnl": round(account_pnl - base_pnl, 2),
+    **metrics,
+    "winRate": metrics["cycleWinRate"],
+    "winningTrades": metrics["winningCycles"],
+    "losingTrades": metrics["losingCycles"],
+    "avgWin": metrics["avgWin"],
+    "avgLoss": metrics["avgLoss"],
+    "profitLossRatio": metrics["profitLossRatio"],
+    "tradeMetricVersion": 3,
+  })
 
 
 def _build_worker_base_metrics(
@@ -773,7 +913,14 @@ def _strategy_category(payload: dict[str, Any]) -> str:
 def _holding_policy(payload: dict[str, Any]) -> str:
   if payload.get("strategyCategory") not in {"core_position_overlay", "directional_holding"}:
     return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
-  return "intraday" if _strategy_category(payload) == "core_position_overlay" else "overnight"
+  return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
+
+
+def _overlay_settlement_policy(payload: dict[str, Any]) -> str:
+  policy = str(payload.get("overlaySettlementPolicy") or "")
+  if policy in {"intraday_restore", "cross_day_carry"}:
+    return policy
+  return "intraday_restore"
 
 
 def _strategy_metrics(category: str, summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -783,6 +930,13 @@ def _strategy_metrics(category: str, summary: dict[str, Any]) -> dict[str, dict[
       "baseHoldingReturn": summary.get("baseHoldingReturn"),
       "t0ExcessPnl": summary.get("t0ExcessPnl"),
       "t0ExcessReturn": summary.get("t0ExcessReturn"),
+      "baseBenchmarkPnl": summary.get("baseBenchmarkPnl"),
+      "overlayPnl": summary.get("overlayPnl"),
+      "realizedOverlayPnl": summary.get("realizedOverlayPnl"),
+      "unrealizedOverlayPnl": summary.get("unrealizedOverlayPnl"),
+      "completedCycleCount": summary.get("completedCycleCount"),
+      "openCycleCount": summary.get("openCycleCount"),
+      "cycleWinRate": summary.get("cycleWinRate"),
     }}
   return {"holdingMetrics": {
     "totalPnl": summary.get("totalPnl"),

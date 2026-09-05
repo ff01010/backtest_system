@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
@@ -9,10 +10,16 @@ from backend.services import state_store
 
 
 class FakeCursor:
-  def __init__(self, row: dict[str, Any] | None, rows: list[dict[str, Any]] | None = None) -> None:
+  def __init__(
+    self,
+    row: dict[str, Any] | None,
+    rows: list[dict[str, Any]] | None = None,
+    fetch_rows: list[dict[str, Any] | None] | None = None,
+  ) -> None:
     self.commands: list[tuple[str, tuple[Any, ...] | None]] = []
     self.row = row
     self.rows = rows if rows is not None else ([row] if row is not None else [])
+    self.fetch_rows = list(fetch_rows or [])
 
   def __enter__(self) -> FakeCursor:
     return self
@@ -24,6 +31,8 @@ class FakeCursor:
     self.commands.append((query, params))
 
   def fetchone(self) -> dict[str, Any] | None:
+    if self.fetch_rows:
+      return self.fetch_rows.pop(0)
     return self.row
 
   def fetchall(self) -> list[dict[str, Any]]:
@@ -55,23 +64,40 @@ def test_claim_l2_job_uses_transaction_scoped_fair_scheduler_lock(monkeypatch: A
     "SELECT pg_advisory_xact_lock(%s)",
     (state_store._L2_FAIR_CLAIM_LOCK_KEY,),
   )
-  claim_query, claim_params = cursor.commands[1]
-  assert "FOR UPDATE OF job SKIP LOCKED" in claim_query
-  assert "active.owner_user_id=job.owner_user_id" in claim_query
-  assert "active.status='running'" in claim_query
-  assert "active.lease_expires_at >= now()" in claim_query
-  assert "ORDER BY (" in claim_query
-  assert claim_params == (30, "runner-1")
+  assert "UPDATE bar_backtest_job" in cursor.commands[1][0]
+  assert "UPDATE l2_backtest_job" in cursor.commands[2][0]
+  claim_query, claim_params = cursor.commands[4]
+  assert "FROM backtest_execution_slot" in claim_query
+  assert "UNION ALL" in claim_query
+  assert "ORDER BY owner_active_count" in claim_query
+  assert "%s::text IS NULL" in claim_query
+  assert claim_params == (None, None)
+
+
+def test_runner_availability_uses_fresh_ready_or_running_heartbeat(monkeypatch: Any) -> None:
+  cursor = FakeCursor({"available": False})
+  connection = FakeConnection(cursor)
+  monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+  monkeypatch.setattr(state_store.settings, "BACKTEST_RUNNER_AVAILABILITY_REQUIRED", True)
+
+  assert state_store.has_healthy_backtest_runner("bar") is False
+  query, params = cursor.commands[0]
+  assert "status IN ('ready', 'running')" in query
+  assert "heartbeat_at >=" in query
+  assert params == ("bar", state_store.settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS)
 
 
 def test_claim_l2_job_preserves_attempt_token_result_contract(monkeypatch: Any) -> None:
-  cursor = FakeCursor({
-    "run_id": "run-1",
-    "owner_user_id": "user-1",
-    "payload": {"symbol": "688981.SH"},
-    "attempt_no": 2,
-    "attempt_token": "attempt-2",
-  })
+  job_row = {
+    "run_id": "run-1", "owner_user_id": "user-1",
+    "payload": {"symbol": "688981.SH"}, "attempt_no": 2,
+    "attempt_token": "attempt-2", "lease_expires_at": "later",
+  }
+  cursor = FakeCursor(None, fetch_rows=[
+    {"job_kind": "l2", "run_id": "run-1", "owner_user_id": "user-1", "owner_active_count": 0},
+    {"active_count": 0, "override_limit": None},
+    job_row,
+  ])
   connection = FakeConnection(cursor)
   monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
 
@@ -84,8 +110,46 @@ def test_claim_l2_job_preserves_attempt_token_result_contract(monkeypatch: Any) 
     "attemptNo": 2,
     "attemptToken": "attempt-2",
   }
-  assert "UPDATE backtest_run SET status='running'" in cursor.commands[2][0]
-  assert cursor.commands[2][1] == ("run-1",)
+  assert "INSERT INTO backtest_execution_slot" in cursor.commands[7][0]
+  assert "UPDATE backtest_run SET status='running'" in cursor.commands[8][0]
+  assert cursor.commands[8][1] == ("run-1",)
+
+
+def test_global_scheduler_uses_fairness_burst_for_user_without_slot(monkeypatch: Any) -> None:
+  job_row = {
+    "run_id": "run-b", "owner_user_id": "user-b", "payload": {}, "attempt_no": 1,
+    "attempt_token": "attempt-b", "lease_expires_at": "later",
+  }
+  cursor = FakeCursor(None, fetch_rows=[
+    {"job_kind": "bar", "run_id": "run-b", "owner_user_id": "user-b", "owner_active_count": 0},
+    {"active_count": 8, "override_limit": None},
+    job_row,
+  ])
+  monkeypatch.setattr(state_store.settings, "BACKTEST_BASE_CONCURRENCY", 8)
+  monkeypatch.setattr(state_store.settings, "BACKTEST_BURST_MAX_CONCURRENCY", 12)
+  monkeypatch.setattr(state_store.settings, "BACKTEST_USER_GUARANTEED_CONCURRENCY", 1)
+  monkeypatch.setattr(state_store.settings, "BACKTEST_FAIRNESS_BURST_ENABLED", True)
+
+  claimed = state_store._claim_backtest_job(cursor, "bar", "runner-b", 30)
+
+  assert claimed == job_row
+  slot_params = cursor.commands[7][1]
+  assert slot_params is not None
+  assert slot_params[5] is True
+
+
+def test_global_scheduler_does_not_burst_for_user_with_active_slot(monkeypatch: Any) -> None:
+  cursor = FakeCursor(None, fetch_rows=[
+    {"job_kind": "bar", "run_id": "run-a", "owner_user_id": "user-a", "owner_active_count": 1},
+    {"active_count": 8, "override_limit": None},
+  ])
+  monkeypatch.setattr(state_store.settings, "BACKTEST_BASE_CONCURRENCY", 8)
+  monkeypatch.setattr(state_store.settings, "BACKTEST_BURST_MAX_CONCURRENCY", 12)
+  monkeypatch.setattr(state_store.settings, "BACKTEST_USER_GUARANTEED_CONCURRENCY", 1)
+  monkeypatch.setattr(state_store.settings, "BACKTEST_FAIRNESS_BURST_ENABLED", True)
+
+  assert state_store._claim_backtest_job(cursor, "bar", "runner-a", 30) is None
+  assert not any("INSERT INTO backtest_execution_slot" in query for query, _ in cursor.commands)
 
 
 def test_delete_backtest_run_permanently_removes_completed_run(monkeypatch: Any) -> None:
@@ -142,9 +206,11 @@ def test_finish_bar_backtest_job_preserves_terminal_status_without_research_snap
   monkeypatch: Any,
   status: str,
 ) -> None:
-  cursor = FakeCursor({"run_id": "run-1"})
+  cursor = FakeCursor(None, fetch_rows=[{"status": status}])
   connection = FakeConnection(cursor)
   monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+  monkeypatch.setattr(state_store.settings, "RESEARCH_RESULT_REPORT_ENABLED", True)
+  monkeypatch.setattr(state_store.settings, "BACKTEST_INSTANCE_ID", "server")
 
   assert state_store.finish_bar_backtest_job(
     "run-1", "attempt-1", status, {"totalReturn": 0.1}, {"equity": []},
@@ -154,10 +220,42 @@ def test_finish_bar_backtest_job_preserves_terminal_status_without_research_snap
   assert cursor.commands[0][1] == (status, None, "run-1", "attempt-1")
   assert "UPDATE backtest_run" in cursor.commands[1][0]
   assert cursor.commands[1][1][0] == status
-  enqueue_query, enqueue_params = cursor.commands[2]
+  assert "DELETE FROM backtest_execution_slot" in cursor.commands[2][0]
+  enqueue_query, enqueue_params = cursor.commands[3]
   assert "FROM research_signal_snapshot" in enqueue_query
+  assert "'backtestInstanceId', %s::text" in enqueue_query
   assert "'status', %s::text" in enqueue_query
-  assert enqueue_params[0] == status
+  assert enqueue_params[:2] == ("server", status)
+
+
+def test_finish_bar_backtest_job_skips_result_outbox_when_reporting_disabled(
+  monkeypatch: Any,
+) -> None:
+  cursor = FakeCursor(None, fetch_rows=[{"status": "succeeded"}])
+  connection = FakeConnection(cursor)
+  monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+  monkeypatch.setattr(state_store.settings, "RESEARCH_RESULT_REPORT_ENABLED", False)
+
+  assert state_store.finish_bar_backtest_job(
+    "run-1", "attempt-1", "succeeded", {"totalReturn": 0.1}, {"equity": []},
+  ) is True
+
+  assert len(cursor.commands) == 3
+
+
+def test_finish_job_keeps_database_cancellation_over_late_success() -> None:
+  cursor = FakeCursor(None, fetch_rows=[{"status": "cancelled"}])
+
+  status = state_store._finish_backtest_job(
+    cursor, "bar_backtest_job", "run-1", "attempt-1", "succeeded",
+    {"tradeCount": 3}, {"trades": [1]},
+  )
+
+  assert status == "cancelled"
+  main_params = cursor.commands[1][1]
+  assert main_params is not None
+  assert main_params[0] == "cancelled"
+  assert main_params[2] is None
 
 def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypatch: Any) -> None:
   cursor = FakeCursor(None)
@@ -166,11 +264,61 @@ def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypa
 
   assert state_store.claim_bar_backtest_job("runner-1", 30) is None
 
-  cleanup_query, cleanup_params = cursor.commands[0]
+  assert cursor.commands[0] == (
+    "SELECT pg_advisory_xact_lock(%s)",
+    (state_store._BACKTEST_SCHEDULER_LOCK_KEY,),
+  )
+  cleanup_query, cleanup_params = cursor.commands[1]
   assert "UPDATE bar_backtest_job" in cleanup_query
-  assert "status='running' AND cancel_requested AND lease_expires_at < now()" in cleanup_query
+  assert "status='cancelling' AND lease_expires_at < now()" in cleanup_query
   assert "UPDATE backtest_run AS run" in cleanup_query
   assert cleanup_params is None
-  claim_query, claim_params = cursor.commands[1]
-  assert "FOR UPDATE SKIP LOCKED" in claim_query
-  assert claim_params == (30, "runner-1")
+  assert "UPDATE l2_backtest_job" in cursor.commands[2][0]
+  assert "DELETE FROM backtest_execution_slot" in cursor.commands[3][0]
+  claim_query, claim_params = cursor.commands[4]
+  assert "UNION ALL" in claim_query
+  assert claim_params == (None, None)
+
+def test_save_research_signal_snapshot_reuses_matching_artifact(
+  tmp_path: Path,
+) -> None:
+  artifact_path = tmp_path / "dataset_hash.ndjson"
+  artifact_path.write_text('{"action":"long"}\n', encoding="utf-8")
+  cursor = FakeCursor({"id": "artifact-1"})
+  snapshot = {
+    "datasetId": "251294ab-87cd-46ab-9d48-d96987e51b84",
+    "snapshotHash": "a" * 64,
+    "artifactFile": str(artifact_path),
+    "manifest": {"version": 1},
+    "sourcePartitions": [],
+  }
+
+  state_store._save_research_signal_snapshot(cursor, "run-2", "user-1", snapshot)
+
+  artifact_query, artifact_params = cursor.commands[0]
+  assert "ON CONFLICT (storage_key) DO UPDATE" in artifact_query
+  assert "artifact_file.content_sha256=EXCLUDED.content_sha256" in artifact_query
+  assert artifact_params is not None
+  assert artifact_params[1] == "run-2"
+  snapshot_query, snapshot_params = cursor.commands[1]
+  assert "INSERT INTO research_signal_snapshot" in snapshot_query
+  assert snapshot_params is not None
+  assert snapshot_params[0] == "run-2"
+  assert snapshot_params[4] == "artifact-1"
+
+
+def test_save_research_signal_snapshot_rejects_storage_key_content_conflict(
+  tmp_path: Path,
+) -> None:
+  artifact_path = tmp_path / "dataset_hash.ndjson"
+  artifact_path.write_text('{"action":"long"}\n', encoding="utf-8")
+  cursor = FakeCursor(None)
+  snapshot = {
+    "datasetId": "251294ab-87cd-46ab-9d48-d96987e51b84",
+    "snapshotHash": "a" * 64,
+    "artifactFile": str(artifact_path),
+    "manifest": {"version": 1},
+  }
+
+  with pytest.raises(state_store.DatabaseError, match="已有存储记录冲突"):
+    state_store._save_research_signal_snapshot(cursor, "run-2", "user-1", snapshot)

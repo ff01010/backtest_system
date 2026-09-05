@@ -5,6 +5,7 @@ import json
 import os
 import time
 import traceback
+from dataclasses import asdict
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -32,6 +33,8 @@ class WorkerRunRequest(BaseModel):
   fillModel: Literal["bar_next_open"] = "bar_next_open"
   slippage: float = Field(default=0, ge=0, lt=1)
   holdingPolicy: str = "intraday"
+  strategyCategory: str = "directional_holding"
+  overlaySettlementPolicy: str = "intraday_restore"
   baseQuantity: int = Field(default=0, ge=0)
   baseCostPrice: float = Field(default=0, ge=0)
   initialPositionEnabled: bool = False
@@ -50,6 +53,7 @@ class WorkerL2SessionCreateRequest(BaseModel):
   passiveParticipationRate: float = Field(default=0.1, gt=0, le=1)
   holdingPolicy: str = "intraday"
   strategyCategory: str = "directional_holding"
+  overlaySettlementPolicy: str = "intraday_restore"
   symbol: str = ""
   baseQuantity: int = Field(default=0, ge=0)
   baseCostPrice: float = Field(default=0, ge=0)
@@ -180,6 +184,8 @@ class L2WorkerSession:
       InstrumentRules(**payload.instrumentRules), payload.latencyMs,
       payload.passiveParticipationRate, payload.holdingPolicy, payload.baseQuantity,
       payload.baseCostPrice, payload.t0Enabled, fee_profile,
+      strategy_category=payload.strategyCategory,
+      overlay_settlement_policy=payload.overlaySettlementPolicy,
     )
     self.engine.initialize_base_position(payload.symbol)
     self.trade_date: str | None = None
@@ -254,6 +260,9 @@ def _snapshot_to_dict(snapshot: Any) -> dict[str, Any]:
       symbol: {"quantity": position.quantity, "averagePrice": position.average_price}
       for symbol, position in snapshot.short_positions.items()
     },
+    "basePosition": snapshot.base_position,
+    "overlayQuantity": snapshot.overlay_quantity,
+    "sellableQuantity": snapshot.sellable_quantity,
   }
 
 
@@ -292,17 +301,32 @@ def run(payload: WorkerRunRequest) -> dict[str, Any]:
       base_quantity=payload.baseQuantity,
       base_cost_price=payload.baseCostPrice,
       t0_enabled=payload.t0Enabled,
+      strategy_category=payload.strategyCategory,
+      overlay_settlement_policy=payload.overlaySettlementPolicy,
     )
     result = engine.run(strategy, bars, payload.warmupBarCount)
   except ValueError as error:
     raise _worker_http_error(error) from error
   return {
-    "trades": [fill_to_api_trade(fill) for fill in result.fills],
+    "fills": [asdict(fill) for fill in result.fills],
+    "trades": [_fill_to_worker_trade(fill, index) for index, fill in enumerate(result.fills)],
     "portfolioSnapshots": [_snapshot_to_dict(item) for item in result.portfolio_snapshots],
     "skippedSignals": strategy.skipped_signals,
     "unexecutedOrders": [_unexecuted_order_to_api(item) for item in result.unexecuted_orders],
     "warnings": strategy.direction_warnings,
   }
+
+
+def _fill_to_worker_trade(fill: Any, index: int) -> dict[str, Any]:
+  trade = fill_to_api_trade(fill)
+  trade.update({
+    "fillId": f"fill-{index + 1}",
+    "positionKey": fill.position_key,
+    "accountRealizedPnl": fill.realized_pnl,
+    "totalFee": fill.fee,
+  })
+  return trade
+
 
 
 def _unexecuted_order_to_api(order: Any) -> dict[str, Any]:

@@ -97,3 +97,54 @@ def test_public_request_hash_is_stable_and_changes_with_override() -> None:
 
   assert api_app._public_request_hash(first) == api_app._public_request_hash(same)
   assert api_app._public_request_hash(first) != api_app._public_request_hash(changed)
+
+
+def test_public_run_payload_exposes_overlay_result_contract() -> None:
+  payload = api_app._public_run_payload({
+    "id": "run-1",
+    "displayNo": 39,
+    "configId": "config-1",
+    "symbol": "688981.SH",
+    "timeframe": "5m",
+    "fillModel": "bar_next_open",
+    "status": "succeeded",
+    "startDate": "2026-09-01",
+    "endDate": "2026-09-03",
+    "summaryJson": {},
+    "paramsJson": {
+      "strategyCategory": "core_position_overlay",
+      "overlaySettlementPolicy": "intraday_restore",
+    },
+    "resultJson": {
+      "strategyCategory": "core_position_overlay",
+      "resultSchemaVersion": 3,
+      "experimentManifest": {"overlaySettlementPolicy": "cross_day_carry"},
+    },
+    "createdAt": "2026-09-04T10:00:00+08:00",
+    "finishedAt": "2026-09-04T10:01:00+08:00",
+  })
+
+  assert payload["strategy_category"] == "core_position_overlay"
+  assert payload["overlay_settlement_policy"] == "cross_day_carry"
+  assert payload["result_schema_version"] == 3
+
+
+def test_backtest_submission_rejects_unavailable_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(api_app.state_store, "has_healthy_backtest_runner", lambda _: False)
+
+  with pytest.raises(HTTPException) as raised:
+    api_app._require_backtest_runner("bar_next_open")
+
+  assert raised.value.status_code == 503
+  assert raised.value.detail == "回测执行服务暂不可用，请稍后重试"
+
+
+def test_health_reports_runner_degradation_without_internal_counts(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(api_app.state_store, "get_backtest_runner_health", lambda: {
+    "status": "degraded",
+    "runners": {"bar": {"healthy": 0, "queued": 3}},
+  })
+
+  assert api_app.health() == {"status": "degraded", "backtest": "unavailable"}

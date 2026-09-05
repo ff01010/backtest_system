@@ -34,7 +34,11 @@ from backend.date_codec import TradingDateError, format_legacy_date, normalize_d
 from backend import schemas
 from backend.time_utils import format_epoch_as_shanghai
 from backend.strategies.catalog import get_strategy_source_snapshot
-from backend.strategies.scripted import warmup_trading_days_for_script, validate_script_code
+from backend.strategies.scripted import (
+  script_uses_research_signal,
+  warmup_trading_days_for_script,
+  validate_script_code,
+)
 from backend.services import (
   backtest_preflight,
   backtest_runner,
@@ -267,6 +271,8 @@ def _validate_strategy_script(payload: dict) -> None:
     raise HTTPException(422, f"Python 语法错误: 第 {error.lineno} 行 {error.msg}")
   if payload.get("status") not in {"draft", "published", "disabled"}:
     raise HTTPException(422, f"非法脚本状态: {payload.get('status')}")
+  if payload.get("signalRequired") and not script_uses_research_signal(str(payload.get("code", ""))):
+    raise HTTPException(422, "研究信号驱动策略必须显式读取 bar['researchSignal']")
 
 
 _EXPERIMENT_PARAM_KEYS = {
@@ -306,10 +312,22 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
   if not script_id:
     raise HTTPException(422, "策略必须先保存代码")
   try:
-    script = state_store.get_strategy_script(str(script_id))
+    strategy_version_id = config.get("strategyVersionId")
+    script = (
+      state_store.get_strategy_script_version(str(strategy_version_id), str(script_id))
+      if strategy_version_id
+      else state_store.get_strategy_script(str(script_id))
+    )
   except KeyError as error:
     raise HTTPException(422, "策略保存的代码不存在") from error
   mismatches = []
+  signal_required = bool(script.get("signalRequired", False))
+  signal_selected = bool(request.get("signalDatasetId"))
+  if signal_required and not signal_selected:
+    raise HTTPException(422, "当前策略必须选择研究信号后才能运行")
+  if signal_selected and not signal_required:
+    raise HTTPException(422, "当前策略未声明为研究信号驱动策略，不能附加研究信号")
+
   for key, saved_value, request_value in (
     ("标的", config["symbol"], request["symbol"]),
     ("周期", config["timeframe"], request["timeframe"]),
@@ -331,12 +349,15 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
   _validate_saved_params(request, config)
   request["strategy"] = config["strategy"]
   request["scriptId"] = script["id"]
+  request["strategyVersionId"] = script.get("versionId") or strategy_version_id
   request["warmupTradingDays"] = warmup_days
-  request["configVersionId"] = None
+  request["configVersionId"] = config.get("publishedVersionId")
   request["runDraft"] = False
   request["versionScriptSnapshot"] = {
     "id": script["id"], "name": script["name"], "description": script["description"],
     "code": script["code"], "entryType": script["entryType"],
+    "versionId": script.get("versionId") or strategy_version_id,
+    "signalRequired": signal_required,
     "codeHash": hashlib.sha256(script["code"].encode("utf-8")).hexdigest(),
   }
   request["savedScriptSnapshot"] = request["versionScriptSnapshot"]
@@ -347,6 +368,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "params": config.get("paramsJson", {}).get("params", {}),
     "description": script["description"], "runParams": request.get("strategyParams", {}),
     "warmupTradingDays": warmup_days,
+    "signalRequired": signal_required,
     "execution": execution_algorithm_snapshot(
       str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
     ),
@@ -514,6 +536,7 @@ def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest)
     allowShort=values.get("allowShort", True),
     strategyCategory=values.get("strategyCategory"),
     holdingPolicy=values.get("holdingPolicy", "intraday"),
+    overlaySettlementPolicy=values.get("overlaySettlementPolicy", "intraday_restore"),
     fillModel=values.get("fillModel", "bar_next_open"),
     executionAlgorithm=execution_algorithm,
     executionParameters=execution_parameters,
@@ -537,6 +560,10 @@ def _public_request_hash(payload: schemas.PublicBacktestCreateRequest) -> str:
 
 
 def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
+  result = run.get("resultJson") if isinstance(run.get("resultJson"), dict) else {}
+  params = run.get("paramsJson") if isinstance(run.get("paramsJson"), dict) else {}
+  manifest = result.get("experimentManifest") if isinstance(result.get("experimentManifest"), dict) else {}
+
   return {
     "run_id": run["id"],
     "display_no": run["displayNo"],
@@ -544,6 +571,9 @@ def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
     "symbol": run["symbol"],
     "timeframe": run["timeframe"],
     "fill_model": run["fillModel"],
+    "strategy_category": result.get("strategyCategory") or params.get("strategyCategory"),
+    "overlay_settlement_policy": manifest.get("overlaySettlementPolicy") or params.get("overlaySettlementPolicy"),
+    "result_schema_version": result.get("resultSchemaVersion"),
     "status": run["status"],
     "start_date": run["startDate"],
     "end_date": run["endDate"],
@@ -556,12 +586,28 @@ def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
 @app.on_event("startup")
 def startup():
   settings.validate_public_api_configuration()
+  settings.validate_research_integration_configuration()
   state_store.ensure_schema()
 
 
 @app.get("/api/health")
 def health():
-  return {"status": "ok"}
+  runner_health = state_store.get_backtest_runner_health()
+  return {
+    "status": runner_health["status"],
+    "backtest": "ok" if runner_health["status"] == "ok" else "unavailable",
+  }
+
+
+def _require_backtest_runner(fill_model: str) -> None:
+  job_kind = "l2" if fill_model == "l2_quote" else "bar"
+  try:
+    available = state_store.has_healthy_backtest_runner(job_kind)
+  except state_store.DatabaseError as error:
+    logger.exception("检查回测执行器可用性失败")
+    raise HTTPException(503, "回测执行服务暂不可用，请稍后重试") from error
+  if not available:
+    raise HTTPException(503, "回测执行服务暂不可用，请稍后重试")
 
 
 @app.get("/api/research/signal-datasets")
@@ -793,6 +839,33 @@ def admin_system_errors(
   )}
 
 
+@app.get("/api/admin/backtest-capacity")
+def admin_backtest_capacity(request: Request):
+  _require_admin(request)
+  return state_store.get_backtest_scheduler_capacity()
+
+
+@app.put("/api/admin/backtest-capacity")
+def update_admin_backtest_capacity(
+  payload: schemas.BacktestCapacityOverrideRequest,
+  request: Request,
+):
+  _require_admin(request)
+  try:
+    return state_store.set_backtest_scheduler_capacity(payload.limit, payload.ttlSeconds, payload.reason)
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
+
+
+@app.delete("/api/admin/backtest-capacity")
+def clear_admin_backtest_capacity(
+  request: Request,
+  reason: str = Query("管理员提前结束临时扩容", min_length=1, max_length=500),
+):
+  _require_admin(request)
+  return state_store.clear_backtest_scheduler_capacity(reason)
+
+
 @app.get("/api/strategies")
 def strategies():
   return {"strategies": strategy_adapters.list_strategy_ids()}
@@ -896,8 +969,8 @@ def create_strategy_script(payload: schemas.StrategyScriptCreate):
   try:
     script = state_store.create_strategy_script(request)
     return {"script": script}
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略脚本名称已存在: {payload.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
     raise HTTPException(500, f"PostgreSQL 写入策略脚本失败: {e}")
 
@@ -911,8 +984,8 @@ def update_strategy_script(script_id: str, payload: schemas.StrategyScriptUpdate
     return {"script": script}
   except KeyError:
     raise HTTPException(404, f"策略脚本不存在: {script_id}")
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略脚本名称已存在: {payload.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
     raise HTTPException(500, f"PostgreSQL 更新策略脚本失败: {e}")
 
@@ -939,8 +1012,8 @@ def create_strategy_config(payload: schemas.StrategyConfigCreate):
   try:
     config = state_store.create_strategy_config(request)
     return {"config": config}
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略配置名称已存在: {payload.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
     raise HTTPException(500, f"PostgreSQL 写入策略配置失败: {e}")
 
@@ -958,8 +1031,8 @@ def update_strategy_config(config_id: str, payload: schemas.StrategyConfigUpdate
     return {"config": config}
   except KeyError:
     raise HTTPException(404, f"策略配置不存在: {config_id}")
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略配置名称已存在: {payload.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
     raise HTTPException(500, f"PostgreSQL 更新策略配置失败: {e}")
 
@@ -978,13 +1051,24 @@ def save_complete_strategy(payload: schemas.CompleteStrategySave):
   try:
     return state_store.save_complete_strategy(
       script_request, config_request, payload.scriptId, payload.configId,
+      payload.expectedRevision,
     )
   except KeyError as error:
     raise HTTPException(404, "策略脚本或策略配置不存在") from error
-  except state_store.ConflictError:
-    raise HTTPException(409, f"策略名称已存在: {payload.script.name}")
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as error:
     raise HTTPException(500, f"PostgreSQL 保存完整策略失败: {error}") from error
+
+
+@app.get("/api/complete-strategies/{config_id}")
+def get_complete_strategy(config_id: str):
+  try:
+    return {"config": state_store.get_strategy_config(config_id)}
+  except KeyError as error:
+    raise HTTPException(404, f"策略不存在: {config_id}") from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"PostgreSQL 读取完整策略失败: {error}") from error
 
 
 def _apply_script_warmup_to_config(script: dict[str, Any], config: dict[str, Any]) -> None:
@@ -1192,6 +1276,8 @@ def public_create_backtest(payload: schemas.PublicBacktestCreateRequest, request
     )
   except state_store.ConflictError as error:
     raise HTTPException(409, str(error)) from error
+  except state_store.RunnerUnavailableError as error:
+    raise HTTPException(503, str(error)) from error
   except ValueError as error:
     raise HTTPException(429, str(error)) from error
   return {
@@ -1269,15 +1355,17 @@ def public_backtest_trades(
 @app.post("/api/v1/backtests/{run_id}/cancel")
 def public_cancel_backtest(run_id: str, request: Request):
   _require_public_scope(request, "backtest:cancel")
-  if not state_store.request_l2_backtest_cancel(run_id) and not state_store.request_bar_backtest_cancel(run_id):
+  status = state_store.request_backtest_cancel(run_id)
+  if status is None:
     raise HTTPException(404, "未找到可取消的回测任务")
-  return {"run_id": run_id, "status": "cancelling", "request_id": request.state.request_id}
+  return {"run_id": run_id, "status": status, "request_id": request.state.request_id}
 
 
 @app.post("/api/backtest/run")
 def run_backtest(payload: schemas.BacktestRunRequest):
   request = _model_dump(payload)
   _validate_backtest_request(request)
+  _require_backtest_runner(str(request.get("fillModel", "bar_next_open")))
 
   if request.get("fillModel") == "l2_quote":
     try:
@@ -1313,10 +1401,11 @@ def run_backtest(payload: schemas.BacktestRunRequest):
 
 @app.post("/api/backtest/runs/{run_id}/cancel")
 def cancel_backtest_run(run_id: str):
-  """请求取消未结束的回测；Runner 会在当前可中断边界结束。"""
-  if not state_store.request_l2_backtest_cancel(run_id) and not state_store.request_bar_backtest_cancel(run_id):
+  """幂等请求取消，并返回数据库中的真实任务状态。"""
+  status = state_store.request_backtest_cancel(run_id)
+  if status is None:
     raise HTTPException(404, "未找到可取消的回测任务")
-  return {"runId": run_id, "status": "cancelling"}
+  return {"runId": run_id, "status": status}
 
 
 @app.delete("/api/backtest/runs")

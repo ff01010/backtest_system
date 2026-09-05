@@ -33,15 +33,58 @@ class L2Runner:
 
   def __init__(self, worker_id: str | None = None) -> None:
     self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
+    self._health_signature: tuple[str, str | None, str | None] | None = None
+    self._health_written_at = 0.0
 
   def run_forever(self) -> None:
     """持续领取任务；空队列时短暂轮询。"""
+    backoff_seconds = 1.0
     while True:
-      job = state_store.claim_l2_backtest_job(self._worker_id, settings.L2_JOB_LEASE_SECONDS)
+      try:
+        job = state_store.claim_l2_backtest_job(self._worker_id, settings.L2_JOB_LEASE_SECONDS)
+      except state_store.DatabaseError as error:
+        self._handle_database_error(error, backoff_seconds)
+        backoff_seconds = min(
+          backoff_seconds * 2, settings.BACKTEST_RUNNER_ERROR_BACKOFF_MAX_SECONDS,
+        )
+        continue
+      backoff_seconds = 1.0
       if job is None:
+        self._record_health("ready")
         time.sleep(settings.L2_RUNNER_POLL_SECONDS)
         continue
-      self._run_job(job)
+      self._record_health("running", job["runId"])
+      try:
+        self._run_job(job)
+      except state_store.DatabaseError as error:
+        self._handle_database_error(error, backoff_seconds)
+
+  def _handle_database_error(self, error: Exception, backoff_seconds: float) -> None:
+    logger.exception("L2 Runner 数据库操作失败，%.1f 秒后重试", backoff_seconds)
+    self._record_health("error", error_code=type(error).__name__)
+    time.sleep(backoff_seconds)
+
+  def _record_health(
+    self,
+    status: str,
+    current_run_id: str | None = None,
+    error_code: str | None = None,
+  ) -> None:
+    signature = (status, current_run_id, error_code)
+    now = time.monotonic()
+    if (
+      signature == self._health_signature
+      and now - self._health_written_at < settings.BACKTEST_RUNNER_HEARTBEAT_WRITE_SECONDS
+    ):
+      return
+    try:
+      state_store.record_backtest_runner_heartbeat(
+        self._worker_id, "l2", status, current_run_id, error_code,
+      )
+      self._health_signature = signature
+      self._health_written_at = now
+    except state_store.DatabaseError:
+      logger.exception("L2 Runner 健康心跳写入失败")
 
   def run_once(self) -> bool:
     """处理一个任务，便于容器健康检查和单元测试。"""
@@ -53,7 +96,7 @@ class L2Runner:
 
   def _run_job(self, job: dict[str, Any]) -> None:
     session: L2StrategySession | None = None
-    lease = _JobLeaseKeeper(job)
+    lease = _JobLeaseKeeper(job, self._worker_id)
     completed = False
     stage = "l2.initialize"
     try:
@@ -144,6 +187,7 @@ class L2Runner:
       "passiveParticipationRate": float(params.get("l2PassiveParticipationRate", 0.1)),
       "holdingPolicy": _holding_policy(payload),
       "strategyCategory": _strategy_category(payload),
+      "overlaySettlementPolicy": _overlay_settlement_policy(payload),
       "symbol": str(payload["symbol"]),
       "baseQuantity": int(payload.get("baseQuantity", 0)),
       "baseCostPrice": float(payload.get("baseCostPrice", 0)),
@@ -165,7 +209,14 @@ def _strategy_category(payload: dict[str, Any]) -> str:
 def _holding_policy(payload: dict[str, Any]) -> str:
   if payload.get("strategyCategory") not in {"core_position_overlay", "directional_holding"}:
     return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
-  return "intraday" if _strategy_category(payload) == "core_position_overlay" else "overnight"
+  return "overnight" if payload.get("holdingPolicy") == "overnight" else "intraday"
+
+
+def _overlay_settlement_policy(payload: dict[str, Any]) -> str:
+  policy = str(payload.get("overlaySettlementPolicy") or "")
+  if policy in {"intraday_restore", "cross_day_carry"}:
+    return policy
+  return "intraday_restore"
 
 
 def _validate_quote_coverage(
@@ -383,16 +434,19 @@ def _later_timestamp(left: str | None, right: str) -> str:
   return left
 
 
-def _heartbeat(job: dict[str, Any]) -> None:
-  if not state_store.heartbeat_l2_backtest_job(job["runId"], job["attemptToken"], settings.L2_JOB_LEASE_SECONDS):
+def _heartbeat(job: dict[str, Any], worker_id: str | None = None) -> None:
+  if not state_store.heartbeat_l2_backtest_job(
+    job["runId"], job["attemptToken"], settings.L2_JOB_LEASE_SECONDS, worker_id,
+  ):
     raise L2DataError("L2 任务租约丢失或已取消")
 
 
 class _JobLeaseKeeper:
   """在策略回调阻塞时仍由父 runner 持续续租。"""
 
-  def __init__(self, job: dict[str, Any]) -> None:
+  def __init__(self, job: dict[str, Any], worker_id: str | None = None) -> None:
     self._job = job
+    self._worker_id = worker_id
     self._stop_event = threading.Event()
     self._lock = threading.Lock()
     self._failure: Exception | None = None
@@ -412,10 +466,13 @@ class _JobLeaseKeeper:
       raise failure
 
   def _run(self) -> None:
-    interval = max(1.0, min(10.0, settings.L2_JOB_LEASE_SECONDS / 3))
+    interval = min(settings.BACKTEST_CANCEL_POLL_SECONDS, settings.L2_JOB_LEASE_SECONDS / 3)
     while not self._stop_event.wait(interval):
       try:
-        _heartbeat(self._job)
+        if self._worker_id is None:
+          _heartbeat(self._job)
+        else:
+          _heartbeat(self._job, self._worker_id)
       except Exception as error:
         with self._lock:
           self._failure = error
@@ -531,6 +588,7 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
   logging.basicConfig(level=os.getenv("TREND_GRID_LOG_LEVEL", "INFO"))
+  state_store.ensure_schema()
   L2Runner().run_forever()
 
 

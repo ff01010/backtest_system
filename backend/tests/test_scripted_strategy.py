@@ -11,6 +11,7 @@ from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteS
 from backend.services.backtest_errors import StrategyExecutionError, error_summary
 from backend.strategies.scripted import (
   ScriptedBarStrategy,
+  script_uses_research_signal,
   quote_mode_for_script,
   validate_script_code,
   warmup_trading_days_for_script,
@@ -221,6 +222,7 @@ def on_bar(bar, state):
       "script:13:overlay_short": PositionSnapshot("688981.SH", 400, 12),
     },
     base_position=5_000,
+    overlay_quantity=600,
   )
 
   context = strategy._context(Bar("20260727093000", "688981.SH", 10, 10, 10, 10), portfolio)
@@ -228,6 +230,8 @@ def on_bar(bar, state):
   assert context["position"] == 600
   assert context["strategyPosition"] == 600
   assert context["basePosition"] == 5_000
+  assert context["actualPosition"] == 5_600
+  assert context["overlayQuantity"] == 600
 
 
 def test_script_context_error_explains_supported_time_contract() -> None:
@@ -410,7 +414,7 @@ def test_qmt_trend_follow_script_applies_two_take_profit_levels() -> None:
   assert [fill.quantity for fill in result.fills] == [1200, 600, 600]
 
 
-def test_qmt_trend_follow_script_opens_long_when_only_long_is_enabled() -> None:
+def test_qmt_trend_follow_script_cannot_close_same_day_long_without_sellable_inventory() -> None:
   strategy = _qmt_script_strategy(7, {"allowLong": True, "allowShort": False})
   bars = [
     Bar("20260727093000", "688981.SH", 10, 10, 10, 10),
@@ -423,11 +427,8 @@ def test_qmt_trend_follow_script_opens_long_when_only_long_is_enabled() -> None:
 
   result = BarBacktestEngine(1_000_000).run(strategy, bars)
 
-  assert [fill.metadata["direction"] for fill in result.fills] == [
-    "BUY_OPEN",
-    "SELL_CLOSE",
-  ]
-  assert [fill.reason for fill in result.fills] == ["higher_valley_open_long", "stop"]
+  assert [fill.metadata["direction"] for fill in result.fills] == ["BUY_OPEN"]
+  assert result.final_portfolio.long_positions["688981.SH"].quantity == 1200
 
 
 def test_qmt_trend_follow_script_applies_break_even_and_morning_force_close() -> None:
@@ -485,3 +486,32 @@ def test_script_context_exposes_frozen_research_signal_only_on_aligned_bar() -> 
   assert unmatched["researchSignal"] is None
   assert matched["researchSignal"] == {"signalId": "sig-1", "action": "long"}
   assert "_researchSignalByBarTime" not in matched["params"]
+
+
+def test_script_identifies_explicit_research_signal_usage() -> None:
+  assert script_uses_research_signal("def on_bar(bar, state):\n  return bar.get('researchSignal')\n")
+  assert not script_uses_research_signal("def on_bar(bar, state):\n  return []\n")
+
+
+def test_orders_keep_active_research_signal_metadata() -> None:
+  strategy = ScriptedBarStrategy("research-order", """
+def on_bar(bar, state):
+  signal = bar.get('researchSignal')
+  if signal and signal['action'] == 'long':
+    return [{'action': 'buy_open', 'quantity': 100, 'reason': '研究信号开多'}]
+  return []
+""", {
+    "_researchSignalByBarTime": {
+      "20260727093500": {
+        "signalId": "sig-1", "action": "long", "effectiveAt": "2026-07-27T01:35:00Z",
+      },
+    },
+  })
+  portfolio = PortfolioSnapshot(cash=100_000, equity=100_000, positions={})
+
+  orders = strategy.on_bar(Bar("20260727093500", "688981.SH", 10, 10, 10, 10), portfolio)
+
+  assert len(orders) == 1
+  assert orders[0].metadata["research_signal_id"] == "sig-1"
+  assert orders[0].metadata["research_signal_action"] == "long"
+  assert orders[0].metadata["research_signal_effective_at"] == "2026-07-27T01:35:00Z"

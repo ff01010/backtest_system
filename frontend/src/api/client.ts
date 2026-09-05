@@ -46,7 +46,14 @@ async function sendJson<T>(url: string, method: string, payload: unknown): Promi
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`API ${res.status}: ${text}`);
+    let message = text;
+    try {
+      const body = JSON.parse(text) as { detail?: unknown };
+      if (typeof body.detail === 'string') message = body.detail;
+    } catch {
+      // 非 JSON 错误保留服务端原文，便于诊断代理层问题。
+    }
+    throw new Error(message || `API ${res.status}: 请求失败`);
   }
   return res.json();
 }
@@ -266,6 +273,7 @@ export interface BacktestRunPayload {
   allowShort: boolean;
   strategyCategory: 'core_position_overlay' | 'directional_holding';
   holdingPolicy: 'intraday' | 'overnight';
+  overlaySettlementPolicy: 'intraday_restore' | 'cross_day_carry';
   fillModel: 'bar_next_open' | 'l2_quote';
   executionAlgorithm: 'immediate' | 'twap';
   executionParameters: Record<string, number | string>;
@@ -324,6 +332,9 @@ export async function runBacktest(payload: BacktestRunPayload): Promise<Backtest
         throw new Error(`回测参数校验失败：${message}`);
       }
     }
+    if (res.status === 503) {
+      throw new Error('回测执行服务暂不可用，请稍后重试');
+    }
     throw new Error(`API ${res.status}: 回测请求失败`);
   }
   return res.json();
@@ -373,7 +384,10 @@ export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistor
   return data.run;
 }
 
-export async function cancelBacktestRun(runId: string): Promise<{ runId: string; status: 'cancelling' }> {
+export async function cancelBacktestRun(runId: string): Promise<{
+  runId: string;
+  status: 'queued' | 'running' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
+}> {
   const res = await fetch(`${BASE}/backtest/runs/${runId}/cancel`, {
     method: 'POST',
     credentials: 'include',
@@ -426,6 +440,7 @@ export interface StrategyScriptPayload {
   description: string;
   code: string;
   entryType: string;
+  signalRequired: boolean;
 }
 
 export interface BacktestTimeframeAvailability {
@@ -578,11 +593,12 @@ export async function saveCompleteStrategy(
   config: StrategyConfigPayload,
   scriptId: string | null,
   configId: string | null,
+  expectedRevision: number | null,
 ): Promise<{ script: StrategyScript; config: StrategyConfig }> {
   return sendJson<{ script: StrategyScript; config: StrategyConfig }>(
     `${BASE}/complete-strategies`,
     'POST',
-    { script, config, scriptId, configId },
+    { script, config, scriptId, configId, expectedRevision },
   );
 }
 
