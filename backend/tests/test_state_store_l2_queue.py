@@ -87,6 +87,29 @@ def test_runner_availability_uses_fresh_ready_or_running_heartbeat(monkeypatch: 
   assert params == ("bar", state_store.settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS)
 
 
+def test_runner_availability_accepts_visible_healthy_heartbeat(monkeypatch: Any) -> None:
+  cursor = FakeCursor({"available": True})
+  connection = FakeConnection(cursor)
+  monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+  monkeypatch.setattr(state_store.settings, "BACKTEST_RUNNER_AVAILABILITY_REQUIRED", True)
+
+  assert state_store.has_healthy_backtest_runner("l2") is True
+
+
+def test_runner_health_read_policy_does_not_relax_writes() -> None:
+  migration_path = Path(__file__).resolve().parents[2] / "db" / "migrations" / (
+    "024_backtest_runner_health_read_policy.sql"
+  )
+  migration = migration_path.read_text(encoding="utf-8")
+  policy = migration.split(
+    "CREATE POLICY backtest_runner_health_read", 1,
+  )[1].split(";", 1)[0]
+
+  assert "FOR SELECT" in policy
+  assert "USING (true)" in policy
+  assert "WITH CHECK" not in policy
+
+
 def test_claim_l2_job_preserves_attempt_token_result_contract(monkeypatch: Any) -> None:
   job_row = {
     "run_id": "run-1", "owner_user_id": "user-1",
