@@ -99,6 +99,72 @@ def test_runtime_change_appends_new_script_version(monkeypatch: Any) -> None:
   assert not any("UPDATE user_strategy_version" in value for value in cursor.statements)
 
 
+def test_historical_script_content_reuses_immutable_version(monkeypatch: Any) -> None:
+  payload = {
+    "name": "策略 A",
+    "code": "def on_bar(bar, state):\n  return []",
+  }
+  cursor = FakeCursor([{
+    "current_version_no": 5,
+    "version_id": "55555555-5555-4555-8555-555555555555",
+    "content_fingerprint": "b" * 64,
+    "matching_version_id": "22222222-2222-4222-8222-222222222222",
+    "matching_version_no": 2,
+    "max_version_no": 5,
+  }])
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  saved = state_store._write_strategy_script(cursor, "script-1", payload)
+
+  assert saved == ("script-1", "22222222-2222-4222-8222-222222222222", 2)
+  assert not any("INSERT INTO user_strategy_version" in value for value in cursor.statements)
+
+
+def test_new_content_uses_max_version_after_historical_restore(monkeypatch: Any) -> None:
+  payload = {
+    "name": "策略 A",
+    "code": "def on_bar(bar, state):\n  return ['new']",
+  }
+  cursor = FakeCursor([
+    {
+      "current_version_no": 2,
+      "version_id": "22222222-2222-4222-8222-222222222222",
+      "content_fingerprint": "a" * 64,
+      "matching_version_id": None,
+      "matching_version_no": None,
+      "max_version_no": 5,
+    },
+    {"id": "66666666-6666-4666-8666-666666666666"},
+  ])
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  saved = state_store._write_strategy_script(cursor, "script-1", payload)
+
+  assert saved == ("script-1", "66666666-6666-4666-8666-666666666666", 6)
+
+
+@pytest.mark.parametrize(
+  ("existing_names", "requested_name", "expected"),
+  [
+    ([], "策略 A", "策略 A"),
+    (["策略 A"], "策略 A", "策略 A-1"),
+    (["策略 A", "策略 A-1"], "策略 A", "策略 A-2"),
+    (["A" * 64], "A" * 64, f"{'A' * 62}-1"),
+  ],
+)
+def test_strategy_name_uses_first_available_numeric_suffix(
+  monkeypatch: Any,
+  existing_names: list[str],
+  requested_name: str,
+  expected: str,
+) -> None:
+  cursor = FakeCursor([{"names": existing_names}])
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  assert state_store._resolve_unique_strategy_name(cursor, requested_name, None) == expected
+  assert any("pg_advisory_xact_lock" in value for value in cursor.statements)
+
+
 def test_config_snapshot_binds_exact_script_version() -> None:
   config = {
     "id": "config-1",
@@ -146,20 +212,25 @@ def test_complete_strategy_rejects_stale_revision(monkeypatch: Any) -> None:
 
 
 def test_new_complete_strategy_ignores_client_script_identity(monkeypatch: Any) -> None:
-  cursor = FakeCursor([])
+  cursor = FakeCursor([{"names": ["复制策略"]}])
   captured: dict[str, Any] = {}
 
   @contextmanager
   def database() -> Any:
     yield FakeConnection(cursor)
 
-  def write_script(_: Any, script_id: str | None, __: Any) -> tuple[str, str, int]:
+  def write_script(_: Any, script_id: str | None, payload: dict[str, Any]) -> tuple[str, str, int]:
     captured["script_id"] = script_id
+    captured["script_name"] = payload["name"]
     return "new-script", "new-version", 1
+
+  def write_config(_: Any, __: Any, payload: dict[str, Any], *___: Any) -> str:
+    captured["config_name"] = payload["name"]
+    return "new-config"
 
   monkeypatch.setattr(state_store, "_db", database)
   monkeypatch.setattr(state_store, "_write_strategy_script", write_script)
-  monkeypatch.setattr(state_store, "_write_config", lambda *_: "new-config")
+  monkeypatch.setattr(state_store, "_write_config", write_config)
   monkeypatch.setattr(
     state_store,
     "_get_strategy_config_with_cursor",
@@ -177,4 +248,6 @@ def test_new_complete_strategy_ignores_client_script_identity(monkeypatch: Any) 
   )
 
   assert captured["script_id"] is None
+  assert captured["script_name"] == "复制策略-1"
+  assert captured["config_name"] == "复制策略-1"
   assert result["script"]["id"] == "new-script"

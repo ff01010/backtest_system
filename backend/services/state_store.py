@@ -33,6 +33,7 @@ class RunnerUnavailableError(DatabaseError):
 
 
 _BACKTEST_SCHEDULER_LOCK_KEY = 314159265
+_STRATEGY_NAME_MAX_LENGTH = 64
 # 保留旧名称，避免外部诊断脚本在迁移期间失效。
 _L2_FAIR_CLAIM_LOCK_KEY = _BACKTEST_SCHEDULER_LOCK_KEY
 logger = logging.getLogger(__name__)
@@ -616,6 +617,31 @@ def _insert_script_version(
   return _uuid(cur.fetchone()["id"]) or "", fingerprint
 
 
+def _script_version_state(cur: Any, script_id: str, fingerprint: str) -> dict[str, Any]:
+  cur.execute("""
+    SELECT strategy.current_version_no, version.id AS version_id,
+      version.content_fingerprint,
+      matching_version.id AS matching_version_id,
+      matching_version.version_no AS matching_version_no,
+      (SELECT max(candidate.version_no)
+       FROM user_strategy_version candidate
+       WHERE candidate.strategy_id=strategy.id) AS max_version_no
+    FROM user_strategy strategy
+    JOIN user_strategy_version version
+      ON version.strategy_id=strategy.id
+      AND version.version_no=strategy.current_version_no
+    LEFT JOIN user_strategy_version matching_version
+      ON matching_version.strategy_id=strategy.id
+      AND matching_version.content_fingerprint=%s
+    WHERE strategy.id=%s AND strategy.owner_user_id=%s
+    FOR UPDATE OF strategy
+  """, (fingerprint, script_id, current_user_id()))
+  row = cur.fetchone()
+  if not row:
+    raise KeyError(script_id)
+  return row
+
+
 def _write_strategy_script(
   cur: Any,
   script_id: str | None,
@@ -629,25 +655,19 @@ def _write_strategy_script(
     saved_id = _uuid(cur.fetchone()["id"]) or ""
     version_id, _ = _insert_script_version(cur, saved_id, 1, payload)
     return saved_id, version_id, 1
-  cur.execute("""
-    SELECT strategy.current_version_no, version.id AS version_id,
-      version.content_fingerprint
-    FROM user_strategy strategy
-    JOIN user_strategy_version version
-      ON version.strategy_id=strategy.id
-      AND version.version_no=strategy.current_version_no
-    WHERE strategy.id=%s AND strategy.owner_user_id=%s
-    FOR UPDATE OF strategy
-  """, (script_id, current_user_id()))
-  row = cur.fetchone()
-  if not row:
-    raise KeyError(script_id)
   runtime = _script_runtime_config(payload)
   fingerprint = _script_content_fingerprint(str(payload["code"]), runtime)
+  row = _script_version_state(cur, script_id, fingerprint)
   version_no = int(row["current_version_no"])
   version_id = _uuid(row["version_id"]) or ""
-  if row.get("content_fingerprint") != fingerprint:
-    version_no += 1
+  matching_version_id = _uuid(row.get("matching_version_id"))
+  if row.get("content_fingerprint") == fingerprint:
+    pass
+  elif matching_version_id:
+    version_id = matching_version_id
+    version_no = int(row["matching_version_no"])
+  else:
+    version_no = int(row.get("max_version_no") or version_no) + 1
     version_id, _ = _insert_script_version(cur, script_id, version_no, payload)
   cur.execute("""
     UPDATE user_strategy
@@ -658,6 +678,37 @@ def _write_strategy_script(
     script_id, current_user_id(),
   ))
   return script_id, version_id, version_no
+
+
+def _strategy_name_candidate(requested_name: str, suffix: int) -> str:
+  if suffix == 0:
+    return requested_name
+  suffix_text = f"-{suffix}"
+  return f"{requested_name[:_STRATEGY_NAME_MAX_LENGTH - len(suffix_text)]}{suffix_text}"
+
+
+def _resolve_unique_strategy_name(cur: Any, requested_name: str, config_id: str | None) -> str:
+  """在用户级事务锁内分配名称，避免并发保存绕过自动编号。"""
+  normalized_name = requested_name.strip()
+  if not normalized_name:
+    raise ConflictError("策略名称不能为空")
+  cur.execute(
+    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+    (f"strategy-name:{current_user_id()}",),
+  )
+  cur.execute("""
+    SELECT COALESCE(array_agg(name::text), ARRAY[]::text[]) AS names
+    FROM strategy_config
+    WHERE owner_user_id=%s AND archived_at IS NULL
+      AND (%s::uuid IS NULL OR id<>%s::uuid)
+  """, (current_user_id(), config_id, config_id))
+  existing_names = set(cur.fetchone()["names"])
+  suffix = 0
+  while True:
+    candidate = _strategy_name_candidate(normalized_name, suffix)
+    if candidate not in existing_names:
+      return candidate
+    suffix += 1
 
 
 def create_strategy_script(payload: dict[str, Any]) -> dict[str, Any]:
@@ -856,10 +907,14 @@ def save_complete_strategy(
           raise ConflictError("策略脚本归属不一致，禁止将方案改绑到其他脚本")
         if expected_revision is None or int(current["revision"]) != expected_revision:
           raise ConflictError("该策略已在其他会话中更新，请刷新后重试")
-      saved_script_id, strategy_version_id, _ = _write_strategy_script(
-        cur, owned_script_id, script_payload,
+      resolved_name = _resolve_unique_strategy_name(
+        cur, str(config_payload["name"]), config_id,
       )
-      config = {**config_payload, "scriptId": saved_script_id}
+      resolved_script = {**script_payload, "name": resolved_name}
+      saved_script_id, strategy_version_id, _ = _write_strategy_script(
+        cur, owned_script_id, resolved_script,
+      )
+      config = {**config_payload, "name": resolved_name, "scriptId": saved_script_id}
       saved_config_id = _write_config(
         cur, config_id, config, saved_script_id, strategy_version_id,
       )
