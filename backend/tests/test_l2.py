@@ -759,6 +759,67 @@ def test_l2_directional_result_uses_complete_position_cycles() -> None:
   assert result["cycles"] == []
 
 
+def test_l2_directional_result_accepts_pipe_enum_and_serialized_effects() -> None:
+  raw_result = {
+    "fills": [{
+      "time": "2026-01-02 09:31:03", "symbol": "688981.SH", "side": "BUY",
+      "quantity": 100, "price": 10.0, "fee": 0.0, "realized_pnl": 0.0,
+      "position_effect": PositionEffect.OPEN_LONG, "position_key": "script:long",
+    }, {
+      "time": "2026-01-02 10:31:03", "symbol": "688981.SH", "side": "SELL",
+      "quantity": 100, "price": 11.0, "fee": 0.0, "realized_pnl": 100.0,
+      "position_effect": "PositionEffect.CLOSE_LONG", "position_key": "script:long",
+    }, {
+      "time": "2026-01-02 11:31:03", "symbol": "688981.SH", "side": "SELL",
+      "quantity": 100, "price": 11.0, "fee": 0.0, "realized_pnl": 0.0,
+      "position_effect": "OPEN_SHORT", "position_key": "script:short",
+    }, {
+      "time": "2026-01-02 13:31:03", "symbol": "688981.SH", "side": "BUY",
+      "quantity": 100, "price": 10.0, "fee": 0.0, "realized_pnl": 100.0,
+      "position_effect": "close_short", "position_key": "script:short",
+    }],
+    "equity": [{
+      "time": "2026-01-02 14:57:00", "equity": 10_200, "cash": 10_200,
+      "close": 10.0,
+    }],
+    "orders": [],
+    "warnings": [],
+  }
+
+  result = normalize_l2_result(raw_result, {
+    "initialCapital": 10_000,
+    "strategyCategory": "directional_holding",
+  })
+
+  assert result["summary"]["completedTradeCount"] == 2
+  assert result["summary"]["winningTrades"] == 2
+  assert result["summary"]["openTradeCount"] == 0
+  assert result["dailyHoldings"][0]["longQty"] == 0
+  assert result["dailyHoldings"][0]["shortQty"] == 0
+
+
+def test_l2_daily_holdings_accepts_pipe_position_effect_enum() -> None:
+  result = normalize_l2_result({
+    "fills": [{
+      "time": "2026-01-02 09:31:03", "symbol": "688981.SH", "side": "SELL",
+      "quantity": 100, "price": 10.0, "fee": 0.0, "realized_pnl": 0.0,
+      "position_effect": PositionEffect.OPEN_SHORT, "position_key": "script:short",
+    }],
+    "equity": [{
+      "time": "2026-01-02 14:57:00", "equity": 10_000, "cash": 11_000,
+      "close": 10.0,
+    }],
+    "orders": [],
+    "warnings": [],
+  }, {
+    "initialCapital": 10_000,
+    "strategyCategory": "directional_holding",
+  })
+
+  assert result["dailyHoldings"][0]["longQty"] == 0
+  assert result["dailyHoldings"][0]["shortQty"] == 100
+
+
 def test_l2_overlay_result_keeps_cross_day_cycle_and_manifest_policy() -> None:
   raw_result = {
     "fills": [{
