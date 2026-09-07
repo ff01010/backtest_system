@@ -118,14 +118,14 @@ def _build_daily_holdings(
     while fill_index < len(fills) and _time_key(fills[fill_index].get("time")) <= point_time:
       fill = fills[fill_index]
       quantity = max(0, int(_number(fill.get("quantity"), 0)))
-      effect = str(fill.get("position_effect") or "")
-      if effect == "open_long":
+      effect = _normalize_position_effect(fill.get("position_effect"))
+      if effect == PositionEffect.OPEN_LONG:
         long_quantity += quantity
-      elif effect == "close_long":
+      elif effect == PositionEffect.CLOSE_LONG:
         long_quantity = max(0, long_quantity - quantity)
-      elif effect == "open_short":
+      elif effect == PositionEffect.OPEN_SHORT:
         short_quantity += quantity
-      elif effect == "close_short":
+      elif effect == PositionEffect.CLOSE_SHORT:
         short_quantity = max(0, short_quantity - quantity)
       last_fill_price = _number(fill.get("price"), last_fill_price)
       fill_index += 1
@@ -225,10 +225,28 @@ def _directional_fills(raw_fills: list[dict[str, Any]]) -> list[ClosedTradeFill]
   return [ClosedTradeFill(
     symbol=str(item.get("symbol") or ""),
     position_key=str(item.get("position_key") or "strategy_position"),
-    position_effect=PositionEffect(str(item.get("position_effect")).split(".")[-1]),
+    position_effect=_normalize_position_effect(item.get("position_effect")),
     quantity=int(_number(item.get("quantity"), 0)),
     realized_pnl=_number(item.get("realized_pnl"), 0.0),
   ) for item in raw_fills]
+
+
+def _normalize_position_effect(value: object) -> PositionEffect | None:
+  """兼容进程内枚举和历史序列化字符串，避免结果阶段二次解释失败。"""
+  if isinstance(value, PositionEffect):
+    return value
+  text = str(value or "").strip()
+  if not text:
+    return None
+  member = text.rsplit(".", 1)[-1]
+  try:
+    return PositionEffect(member)
+  except ValueError:
+    try:
+      return PositionEffect[member.upper()]
+    except KeyError as error:
+      raise ValueError(f"L2 成交持仓影响无效: {text}") from error
+
 
 def _merge_overlay_report(
   trades: list[dict[str, Any]],
