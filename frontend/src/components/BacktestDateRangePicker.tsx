@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 export interface BacktestCalendarDay {
   date: string;
@@ -13,6 +14,17 @@ interface Props {
   onChange: (key: 'startDate' | 'endDate', value: string) => void;
   onMonthChange: (month: string) => void;
 }
+
+interface PopoverPosition {
+  left: number;
+  maxHeight: number;
+  top: number;
+}
+
+const POPOVER_FALLBACK_HEIGHT = 330;
+const POPOVER_FALLBACK_WIDTH = 244;
+const POPOVER_GAP = 6;
+const VIEWPORT_MARGIN = 8;
 
 function monthStart(month: string): Date {
   return new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)) - 1, 1);
@@ -32,11 +44,65 @@ export default function BacktestDateRangePicker({ startDate, endDate, days, onCh
   const [open, setOpen] = useState(false);
   const [target, setTarget] = useState<'startDate' | 'endDate'>('startDate');
   const [month, setMonth] = useState(startDate.slice(0, 7));
+  const [popoverPosition, setPopoverPosition] = useState<PopoverPosition>({ left: 0, maxHeight: POPOVER_FALLBACK_HEIGHT, top: 0 });
+  const anchorRef = useRef<HTMLDivElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const popoverId = useId();
   const dayByDate = useMemo(() => new Map(days.map((item) => [item.date, item])), [days]);
+
+  const updatePopoverPosition = useCallback((): void => {
+    const anchor = anchorRef.current;
+    if (!anchor) return;
+
+    const anchorRect = anchor.getBoundingClientRect();
+    const popoverWidth = popoverRef.current?.offsetWidth || POPOVER_FALLBACK_WIDTH;
+    const popoverHeight = popoverRef.current?.offsetHeight || POPOVER_FALLBACK_HEIGHT;
+    const spaceBelow = window.innerHeight - anchorRect.bottom - POPOVER_GAP - VIEWPORT_MARGIN;
+    const spaceAbove = anchorRect.top - POPOVER_GAP - VIEWPORT_MARGIN;
+    const showAbove = spaceBelow < popoverHeight && spaceAbove > spaceBelow;
+    const availableHeight = Math.max(96, showAbove ? spaceAbove : spaceBelow);
+    const renderedHeight = Math.min(popoverHeight, availableHeight);
+    const maxLeft = Math.max(VIEWPORT_MARGIN, window.innerWidth - popoverWidth - VIEWPORT_MARGIN);
+    const left = Math.min(Math.max(anchorRect.left, VIEWPORT_MARGIN), maxLeft);
+    const top = showAbove
+      ? Math.max(VIEWPORT_MARGIN, anchorRect.top - POPOVER_GAP - renderedHeight)
+      : Math.min(anchorRect.bottom + POPOVER_GAP, window.innerHeight - VIEWPORT_MARGIN - renderedHeight);
+
+    setPopoverPosition({ left, maxHeight: availableHeight, top });
+  }, []);
 
   useEffect(() => {
     if (open) onMonthChange(month);
   }, [month, onMonthChange, open]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+  }, [month, open, updatePopoverPosition]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      const targetElement = event.target as Node | null;
+      if (targetElement && (anchorRef.current?.contains(targetElement) || popoverRef.current?.contains(targetElement))) return;
+      setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    document.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('resize', updatePopoverPosition);
+    window.addEventListener('scroll', updatePopoverPosition, true);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('resize', updatePopoverPosition);
+      window.removeEventListener('scroll', updatePopoverPosition, true);
+    };
+  }, [open, updatePopoverPosition]);
 
   const choose = (value: string): void => {
     const status = dayByDate.get(value)?.status;
@@ -87,16 +153,33 @@ export default function BacktestDateRangePicker({ startDate, endDate, days, onCh
   };
 
   return (
-    <div style={{ position: 'relative' }}>
+    <div ref={anchorRef} style={{ position: 'relative' }}>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
         {(['startDate', 'endDate'] as const).map((key) => (
-          <button key={key} type="button" onClick={() => { setTarget(key); setMonth((key === 'startDate' ? startDate : endDate).slice(0, 7)); setOpen(true); }} style={{ height: 34, border: `1px solid ${target === key && open ? '#0f766e' : '#cbd5e1'}`, borderRadius: 4, background: '#f8fafc', color: '#334155', textAlign: 'left', padding: '0 10px', fontSize: 12 }}>
+          <button
+            key={key}
+            type="button"
+            aria-controls={popoverId}
+            aria-expanded={target === key && open}
+            onClick={() => {
+              setTarget(key);
+              setMonth((key === 'startDate' ? startDate : endDate).slice(0, 7));
+              setOpen(true);
+            }}
+            style={{ height: 34, border: `1px solid ${target === key && open ? '#0f766e' : '#cbd5e1'}`, borderRadius: 4, background: '#f8fafc', color: '#334155', textAlign: 'left', padding: '0 10px', fontSize: 12 }}
+          >
             {key === 'startDate' ? '开始：' : '结束：'}{key === 'startDate' ? startDate : endDate}
           </button>
         ))}
       </div>
-      {open && (
-        <div style={{ position: 'absolute', zIndex: 30, top: 40, left: 0, padding: 12, background: '#ffffff', border: '1px solid #cbd5e1', borderRadius: 6, boxShadow: '0 12px 28px rgba(15, 23, 42, 0.18)' }}>
+      {open && createPortal(
+        <div
+          id={popoverId}
+          ref={popoverRef}
+          role="dialog"
+          aria-label="回测日期选择"
+          style={{ position: 'fixed', zIndex: 70, top: popoverPosition.top, left: popoverPosition.left, maxHeight: popoverPosition.maxHeight, overflowY: 'auto', padding: 12, background: '#ffffff', border: '1px solid #cbd5e1', borderRadius: 6, boxShadow: '0 12px 28px rgba(15, 23, 42, 0.18)' }}
+        >
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
             <button type="button" onClick={() => setMonth(shiftMonth(month, -1))} style={{ border: 0, background: 'transparent', color: '#0f766e', cursor: 'pointer' }}>‹</button>
             <span style={{ color: '#64748b', fontSize: 11 }}>灰色日期不可选</span>
@@ -104,7 +187,8 @@ export default function BacktestDateRangePicker({ startDate, endDate, days, onCh
           </div>
           {renderMonth(month)}
           <button type="button" onClick={() => setOpen(false)} style={{ width: '100%', marginTop: 10, height: 28, border: '1px solid #cbd5e1', borderRadius: 3, background: '#f8fafc', color: '#475569', fontSize: 11 }}>关闭</button>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );
