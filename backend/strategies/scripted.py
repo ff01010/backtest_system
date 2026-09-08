@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import builtins
 from typing import Any, Sequence
 
 from backend.backtesting.models import (
@@ -15,6 +14,13 @@ from backend.backtesting.models import (
 )
 from backend.l2.models import QuoteSnapshot
 from backend.services.backtest_errors import StrategyExecutionError
+from backend.strategies.runtime_contract import (
+  BLOCKED_BUILTIN_NAMES,
+  RUNTIME_BUILTINS,
+  StrategyRuntimePolicyError,
+  StrategyRuntimeVersionError,
+  validate_runtime_version,
+)
 from backend.strategies.script_time_context import ScriptTimeContextError, normalize_script_bar_time
 
 _ACTIONS: dict[str, tuple[OrderSide, PositionEffect]] = {
@@ -23,34 +29,6 @@ _ACTIONS: dict[str, tuple[OrderSide, PositionEffect]] = {
   "sell_close": (OrderSide.SELL, PositionEffect.CLOSE_LONG),
   "buy_close": (OrderSide.BUY, PositionEffect.CLOSE_SHORT),
 }
-_BLOCKED_CALLS = {"compile", "eval", "exec", "input", "open"}
-_SAFE_BUILTINS = {
-  "abs": abs,
-  "any": any,
-  "bool": bool,
-  "dict": dict,
-  "ImportError": ImportError,
-  "isinstance": isinstance,
-  "list": list,
-  "float": float,
-  "int": int,
-  "len": len,
-  "max": max,
-  "min": min,
-  "object": object,
-  "range": range,
-  "round": round,
-  "set": set,
-  "sorted": sorted,
-  "str": str,
-  "sum": sum,
-  "TypeError": TypeError,
-  "ValueError": ValueError,
-  "__build_class__": builtins.__build_class__,
-  "__import__": __import__,
-}
-
-
 def warmup_trading_days_for_script(code: str) -> int:
   """静态读取策略声明的预热交易日数，不执行用户代码。"""
   try:
@@ -93,8 +71,8 @@ class _ScriptValidator(ast.NodeVisitor):
     self.generic_visit(node)
 
   def visit_Call(self, node: ast.Call) -> None:
-    if isinstance(node.func, ast.Name) and node.func.id in _BLOCKED_CALLS:
-      raise ValueError(f"自定义策略脚本不允许调用 {node.func.id}")
+    if isinstance(node.func, ast.Name) and node.func.id in BLOCKED_BUILTIN_NAMES:
+      raise StrategyRuntimePolicyError(node.func.id)
     self.generic_visit(node)
 
 
@@ -193,14 +171,16 @@ class ScriptedBarStrategy:
     code: str,
     params: dict[str, Any],
     quote_mode: str | None = None,
+    runtime_version: str | None = None,
   ) -> None:
     try:
+      validate_runtime_version(runtime_version)
       validate_script_code(code)
       self._quote_mode = quote_mode_for_script(code, quote_mode)
-    except ValueError as error:
+    except (ValueError, StrategyRuntimeVersionError) as error:
       raise StrategyExecutionError.from_exception(error) from error
     namespace: dict[str, Any] = {
-      "__builtins__": _SAFE_BUILTINS,
+      "__builtins__": RUNTIME_BUILTINS,
       "__name__": f"strategy_script_{script_id}",
     }
     try:

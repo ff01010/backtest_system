@@ -16,6 +16,13 @@ from typing import Any
 from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade
 from backend.services.backtest_errors import RemoteBacktestError, error_detail
+from backend.services.system_error_catalog import root_cause
+from backend.strategies.runtime_contract import (
+  SCRIPT_RUNTIME_VERSION,
+  drop_strategy_process_privileges,
+  missing_name,
+  strategy_source_line,
+)
 from backend.strategies.scripted import ScriptedBarStrategy
 
 
@@ -67,6 +74,7 @@ def _bar_process_main(connection: Connection, payload: dict[str, Any]) -> None:
   """只接收冻结脚本、参数和行情，不继承数据库或外部服务配置。"""
   try:
     os.environ.clear()
+    drop_strategy_process_privileges()
     connection.send({"status": "ok", "result": _execute_script(payload)})
   except Exception as error:
     try:
@@ -89,6 +97,7 @@ def _execute_script(payload: dict[str, Any]) -> dict[str, Any]:
   ) for item in payload["bars"]]
   strategy = ScriptedBarStrategy(
     str(payload["scriptId"]), str(payload["code"]), dict(payload.get("params") or {}),
+    runtime_version=str(payload.get("runtimeVersion") or "legacy"),
   )
   commission_rate = float(payload["commissionRate"])
   fee_profile = dict(payload.get("feeProfile") or {})
@@ -178,12 +187,21 @@ def _terminate(process: multiprocessing.Process, grace_seconds: int) -> None:
 
 
 def _error_diagnostic(error: Exception) -> dict[str, str]:
-  trace = traceback.extract_tb(error.__traceback__)[-8:]
+  cause = root_cause(error)
+  trace = traceback.extract_tb(cause.__traceback__)[-8:]
   reason = re.sub(
-    r"(?i)\b(password|token|secret|authorization)\b\s*[:=]\s*\S+", r"\1=***", str(error),
+    r"(?i)\b(password|token|secret|authorization)\b\s*[:=]\s*\S+", r"\1=***", str(cause),
   )
-  return {
-    "exceptionType": type(error).__name__,
+  diagnostic = {
+    "exceptionType": type(cause).__name__,
     "reason": reason[:500],
     "trace": " > ".join(f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in trace),
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
   }
+  name = missing_name(cause)
+  line = strategy_source_line(cause)
+  if name:
+    diagnostic["missingName"] = name
+  if line:
+    diagnostic["strategyLine"] = str(line)
+  return diagnostic

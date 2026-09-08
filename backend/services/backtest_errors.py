@@ -6,6 +6,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.services.system_error_catalog import classify_system_error
+from backend.strategies.runtime_contract import (
+  BLOCKED_BUILTIN_NAMES,
+  SCRIPT_RUNTIME_VERSION,
+  StrategyRuntimePolicyError,
+  StrategyRuntimeVersionError,
+  is_standard_builtin_name,
+  missing_name,
+  strategy_source_line,
+)
 
 
 @dataclass(frozen=True)
@@ -21,6 +30,9 @@ class BacktestErrorDetail:
   symbol: str | None = None
   retryable: bool = False
   task_id: str | None = None
+  missing_name: str | None = None
+  strategy_line: int | None = None
+  runtime_version: str | None = None
 
   def to_dict(self) -> dict[str, Any]:
     return {
@@ -33,12 +45,16 @@ class BacktestErrorDetail:
       "symbol": self.symbol,
       "retryable": self.retryable,
       "taskId": self.task_id,
+      "missingName": self.missing_name,
+      "strategyLine": self.strategy_line,
+      "runtimeVersion": self.runtime_version,
     }
 
   def with_task_id(self, task_id: str | None) -> "BacktestErrorDetail":
     return BacktestErrorDetail(
       self.category, self.code, self.message, self.hint, self.callback,
       self.event_time, self.symbol, self.retryable, task_id,
+      self.missing_name, self.strategy_line, self.runtime_version,
     )
 
   def with_event_context(
@@ -49,6 +65,7 @@ class BacktestErrorDetail:
     return BacktestErrorDetail(
       self.category, self.code, self.message, self.hint, self.callback,
       self.event_time or event_time, self.symbol or symbol, self.retryable, self.task_id,
+      self.missing_name, self.strategy_line, self.runtime_version,
     )
 
 
@@ -71,17 +88,7 @@ class StrategyExecutionError(BacktestExecutionError, ValueError):
     event_time: str | None = None,
     symbol: str | None = None,
   ) -> "StrategyExecutionError":
-    message, hint = _strategy_message(error)
-    return cls(BacktestErrorDetail(
-      category="strategy_error",
-      code=_strategy_code(error),
-      message=message,
-      hint=hint,
-      callback=callback,
-      event_time=event_time,
-      symbol=symbol,
-      retryable=False,
-    ))
+    return cls(_strategy_error_detail(error, callback, event_time, symbol))
 
 
 class RemoteBacktestError(BacktestExecutionError):
@@ -111,6 +118,9 @@ class RemoteBacktestError(BacktestExecutionError):
       symbol=_optional_text(value.get("symbol")),
       retryable=bool(value.get("retryable", False)),
       task_id=_optional_text(value.get("taskId")),
+      missing_name=_optional_text(value.get("missingName")),
+      strategy_line=_optional_int(value.get("strategyLine")),
+      runtime_version=_optional_text(value.get("runtimeVersion")),
     ), diagnostic)
 
 
@@ -150,6 +160,43 @@ def _strategy_code(error: Exception) -> str:
   return "strategy.runtime_error"
 
 
+def _strategy_error_detail(
+  error: Exception,
+  callback: str | None,
+  event_time: str | None,
+  symbol: str | None,
+) -> BacktestErrorDetail:
+  name = missing_name(error)
+  line = strategy_source_line(error)
+  category = "strategy_error"
+  code = _strategy_code(error)
+  message, hint = _strategy_message(error)
+  if isinstance(error, StrategyRuntimeVersionError):
+    category, code = "system_error", "runtime.version_mismatch"
+    message = "回测因平台策略运行时版本不一致而未完成。"
+    hint = "无需修改当前策略，请提供任务编号联系管理员。"
+  elif isinstance(error, StrategyRuntimePolicyError) or name in BLOCKED_BUILTIN_NAMES:
+    code = "strategy.runtime_policy_blocked"
+    message = f"策略运行环境不允许调用 {name or '该函数'}。"
+    hint = "请移除该调用，或改用策略运行手册中支持的方式。"
+  elif isinstance(error, UnboundLocalError):
+    code = "strategy.local_unbound"
+    message = f"局部变量 {name or '未知名称'} 未在所有执行路径中初始化。"
+    hint = "请在条件分支之前初始化该变量。"
+  elif isinstance(error, NameError) and is_standard_builtin_name(name):
+    category, code = "system_error", "runtime.contract_missing"
+    message = "回测因平台运行环境兼容问题未完成。"
+    hint = "无需修改当前策略，请提供任务编号联系管理员。"
+  elif isinstance(error, NameError):
+    code = "strategy.undefined_name"
+    message = f"策略引用了未定义的名称 {name or '未知名称'}。"
+    hint = "请先定义或导入该名称，并检查变量作用域。"
+  return BacktestErrorDetail(
+    category, code, message, hint, callback, event_time, symbol, False, None,
+    name, line, SCRIPT_RUNTIME_VERSION,
+  )
+
+
 def _strategy_message(error: Exception) -> tuple[str, str]:
   """用异常类型和受控契约文本提供可操作提示，不回显脚本自定义内容。"""
   text = str(error)
@@ -182,3 +229,7 @@ def _strategy_message(error: Exception) -> tuple[str, str]:
 
 def _optional_text(value: Any) -> str | None:
   return value if isinstance(value, str) and value else None
+
+
+def _optional_int(value: Any) -> int | None:
+  return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None

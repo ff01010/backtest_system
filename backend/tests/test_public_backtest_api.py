@@ -147,4 +147,8 @@ def test_health_reports_runner_degradation_without_internal_counts(
     "runners": {"bar": {"healthy": 0, "queued": 3}},
   })
 
-  assert api_app.health() == {"status": "degraded", "backtest": "unavailable"}
+  assert api_app.health() == {
+    "status": "degraded",
+    "backtest": "unavailable",
+    "strategyRuntimeVersion": "python3.12-runtime-v2",
+  }

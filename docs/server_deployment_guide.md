@@ -109,9 +109,11 @@ quant-backtest-artifacts       回测输出文件
 | `quant-backtest-postgres` | `postgres` | 保存用户、策略、方案和回测记录 |
 | `quant-backtest-strategy-worker` | `strategy-worker` | 在隔离环境中执行用户策略脚本 |
 | `quant-backtest-backend` | `backend` | 登录、权限、QMT 覆盖检查、回测编排和 API |
+| `quant-backtest-platform-bar-runner-*` | `bar-runner` | 领取并执行标准 Bar 回测任务 |
+| `quant-backtest-platform-l2-runner-*` | `l2-runner` | 领取并执行 L2 盘口回测任务 |
 | `quant-backtest-frontend` | `frontend` | Nginx 前端页面和 API 反向代理 |
 
-策略 worker 没有数据库密码、没有宿主机目录挂载，并且不对外暴露端口。
+策略 worker 没有数据库密码、没有宿主机目录挂载，并且不对外暴露端口；容器使用非 root 用户、只读文件系统、受限临时目录和内部网络。Bar/L2 的用户策略子进程也会清空环境并在 Linux 下主动降权，但目前仍与父 Runner 共享容器文件系统和网络命名空间，因此这是兼容与降权加固，不是完整安全沙箱。
 
 ## 5. 首次部署或升级步骤
 
@@ -166,10 +168,12 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml --pro
 
 迁移可以重复执行。已有表、索引或列显示 `already exists, skipping` 是正常提示；命令最终必须正常结束，不能出现 `ERROR` 或事务回滚。
 
+本次运行时兼容改造需要成功执行 `025_strategy_runtime_error_stats.sql`。该迁移只创建无用户、任务和源码关联的脱敏统计表，不改变回测记录及其错误日志的级联删除关系。
+
 ### 第四步：重建并启动应用
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml up -d --build strategy-worker backend frontend
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml up -d --build --scale bar-runner=12 --scale l2-runner=12 strategy-worker backend bar-runner l2-runner frontend
 ```
 
 首次拉取前端 Node 镜像或执行 `npm ci` 时，构建可能需要几分钟。
@@ -182,7 +186,7 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml ps
 
 期望结果：
 
-- PostgreSQL、策略 worker、后端、前端均为 `Up`。
+- PostgreSQL、策略 worker、后端、Bar Runner、L2 Runner、前端均为 `Up`。
 - PostgreSQL、策略 worker 和后端应显示 `healthy`。
 - 前端端口应显示 `0.0.0.0:28601->80/tcp` 或等效输出。
 
@@ -269,7 +273,7 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml up -d
 ### 重建并重启全部应用容器
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml up -d --build strategy-worker backend frontend
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml up -d --build --scale bar-runner=12 --scale l2-runner=12 strategy-worker backend bar-runner l2-runner frontend
 ```
 
 ## 9. 注意事项
@@ -277,6 +281,7 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml up -d
 - 不要把 `deploy/.env` 提交到 Git，也不要把数据库密码贴到聊天记录或文档中。
 - 不要删除 PostgreSQL 数据卷，除非确认要清空全部系统数据。
 - 每次拉取包含新 `db/migrations/*.sql` 的代码后，都要执行一次迁移命令。
+- `TREND_GRID_STRATEGY_RUNTIME_ERROR_RETENTION_DAYS` 控制平台运行环境错误聚合保留期，默认 180 天；统计只含错误码、运行时版本、标准内置名称和时间。
 - `8080` 已被其他服务占用，本系统固定使用 `28601`。
 - `28681` 当前未使用，不需要为后端或 worker 单独开放。
 - 回测不会在运行时向东财、新浪或其他外部行情接口拉取数据；缺失数据必须先导入 QMT 原始文件。

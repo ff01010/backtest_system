@@ -7,7 +7,12 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY backend /app/backend
 
+RUN addgroup --system --gid 10001 app \
+  && adduser --system --uid 10001 --ingroup app app
+
 ENV PYTHONPATH=/app
 EXPOSE 8001
+
+USER 10001:10001
 
 CMD ["uvicorn", "backend.worker_app:app", "--host", "0.0.0.0", "--port", "8001"]

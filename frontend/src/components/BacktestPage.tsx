@@ -57,6 +57,7 @@ import type {
   StrategySource,
 } from '../types';
 import { typography } from '../styles/typography';
+import { backtestErrorPresentation } from '../utils/backtestErrorPresentation';
 import BacktestTabs from './BacktestTabs';
 import InstrumentSearchField from './InstrumentSearchField';
 import StrategyGuideDrawer from './StrategyGuideDrawer';
@@ -1054,14 +1055,14 @@ function getRunErrorDetail(run: BacktestRunHistory): BacktestErrorDetail | null 
 }
 
 function BacktestErrorCard({ detail }: { detail: BacktestErrorDetail }): ReactNode {
-  const isStrategy = detail.category === 'strategy_error';
-  const location = [detail.callback, detail.symbol, detail.eventTime].filter(Boolean).join(' · ');
+  const presentation = backtestErrorPresentation(detail);
+  const isStrategy = presentation.isUserActionable;
   return (
     <div style={{ border: `1px solid ${isStrategy ? '#fdba74' : '#fecaca'}`, background: isStrategy ? '#fff7ed' : '#fef2f2', borderRadius: 6, padding: 12, color: '#7c2d12', fontSize: 13, lineHeight: 1.6 }}>
       <div style={{ fontWeight: 700, color: isStrategy ? '#9a3412' : '#b91c1c' }}>
-        {isStrategy ? '策略执行失败' : '回测未完成'}
+        {presentation.title}
       </div>
-      {location && <div style={{ color: '#9a3412', marginTop: 3 }}>{location}</div>}
+      {presentation.location && <div style={{ color: '#9a3412', marginTop: 3 }}>{presentation.location}</div>}
       <div style={{ marginTop: 5 }}>原因：{detail.message}</div>
       {detail.hint && <div style={{ marginTop: 3 }}>建议：{detail.hint}</div>}
       {detail.taskId && <div style={{ marginTop: 6, color: '#64748b', fontSize: 12 }}>任务编号：<code>{detail.taskId}</code></div>}

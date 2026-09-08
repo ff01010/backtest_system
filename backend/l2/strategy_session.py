@@ -16,6 +16,12 @@ from backend.backtesting.fees import FeeProfile
 from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot, TradeEvent
 from backend.services.backtest_errors import RemoteBacktestError, error_detail
+from backend.strategies.runtime_contract import (
+  SCRIPT_RUNTIME_VERSION,
+  drop_strategy_process_privileges,
+  missing_name,
+  strategy_source_line,
+)
 from backend.strategies.scripted import ScriptedBarStrategy
 
 
@@ -196,9 +202,11 @@ def _engine_process_main(connection: Connection, payload: dict[str, Any]) -> Non
   """策略子进程入口；不继承服务配置，只处理父进程提供的数据块。"""
   try:
     os.environ.clear()
+    drop_strategy_process_privileges()
     strategy = ScriptedBarStrategy(
       str(payload["scriptId"]), str(payload["code"]), dict(payload.get("params") or {}),
       str(payload.get("quoteMode") or "order_driven"),
+      str(payload.get("runtimeVersion") or "legacy"),
     )
     engine = _build_engine(payload, strategy)
     engine.initialize_base_position(str(payload["symbol"]))
@@ -303,13 +311,21 @@ def _send_error(connection: Connection, error: Exception) -> None:
 
 def _error_diagnostic(error: Exception) -> dict[str, str]:
   cause = _root_error(error)
-  return {
+  diagnostic = {
     "exceptionType": type(cause).__name__,
     "reason": _redact_diagnostic_text(str(cause))[:500],
     "trace": _trace_summary(cause),
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
     "__internal_raw_message": str(cause),
     "__internal_raw_traceback": "".join(traceback.format_exception(type(cause), cause, cause.__traceback__)),
   }
+  name = missing_name(cause)
+  line = strategy_source_line(cause)
+  if name:
+    diagnostic["missingName"] = name
+  if line:
+    diagnostic["strategyLine"] = str(line)
+  return diagnostic
 
 
 def _root_error(error: Exception) -> Exception:
@@ -340,6 +356,7 @@ def _session_payload(payload: dict[str, Any]) -> dict[str, Any]:
     "code": str(payload["code"]),
     "params": dict(payload.get("params") or {}),
     "quoteMode": str(payload.get("quoteMode") or "order_driven"),
+    "runtimeVersion": str(payload.get("runtimeVersion") or "legacy"),
     "symbol": str(payload["symbol"]),
     "initialCapital": float(payload["initialCapital"]),
     "commissionRate": float(payload["commissionRate"]),

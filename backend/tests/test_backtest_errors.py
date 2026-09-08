@@ -20,6 +20,9 @@ def test_unknown_error_is_sanitized() -> None:
     "symbol": None,
     "retryable": False,
     "taskId": "run-42",
+    "missingName": None,
+    "strategyLine": None,
+    "runtimeVersion": None,
   }
   assert "internal-host" not in str(summary)
 
