@@ -33,20 +33,22 @@ def system_error_log_record(
   source: str,
   stage: str,
   task_id: str | None = None,
+  worker_id: str | None = None,
 ) -> SystemErrorLogRecord | None:
   """记录系统错误及 worker 拒绝任务时返回的原始诊断。"""
   if isinstance(error, RemoteBacktestError) and error.diagnostic:
-    return _remote_worker_record(error, source, stage, task_id)
+    return _remote_worker_record(error, source, stage, task_id, worker_id)
   detail = error_detail(error)
   if detail.category != "system_error":
     return None
   if isinstance(error, BacktestExecutionError) and detail.code.startswith("runtime."):
-    return _runtime_record(error, source, stage, task_id)
+    return _runtime_record(error, source, stage, task_id, worker_id)
 
   cause = root_cause(error)
   classified = classify_system_error(error)
   context = {
     **classified.context,
+    **_worker_context(worker_id),
     **_internal_error_context(error),
   }
   return SystemErrorLogRecord(
@@ -58,7 +60,7 @@ def system_error_log_record(
     reason=classified.admin_reason,
     exception_type=type(cause).__name__,
     context=context,
-    raw_log_ref=_raw_log_ref(source, stage, task_id),
+    raw_log_ref=_raw_log_ref(source, stage, task_id, worker_id),
   )
 
 
@@ -67,11 +69,12 @@ def _remote_worker_record(
   source: str,
   stage: str,
   task_id: str | None,
+  worker_id: str | None,
 ) -> SystemErrorLogRecord:
   """记录 worker 已返回的受限诊断正文，供管理员定位回放失败。"""
   diagnostic = error.diagnostic
   is_runtime_error = error.detail.code.startswith("runtime.")
-  context = {"service": "strategy_worker"}
+  context = {"service": "strategy_worker", **_worker_context(worker_id)}
   if error.detail.symbol:
     context["symbol"] = error.detail.symbol
   if error.detail.event_time:
@@ -91,7 +94,7 @@ def _remote_worker_record(
     reason=diagnostic.get("reason") or error.detail.message,
     exception_type=diagnostic.get("exceptionType") or type(error).__name__,
     context=context,
-    raw_log_ref=_raw_log_ref(source, stage, task_id),
+    raw_log_ref=_raw_log_ref(source, stage, task_id, worker_id),
   )
 
 
@@ -100,10 +103,14 @@ def _runtime_record(
   source: str,
   stage: str,
   task_id: str | None,
+  worker_id: str | None,
 ) -> SystemErrorLogRecord:
   """保留平台运行时错误的受控字段，供独立脱敏统计复用。"""
   detail = error.detail
-  context = {"runtimeVersion": detail.runtime_version or "legacy"}
+  context = {
+    "runtimeVersion": detail.runtime_version or "legacy",
+    **_worker_context(worker_id),
+  }
   if detail.missing_name:
     context["missingName"] = detail.missing_name
   if detail.strategy_line:
@@ -117,14 +124,28 @@ def _runtime_record(
     reason=detail.message,
     exception_type=type(root_cause(error)).__name__,
     context=context,
-    raw_log_ref=_raw_log_ref(source, stage, task_id),
+    raw_log_ref=_raw_log_ref(source, stage, task_id, worker_id),
   )
 
 
-def _raw_log_ref(source: str, stage: str, task_id: str | None) -> str:
-  container = {"l2_runner": "quant-backtest-platform-l2-runner-*", "sync_runner": "quant-backtest-backend"}.get(source, source)
+def _raw_log_ref(
+  source: str,
+  stage: str,
+  task_id: str | None,
+  worker_id: str | None = None,
+) -> str:
+  if source == "l2_runner" and worker_id:
+    container = worker_id.partition(":")[0]
+  else:
+    container = {"l2_runner": "quant-backtest-platform-l2-runner-*", "sync_runner": "quant-backtest-backend"}.get(source, source)
   task = task_id or "unknown"
+  if worker_id:
+    return f"container={container}; workerId={worker_id}; taskId={task}; stage={stage}"
   return f"container={container}; taskId={task}; stage={stage}"
+
+
+def _worker_context(worker_id: str | None) -> dict[str, str]:
+  return {"workerId": worker_id} if worker_id else {}
 
 
 def _internal_error_context(error: Exception) -> dict[str, str]:

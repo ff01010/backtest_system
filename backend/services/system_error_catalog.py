@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 from backend import settings
+from backend.backtesting.overlay import ResultReconciliationError
 from backend.l2.providers import L2DataCoverageError, L2DataError
 from backend.services.clickhouse_client import ClickHouseError
 
@@ -29,6 +30,15 @@ def classify_system_error(error: Exception) -> SystemErrorClassification:
   """将底层异常映射为稳定错误编码，避免前端依赖异常文本。"""
   cause = root_cause(error)
   host = _clickhouse_host()
+  if isinstance(cause, ResultReconciliationError):
+    context = {"tradeDate": cause.trade_date} if cause.trade_date else {}
+    return SystemErrorClassification(
+      "result.overlay_reconciliation_failed", "result", False,
+      "平台结果生成失败。",
+      "无需修改策略，请提供任务编号联系管理员。",
+      "增强收益与账户收益无法对账",
+      context,
+    )
   if isinstance(cause, L2DataCoverageError):
     missing_dates = ", ".join(cause.missing_dates)
     return SystemErrorClassification(

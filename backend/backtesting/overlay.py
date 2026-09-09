@@ -11,6 +11,14 @@ from backend.backtesting.models import OrderSide
 _EPSILON = 1e-8
 
 
+class ResultReconciliationError(ValueError):
+  """结果收益无法与账户事实对账。"""
+
+  def __init__(self, message: str, trade_date: str | None = None) -> None:
+    super().__init__(message)
+    self.trade_date = trade_date
+
+
 @dataclass(frozen=True)
 class OverlayFill:
   """进入增强归属账的标准化实际成交。"""
@@ -242,7 +250,8 @@ def build_overlay_report(
     overlay_pnl = account_pnl - base_pnl
     unrealized = ledger.unrealized_pnl(close)
     if abs(overlay_pnl - ledger.realized_pnl - unrealized) > 0.05:
-      raise ValueError("增强收益与账户收益无法对账")
+      trade_date = str(holding.get("date") or "") or None
+      raise ResultReconciliationError("增强收益与账户收益无法对账", trade_date)
     daily.append({
       "targetBaseQuantity": target_base_quantity,
       "actualQuantity": actual_quantity,

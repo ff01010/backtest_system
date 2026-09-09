@@ -1,13 +1,88 @@
 import socket
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from http.client import ResponseNotReady
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+import pytest
 
 from backend import settings
+from backend.backtesting.overlay import ResultReconciliationError
+from backend.services import state_store
 from backend.services.backtest_errors import BacktestErrorDetail, RemoteBacktestError, StrategyExecutionError
 from backend.services.clickhouse_client import ClickHouseError
 from backend.services.state_store import _insert_strategy_runtime_error_stat, _public_system_error_context
 from backend.services.system_error_log import system_error_log_record
+
+
+_RESULT_RAW_LOG_REF = (
+  "container=l2-runner-a; workerId=l2-runner-a:4321; "
+  "taskId=run-result; stage=l2.result_finalize"
+)
+
+
+class _SystemErrorCursor:
+  def __init__(self) -> None:
+    self.commands: list[tuple[str, object]] = []
+    self._next_row: dict[str, Any] | None = None
+    self._inserted: tuple[Any, ...] | None = None
+
+  def __enter__(self) -> "_SystemErrorCursor":
+    return self
+
+  def __exit__(self, *args: object) -> None:
+    return None
+
+  def execute(self, query: str, params: object = None) -> None:
+    self.commands.append((query, params))
+    if "UPDATE l2_backtest_job" in query:
+      self._next_row = {"status": "failed"}
+    elif "INSERT INTO system_error_log" in query:
+      self._inserted = tuple(params)  # type: ignore[arg-type]
+
+  def fetchone(self) -> dict[str, Any] | None:
+    row = self._next_row
+    self._next_row = None
+    return row
+
+  def fetchall(self) -> list[dict[str, Any]]:
+    if self._inserted is None:
+      return []
+    values = self._inserted
+    return [{
+      "id": 1,
+      "run_id": values[0],
+      "display_no": 42,
+      "owner_user_id": values[1],
+      "username": "tester",
+      "display_name": "测试用户",
+      "symbol": "688981.SH",
+      "timeframe": "1m",
+      "source": values[2],
+      "stage": values[3],
+      "error_code": values[4],
+      "reason": values[5],
+      "exception_type": values[6],
+      "context_json": values[7].obj,
+      "category": values[8],
+      "retryable": values[9],
+      "raw_log_ref": values[10],
+      "occurred_at": datetime(2026, 1, 5, tzinfo=timezone.utc),
+    }]
+
+
+class _SystemErrorConnection:
+  def __init__(self, cursor: _SystemErrorCursor) -> None:
+    self._cursor = cursor
+
+  def cursor(self) -> _SystemErrorCursor:
+    return self._cursor
+
+
+@contextmanager
+def _system_error_db(cursor: _SystemErrorCursor) -> Iterator[_SystemErrorConnection]:
+  yield _SystemErrorConnection(cursor)
 
 
 def test_unresolved_clickhouse_host_is_safe_and_actionable(monkeypatch) -> None:
@@ -51,6 +126,57 @@ def test_unknown_system_error_is_not_marked_retryable() -> None:
   assert record.category == "internal"
   assert record.retryable is False
   assert record.context["__internal_raw_message"] == "unexpected"
+
+
+def test_overlay_reconciliation_error_records_actual_l2_runner() -> None:
+  record = system_error_log_record(
+    ResultReconciliationError("增强收益与账户收益无法对账", "2026-01-05"),
+    "l2_runner",
+    "l2.result_finalize",
+    "run-result",
+    worker_id="l2-runner-a:4321",
+  )
+
+  assert record is not None
+  assert record.code == "result.overlay_reconciliation_failed"
+  assert record.category == "result"
+  assert record.retryable is False
+  assert record.reason == "增强收益与账户收益无法对账"
+  assert record.exception_type == "ResultReconciliationError"
+  assert record.context["workerId"] == "l2-runner-a:4321"
+  assert record.context["tradeDate"] == "2026-01-05"
+  assert record.raw_log_ref == _RESULT_RAW_LOG_REF
+
+
+def test_administrator_can_find_result_error_by_task_id(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  record = system_error_log_record(
+    ResultReconciliationError("增强收益与账户收益无法对账", "2026-01-05"),
+    "l2_runner", "l2.result_finalize", "run-result",
+    worker_id="l2-runner-a:4321",
+  )
+  assert record is not None
+  cursor = _SystemErrorCursor()
+  monkeypatch.setattr(state_store, "_db", lambda: _system_error_db(cursor))
+
+  saved = state_store.finish_l2_backtest_job(
+    "run-result", "attempt-1", "failed", {"error": "平台结果生成失败。"},
+    system_error=record.to_dict(), owner_user_id="owner-1",
+  )
+
+  records = state_store.list_system_error_logs(run_id="run-result")
+
+  query, params = cursor.commands[-1]
+  assert saved is True
+  assert "e.run_id=%s" in query
+  assert params == ["run-result", 100]
+  assert records[0]["reason"] == "增强收益与账户收益无法对账"
+  assert records[0]["context"] == {
+    "workerId": "l2-runner-a:4321",
+    "tradeDate": "2026-01-05",
+  }
+  assert records[0]["rawLogRef"] == _RESULT_RAW_LOG_REF
 
 
 def test_internal_error_context_is_not_returned_by_api() -> None:
