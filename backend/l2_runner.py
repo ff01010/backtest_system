@@ -154,7 +154,9 @@ class L2Runner:
       status = "cancelled" if "租约丢失或已取消" in str(error) else "failed"
       system_error = None
       if status == "failed":
-        system_error = system_error_log_record(error, "l2_runner", stage, job["runId"])
+        system_error = system_error_log_record(
+          error, "l2_runner", stage, job["runId"], worker_id=self._worker_id,
+        )
       state_store.finish_l2_backtest_job(
         job["runId"], job["attemptToken"], status, error_summary(error, job["runId"]),
         system_error=system_error.to_dict() if system_error else None,

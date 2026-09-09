@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 
 from backend.backtesting.models import OrderSide
-from backend.backtesting.overlay import OverlayAttributionLedger, OverlayFill, build_overlay_report
+from backend.backtesting.overlay import (
+  OverlayAttributionLedger,
+  OverlayFill,
+  ResultReconciliationError,
+  build_overlay_report,
+)
 
 
 def _fill(
@@ -98,3 +103,26 @@ def test_report_rejects_account_and_overlay_position_mismatch() -> None:
       1_000,
       10,
     )
+
+
+def test_report_raises_controlled_error_when_overlay_pnl_does_not_reconcile() -> None:
+  with pytest.raises(
+    ResultReconciliationError,
+    match="增强收益与账户收益无法对账",
+  ) as raised:
+    build_overlay_report(
+      [],
+      [{
+        "date": "2026-01-05",
+        "close": 10,
+        "longQty": 1_000,
+        "shortQty": 0,
+        "totalEquity": 20_001,
+        "dailyPnl": 1,
+      }],
+      10_000,
+      1_000,
+      10,
+    )
+
+  assert raised.value.trade_date == "2026-01-05"

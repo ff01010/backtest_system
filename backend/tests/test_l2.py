@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from backend.backtesting.models import OrderIntent, OrderSide, PositionEffect
+from backend.backtesting.models import Bar, OrderIntent, OrderSide, PortfolioSnapshot, PositionEffect
 from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot, SourceMappingProfile, TradeEvent, parse_timestamp
 from backend.l2.config import load_temporary_quote_profile
@@ -55,6 +55,24 @@ class EventRecordingBuyStrategy(BuyStrategy):
 
   def on_order_event(self, event: dict[str, Any]) -> None:
     self.order_events.append(event)
+
+
+class SellBaseOnceStrategy:
+  def __init__(self, quantity: int = 100) -> None:
+    self._quantity = quantity
+    self._submitted = False
+
+  def on_bar(self, bar: Bar, portfolio: PortfolioSnapshot) -> list[OrderIntent]:
+    if self._submitted:
+      return []
+    self._submitted = True
+    return [OrderIntent(
+      symbol=bar.symbol,
+      side=OrderSide.SELL,
+      quantity=self._quantity,
+      reason="卖出底仓做增强",
+      position_effect=PositionEffect.OPEN_SHORT,
+    )]
 
 
 def _bar() -> NormalizedBar:
@@ -631,6 +649,7 @@ def test_l2_overlay_intraday_settlement_keeps_only_base_position() -> None:
   )
   engine.initialize_base_position("688981.SH")
   engine.begin_day("20260102")
+  engine.process_bar(_bar())
   open_long = OrderIntent("688981.SH", OrderSide.BUY, 2_000, "策略开多", position_effect=PositionEffect.OPEN_LONG, position_key="script:test")
   open_short = OrderIntent("688981.SH", OrderSide.SELL, 1_000, "策略开空", position_effect=PositionEffect.OPEN_SHORT, position_key="script:test")
   engine._submit(open_long, parse_timestamp("2026-01-02 09:31:00"))
@@ -648,6 +667,109 @@ def test_l2_overlay_intraday_settlement_keeps_only_base_position() -> None:
   assert snapshot.long_positions_by_key["base_position"].quantity == 5_000
   assert snapshot.long_positions_by_key.get("script:test:overlay_long") is None
   assert snapshot.short_positions_by_key.get("script:test:overlay_short") is None
+
+
+def test_l2_overlay_day_end_uses_last_bar_close_after_day_end_quote_fill() -> None:
+  engine = L2ExecutionEngine(
+    SellBaseOnceStrategy(), 100_000, 0, InstrumentRules(),
+    base_quantity=100, base_cost_price=10, t0_enabled=True,
+    strategy_category="core_position_overlay",
+  )
+  engine.initialize_base_position("688981.SH")
+  engine.begin_day("20260102")
+  engine.process_bar(_bar())
+  engine.process_quote(_quote("2026-01-02 09:31:03"))
+  engine.process_quote(QuoteSnapshot(
+    "688981.SH", "20260102", "2026-01-02 14:56:57", 1,
+    (QuoteLevel(10.4, 1_000),), (QuoteLevel(10.5, 1_000),), 10.45, "v1",
+  ))
+
+  engine.finish_day("20260102")
+
+  raw_result = engine.result()
+  assert [(fill["side"], fill["price"]) for fill in raw_result["fills"]] == [
+    ("SELL", 9.9),
+    ("BUY", 10.5),
+  ]
+  assert [fill["fee"] for fill in raw_result["fills"]] == [0.5049, 0.0105]
+  assert raw_result["equity"] == [{
+    "time": "2026-01-02 09:31:00",
+    "equity": 100_939.4846,
+    "cash": 99_939.4846,
+    "close": 10,
+    "longQty": 100,
+    "shortQty": 0,
+    "baseQty": 100,
+    "targetBaseQty": 100,
+    "actualQty": 100,
+    "overlayQty": 0,
+    "sellableQty": 0,
+  }]
+
+  result = normalize_l2_result(raw_result, {
+    "initialCapital": 100_000,
+    "baseQuantity": 100,
+    "baseCostPrice": 10,
+    "t0Enabled": True,
+    "strategyCategory": "core_position_overlay",
+  })
+
+  assert result["summary"]["accountPnl"] == -60.52
+  assert result["summary"]["baseBenchmarkPnl"] == 0
+  assert result["summary"]["overlayPnl"] == -60.52
+  assert result["summary"]["realizedOverlayPnl"] == -60.52
+
+
+def test_l2_day_end_rejects_quote_fallback_without_valid_bar() -> None:
+  engine = L2ExecutionEngine(
+    SellBaseOnceStrategy(), 100_000, 0, InstrumentRules(),
+    base_quantity=100, base_cost_price=10, t0_enabled=True,
+    strategy_category="core_position_overlay",
+  )
+  engine.initialize_base_position("688981.SH")
+  engine.begin_day("20260102")
+  engine.process_quote(_quote("2026-01-02 14:56:57"))
+
+  with pytest.raises(ValueError, match="20260102 无有效 Bar，无法进行日终结算"):
+    engine.finish_day("20260102")
+
+
+def test_l2_overlay_carry_uses_bar_close_for_unrealized_pnl() -> None:
+  engine = L2ExecutionEngine(
+    BuyStrategy(), 100_000, 0, InstrumentRules(),
+    base_quantity=100, base_cost_price=10, t0_enabled=True,
+    strategy_category="core_position_overlay",
+    overlay_settlement_policy="cross_day_carry",
+  )
+  engine.initialize_base_position("688981.SH")
+  engine.begin_day("20260102")
+  engine.process_bar(_bar())
+  engine.process_quote(QuoteSnapshot(
+    "688981.SH", "20260102", "2026-01-02 09:31:03", 1,
+    (QuoteLevel(10.4, 1_000),), (QuoteLevel(10.5, 1_000),), 10.45, "v1",
+  ))
+
+  engine.finish_day("20260102")
+
+  raw_result = engine.result()
+  assert [(fill["price"], fill["fee"]) for fill in raw_result["fills"]] == [(10.5, 0.0105)]
+  assert raw_result["equity"][0]["cash"] == 98_949.9895
+  assert raw_result["equity"][0]["equity"] == 100_949.9895
+  assert raw_result["equity"][0]["close"] == 10
+
+  result = normalize_l2_result(raw_result, {
+    "initialCapital": 100_000,
+    "baseQuantity": 100,
+    "baseCostPrice": 10,
+    "t0Enabled": True,
+    "strategyCategory": "core_position_overlay",
+    "overlaySettlementPolicy": "cross_day_carry",
+  })
+
+  assert result["summary"]["accountPnl"] == -50.01
+  assert result["summary"]["baseBenchmarkPnl"] == 0
+  assert result["summary"]["overlayPnl"] == -50.01
+  assert result["summary"]["unrealizedOverlayPnl"] == -50.01
 
 
 def test_l2_result_adapter_reports_base_holding_and_t0_excess() -> None:
@@ -885,6 +1007,7 @@ def test_l2_intraday_closes_overlay_long_at_one_sided_limit_quote() -> None:
   engine = L2ExecutionEngine(BuyStrategy(), 100_000, 0, InstrumentRules(), base_quantity=1_000, base_cost_price=10)
   engine.initialize_base_position("688981.SH")
   engine.begin_day("20260102")
+  engine.process_bar(_bar())
   buy = OrderIntent("688981.SH", OrderSide.BUY, 1_000, "策略开多", position_effect=PositionEffect.OPEN_LONG, position_key="script:test")
   engine._submit(buy, parse_timestamp("2026-01-02 09:31:00"))
   engine._apply_fill(engine._orders[-1], 1_000, 10, "2026-01-02 09:31:03", "test")
@@ -1551,8 +1674,9 @@ def on_order_event(event, state):
   })
   try:
     session.begin_day("2026-01-02")
-    first = session.process_quote(_quote("2026-01-02 09:30:03"))
-    second = session.process_quote(_quote("2026-01-02 09:30:06"))
+    session.process_bars([_bar()])
+    first = session.process_quote(_quote("2026-01-02 09:31:03"))
+    second = session.process_quote(_quote("2026-01-02 09:31:06"))
     session.finish_day("2026-01-02")
     result = session.result()
 
@@ -1585,8 +1709,8 @@ def test_local_strategy_session_accepts_dataclass_quote_chunk() -> None:
   try:
     session.begin_day("2026-01-02")
     session.process_chunk_payload({
-      "bars": [],
-      "quotes": [asdict(_quote("2026-01-02 09:30:03"))],
+      "bars": [asdict(_bar())],
+      "quotes": [asdict(_quote("2026-01-02 09:31:03"))],
       "trades": [],
     })
     session.finish_day("2026-01-02")

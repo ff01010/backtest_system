@@ -2,6 +2,7 @@
 
 from http.client import ResponseNotReady
 
+from backend.backtesting.overlay import ResultReconciliationError
 from backend.services.backtest_errors import RemoteBacktestError, StrategyExecutionError, error_summary
 from backend.services.clickhouse_client import ClickHouseError
 
@@ -25,6 +26,21 @@ def test_unknown_error_is_sanitized() -> None:
     "runtimeVersion": None,
   }
   assert "internal-host" not in str(summary)
+
+
+def test_overlay_reconciliation_error_has_safe_actionable_summary() -> None:
+  summary = error_summary(
+    ResultReconciliationError("增强收益与账户收益无法对账: internal values"),
+    "run-result",
+  )
+
+  assert summary["error"] == "平台结果生成失败。"
+  assert summary["errorDetail"]["category"] == "system_error"
+  assert summary["errorDetail"]["code"] == "result.overlay_reconciliation_failed"
+  assert summary["errorDetail"]["hint"] == "无需修改策略，请提供任务编号联系管理员。"
+  assert summary["errorDetail"]["retryable"] is False
+  assert summary["errorDetail"]["taskId"] == "run-result"
+  assert "internal values" not in str(summary)
 
 
 def test_clickhouse_connection_state_error_is_safe_and_not_retryable() -> None:

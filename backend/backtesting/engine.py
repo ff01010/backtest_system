@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from collections import defaultdict
 from typing import Any, Callable, Protocol, Sequence
 
+from backend.backtesting.daily_settlement import settle_daily_portfolio
 from backend.backtesting.fees import FeeProfile
 from backend.backtesting.models import (
   BacktestResult,
@@ -581,6 +582,8 @@ class BarBacktestEngine:
     portfolio_snapshots: list[PortfolioSnapshot] = []
     warmup_bars = bars[:warmup_bar_count]
     formal_bars = bars[warmup_bar_count:]
+    if not formal_bars:
+      raise ValueError("当天无有效 Bar，无法进行日终结算")
     for bar in warmup_bars:
       strategy.on_bar(bar, self._snapshot())
     if formal_bars and self._base_quantity > 0:
@@ -611,7 +614,7 @@ class BarBacktestEngine:
     return BacktestResult(
       self._ledger.fills,
       equity_curve,
-      self._snapshot(),
+      portfolio_snapshots[-1] if portfolio_snapshots else self._snapshot(),
       portfolio_snapshots,
       unexecuted_orders,
     )
@@ -639,6 +642,15 @@ class BarBacktestEngine:
     orders: Sequence[_AcceptedBarOrder],
     is_day_end: bool,
   ) -> PortfolioSnapshot:
+    self._apply_accepted_orders(strategy, bar, orders)
+    return self._close_day_if_needed_with_events(strategy, bar, is_day_end)
+
+  def _apply_accepted_orders(
+    self,
+    strategy: BarStrategy,
+    bar: Bar,
+    orders: Sequence[_AcceptedBarOrder],
+  ) -> None:
     for item in orders:
       executable_order = self._limit_order_to_available_position(item.intent)
       if executable_order is None:
@@ -663,7 +675,6 @@ class BarBacktestEngine:
       if self._uses_t0_capacity(executable_order):
         self._t0_remaining = max(0, self._t0_remaining - applied_fill.quantity)
       self._notify_order_event(strategy, self._order_event(execution_item, "filled", applied_fill.time, applied_fill))
-    return self._close_day_if_needed_with_events(strategy, bar, is_day_end)
 
   def _close_day_if_needed_with_events(
     self,
@@ -671,11 +682,22 @@ class BarBacktestEngine:
     bar: Bar,
     is_day_end: bool,
   ) -> PortfolioSnapshot:
-    if self._restores_at_day_end() and is_day_end:
+    if not is_day_end:
+      return self._snapshot()
+
+    def complete_trades() -> None:
+      if not self._restores_at_day_end():
+        return
       orders = self._settlement_orders(bar)
       accepted = self._accept_orders(strategy, orders, False, bar.time)
-      self._execute_accepted_orders(strategy, bar, accepted, False)
-    return self._snapshot()
+      self._apply_accepted_orders(strategy, bar, accepted)
+
+    return settle_daily_portfolio(
+      last_bar=bar,
+      ledger=self._ledger,
+      complete_trades=complete_trades,
+      snapshot=self._snapshot,
+    )
 
   @staticmethod
   def _notify_order_event(strategy: BarStrategy, event: dict[str, Any]) -> None:
@@ -729,6 +751,8 @@ class BarBacktestEngine:
     bars: Sequence[Bar],
   ) -> BacktestResult:
     """执行带时间戳订单的兼容策略，保证订单只在对应 K 线成交。"""
+    if not bars:
+      raise ValueError("当天无有效 Bar，无法进行日终结算")
     scheduled_orders: dict[str, list[OrderIntent]] = defaultdict(list)
     for order in strategy.generate_orders(bars):
       if order.time is None:
@@ -756,7 +780,7 @@ class BarBacktestEngine:
     return BacktestResult(
       self._ledger.fills,
       equity_curve,
-      self._snapshot(),
+      portfolio_snapshots[-1] if portfolio_snapshots else self._snapshot(),
       portfolio_snapshots,
     )
 
@@ -766,6 +790,8 @@ class BarBacktestEngine:
     bars: Sequence[Bar],
   ) -> BacktestResult:
     """在每根 K 线完成后，立即处理策略发出的订单意图。"""
+    if not bars:
+      raise ValueError("当天无有效 Bar，无法进行日终结算")
     equity_curve: list[EquityPoint] = []
     portfolio_snapshots: list[PortfolioSnapshot] = []
     next_index = 0
@@ -789,7 +815,7 @@ class BarBacktestEngine:
     return BacktestResult(
       self._ledger.fills,
       equity_curve,
-      self._snapshot(),
+      portfolio_snapshots[-1] if portfolio_snapshots else self._snapshot(),
       portfolio_snapshots,
     )
 
@@ -819,12 +845,23 @@ class BarBacktestEngine:
     return self._close_day_if_needed(bar, is_day_end)
 
   def _close_day_if_needed(self, bar: Bar, is_day_end: bool) -> PortfolioSnapshot:
-    if self._restores_at_day_end() and is_day_end:
+    if not is_day_end:
+      return self._snapshot()
+
+    def complete_trades() -> None:
+      if not self._restores_at_day_end():
+        return
       for order in self._settlement_orders(bar):
         fill = self._execution_model.create_fill(order, bar, self._commission_rate, self._fee_profile)
         if fill is not None:
           self._ledger.apply_fill(fill)
-    return self._snapshot()
+
+    return settle_daily_portfolio(
+      last_bar=bar,
+      ledger=self._ledger,
+      complete_trades=complete_trades,
+      snapshot=self._snapshot,
+    )
 
   def _begin_day_if_needed(self, bar: Bar) -> None:
     if self._t0_date == bar.date:
