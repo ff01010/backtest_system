@@ -5,12 +5,13 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 from uuid import uuid4
 
+from backend.backtesting.daily_settlement import settle_daily_portfolio
 from backend.backtesting.engine import PortfolioLedger
 from backend.backtesting.fees import FeeProfile
-from backend.backtesting.models import Bar, Fill, OrderIntent, OrderSide, PositionEffect
+from backend.backtesting.models import Bar, Fill, OrderIntent, OrderSide, PortfolioSnapshot, PositionEffect
 from backend.execution.contract import ChildOrder, ExecutionContext
 from backend.execution.runtime import ExecutionRuntime
 from backend.l2.models import InstrumentRules, L2Order, NormalizedBar, QuoteLevel, QuoteSnapshot, TradeEvent, parse_timestamp
@@ -80,6 +81,7 @@ class L2ExecutionEngine:
     self._orders: list[L2Order] = []
     self._order_events: list[dict[str, Any]] = []
     self._equity: list[dict[str, Any]] = []
+    self._daily_snapshot: PortfolioSnapshot | None = None
     self._warnings: list[str] = []
     self._last_quote: QuoteSnapshot | None = None
     self._last_bar: NormalizedBar | None = None
@@ -111,6 +113,7 @@ class L2ExecutionEngine:
 
   def begin_day(self, trade_date: str) -> None:
     """锁定 T+1 当日可卖数量，并拒绝未完成订单跨日。"""
+    self._daily_snapshot = None
     if self._orders:
       self._cancel_open_orders("日终撤单")
     snapshot = self._ledger.snapshot()
@@ -171,19 +174,27 @@ class L2ExecutionEngine:
 
   def finish_day(self, trade_date: str) -> None:
     """收盘撤单并在日内模式用最后有效盘口尝试平仓。"""
-    self._cancel_open_orders("日终撤单")
-    self._execution_runtime.cancel_all("日终撤单")
-    if self._last_bar is None:
-      raise ValueError(f"{trade_date} 无有效 Bar，无法进行日终结算")
-    if self._restores_at_day_end():
-      self._force_close_at_last_quote(trade_date)
-    self._ledger.mark(self._last_bar.symbol, self._last_bar.close)
-    self._record_equity(self._last_bar)
+    last_bar = self._last_bar
+
+    def complete_trades() -> None:
+      self._cancel_open_orders("日终撤单")
+      self._execution_runtime.cancel_all("日终撤单")
+      if self._restores_at_day_end():
+        self._force_close_at_last_quote(trade_date)
+
+    self._daily_snapshot = settle_daily_portfolio(
+      last_bar=last_bar,
+      ledger=self._ledger,
+      complete_trades=complete_trades,
+      snapshot=self._snapshot,
+      missing_bar_error=f"{trade_date} 无有效 Bar，无法进行日终结算",
+    )
+    self._record_equity(cast(NormalizedBar, last_bar), self._daily_snapshot)
     self._order_events.append({"type": "day_finished", "tradeDate": trade_date})
 
   def result(self) -> dict[str, Any]:
     """返回受限规模的结果，不包含原始 L2 数据。"""
-    snapshot = self._snapshot()
+    snapshot = self._daily_snapshot or self._snapshot()
     return {
       "fills": [asdict(item) for item in self._ledger.fills],
       "equity": self._equity,
@@ -564,8 +575,7 @@ class L2ExecutionEngine:
         "reason": reason,
       })
 
-  def _record_equity(self, bar: NormalizedBar) -> None:
-    snapshot = self._snapshot()
+  def _record_equity(self, bar: NormalizedBar, snapshot: PortfolioSnapshot) -> None:
     actual_quantity = sum(item.quantity for item in snapshot.long_positions.values()) - sum(
       item.quantity for item in snapshot.short_positions.values()
     )

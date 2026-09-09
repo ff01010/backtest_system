@@ -181,6 +181,39 @@ def test_standard_bar_execution_fills_at_next_open_with_slippage() -> None:
   assert result.fills[0].price == 11.011
 
 
+def test_standard_bar_day_end_restoration_keeps_fill_facts_and_marks_at_close() -> None:
+  class SellBaseOnceStrategy:
+    def on_bar(self, bar: Bar, portfolio: PortfolioSnapshot) -> list[OrderIntent]:
+      if not bar.time.endswith("0930"):
+        return []
+      return [OrderIntent(
+        bar.symbol,
+        OrderSide.SELL,
+        100,
+        "卖出底仓",
+        position_effect=PositionEffect.OPEN_SHORT,
+      )]
+
+  result = BarBacktestEngine(
+    initial_cash=100_000,
+    fee_profile=FeeProfile(minimum_commission=0),
+    execution_model=NextOpenExecutionModel(slippage=0.01),
+    execute_on_next_bar_open=True,
+    base_quantity=100,
+    base_cost_price=10,
+    t0_enabled=True,
+    strategy_category="core_position_overlay",
+  ).run(SellBaseOnceStrategy(), [
+    Bar("202607230930", "688981.SH", 10, 10, 10, 10),
+    Bar("202607231500", "688981.SH", 10, 10, 10, 10),
+  ])
+
+  assert [fill.price for fill in result.fills] == [9.9, 10.1]
+  assert [fill.fee for fill in result.fills] == [0.5841, 0.0909]
+  assert result.final_portfolio.cash == 99_979.325
+  assert result.final_portfolio.equity == 100_979.325
+
+
 def test_fee_profile_applies_minimum_commission_once_per_bar_order() -> None:
   profile = FeeProfile()
   result = BarBacktestEngine(
