@@ -669,7 +669,7 @@ def test_l2_overlay_intraday_settlement_keeps_only_base_position() -> None:
   assert snapshot.short_positions_by_key.get("script:test:overlay_short") is None
 
 
-def test_l2_overlay_day_end_uses_last_bar_close_after_quote_price_settlement() -> None:
+def test_l2_overlay_day_end_uses_last_bar_close_after_day_end_quote_fill() -> None:
   engine = L2ExecutionEngine(
     SellBaseOnceStrategy(), 100_000, 0, InstrumentRules(),
     base_quantity=100, base_cost_price=10, t0_enabled=True,
