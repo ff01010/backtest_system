@@ -27,6 +27,7 @@ def _payload(code: str) -> dict[str, object]:
     "baseCostPrice": 0,
     "t0Enabled": False,
     "warmupBarCount": 0,
+    "runtimeVersion": "python3.12-runtime-v2",
   }
 
 
@@ -39,6 +40,16 @@ def on_bar(bar, state):
 
   assert result["trades"] == []
   assert result["skippedSignals"] == []
+
+
+def test_bar_strategy_session_supports_standard_tuple_builtin() -> None:
+  result = BarStrategySession().run_script(_payload("""
+def on_bar(bar, state):
+  state['items'] = tuple(enumerate(range(2)))
+  return []
+"""))
+
+  assert len(result["portfolioSnapshots"]) == 1
 
 
 def test_bar_strategy_session_terminates_blocked_strategy_on_cancel() -> None:

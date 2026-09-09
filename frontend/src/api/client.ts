@@ -118,6 +118,15 @@ export interface SystemErrorLogEntry {
   occurredAt: string;
 }
 
+export interface StrategyRuntimeErrorStat {
+  date: string;
+  code: 'runtime.contract_missing' | 'runtime.version_mismatch';
+  runtimeVersion: string;
+  missingName: string | null;
+  count: number;
+  lastOccurredAt: string;
+}
+
 export async function login(username: string, password: string): Promise<SessionUser> {
   const data = await sendJson<{ user: SessionUser }>(`${BASE}/auth/login`, 'POST', { username, password });
   return data.user;
@@ -210,6 +219,20 @@ export async function fetchSystemErrorLogs(filters: {
     if (value) search.set(key, value);
   });
   const data = await fetchJson<{ items: SystemErrorLogEntry[] }>(`${BASE}/admin/system-errors?${search}`);
+  return data.items;
+}
+
+export async function fetchStrategyRuntimeErrorStats(filters: {
+  fromTime?: string;
+  toTime?: string;
+} = {}): Promise<StrategyRuntimeErrorStat[]> {
+  const search = new URLSearchParams({ limit: '100' });
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value) search.set(key, value);
+  });
+  const data = await fetchJson<{ items: StrategyRuntimeErrorStat[] }>(
+    `${BASE}/admin/strategy-runtime-errors?${search}`,
+  );
   return data.items;
 }
 

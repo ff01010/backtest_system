@@ -320,11 +320,15 @@ export interface BacktestErrorDetail {
   symbol?: string | null;
   retryable: boolean;
   taskId?: string | null;
+  missingName?: string | null;
+  strategyLine?: number | null;
+  runtimeVersion?: string | null;
 }
 
 export interface ExperimentManifest {
   experimentHash: string;
   engineVersion: string;
+  strategyRuntimeVersion?: string;
   signalModel: string;
   fillModel: string;
   randomSeed: number;

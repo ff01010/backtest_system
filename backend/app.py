@@ -39,6 +39,7 @@ from backend.strategies.scripted import (
   warmup_trading_days_for_script,
   validate_script_code,
 )
+from backend.strategies.runtime_contract import SCRIPT_RUNTIME_VERSION, StrategyRuntimePolicyError
 from backend.services import (
   backtest_preflight,
   backtest_runner,
@@ -51,7 +52,7 @@ from backend.services import (
 )
 from backend.services import auth
 from backend.services.user_context import CurrentUser
-from backend.services.backtest_errors import error_detail, error_summary
+from backend.services.backtest_errors import StrategyExecutionError, error_detail, error_summary
 from backend.services.system_error_log import system_error_log_record
 from backend.services.user_context import get_current_user, reset_current_user, set_current_user
 
@@ -265,6 +266,9 @@ def _validate_strategy_script(payload: dict) -> None:
       validate_script_code(payload.get("code", ""))
     else:
       ast.parse(payload.get("code", ""))
+  except StrategyRuntimePolicyError as error:
+    detail = StrategyExecutionError.from_exception(error).detail.to_dict()
+    raise HTTPException(422, {"errorDetail": detail}) from error
   except ValueError as error:
     raise HTTPException(422, str(error)) from error
   except SyntaxError as error:
@@ -359,6 +363,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "versionId": script.get("versionId") or strategy_version_id,
     "signalRequired": signal_required,
     "codeHash": hashlib.sha256(script["code"].encode("utf-8")).hexdigest(),
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
   }
   request["savedScriptSnapshot"] = request["versionScriptSnapshot"]
   request["savedConfigSnapshot"] = {
@@ -369,6 +374,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "description": script["description"], "runParams": request.get("strategyParams", {}),
     "warmupTradingDays": warmup_days,
     "signalRequired": signal_required,
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
     "execution": execution_algorithm_snapshot(
       str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
     ),
@@ -588,6 +594,7 @@ def startup():
   settings.validate_public_api_configuration()
   settings.validate_research_integration_configuration()
   state_store.ensure_schema()
+  state_store.prune_strategy_runtime_error_stats()
 
 
 @app.get("/api/health")
@@ -596,6 +603,7 @@ def health():
   return {
     "status": runner_health["status"],
     "backtest": "ok" if runner_health["status"] == "ok" else "unavailable",
+    "strategyRuntimeVersion": SCRIPT_RUNTIME_VERSION,
   }
 
 
@@ -839,6 +847,18 @@ def admin_system_errors(
   )}
 
 
+@app.get("/api/admin/strategy-runtime-errors")
+def admin_strategy_runtime_errors(
+  request: Request,
+  limit: int = Query(100, ge=1, le=200),
+  from_time: str | None = Query(default=None, alias="fromTime"),
+  to_time: str | None = Query(default=None, alias="toTime"),
+):
+  """返回不可关联用户和任务的平台运行时错误聚合。"""
+  _require_admin(request)
+  return {"items": state_store.list_strategy_runtime_error_stats(from_time, to_time, limit)}
+
+
 @app.get("/api/admin/backtest-capacity")
 def admin_backtest_capacity(request: Request):
   _require_admin(request)
@@ -968,7 +988,7 @@ def create_strategy_script(payload: schemas.StrategyScriptCreate):
   _validate_strategy_script(request)
   try:
     script = state_store.create_strategy_script(request)
-    return {"script": script}
+    return {"script": {**script, "runtimeVersion": SCRIPT_RUNTIME_VERSION}}
   except state_store.ConflictError as error:
     raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
@@ -981,7 +1001,7 @@ def update_strategy_script(script_id: str, payload: schemas.StrategyScriptUpdate
   _validate_strategy_script(request)
   try:
     script = state_store.update_strategy_script(script_id, request)
-    return {"script": script}
+    return {"script": {**script, "runtimeVersion": SCRIPT_RUNTIME_VERSION}}
   except KeyError:
     raise HTTPException(404, f"策略脚本不存在: {script_id}")
   except state_store.ConflictError as error:
@@ -1049,10 +1069,11 @@ def save_complete_strategy(payload: schemas.CompleteStrategySave):
     raise HTTPException(422, f"非法买入持有基准: {config_request['benchmarkSymbol']}")
   _validate_strategy_config_timeframe(config_request)
   try:
-    return state_store.save_complete_strategy(
+    saved = state_store.save_complete_strategy(
       script_request, config_request, payload.scriptId, payload.configId,
       payload.expectedRevision,
     )
+    return {**saved, "runtimeVersion": SCRIPT_RUNTIME_VERSION}
   except KeyError as error:
     raise HTTPException(404, "策略脚本或策略配置不存在") from error
   except state_store.ConflictError as error:

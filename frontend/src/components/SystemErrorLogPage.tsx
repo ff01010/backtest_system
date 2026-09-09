@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { fetchSystemErrorLogs, fetchUsers } from '../api/client';
-import type { ManagedUser, SystemErrorLogEntry } from '../api/client';
+import { fetchStrategyRuntimeErrorStats, fetchSystemErrorLogs, fetchUsers } from '../api/client';
+import type { ManagedUser, StrategyRuntimeErrorStat, SystemErrorLogEntry } from '../api/client';
 
 interface Filters {
   userId: string;
@@ -20,6 +20,7 @@ function toIso(value: string): string | undefined {
 
 export default function SystemErrorLogPage() {
   const [items, setItems] = useState<SystemErrorLogEntry[]>([]);
+  const [runtimeStats, setRuntimeStats] = useState<StrategyRuntimeErrorStat[]>([]);
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [filters, setFilters] = useState<Filters>(emptyFilters);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -29,14 +30,21 @@ export default function SystemErrorLogPage() {
   const refresh = async () => {
     setLoading(true);
     try {
-      const nextItems = await fetchSystemErrorLogs({
-        userId: filters.userId || undefined,
-        runId: filters.runId.trim() || undefined,
-        errorCode: filters.errorCode.trim() || undefined,
+      const timeFilters = {
         fromTime: toIso(filters.fromTime),
         toTime: toIso(filters.toTime),
-      });
+      };
+      const [nextItems, nextRuntimeStats] = await Promise.all([
+        fetchSystemErrorLogs({
+          userId: filters.userId || undefined,
+          runId: filters.runId.trim() || undefined,
+          errorCode: filters.errorCode.trim() || undefined,
+          ...timeFilters,
+        }),
+        fetchStrategyRuntimeErrorStats(timeFilters),
+      ]);
       setItems(nextItems);
+      setRuntimeStats(nextRuntimeStats);
       setSelectedId(null);
       setError('');
     } catch (reason) {
@@ -78,6 +86,22 @@ export default function SystemErrorLogPage() {
         </div>
 
         {error ? <div style={errorStyle}>{error}</div> : null}
+        <section style={runtimePanelStyle}>
+          <div>
+            <div style={eyebrowStyle}>RUNTIME COMPATIBILITY</div>
+            <h3 style={{ margin: '4px 0', color: 'var(--text)' }}>策略运行环境错误统计</h3>
+            <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 12 }}>默认保留 180 天，仅含平台错误码、运行时版本、标准内置名称和次数，无法反查用户或任务。</p>
+          </div>
+          <div style={runtimeGridStyle}>
+            {runtimeStats.map((item) => <div key={`${item.date}-${item.code}-${item.runtimeVersion}-${item.missingName || ''}`} style={runtimeCardStyle}>
+              <strong style={{ color: 'var(--text)' }}>{item.missingName || '版本不一致'} · {item.count} 次</strong>
+              <span style={subtextStyle}>{item.date} · {item.code}</span>
+              <span style={monoStyle}>{item.runtimeVersion}</span>
+              <span style={subtextStyle}>最近：{item.lastOccurredAt}</span>
+            </div>)}
+            {!loading && runtimeStats.length === 0 ? <div style={emptyRuntimeStyle}>当前时间范围内没有平台运行环境错误。</div> : null}
+          </div>
+        </section>
         <div style={tablePanelStyle}>
           <table style={tableStyle}>
             <thead><tr style={tableHeadStyle}>
@@ -126,6 +150,10 @@ const inputStyle = { width: '100%', height: 34, boxSizing: 'border-box' as const
 const buttonStyle = { height: 34, border: 0, borderRadius: 6, padding: '0 13px', background: 'var(--accent)', color: '#ffffff', fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' as const };
 const secondaryButtonStyle = { ...buttonStyle, alignSelf: 'end', background: 'transparent', border: '1px solid var(--border-strong)', color: 'var(--text-muted)' };
 const errorStyle = { marginBottom: 14, border: '1px solid #f6c7c2', borderRadius: 7, background: 'var(--danger-soft)', color: 'var(--danger)', padding: '9px 12px' };
+const runtimePanelStyle = { marginBottom: 14, padding: 14, border: '1px solid var(--border)', borderLeft: '3px solid var(--accent)', borderRadius: 10, background: 'var(--surface)' };
+const runtimeGridStyle = { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 10, marginTop: 12 };
+const runtimeCardStyle = { display: 'grid', gap: 2, padding: 11, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--surface-muted)' };
+const emptyRuntimeStyle = { padding: 12, color: 'var(--text-muted)', fontSize: 13 };
 const tablePanelStyle = { overflow: 'auto', border: '1px solid var(--border)', borderRadius: 10, background: 'var(--surface)' };
 const tableStyle = { width: '100%', minWidth: 1050, borderCollapse: 'collapse' as const, color: 'var(--text)', fontSize: 13 };
 const tableHeadStyle = { background: 'var(--surface-muted)', color: 'var(--text-muted)', textAlign: 'left' as const };

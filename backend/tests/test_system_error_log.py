@@ -1,10 +1,12 @@
 import socket
 from http.client import ResponseNotReady
+from pathlib import Path
+from typing import Any
 
 from backend import settings
 from backend.services.backtest_errors import BacktestErrorDetail, RemoteBacktestError, StrategyExecutionError
 from backend.services.clickhouse_client import ClickHouseError
-from backend.services.state_store import _public_system_error_context
+from backend.services.state_store import _insert_strategy_runtime_error_stat, _public_system_error_context
 from backend.services.system_error_log import system_error_log_record
 
 
@@ -126,3 +128,79 @@ def test_remote_strategy_diagnostic_is_saved_for_administrator() -> None:
   assert record.reason == "name '__build_class__' is not defined"
   assert record.exception_type == "NameError"
   assert record.context["__internal_raw_message"] == "name '__build_class__' is not defined"
+
+
+def test_remote_runtime_error_preserves_platform_code_for_aggregate() -> None:
+  error = RemoteBacktestError.from_dict(
+    {
+      "category": "system_error",
+      "code": "runtime.contract_missing",
+      "message": "回测因平台运行环境兼容问题未完成。",
+      "missingName": "tuple",
+      "runtimeVersion": "python3.12-runtime-v2",
+    },
+    {
+      "exceptionType": "NameError",
+      "reason": "name 'tuple' is not defined",
+      "missingName": "tuple",
+      "runtimeVersion": "python3.12-runtime-v2",
+    },
+  )
+
+  record = system_error_log_record(error, "l2_runner", "l2.market_replay", "run-runtime")
+
+  assert record is not None
+  assert record.code == "runtime.contract_missing"
+  assert record.category == "runtime"
+  assert record.context["missingName"] == "tuple"
+  assert record.context["runtimeVersion"] == "python3.12-runtime-v2"
+
+
+class _RecordingCursor:
+  def __init__(self) -> None:
+    self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+  def execute(self, query: str, params: tuple[Any, ...]) -> None:
+    self.calls.append((query, params))
+
+
+def test_runtime_error_stat_keeps_only_minimal_platform_fields() -> None:
+  cursor = _RecordingCursor()
+  _insert_strategy_runtime_error_stat(cursor, {
+    "code": "runtime.contract_missing",
+    "context": {
+      "runtimeVersion": "python3.12-runtime-v2",
+      "missingName": "tuple",
+      "runId": "run-secret",
+      "sourceCode": "private strategy",
+    },
+  })
+
+  assert len(cursor.calls) == 1
+  assert cursor.calls[0][1] == (
+    "runtime.contract_missing", "python3.12-runtime-v2", "tuple",
+  )
+  assert "run-secret" not in str(cursor.calls)
+  assert "private strategy" not in str(cursor.calls)
+
+
+def test_user_defined_name_is_not_written_to_runtime_error_stat() -> None:
+  cursor = _RecordingCursor()
+  _insert_strategy_runtime_error_stat(cursor, {
+    "code": "strategy.undefined_name",
+    "context": {"missingName": "private_signal"},
+  })
+
+  assert cursor.calls == []
+
+
+def test_runtime_error_stat_migration_has_no_business_identity_foreign_key() -> None:
+  migration = (
+    Path(__file__).resolve().parents[2]
+    / "db" / "migrations" / "025_strategy_runtime_error_stats.sql"
+  ).read_text(encoding="utf-8")
+
+  assert "REFERENCES backtest_run" not in migration
+  assert "owner_user_id" not in migration
+  assert "run_id" not in migration
+  assert "source_code" not in migration

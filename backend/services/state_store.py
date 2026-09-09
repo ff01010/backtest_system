@@ -17,6 +17,7 @@ from psycopg.types.json import Jsonb
 
 from backend import settings
 from backend.services.user_context import get_current_user
+from backend.strategies.runtime_contract import SCRIPT_RUNTIME_VERSION, is_standard_builtin_name
 from backend.time_utils import format_shanghai_datetime
 
 
@@ -100,6 +101,9 @@ def ensure_schema() -> None:
       """)
       if not cur.fetchone()["has_strategy_ownership"]:
         raise DatabaseError("数据库缺少策略归属迁移 023，请先运行 deploy 的 migrate 服务")
+      cur.execute("SELECT to_regclass('public.strategy_runtime_error_stat') AS runtime_error_table")
+      if cur.fetchone()["runtime_error_table"] is None:
+        raise DatabaseError("数据库缺少策略运行时错误统计迁移 025，请先运行 deploy 的 migrate 服务")
 
 
 def replace_trade_calendar(
@@ -816,6 +820,7 @@ def _config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
     "code": code,
     "entryType": config.get("entryType", "on_bar"),
     "signalRequired": bool(config.get("signalRequired", False)),
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
   }
   return {
     "name": config["name"], "scriptId": config.get("scriptId"),
@@ -1051,6 +1056,7 @@ def _with_script_code_hash(payload: dict[str, Any]) -> dict[str, Any]:
       "code": script["code"],
       "entryType": script["entryType"],
       "signalRequired": bool(script.get("signalRequired", False)),
+      "runtimeVersion": SCRIPT_RUNTIME_VERSION,
     }
   normalized["paramsJson"] = params
   return normalized
@@ -2010,6 +2016,56 @@ def list_system_error_logs(
       return [_normalize_system_error(row) for row in cur.fetchall()]
 
 
+def list_strategy_runtime_error_stats(
+  from_time: str | None = None,
+  to_time: str | None = None,
+  limit: int = 100,
+) -> list[dict[str, Any]]:
+  """按日聚合独立脱敏的平台运行时错误，不返回任务或用户信息。"""
+  clauses: list[str] = []
+  params: list[Any] = []
+  for value, clause in (
+    (from_time, "occurred_at >= %s::timestamptz"),
+    (to_time, "occurred_at <= %s::timestamptz"),
+  ):
+    if value:
+      clauses.append(clause)
+      params.append(value)
+  where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+  params.append(limit)
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(f"""
+        SELECT occurred_at::date AS error_date, error_code, runtime_version,
+          missing_name, count(*) AS occurrence_count, max(occurred_at) AS last_occurred_at
+        FROM strategy_runtime_error_stat
+        {where}
+        GROUP BY occurred_at::date, error_code, runtime_version, missing_name
+        ORDER BY last_occurred_at DESC
+        LIMIT %s
+      """, params)
+      return [{
+        "date": row["error_date"].isoformat(),
+        "code": row["error_code"],
+        "runtimeVersion": row["runtime_version"],
+        "missingName": row["missing_name"],
+        "count": int(row["occurrence_count"]),
+        "lastOccurredAt": _format_time(row["last_occurred_at"]),
+      } for row in cur.fetchall()]
+
+
+def prune_strategy_runtime_error_stats() -> int:
+  """在服务启动时按私有部署配置清理过期脱敏统计。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "DELETE FROM strategy_runtime_error_stat "
+        "WHERE occurred_at < now() - (%s * interval '1 day')",
+        (settings.STRATEGY_RUNTIME_ERROR_RETENTION_DAYS,),
+      )
+      return cur.rowcount
+
+
 def update_backtest_run_meta(run_id: str, note: str, tags: list[str]) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
@@ -2058,6 +2114,21 @@ def _insert_system_error(
     record["reason"], record["exception_type"], Jsonb(record["context"]),
     record["category"], record["retryable"], record["raw_log_ref"],
   ))
+  _insert_strategy_runtime_error_stat(cur, record)
+
+
+def _insert_strategy_runtime_error_stat(cur: Any, record: dict[str, Any]) -> None:
+  """只为平台运行时缺陷留存不可反查用户的最小统计。"""
+  if record.get("code") not in {"runtime.contract_missing", "runtime.version_mismatch"}:
+    return
+  context = record.get("context") if isinstance(record.get("context"), dict) else {}
+  runtime_version = str(context.get("runtimeVersion") or "legacy")[:64]
+  missing_value = context.get("missingName")
+  missing = missing_value if isinstance(missing_value, str) and is_standard_builtin_name(missing_value) else None
+  cur.execute("""
+    INSERT INTO strategy_runtime_error_stat (error_code, runtime_version, missing_name)
+    VALUES (%s, %s, %s)
+  """, (record["code"], runtime_version, missing))
 
 
 def _normalize_system_error(row: dict[str, Any]) -> dict[str, Any]:

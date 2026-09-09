@@ -20,6 +20,11 @@ from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteS
 from backend.services.backtest_errors import error_detail
 from backend.services.system_error_catalog import root_cause
 from backend.strategies.scripted import ScriptedBarStrategy
+from backend.strategies.runtime_contract import (
+  SCRIPT_RUNTIME_VERSION,
+  missing_name,
+  strategy_source_line,
+)
 
 
 class WorkerRunRequest(BaseModel):
@@ -40,6 +45,7 @@ class WorkerRunRequest(BaseModel):
   initialPositionEnabled: bool = False
   t0Enabled: bool = False
   warmupBarCount: int = Field(default=0, ge=0)
+  runtimeVersion: str = "legacy"
 
 
 class WorkerL2SessionCreateRequest(BaseModel):
@@ -61,6 +67,7 @@ class WorkerL2SessionCreateRequest(BaseModel):
   t0Enabled: bool = False
   quoteMode: str = "order_driven"
   instrumentRules: dict[str, Any] = Field(default_factory=dict)
+  runtimeVersion: str = "legacy"
 
 
 class WorkerL2DayRequest(BaseModel):
@@ -155,16 +162,24 @@ def _worker_http_error(
   """向调度端返回公开错误和仅供管理员留存的原始诊断。"""
   detail = error_detail(error).with_event_context(symbol, event_time)
   cause = root_cause(error)
+  diagnostic = {
+    "exceptionType": type(cause).__name__,
+    "reason": str(cause)[:500],
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "__internal_raw_message": str(cause)[:2_000],
+    "__internal_raw_traceback": "".join(
+      traceback.format_exception(type(error), error, error.__traceback__),
+    )[:8_000],
+  }
+  name = missing_name(cause)
+  line = strategy_source_line(cause)
+  if name:
+    diagnostic["missingName"] = name
+  if line:
+    diagnostic["strategyLine"] = str(line)
   return HTTPException(422, {
     "errorDetail": detail.to_dict(),
-    "diagnostic": {
-      "exceptionType": type(cause).__name__,
-      "reason": str(cause)[:500],
-      "__internal_raw_message": str(cause)[:2_000],
-      "__internal_raw_traceback": "".join(
-        traceback.format_exception(type(error), error, error.__traceback__),
-      )[:8_000],
-    },
+    "diagnostic": diagnostic,
   })
 
 
@@ -172,7 +187,9 @@ class L2WorkerSession:
   """worker 内存态会话，保持脚本状态、账户和待成交订单。"""
 
   def __init__(self, payload: WorkerL2SessionCreateRequest) -> None:
-    self.strategy = ScriptedBarStrategy(payload.scriptId, payload.code, payload.params, payload.quoteMode)
+    self.strategy = ScriptedBarStrategy(
+      payload.scriptId, payload.code, payload.params, payload.quoteMode, payload.runtimeVersion,
+    )
     fee_profile = FeeProfile(
       commission_rate=float(payload.feeProfile.get("commissionRate", payload.commissionRate)),
       transfer_fee_rate=float(payload.feeProfile.get("transferFeeRate", 0.00001)),
@@ -268,7 +285,7 @@ def _snapshot_to_dict(snapshot: Any) -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-  return {"status": "ok"}
+  return {"status": "ok", "strategyRuntimeVersion": SCRIPT_RUNTIME_VERSION}
 
 
 @app.post("/run")
@@ -284,7 +301,10 @@ def run(payload: WorkerRunRequest) -> dict[str, Any]:
       close=float(item["close"]),
       volume=float(item.get("volume", 0)),
     ) for item in payload.bars]
-    strategy = ScriptedBarStrategy(payload.scriptId, payload.code, payload.params)
+    strategy = ScriptedBarStrategy(
+      payload.scriptId, payload.code, payload.params,
+      runtime_version=payload.runtimeVersion,
+    )
     fee_profile = FeeProfile(
       commission_rate=float(payload.feeProfile.get("commissionRate", payload.commissionRate)),
       transfer_fee_rate=float(payload.feeProfile.get("transferFeeRate", 0.00001)),

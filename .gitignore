@@ -16,7 +16,8 @@ frontend/coverage/
 *.pid
 storage/
 artifacts/
-backend/strategies/
+backend/strategies/*
+!backend/strategies/runtime_contract.py
 
 # Secrets and local configuration
 .env

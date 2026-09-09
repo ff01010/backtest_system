@@ -6,7 +6,7 @@ import traceback
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from backend.services.backtest_errors import RemoteBacktestError, error_detail
+from backend.services.backtest_errors import BacktestExecutionError, RemoteBacktestError, error_detail
 from backend.services.system_error_catalog import classify_system_error, root_cause
 
 
@@ -37,8 +37,11 @@ def system_error_log_record(
   """记录系统错误及 worker 拒绝任务时返回的原始诊断。"""
   if isinstance(error, RemoteBacktestError) and error.diagnostic:
     return _remote_worker_record(error, source, stage, task_id)
-  if error_detail(error).category != "system_error":
+  detail = error_detail(error)
+  if detail.category != "system_error":
     return None
+  if isinstance(error, BacktestExecutionError) and detail.code.startswith("runtime."):
+    return _runtime_record(error, source, stage, task_id)
 
   cause = root_cause(error)
   classified = classify_system_error(error)
@@ -67,6 +70,7 @@ def _remote_worker_record(
 ) -> SystemErrorLogRecord:
   """记录 worker 已返回的受限诊断正文，供管理员定位回放失败。"""
   diagnostic = error.diagnostic
+  is_runtime_error = error.detail.code.startswith("runtime.")
   context = {"service": "strategy_worker"}
   if error.detail.symbol:
     context["symbol"] = error.detail.symbol
@@ -74,15 +78,44 @@ def _remote_worker_record(
     context["eventTime"] = error.detail.event_time
   if diagnostic.get("trace"):
     context["trace"] = diagnostic["trace"][:1_500]
+  for key in ("missingName", "runtimeVersion", "strategyLine"):
+    if diagnostic.get(key):
+      context[key] = diagnostic[key]
   context.update(_remote_internal_context(diagnostic))
   return SystemErrorLogRecord(
     source=source,
     stage=stage,
-    code="worker.execution_rejected",
-    category="worker",
+    code=error.detail.code if is_runtime_error else "worker.execution_rejected",
+    category="runtime" if is_runtime_error else "worker",
     retryable=error.detail.retryable,
     reason=diagnostic.get("reason") or error.detail.message,
     exception_type=diagnostic.get("exceptionType") or type(error).__name__,
+    context=context,
+    raw_log_ref=_raw_log_ref(source, stage, task_id),
+  )
+
+
+def _runtime_record(
+  error: BacktestExecutionError,
+  source: str,
+  stage: str,
+  task_id: str | None,
+) -> SystemErrorLogRecord:
+  """保留平台运行时错误的受控字段，供独立脱敏统计复用。"""
+  detail = error.detail
+  context = {"runtimeVersion": detail.runtime_version or "legacy"}
+  if detail.missing_name:
+    context["missingName"] = detail.missing_name
+  if detail.strategy_line:
+    context["strategyLine"] = str(detail.strategy_line)
+  return SystemErrorLogRecord(
+    source=source,
+    stage=stage,
+    code=detail.code,
+    category="runtime",
+    retryable=detail.retryable,
+    reason=detail.message,
+    exception_type=type(root_cause(error)).__name__,
     context=context,
     raw_log_ref=_raw_log_ref(source, stage, task_id),
   )

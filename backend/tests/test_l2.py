@@ -482,6 +482,7 @@ def test_l2_session_rules_follow_frontend_short_permission() -> None:
   assert session["quoteMode"] == "order_driven"
   assert session["instrumentRules"]["min_order_quantity"] == 200
   assert session["instrumentRules"]["quantity_step"] == 1
+  assert session["runtimeVersion"] == "legacy"
 
 
 def test_l2_session_uses_continuous_mode_for_quote_script() -> None:
@@ -1478,6 +1479,34 @@ def test_local_strategy_session_returns_strategy_error() -> None:
     assert error.value.diagnostic["trace"]
     assert error.value.diagnostic["__internal_raw_message"]
     assert error.value.diagnostic["__internal_raw_traceback"]
+  finally:
+    session.close()
+
+
+def test_local_l2_strategy_session_supports_tuple_and_runtime_version() -> None:
+  session = L2StrategySession({
+    "scriptId": "local-tuple",
+    "code": "def on_bar(bar, state):\n  state['items'] = tuple(enumerate(range(2)))\n  return []",
+    "params": {},
+    "initialCapital": 100_000,
+    "commissionRate": 0,
+    "feeProfile": {},
+    "latencyMs": 0,
+    "passiveParticipationRate": 0.1,
+    "holdingPolicy": "overnight",
+    "symbol": "688981.SH",
+    "baseQuantity": 0,
+    "baseCostPrice": 0,
+    "t0Enabled": False,
+    "quoteMode": "order_driven",
+    "runtimeVersion": "python3.12-runtime-v2",
+    "instrumentRules": {},
+  })
+  try:
+    session.begin_day("2026-01-02")
+    assert session.process_bars([_bar()])["quoteDemand"] == "idle"
+    session.finish_day("2026-01-02")
+    assert session.result()["fills"] == []
   finally:
     session.close()
 

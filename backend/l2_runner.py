@@ -194,6 +194,7 @@ class L2Runner:
       "initialPositionEnabled": bool(payload.get("initialPositionEnabled", False)),
       "t0Enabled": bool(payload.get("t0Enabled", False)),
       "quoteMode": _quote_mode(payload),
+      "runtimeVersion": str(script.get("runtimeVersion") or "legacy"),
       "instrumentRules": instrument_rules,
       "executionAlgorithm": str(payload.get("executionAlgorithm") or "immediate"),
       "executionParameters": dict(payload.get("executionParameters") or {}),

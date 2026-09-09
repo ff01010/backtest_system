@@ -270,8 +270,10 @@ def on_quote(quote, state):
   assert detail.callback == "on_quote"
   assert detail.event_time == "2026-07-27 09:30:03"
   assert detail.symbol == "688981.SH"
-  assert detail.message == "策略引用了未定义的变量或函数。"
-  assert "missing_variable" not in error_summary(raised.value, "run-1")["error"]
+  assert detail.message == "策略引用了未定义的名称 missing_variable。"
+  assert detail.missing_name == "missing_variable"
+  assert detail.strategy_line == 6
+  assert error_summary(raised.value, "run-1")["error"] == detail.message
 
 
 def test_script_order_event_error_keeps_event_location() -> None:
