@@ -173,10 +173,12 @@ class L2ExecutionEngine:
     """收盘撤单并在日内模式用最后有效盘口尝试平仓。"""
     self._cancel_open_orders("日终撤单")
     self._execution_runtime.cancel_all("日终撤单")
+    if self._last_bar is None:
+      raise ValueError(f"{trade_date} 无有效 Bar，无法进行日终结算")
     if self._restores_at_day_end():
       self._force_close_at_last_quote(trade_date)
-    if self._last_bar is not None:
-      self._record_equity(self._last_bar)
+    self._ledger.mark(self._last_bar.symbol, self._last_bar.close)
+    self._record_equity(self._last_bar)
     self._order_events.append({"type": "day_finished", "tradeDate": trade_date})
 
   def result(self) -> dict[str, Any]:
