@@ -120,9 +120,11 @@ export interface SystemErrorLogEntry {
 
 export interface StrategyRuntimeErrorStat {
   date: string;
-  code: 'runtime.contract_missing' | 'runtime.version_mismatch';
+  code: 'runtime.contract_missing' | 'runtime.version_mismatch'
+    | 'runtime.dependency_missing' | 'runtime.dependency_load_failed';
   runtimeVersion: string;
   missingName: string | null;
+  missingModule: string | null;
   count: number;
   lastOccurredAt: string;
 }

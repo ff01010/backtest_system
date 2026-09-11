@@ -39,7 +39,16 @@ from backend.strategies.scripted import (
   warmup_trading_days_for_script,
   validate_script_code,
 )
-from backend.strategies.runtime_contract import SCRIPT_RUNTIME_VERSION, StrategyRuntimePolicyError
+from backend.strategies.runtime_contract import (
+  RUNTIME_CAPABILITY_DIGEST,
+  RuntimeDependencyLoadError,
+  RuntimeDependencyMissingError,
+  SCRIPT_RUNTIME_VERSION,
+  StrategyModuleUnavailableError,
+  StrategyRuntimePolicyError,
+  declared_runtime_capabilities,
+  run_runtime_deep_probe,
+)
 from backend.services import (
   backtest_preflight,
   backtest_runner,
@@ -58,6 +67,7 @@ from backend.services.user_context import get_current_user, reset_current_user, 
 
 app = FastAPI(title="Trend Grid Viewer", version="0.1.0")
 logger = logging.getLogger(__name__)
+_verified_runtime_capabilities = declared_runtime_capabilities()
 
 
 def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, Any]:
@@ -66,7 +76,10 @@ def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, A
 
 def _backtest_failure_response(error: Exception, run_id: str | None) -> HTTPException:
   detail = error_detail(error, run_id).to_dict()
-  status_code = 404 if detail["code"] == "data.unavailable" else 422
+  if detail["code"] == "data.unavailable":
+    status_code = 404
+  else:
+    status_code = 503 if detail["category"] == "system_error" else 422
   return HTTPException(status_code, {"errorDetail": detail})
 
 
@@ -269,6 +282,14 @@ def _validate_strategy_script(payload: dict) -> None:
   except StrategyRuntimePolicyError as error:
     detail = StrategyExecutionError.from_exception(error).detail.to_dict()
     raise HTTPException(422, {"errorDetail": detail}) from error
+  except (
+    RuntimeDependencyLoadError,
+    RuntimeDependencyMissingError,
+    StrategyModuleUnavailableError,
+  ) as error:
+    detail = StrategyExecutionError.from_exception(error).detail
+    status_code = 503 if detail.category == "system_error" else 422
+    raise HTTPException(status_code, {"errorDetail": detail.to_dict()}) from error
   except ValueError as error:
     raise HTTPException(422, str(error)) from error
   except SyntaxError as error:
@@ -364,6 +385,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "signalRequired": signal_required,
     "codeHash": hashlib.sha256(script["code"].encode("utf-8")).hexdigest(),
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
   request["savedScriptSnapshot"] = request["versionScriptSnapshot"]
   request["savedConfigSnapshot"] = {
@@ -375,6 +397,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "warmupTradingDays": warmup_days,
     "signalRequired": signal_required,
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "execution": execution_algorithm_snapshot(
       str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
     ),
@@ -591,6 +614,8 @@ def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
 
 @app.on_event("startup")
 def startup():
+  global _verified_runtime_capabilities
+  _verified_runtime_capabilities = run_runtime_deep_probe()
   settings.validate_public_api_configuration()
   settings.validate_research_integration_configuration()
   state_store.ensure_schema()
@@ -604,6 +629,8 @@ def health():
     "status": runner_health["status"],
     "backtest": "ok" if runner_health["status"] == "ok" else "unavailable",
     "strategyRuntimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    "runtimeCapabilities": _verified_runtime_capabilities,
   }
 
 
@@ -988,7 +1015,11 @@ def create_strategy_script(payload: schemas.StrategyScriptCreate):
   _validate_strategy_script(request)
   try:
     script = state_store.create_strategy_script(request)
-    return {"script": {**script, "runtimeVersion": SCRIPT_RUNTIME_VERSION}}
+    return {"script": {
+      **script,
+      "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+      "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    }}
   except state_store.ConflictError as error:
     raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
@@ -1001,7 +1032,11 @@ def update_strategy_script(script_id: str, payload: schemas.StrategyScriptUpdate
   _validate_strategy_script(request)
   try:
     script = state_store.update_strategy_script(script_id, request)
-    return {"script": {**script, "runtimeVersion": SCRIPT_RUNTIME_VERSION}}
+    return {"script": {
+      **script,
+      "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+      "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    }}
   except KeyError:
     raise HTTPException(404, f"策略脚本不存在: {script_id}")
   except state_store.ConflictError as error:
@@ -1073,7 +1108,11 @@ def save_complete_strategy(payload: schemas.CompleteStrategySave):
       script_request, config_request, payload.scriptId, payload.configId,
       payload.expectedRevision,
     )
-    return {**saved, "runtimeVersion": SCRIPT_RUNTIME_VERSION}
+    return {
+      **saved,
+      "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+      "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    }
   except KeyError as error:
     raise HTTPException(404, "策略脚本或策略配置不存在") from error
   except state_store.ConflictError as error:

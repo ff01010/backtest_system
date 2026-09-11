@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from backend.services.system_error_catalog import classify_system_error
 from backend.strategies.runtime_contract import (
   BLOCKED_BUILTIN_NAMES,
+  RuntimeDependencyLoadError,
+  RuntimeDependencyMissingError,
   SCRIPT_RUNTIME_VERSION,
+  StrategyModuleUnavailableError,
+  StrategyRuntimeCapabilityError,
   StrategyRuntimePolicyError,
   StrategyRuntimeVersionError,
+  is_safe_module_name,
   is_standard_builtin_name,
   missing_name,
   strategy_source_line,
+  supported_package_for_import_error,
 )
 
 
@@ -33,6 +39,9 @@ class BacktestErrorDetail:
   missing_name: str | None = None
   strategy_line: int | None = None
   runtime_version: str | None = None
+  requested_module: str | None = None
+  missing_module: str | None = None
+  supported_package: str | None = None
 
   def to_dict(self) -> dict[str, Any]:
     return {
@@ -48,24 +57,21 @@ class BacktestErrorDetail:
       "missingName": self.missing_name,
       "strategyLine": self.strategy_line,
       "runtimeVersion": self.runtime_version,
+      "requestedModule": self.requested_module,
+      "missingModule": self.missing_module,
+      "supportedPackage": self.supported_package,
     }
 
   def with_task_id(self, task_id: str | None) -> "BacktestErrorDetail":
-    return BacktestErrorDetail(
-      self.category, self.code, self.message, self.hint, self.callback,
-      self.event_time, self.symbol, self.retryable, task_id,
-      self.missing_name, self.strategy_line, self.runtime_version,
-    )
+    return replace(self, task_id=task_id)
 
   def with_event_context(
     self,
     symbol: str | None,
     event_time: str | None,
   ) -> "BacktestErrorDetail":
-    return BacktestErrorDetail(
-      self.category, self.code, self.message, self.hint, self.callback,
-      self.event_time or event_time, self.symbol or symbol, self.retryable, self.task_id,
-      self.missing_name, self.strategy_line, self.runtime_version,
+    return replace(
+      self, event_time=self.event_time or event_time, symbol=self.symbol or symbol,
     )
 
 
@@ -121,6 +127,9 @@ class RemoteBacktestError(BacktestExecutionError):
       missing_name=_optional_text(value.get("missingName")),
       strategy_line=_optional_int(value.get("strategyLine")),
       runtime_version=_optional_text(value.get("runtimeVersion")),
+      requested_module=_optional_text(value.get("requestedModule")),
+      missing_module=_optional_text(value.get("missingModule")),
+      supported_package=_optional_text(value.get("supportedPackage")),
     ), diagnostic)
 
 
@@ -171,9 +180,48 @@ def _strategy_error_detail(
   category = "strategy_error"
   code = _strategy_code(error)
   message, hint = _strategy_message(error)
-  if isinstance(error, StrategyRuntimeVersionError):
+  requested_module: str | None = None
+  missing_module: str | None = None
+  supported_package: str | None = None
+  if isinstance(error, (StrategyRuntimeVersionError, StrategyRuntimeCapabilityError)):
     category, code = "system_error", "runtime.version_mismatch"
     message = "回测因平台策略运行时版本不一致而未完成。"
+    hint = "无需修改当前策略，请提供任务编号联系管理员。"
+  elif isinstance(error, RuntimeDependencyMissingError):
+    category, code = "system_error", "runtime.dependency_missing"
+    message = "平台策略运行环境缺少已承诺的依赖。"
+    hint = "无需修改当前策略，请提供任务编号联系管理员。"
+    requested_module = error.requested_module
+    missing_module = error.missing_module
+    supported_package = error.supported_package
+  elif isinstance(error, RuntimeDependencyLoadError):
+    category, code = "system_error", "runtime.dependency_load_failed"
+    message = "平台策略运行环境无法加载已承诺的依赖。"
+    hint = "无需修改当前策略，请提供任务编号联系管理员。"
+    requested_module = error.requested_module
+    supported_package = error.supported_package
+  elif isinstance(error, StrategyModuleUnavailableError):
+    code = "strategy.module_unavailable"
+    message = "当前策略运行时不提供请求的模块。"
+    hint = "请改用策略运行手册中的支持库，或申请平台新增依赖。"
+    requested_module = error.requested_module
+  elif isinstance(error, ModuleNotFoundError):
+    requested_module = str(error.name) if is_safe_module_name(error.name) else None
+    supported = supported_package_for_import_error(error)
+    if supported:
+      category, code = "system_error", "runtime.dependency_missing"
+      message = "平台策略运行环境缺少已承诺的依赖。"
+      hint = "无需修改当前策略，请提供任务编号联系管理员。"
+      missing_module = requested_module
+      requested_module, supported_package = supported
+    else:
+      code = "strategy.module_unavailable"
+      message = "当前策略运行时不提供请求的模块。"
+      hint = "请改用策略运行手册中的支持库，或申请平台新增依赖。"
+  elif isinstance(error, (ImportError, OSError)) and _is_supported_binary_load_error(error):
+    requested_module, supported_package = supported_package_for_import_error(error) or (None, None)
+    category, code = "system_error", "runtime.dependency_load_failed"
+    message = "平台策略运行环境无法加载已承诺的依赖。"
     hint = "无需修改当前策略，请提供任务编号联系管理员。"
   elif isinstance(error, StrategyRuntimePolicyError) or name in BLOCKED_BUILTIN_NAMES:
     code = "strategy.runtime_policy_blocked"
@@ -192,9 +240,29 @@ def _strategy_error_detail(
     message = f"策略引用了未定义的名称 {name or '未知名称'}。"
     hint = "请先定义或导入该名称，并检查变量作用域。"
   return BacktestErrorDetail(
-    category, code, message, hint, callback, event_time, symbol, False, None,
-    name, line, SCRIPT_RUNTIME_VERSION,
+    category=category,
+    code=code,
+    message=message,
+    hint=hint,
+    callback=callback,
+    event_time=event_time,
+    symbol=symbol,
+    missing_name=name,
+    strategy_line=line,
+    runtime_version=SCRIPT_RUNTIME_VERSION,
+    requested_module=requested_module,
+    missing_module=missing_module,
+    supported_package=supported_package,
   )
+
+
+def _is_supported_binary_load_error(error: ImportError | OSError) -> bool:
+  if supported_package_for_import_error(error) is None:
+    return False
+  text = str(error).lower()
+  return any(marker in text for marker in (
+    "shared object", "dll load", "undefined symbol", "cannot open shared",
+  ))
 
 
 def _strategy_message(error: Exception) -> tuple[str, str]:

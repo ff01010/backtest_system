@@ -25,7 +25,7 @@ from backend.backtesting.overlay import OverlayFill, build_overlay_report
 from backend.backtesting.trade_metrics import ClosedTradeFill, build_closed_trade_metrics
 from backend.strategies.catalog import create_bar_strategy, get_strategy_source_snapshot
 from backend.strategies.external_engine import load_external_engine
-from backend.strategies.runtime_contract import SCRIPT_RUNTIME_VERSION
+from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
 from backend.strategies.script_time_context import normalize_script_bar_time
 from backend.services import bar_data, market_data, state_store, strategy_worker
 
@@ -169,6 +169,11 @@ def run_user_script_backtest(
     or payload.get("scriptRuntimeVersion")
     or "legacy"
   )
+  manifest["strategyRuntimeCapabilityDigest"] = str(
+    (version_snapshot.get("capabilityDigest") if isinstance(version_snapshot, dict) else None)
+    or payload.get("capabilityDigest")
+    or "legacy"
+  )
   research_signal_by_bar_time = _research_signal_by_bar_time(
     payload.get("researchSignalSnapshot"),
     [str(row.time) for row in bars.itertuples(index=False)],
@@ -208,6 +213,11 @@ def run_user_script_backtest(
     "runtimeVersion": str(
       (version_snapshot.get("runtimeVersion") if isinstance(version_snapshot, dict) else None)
       or payload.get("scriptRuntimeVersion")
+      or "legacy"
+    ),
+    "capabilityDigest": str(
+      (version_snapshot.get("capabilityDigest") if isinstance(version_snapshot, dict) else None)
+      or payload.get("capabilityDigest")
       or "legacy"
     ),
   })
@@ -338,6 +348,7 @@ def run_research_signal_backtest(
   worker_payload["versionScriptSnapshot"] = {
     "name": "冻结研究信号", "entryType": "on_bar", "code": _RESEARCH_SIGNAL_SCRIPT,
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
   worker_payload["strategyParams"] = {**dict(payload.get("strategyParams") or {}), "signalsByDate": signals}
   result = run_user_script_backtest(worker_payload, script_executor)

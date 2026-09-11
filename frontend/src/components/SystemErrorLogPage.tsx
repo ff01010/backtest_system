@@ -90,11 +90,11 @@ export default function SystemErrorLogPage() {
           <div>
             <div style={eyebrowStyle}>RUNTIME COMPATIBILITY</div>
             <h3 style={{ margin: '4px 0', color: 'var(--text)' }}>策略运行环境错误统计</h3>
-            <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 12 }}>默认保留 180 天，仅含平台错误码、运行时版本、标准内置名称和次数，无法反查用户或任务。</p>
+            <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 12 }}>默认保留 180 天，仅含平台错误码、运行时版本、受控模块名称和次数，无法反查用户或任务。</p>
           </div>
           <div style={runtimeGridStyle}>
-            {runtimeStats.map((item) => <div key={`${item.date}-${item.code}-${item.runtimeVersion}-${item.missingName || ''}`} style={runtimeCardStyle}>
-              <strong style={{ color: 'var(--text)' }}>{item.missingName || '版本不一致'} · {item.count} 次</strong>
+            {runtimeStats.map((item) => <div key={`${item.date}-${item.code}-${item.runtimeVersion}-${item.missingModule || item.missingName || ''}`} style={runtimeCardStyle}>
+              <strong style={{ color: 'var(--text)' }}>{item.missingModule || item.missingName || '版本或依赖异常'} · {item.count} 次</strong>
               <span style={subtextStyle}>{item.date} · {item.code}</span>
               <span style={monoStyle}>{item.runtimeVersion}</span>
               <span style={subtextStyle}>最近：{item.lastOccurredAt}</span>

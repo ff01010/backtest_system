@@ -18,9 +18,11 @@ from backend.backtesting.legacy import fill_to_api_trade
 from backend.services.backtest_errors import RemoteBacktestError, error_detail
 from backend.services.system_error_catalog import root_cause
 from backend.strategies.runtime_contract import (
+  RUNTIME_CAPABILITY_DIGEST,
   SCRIPT_RUNTIME_VERSION,
   drop_strategy_process_privileges,
   missing_name,
+  restore_numeric_thread_environment,
   strategy_source_line,
 )
 from backend.strategies.scripted import ScriptedBarStrategy
@@ -74,6 +76,7 @@ def _bar_process_main(connection: Connection, payload: dict[str, Any]) -> None:
   """只接收冻结脚本、参数和行情，不继承数据库或外部服务配置。"""
   try:
     os.environ.clear()
+    restore_numeric_thread_environment()
     drop_strategy_process_privileges()
     connection.send({"status": "ok", "result": _execute_script(payload)})
   except Exception as error:
@@ -98,6 +101,7 @@ def _execute_script(payload: dict[str, Any]) -> dict[str, Any]:
   strategy = ScriptedBarStrategy(
     str(payload["scriptId"]), str(payload["code"]), dict(payload.get("params") or {}),
     runtime_version=str(payload.get("runtimeVersion") or "legacy"),
+    capability_digest=str(payload.get("capabilityDigest") or "legacy"),
   )
   commission_rate = float(payload["commissionRate"])
   fee_profile = dict(payload.get("feeProfile") or {})
@@ -197,6 +201,7 @@ def _error_diagnostic(error: Exception) -> dict[str, str]:
     "reason": reason[:500],
     "trace": " > ".join(f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in trace),
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
   name = missing_name(cause)
   line = strategy_source_line(cause)

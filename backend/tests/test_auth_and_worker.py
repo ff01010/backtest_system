@@ -140,6 +140,38 @@ def test_worker_runs_script_without_database_access() -> None:
   assert len(result["portfolioSnapshots"]) == 1
 
 
+def test_worker_runs_talib_strategy() -> None:
+  result = run(WorkerRunRequest(
+    scriptId="talib-script",
+    code="""
+import numpy as np
+import talib
+
+
+def on_bar(bar, state):
+  values = np.asarray([1.0, 2.0, 3.0], dtype=float)
+  if not state.get('submitted') and np.isfinite(talib.SMA(values, timeperiod=3)[-1]):
+    state['submitted'] = True
+    return [{'action': 'buy_open', 'quantity': int(np.int64(100)), 'reason': 'TA-Lib SMA'}]
+  return []
+""",
+    bars=[{
+      "time": "202601010930", "symbol": "000001.SZ", "open": 10,
+      "high": 10, "low": 10, "close": 10, "volume": 100,
+    }, {
+      "time": "202601010931", "symbol": "000001.SZ", "open": 10,
+      "high": 10, "low": 10, "close": 10, "volume": 100,
+    }],
+    initialCapital=100_000,
+    commissionRate=0,
+    holdingPolicy="overnight",
+    fillModel="bar_next_open",
+  ))
+
+  assert len(result["trades"]) == 1
+  assert result["trades"][0]["quantity"] == 100
+
+
 def test_worker_keeps_raw_script_exception_for_administrator() -> None:
   request = WorkerRunRequest(
     scriptId="diagnostic-script",

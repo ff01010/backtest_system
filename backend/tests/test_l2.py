@@ -20,6 +20,7 @@ from backend.l2_runner import L2Runner, _JobLeaseKeeper, _continuous_stream_chun
 from backend.services.backtest_errors import RemoteBacktestError, error_detail
 from backend.services.system_error_catalog import classify_system_error
 from backend.services import clickhouse_client
+from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
 from backend.worker_app import (
   L2WorkerSession,
   L2StreamDecoder,
@@ -1622,7 +1623,53 @@ def test_local_l2_strategy_session_supports_tuple_and_runtime_version() -> None:
     "baseCostPrice": 0,
     "t0Enabled": False,
     "quoteMode": "order_driven",
-    "runtimeVersion": "python3.12-runtime-v2",
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    "instrumentRules": {},
+  })
+  try:
+    session.begin_day("2026-01-02")
+    assert session.process_bars([_bar()])["quoteDemand"] == "idle"
+    session.finish_day("2026-01-02")
+    assert session.result()["fills"] == []
+  finally:
+    session.close()
+
+
+def test_local_l2_strategy_session_supports_talib_with_bounded_numeric_threads() -> None:
+  session = L2StrategySession({
+    "scriptId": "local-talib",
+    "code": """
+import os
+import numpy as np
+import talib
+
+NUMERIC_THREAD_NAMES = (
+  'OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS',
+)
+
+
+def on_bar(bar, state):
+  values = np.asarray([1.0, 2.0, 3.0], dtype=float)
+  state['sma'] = float(talib.SMA(values, timeperiod=3)[-1])
+  if not all(os.environ.get(name) == '1' for name in NUMERIC_THREAD_NAMES):
+    raise RuntimeError('数值线程环境未恢复')
+  return []
+""",
+    "params": {},
+    "initialCapital": 100_000,
+    "commissionRate": 0,
+    "feeProfile": {},
+    "latencyMs": 0,
+    "passiveParticipationRate": 0.1,
+    "holdingPolicy": "overnight",
+    "symbol": "688981.SH",
+    "baseQuantity": 0,
+    "baseCostPrice": 0,
+    "t0Enabled": False,
+    "quoteMode": "order_driven",
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "instrumentRules": {},
   })
   try:

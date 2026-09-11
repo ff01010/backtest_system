@@ -48,10 +48,26 @@ read_runner_replicas() {
 }
 
 check_active_backtests() {
-  local counts
+  local counts queued active
   counts="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT count(*) FILTER (WHERE status='"'"'queued'"'"'), count(*) FILTER (WHERE status IN ('"'"'running'"'"','"'"'cancelling'"'"')) FROM backtest_run;"')"
-  echo "发布前回测任务：queued=${counts%%|*}, active=${counts##*|}"
-  [[ "${counts##*|}" == "0" ]] || fail "存在运行中或取消中的回测任务，请先等待完成或手动取消"
+  queued="${counts%%|*}"
+  active="${counts##*|}"
+  echo "发布前回测任务：queued=${queued}, active=${active}"
+  [[ "$queued" == "0" && "$active" == "0" ]]
+}
+
+stop_submission_and_wait_for_backtests() {
+  local attempt
+  echo "停止 backend，阻断新的页面和开放 API 回测提交"
+  "${compose[@]}" stop backend
+  for attempt in $(seq 1 360); do
+    if check_active_backtests; then
+      echo "回测队列已排空，可以开始迁移和同批发布"
+      return
+    fi
+    sleep 5
+  done
+  fail "30 分钟内未能排空回测任务；backend 保持停止"
 }
 
 runner_containers_ready() {
@@ -147,7 +163,8 @@ validate_clickhouse_network
 "${compose[@]}" config >/dev/null || fail "Docker Compose 配置校验失败"
 "${compose[@]}" up -d postgres
 wait_for_postgres
-check_active_backtests
+stop_submission_and_wait_for_backtests
+check_active_backtests || fail "回测任务未完全排空；backend 保持停止"
 "${compose[@]}" --profile migration run --rm migrate
 "${compose[@]}" --profile calendar-sync run --rm --build calendar-sync
 verify_trade_calendar || fail "交易日历同步后校验失败"

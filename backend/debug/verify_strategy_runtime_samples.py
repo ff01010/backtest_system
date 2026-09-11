@@ -9,7 +9,7 @@ from backend.bar_strategy_session import BarStrategySession
 from backend.l2.models import NormalizedBar
 from backend.l2.strategy_session import L2StrategySession
 from backend.services import state_store, strategy_worker
-from backend.strategies.runtime_contract import SCRIPT_RUNTIME_VERSION
+from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
 
 
 def _recent_samples() -> list[dict[str, Any]]:
@@ -68,6 +68,7 @@ def _payload(sample: dict[str, Any], index: int) -> dict[str, Any]:
     "initialPositionEnabled": bool(sample["initial_position_enabled"]),
     "t0Enabled": bool(sample["t0_enabled"]),
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
 
 
@@ -83,6 +84,7 @@ def _verify_bar_runtime() -> None:
     "slippage": 0,
     "holdingPolicy": "overnight",
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   })
   if len(result["portfolioSnapshots"]) != 2:
     raise ValueError("Bar 子进程未返回完整结果")
@@ -95,6 +97,7 @@ def _verify_l2_runtime() -> None:
     "params": {}, "initialCapital": 100_000, "commissionRate": 0,
     "feeProfile": {}, "holdingPolicy": "overnight", "symbol": "688981.SH",
     "quoteMode": "order_driven", "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "instrumentRules": {},
   })
   try:

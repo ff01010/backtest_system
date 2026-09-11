@@ -150,5 +150,7 @@ def test_health_reports_runner_degradation_without_internal_counts(
   assert api_app.health() == {
     "status": "degraded",
     "backtest": "unavailable",
-    "strategyRuntimeVersion": "python3.12-runtime-v2",
+    "strategyRuntimeVersion": api_app.SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": api_app.RUNTIME_CAPABILITY_DIGEST,
+    "runtimeCapabilities": api_app._verified_runtime_capabilities,
   }

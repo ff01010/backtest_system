@@ -323,12 +323,16 @@ export interface BacktestErrorDetail {
   missingName?: string | null;
   strategyLine?: number | null;
   runtimeVersion?: string | null;
+  requestedModule?: string | null;
+  missingModule?: string | null;
+  supportedPackage?: string | null;
 }
 
 export interface ExperimentManifest {
   experimentHash: string;
   engineVersion: string;
   strategyRuntimeVersion?: string;
+  strategyRuntimeCapabilityDigest?: string;
   signalModel: string;
   fillModel: string;
   randomSeed: number;
