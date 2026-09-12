@@ -46,16 +46,33 @@ async function sendJson<T>(url: string, method: string, payload: unknown): Promi
   });
   if (!res.ok) {
     const text = await res.text();
-    let message = text;
-    try {
-      const body = JSON.parse(text) as { detail?: unknown };
-      if (typeof body.detail === 'string') message = body.detail;
-    } catch {
-      // 非 JSON 错误保留服务端原文，便于诊断代理层问题。
-    }
+    const message = getApiErrorMessage(text);
     throw new Error(message || `API ${res.status}: 请求失败`);
   }
   return res.json();
+}
+
+function getApiErrorMessage(text: string): string {
+  try {
+    const body = JSON.parse(text) as { detail?: unknown };
+    if (typeof body.detail === 'string') return body.detail;
+    if (!body.detail || typeof body.detail !== 'object') return text;
+    const detail = body.detail as {
+      message?: unknown;
+      errorDetail?: { message?: unknown; hint?: unknown };
+    };
+    const message = typeof detail.errorDetail?.message === 'string'
+      ? detail.errorDetail.message.trim()
+      : '';
+    const hint = typeof detail.errorDetail?.hint === 'string'
+      ? detail.errorDetail.hint.trim()
+      : '';
+    if (message) return hint && hint !== message ? `${message}；${hint}` : message;
+    return typeof detail.message === 'string' ? detail.message : text;
+  } catch {
+    // 非 JSON 错误保留服务端原文，便于诊断代理层问题。
+    return text;
+  }
 }
 
 export async function fetchHealth(): Promise<{ status: string }> {

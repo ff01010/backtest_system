@@ -1316,6 +1316,7 @@ button, input, select, textarea {
 .strategy-asset-panel,
 .strategy-config-panel,
 .strategy-editor-panel {
+  min-width: 0;
   border: 1px solid var(--border) !important;
   border-radius: var(--radius-sm) !important;
   box-shadow: 0 2px 12px rgba(20, 36, 31, 0.035);
@@ -1641,6 +1642,39 @@ button, input, select, textarea {
 
 .strategy-editor-heading {
   padding: 1px 2px 4px;
+}
+
+.strategy-editor-top {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.strategy-editor-alert {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 8px 12px;
+  border: 1px solid #efb8b3;
+  border-left: 3px solid #c7453d;
+  border-radius: 4px;
+  padding: 9px 11px;
+  background: #fff3f2;
+  color: #9f271f;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.strategy-editor-alert strong {
+  white-space: nowrap;
+}
+
+.strategy-editor-alert span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .strategy-editor-heading > div > div:first-child {

@@ -100,6 +100,16 @@ const fieldStyle = {
   fontSize: typography.base,
 } as const;
 
+export function StrategyStudioErrorNotice({ message }: { message: string }) {
+  if (!message) return null;
+  return (
+    <div className="strategy-editor-alert" role="alert" aria-label="策略操作错误">
+      <strong>操作未完成</strong>
+      <span>{message}</span>
+    </div>
+  );
+}
+
 const OVERLAY_HOLDING_GRID_COLUMNS = 'minmax(110px, 1fr) repeat(3, minmax(88px, 0.8fr)) repeat(5, minmax(116px, 1.15fr))';
 const STANDARD_HOLDING_GRID_COLUMNS = 'minmax(110px, 1fr) repeat(3, minmax(88px, 0.8fr)) repeat(4, minmax(116px, 1.15fr))';
 
@@ -3538,27 +3548,30 @@ export default function BacktestPage({
                   gap: 12,
                   minHeight: 0,
                 }}>
-                  <div className="strategy-editor-heading" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-                    <div>
-                      <div style={{ color: '#0f172a', fontSize: 14, fontWeight: 700 }}>
-                        {selectedStrategy === 'user_script' ? '可编辑策略代码' : '实际运行代码'}
+                  <div className="strategy-editor-top">
+                    <div className="strategy-editor-heading" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+                      <div>
+                        <div style={{ color: '#0f172a', fontSize: 14, fontWeight: 700 }}>
+                          {selectedStrategy === 'user_script' ? '可编辑策略代码' : '实际运行代码'}
+                        </div>
+                        <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
+                          {selectedStrategy === 'user_script'
+                            ? '编辑完成后点击左侧“保存策略”，保存后即可回测'
+                            : (strategySource ? `代码指纹：${strategySource.codeHash.slice(0, 12)}` : '正在读取代码快照')}
+                        </div>
                       </div>
-                      <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>
-                        {selectedStrategy === 'user_script'
-                          ? '编辑完成后点击左侧“保存策略”，保存后即可回测'
-                          : (strategySource ? `代码指纹：${strategySource.codeHash.slice(0, 12)}` : '正在读取代码快照')}
-                      </div>
+                      {selectedStrategy === 'user_script' && (
+                        <button
+                          className="strategy-guide-trigger"
+                          onClick={() => setStrategyGuideOpen(true)}
+                          type="button"
+                        >
+                          <BookOpen size={15} />
+                          策略编写指南
+                        </button>
+                      )}
                     </div>
-                    {selectedStrategy === 'user_script' && (
-                      <button
-                        className="strategy-guide-trigger"
-                        onClick={() => setStrategyGuideOpen(true)}
-                        type="button"
-                      >
-                        <BookOpen size={15} />
-                        策略编写指南
-                      </button>
-                    )}
+                    <StrategyStudioErrorNotice message={error} />
                   </div>
                   {selectedStrategy === 'user_script' ? (
                     <div className="strategy-editor-body" style={{ display: 'grid', gridTemplateRows: 'auto auto auto minmax(0, 1fr) auto', gap: 10, minHeight: 0 }}>
@@ -3907,16 +3920,16 @@ export default function BacktestPage({
                   </ConfigSectionCard>
                   </div>
                   <div className="strategy-config-footer">
-                  {(status || error) && (
-                    <div className={`strategy-runtime-message ${error ? 'is-error' : ''}`} style={{
-                      color: error ? '#b91c1c' : '#0f766e',
-                      background: error ? '#fef2f2' : '#ecfdf5',
-                      border: `1px solid ${error ? '#fecaca' : '#99f6e4'}`,
+                  {status && !error && (
+                    <div className="strategy-runtime-message" style={{
+                      color: '#0f766e',
+                      background: '#ecfdf5',
+                      border: '1px solid #99f6e4',
                       borderRadius: 4,
                       padding: '8px 10px',
                       fontSize: 12,
                     }}>
-                      {error || status}
+                      {status}
                     </div>
                   )}
                   <div className="strategy-run-actions" style={{ display: 'flex', gap: 8, marginTop: 4 }}>
@@ -3956,7 +3969,7 @@ export default function BacktestPage({
                 </section>
               </div>
               <div className={`strategy-studio-statusbar ${error ? 'is-error' : versionDirty ? 'is-dirty' : hasSelectedConfig ? 'is-ready' : ''}`} aria-live="polite">
-                <span>{statusMessage}</span>
+                <span>{error ? '操作未完成，请查看代码区上方的错误详情' : statusMessage}</span>
                 <span>
                   {runDisabled
                     ? versionDirty
