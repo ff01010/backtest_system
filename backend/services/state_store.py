@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Iterator
 
 import psycopg
@@ -274,18 +275,9 @@ def _instrument_id(cur: Any, symbol: str, name: str = "") -> int:
 def search_market_instruments(query: str, limit: int = 20) -> list[dict[str, Any]]:
   """按代码或名称搜索全局证券目录，不受当前用户范围限制。"""
   keyword = query.strip()
-  pattern = f"%{keyword}%"
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        SELECT symbol, exchange, display_name, instrument_type, board
-        FROM market_instrument
-        WHERE is_active=true
-          AND (%s = '' OR symbol ILIKE %s OR display_name ILIKE %s)
-        ORDER BY CASE WHEN symbol = %s THEN 0 WHEN symbol ILIKE %s THEN 1 ELSE 2 END,
-                 exchange, symbol
-        LIMIT %s
-      """, (keyword, pattern, pattern, keyword, f"{keyword}%", limit))
+      _execute_instrument_search(cur, keyword, limit)
       return [{
         "symbol": f"{row['symbol']}.{row['exchange']}",
         "name": row["display_name"],
@@ -293,6 +285,39 @@ def search_market_instruments(query: str, limit: int = 20) -> list[dict[str, Any
         "instrumentType": row["instrument_type"],
         "board": row["board"],
       } for row in cur.fetchall()]
+
+
+def _execute_instrument_search(cur: Any, keyword: str, limit: int) -> None:
+  code_match = re.fullmatch(r"(\d{6})(?:\.(SH|SZ|BJ))?", keyword.upper())
+  if code_match:
+    code, exchange = code_match.groups()
+    if exchange:
+      cur.execute("""
+        SELECT symbol, exchange, display_name, instrument_type, board
+        FROM market_instrument
+        WHERE is_active=true AND symbol=%s AND exchange=%s
+        ORDER BY exchange, symbol
+        LIMIT %s
+      """, (code, exchange, limit))
+      return
+    cur.execute("""
+      SELECT symbol, exchange, display_name, instrument_type, board
+      FROM market_instrument
+      WHERE is_active=true AND symbol=%s
+      ORDER BY exchange, symbol
+      LIMIT %s
+    """, (code, limit))
+    return
+  pattern = f"%{keyword}%"
+  cur.execute("""
+    SELECT symbol, exchange, display_name, instrument_type, board
+    FROM market_instrument
+    WHERE is_active=true
+      AND (%s = '' OR symbol ILIKE %s OR display_name ILIKE %s)
+    ORDER BY CASE WHEN symbol = %s THEN 0 WHEN symbol ILIKE %s THEN 1 ELSE 2 END,
+             exchange, symbol
+    LIMIT %s
+  """, (keyword, pattern, pattern, keyword, f"{keyword}%", limit))
 
 
 def upsert_market_instruments(items: list[Any]) -> int:
@@ -317,15 +342,15 @@ def upsert_market_instruments(items: list[Any]) -> int:
   return len(rows)
 
 
-def replace_market_instruments_from_qmt(items: list[dict[str, str | None]]) -> int:
-  """以完整 QMT 快照替换 PostgreSQL 中的有效股票目录。"""
+def replace_market_instruments_from_directory(items: list[dict[str, str | None]]) -> int:
+  """以完整证券主数据快照替换 PostgreSQL 中的有效股票目录。"""
   if not items:
     return 0
   rows = [
     (
       item["symbol"], item["exchange"], item["display_name"], item["instrument_type"],
-      item["board"], _qmt_secid(item["symbol"], item["exchange"]), item["list_date"],
-      item["delist_date"], Jsonb({"source": "qmt"}),
+      item["board"], _legacy_secid(item["symbol"], item["exchange"]), item["list_date"],
+      item["delist_date"], Jsonb({"source": item.get("source") or "unknown"}),
     )
     for item in items
   ]
@@ -356,9 +381,9 @@ def replace_market_instruments_from_qmt(items: list[dict[str, str | None]]) -> i
     raise DatabaseError(str(error)) from error
 
 
-def _qmt_secid(symbol: str | None, exchange: str | None) -> str:
+def _legacy_secid(symbol: str | None, exchange: str | None) -> str:
   if not symbol or not exchange:
-    raise DatabaseError("QMT 证券目录缺少代码或交易所")
+    raise DatabaseError("证券目录缺少代码或交易所")
   return f"{'1' if exchange == 'SH' else '0'}.{symbol}"
 
 

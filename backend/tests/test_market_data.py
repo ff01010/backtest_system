@@ -15,8 +15,10 @@ _TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 def test_load_bars_reads_qmt_raw_rows(monkeypatch: pytest.MonkeyPatch) -> None:
   epoch = int(datetime(2026, 7, 30, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
+  queries: list[str] = []
 
   def query_rows(query: str) -> list[dict[str, object]]:
+    queries.append(query)
     if "qmt_kline_coverage" in query:
       return [{"trade_date": "2026-07-30", "status": "complete"}]
     return [{
@@ -32,6 +34,65 @@ def test_load_bars_reads_qmt_raw_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     "time": "202607300930", "open": 10.0, "high": 11.0,
     "low": 9.0, "close": 10.5, "volume": 100,
   }]
+  assert any("raw_historical_data.qmt_kline_coverage" in query for query in queries)
+  assert any("raw_historical_data.qmt_kline FINAL" in query for query in queries)
+  assert all("qmt_history_dev" not in query for query in queries)
+
+
+def test_bj_load_uses_published_history_dev_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
+  queries: list[str] = []
+  start = datetime(2026, 9, 11, 9, 30, tzinfo=_TIMEZONE)
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    queries.append(query)
+    if "WITH latest_runs" in query:
+      return [{"trade_date": "2026-09-11", "status": "complete"}]
+    return [{
+      "qmt_index": value.strftime("%Y%m%d%H%M%S"),
+      "time": int(value.timestamp() * 1000),
+      "open": float(offset + 1), "high": float(offset + 1),
+      "low": float(offset + 1), "close": float(offset + 1), "volume": 10,
+    } for offset in range(6) for value in [start + timedelta(minutes=offset)]]
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+
+  frame = market_data.load_bars("920001.BJ", "5m", "20260911", "20260911")
+
+  assert frame.to_dict("records") == [{
+    "open": 1.0, "high": 6.0, "low": 1.0, "close": 6.0, "volume": 60,
+    "time": "202609110935",
+  }]
+  coverage_query = next(query for query in queries if "WITH latest_runs" in query)
+  raw_query = next(query for query in queries if "SELECT formatDateTime" in query)
+  assert "qmt_history_dev.qmt_ingest_runs" in coverage_query
+  assert "latest_runs.state = 'PUBLISHED'" in coverage_query
+  assert "latest_runs.validation_result = 'PASS'" in coverage_query
+  assert "has(latest_runs.actual_routes, '1m/none')" in coverage_query
+  assert "qmt_history_dev.qmt_kline_1m_raw" in raw_query
+  assert "adjustment = 'none'" in raw_query
+  assert "quality_status = 'valid' AND is_final = 1" in raw_query
+
+
+def test_bj_incomplete_ingest_run_rejects_backtest(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", lambda _: [
+    {"trade_date": "2026-09-11", "status": "partial"},
+  ])
+
+  with pytest.raises(market_data.MarketDataError, match="QMT 行情不完整"):
+    market_data.ensure_cached("920001.BJ", "1m", "20260911", "20260911")
+
+
+def test_bj_supports_platform_derived_timeframes(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", lambda _: [
+    {"trade_date": "2026-09-11", "status": "complete"},
+  ])
+
+  resolution = market_data.resolve_backtest_data(
+    "920001.BJ", "45m", "20260911", "20260911", ["2026-09-11"],
+  )
+
+  assert resolution.source_period == "1m"
+  assert resolution.derivation == "45m-from-1m-v1"
 
 
 def test_incomplete_qmt_coverage_rejects_backtest(monkeypatch: pytest.MonkeyPatch) -> None:

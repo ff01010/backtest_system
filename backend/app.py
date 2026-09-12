@@ -89,14 +89,14 @@ def _sync_system_error_record(error: Exception, run_id: str) -> dict[str, Any] |
 
 
 @app.on_event("startup")
-def sync_qmt_instrument_directory() -> None:
-  """用已预置的 QMT 快照刷新 PostgreSQL 搜索目录。"""
+def sync_instrument_directory() -> None:
+  """用统一证券主数据刷新 PostgreSQL 搜索目录。"""
   try:
     count = qmt_instrument_directory.sync_market_instruments()
   except Exception as error:
-    logger.warning("QMT 证券目录同步跳过: %s", error)
+    logger.warning("统一证券目录同步跳过: %s", error)
   else:
-    logger.info("QMT 证券目录已同步 %s 条", count)
+    logger.info("统一证券目录已同步 %s 条", count)
 
 app.add_middleware(
   CORSMiddleware,
