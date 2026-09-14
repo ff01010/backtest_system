@@ -7,6 +7,7 @@ import LoginPage from './components/LoginPage';
 import SystemErrorLogPage from './components/SystemErrorLogPage';
 import UserManagementPage from './components/UserManagementPage';
 import ApiKeyPage from './components/ApiKeyPage';
+import ReleaseNotificationManager from './components/ReleaseNotificationManager';
 import {
   fetchBacktestRunChart,
   fetchChart,
@@ -42,6 +43,18 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
   const [urlParams, setUrlParams] = useUrlState();
   const [researchError, setResearchError] = useState<string | null>(null);
   const [researchStarting, setResearchStarting] = useState(false);
+  const [workspaceSafety, setWorkspaceSafety] = useState({
+    hasUnsavedStrategy: false,
+    isStrategySavePending: false,
+  });
+  const strategySaveActionRef = useRef<() => Promise<boolean>>(async () => false);
+  const requestStrategySave = useCallback(
+    () => strategySaveActionRef.current(),
+    [],
+  );
+  const registerStrategySave = useCallback((action: () => Promise<boolean>) => {
+    strategySaveActionRef.current = action;
+  }, []);
 
   const [instruments, setInstruments] = useState<InstrumentItem[]>([]);
   const [strategies, setStrategies] = useState<string[]>(['user_script']);
@@ -193,6 +206,12 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
         </button>
         {researchError && <span role="alert" style={{ color: '#fda4af', fontSize: typography.sm }}>{researchError}</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10, color: 'var(--chrome-text)', fontSize: typography.sm }}>
+          <ReleaseNotificationManager
+            userId={currentUser.id}
+            hasUnsavedStrategy={workspaceSafety.hasUnsavedStrategy}
+            isStrategySavePending={workspaceSafety.isStrategySavePending}
+            onRequestStrategySave={requestStrategySave}
+          />
           <span>{currentUser.displayName} · {currentUser.role === 'admin' ? '管理员' : '普通用户'}</span>
           <button onClick={onLogout} style={{ border: '1px solid #3a3f4b', borderRadius: 3, padding: '4px 9px', background: 'transparent', color: 'var(--chrome-text)', cursor: 'pointer' }}>退出</button>
         </div>
@@ -251,6 +270,8 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
           strategies={strategies}
           instruments={instruments}
           isAdmin={currentUser.role === 'admin'}
+          onWorkspaceSafetyStateChange={setWorkspaceSafety}
+          onStrategySaveActionChange={registerStrategySave}
           onViewTradeChart={({ runId, symbol, timeframe, date }) => {
             setUrlParams({ runId, symbol, timeframe, date });
             setActivePage('signals');

@@ -81,9 +81,15 @@ def _remote_worker_record(
     context["eventTime"] = error.detail.event_time
   if diagnostic.get("trace"):
     context["trace"] = diagnostic["trace"][:1_500]
-  for key in ("missingName", "runtimeVersion", "strategyLine"):
+  for key in (
+    "missingName", "missingModule", "runtimeVersion", "strategyLine", "supportedPackage",
+  ):
     if diagnostic.get(key):
       context[key] = diagnostic[key]
+  if error.detail.missing_module:
+    context["missingModule"] = error.detail.missing_module
+  if error.detail.supported_package:
+    context["supportedPackage"] = error.detail.supported_package
   context.update(_remote_internal_context(diagnostic))
   return SystemErrorLogRecord(
     source=source,
@@ -113,6 +119,10 @@ def _runtime_record(
   }
   if detail.missing_name:
     context["missingName"] = detail.missing_name
+  if detail.missing_module:
+    context["missingModule"] = detail.missing_module
+  if detail.supported_package:
+    context["supportedPackage"] = detail.supported_package
   if detail.strategy_line:
     context["strategyLine"] = str(detail.strategy_line)
   return SystemErrorLogRecord(

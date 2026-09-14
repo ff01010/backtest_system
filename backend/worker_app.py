@@ -21,8 +21,11 @@ from backend.services.backtest_errors import error_detail
 from backend.services.system_error_catalog import root_cause
 from backend.strategies.scripted import ScriptedBarStrategy
 from backend.strategies.runtime_contract import (
+  RUNTIME_CAPABILITY_DIGEST,
   SCRIPT_RUNTIME_VERSION,
+  declared_runtime_capabilities,
   missing_name,
+  run_runtime_deep_probe,
   strategy_source_line,
 )
 
@@ -46,6 +49,7 @@ class WorkerRunRequest(BaseModel):
   t0Enabled: bool = False
   warmupBarCount: int = Field(default=0, ge=0)
   runtimeVersion: str = "legacy"
+  capabilityDigest: str = "legacy"
 
 
 class WorkerL2SessionCreateRequest(BaseModel):
@@ -68,6 +72,7 @@ class WorkerL2SessionCreateRequest(BaseModel):
   quoteMode: str = "order_driven"
   instrumentRules: dict[str, Any] = Field(default_factory=dict)
   runtimeVersion: str = "legacy"
+  capabilityDigest: str = "legacy"
 
 
 class WorkerL2DayRequest(BaseModel):
@@ -150,6 +155,13 @@ class L2StreamDecoder:
 
 
 app = FastAPI(title="Quant Backtest Strategy Worker")
+_verified_runtime_capabilities = declared_runtime_capabilities()
+
+
+@app.on_event("startup")
+def startup() -> None:
+  global _verified_runtime_capabilities
+  _verified_runtime_capabilities = run_runtime_deep_probe()
 _L2_SESSION_LIMIT = int(os.getenv("TREND_GRID_L2_WORKER_SESSION_LIMIT", "2"))
 _l2_sessions: dict[str, "L2WorkerSession"] = {}
 
@@ -166,6 +178,7 @@ def _worker_http_error(
     "exceptionType": type(cause).__name__,
     "reason": str(cause)[:500],
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "__internal_raw_message": str(cause)[:2_000],
     "__internal_raw_traceback": "".join(
       traceback.format_exception(type(error), error, error.__traceback__),
@@ -177,7 +190,12 @@ def _worker_http_error(
     diagnostic["missingName"] = name
   if line:
     diagnostic["strategyLine"] = str(line)
-  return HTTPException(422, {
+  if detail.missing_module:
+    diagnostic["missingModule"] = detail.missing_module
+  if detail.supported_package:
+    diagnostic["supportedPackage"] = detail.supported_package
+  status_code = 503 if detail.category == "system_error" else 422
+  return HTTPException(status_code, {
     "errorDetail": detail.to_dict(),
     "diagnostic": diagnostic,
   })
@@ -189,6 +207,7 @@ class L2WorkerSession:
   def __init__(self, payload: WorkerL2SessionCreateRequest) -> None:
     self.strategy = ScriptedBarStrategy(
       payload.scriptId, payload.code, payload.params, payload.quoteMode, payload.runtimeVersion,
+      payload.capabilityDigest,
     )
     fee_profile = FeeProfile(
       commission_rate=float(payload.feeProfile.get("commissionRate", payload.commissionRate)),
@@ -284,8 +303,13 @@ def _snapshot_to_dict(snapshot: Any) -> dict[str, Any]:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-  return {"status": "ok", "strategyRuntimeVersion": SCRIPT_RUNTIME_VERSION}
+def health() -> dict[str, object]:
+  return {
+    "status": "ok",
+    "strategyRuntimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    "runtimeCapabilities": _verified_runtime_capabilities,
+  }
 
 
 @app.post("/run")
@@ -304,6 +328,7 @@ def run(payload: WorkerRunRequest) -> dict[str, Any]:
     strategy = ScriptedBarStrategy(
       payload.scriptId, payload.code, payload.params,
       runtime_version=payload.runtimeVersion,
+      capability_digest=payload.capabilityDigest,
     )
     fee_profile = FeeProfile(
       commission_rate=float(payload.feeProfile.get("commissionRate", payload.commissionRate)),

@@ -539,6 +539,40 @@ class CompleteStrategySave(BaseModel):
   expectedRevision: int | None = Field(default=None, ge=1)
 
 
+class ReleaseAcknowledgeRequest(BaseModel):
+  clientBuildId: str = Field(pattern=r"^(dev|[0-9a-f]{40})$")
+
+
+class ReleaseDetail(BaseModel):
+  id: str
+  releaseNo: int
+  version: str
+  title: str
+  summary: str
+  highlights: list[str]
+  level: Literal["normal", "important", "mandatory"]
+  publishedAt: str
+
+
+class ReleaseStatusResponse(BaseModel):
+  serverBuildId: str
+  requiredClientCompatibilityVersion: int
+  clientOutdated: bool
+  activationKind: Literal["release", "silent", "rollback"]
+  presentationMode: Literal[
+    "mandatory_gate", "release_notice", "version_mismatch", "rollback_mismatch", "none",
+  ]
+  acknowledged: bool
+  unread: bool
+  upgradeRequired: bool
+  release: ReleaseDetail | None
+
+
+class ReleaseHistoryResponse(BaseModel):
+  items: list[ReleaseDetail]
+  nextCursor: str | None
+
+
 
 class ErrorResponse(BaseModel):
   error: str

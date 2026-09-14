@@ -5,10 +5,45 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 env_file="$project_root/deploy/.env"
 compose_file="$project_root/deploy/compose.infrastructure.yml"
 clickhouse_compose_file="$project_root/deploy/compose.clickhouse.yml"
+submission_gate_dir="$project_root/deploy/submission-gate"
 
 fail() {
   echo "发布终止：$1" >&2
   exit 1
+}
+
+close_submission_gate() {
+  mkdir -p "$submission_gate_dir"
+  : > "$submission_gate_dir/closed"
+  echo "新回测提交门禁已关闭"
+}
+
+open_submission_gate() {
+  rm -f "$submission_gate_dir/closed"
+  echo "新回测提交门禁已开放"
+}
+
+report_incomplete_release() {
+  if [[ "${release_activated:-false}" != "true" ]]; then
+    echo "发布未完成：新回测提交门禁保持关闭，需完成激活或完整回退后手动开放" >&2
+  fi
+}
+
+read_client_compatibility_version() {
+  local version
+  version="$(sed -n 's/.*"clientCompatibilityVersion"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$project_root/deploy/release-manifest.json" | head -n 1)"
+  [[ "$version" =~ ^[1-9][0-9]*$ ]] || fail "发布清单缺少有效 clientCompatibilityVersion"
+  echo "$version"
+}
+
+require_release_database_password() {
+  local password app_password
+  password="$(grep -E '^RELEASE_DB_PASSWORD=' "$env_file" | tail -n 1 | cut -d= -f2- || true)"
+  app_password="$(grep -E '^APP_DB_PASSWORD=' "$env_file" | tail -n 1 | cut -d= -f2- || true)"
+  [[ ${#password} -ge 32 ]] \
+    || fail "deploy/.env 中的 RELEASE_DB_PASSWORD 必须设置且长度不少于 32 位"
+  [[ "$password" != "$app_password" ]] \
+    || fail "RELEASE_DB_PASSWORD 必须与 APP_DB_PASSWORD 不同"
 }
 
 wait_for_postgres() {
@@ -48,10 +83,26 @@ read_runner_replicas() {
 }
 
 check_active_backtests() {
-  local counts
+  local counts queued active
   counts="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT count(*) FILTER (WHERE status='"'"'queued'"'"'), count(*) FILTER (WHERE status IN ('"'"'running'"'"','"'"'cancelling'"'"')) FROM backtest_run;"')"
-  echo "发布前回测任务：queued=${counts%%|*}, active=${counts##*|}"
-  [[ "${counts##*|}" == "0" ]] || fail "存在运行中或取消中的回测任务，请先等待完成或手动取消"
+  queued="${counts%%|*}"
+  active="${counts##*|}"
+  echo "发布前回测任务：queued=${queued}, active=${active}"
+  [[ "$queued" == "0" && "$active" == "0" ]]
+}
+
+stop_submission_and_wait_for_backtests() {
+  local attempt
+  echo "停止 backend，阻断新的页面和开放 API 回测提交"
+  "${compose[@]}" stop frontend backend
+  for attempt in $(seq 1 360); do
+    if check_active_backtests; then
+      echo "回测队列已排空，可以开始迁移和同批发布"
+      return
+    fi
+    sleep 5
+  done
+  fail "30 分钟内未能排空回测任务；backend 保持停止"
 }
 
 runner_containers_ready() {
@@ -118,7 +169,9 @@ wait_for_application() {
     response="$(curl --fail --silent --show-error "$health_url" 2>/dev/null || true)"
     if runner_containers_ready "bar-runner" "$bar_replicas" \
       && runner_containers_ready "l2-runner" "$l2_replicas" \
-      && [[ "$response" == *'"status":"ok"'* ]]; then
+      && [[ "$response" == *'"status":"ok"'* ]] \
+      && [[ "$response" == *"\"applicationBuildId\":\"${APPLICATION_BUILD_ID}\""* ]] \
+      && [[ "$response" == *"\"clientCompatibilityVersion\":${CLIENT_COMPATIBILITY_VERSION}"* ]]; then
       echo "发布完成，应用与 Runner 健康检查通过：$health_url"
       return
     fi
@@ -128,17 +181,54 @@ wait_for_application() {
   fail "应用或 Runner 未能在 90 秒内通过健康检查：$health_url"
 }
 
+verify_frontend_build() {
+  local port="$1" temp_dir asset_path asset_digest
+  temp_dir="$(mktemp -d)"
+  curl --fail --silent --show-error \
+    "http://127.0.0.1:${port}/build-info.json" -o "$temp_dir/build-info.json"
+  grep -Fq "\"buildId\":\"${APPLICATION_BUILD_ID}\"" "$temp_dir/build-info.json" \
+    || fail "对外 build-info.json 的 buildId 与目标构建不一致"
+  grep -Fq "\"clientCompatibilityVersion\":${CLIENT_COMPATIBILITY_VERSION}" \
+    "$temp_dir/build-info.json" \
+    || fail "对外 build-info.json 的客户端兼容版本不一致"
+  curl --fail --silent --show-error \
+    "http://127.0.0.1:${port}/index.html" -o "$temp_dir/index.html"
+  asset_path="$(grep -oE '/assets/[^\"]+\.js' "$temp_dir/index.html" | head -n 1)"
+  [[ -n "$asset_path" ]] || fail "对外 index.html 未引用入口 JavaScript"
+  curl --fail --silent --show-error \
+    "http://127.0.0.1:${port}${asset_path}" -o "$temp_dir/entry.js"
+  grep -Fq "$APPLICATION_BUILD_ID" "$temp_dir/entry.js" \
+    || fail "实际入口 bundle 未包含目标 buildId"
+  asset_digest="$(sha256sum "$temp_dir/entry.js" | cut -d' ' -f1)"
+  rm -rf "$temp_dir"
+  echo "frontend 实际入口验证通过：asset=${asset_path}, sha256=${asset_digest}"
+}
+
 [[ -f "$env_file" ]] || fail "缺少服务器环境文件：$env_file"
 [[ -f "$clickhouse_compose_file" ]] || fail "缺少 ClickHouse 网络配置：$clickhouse_compose_file"
 command -v docker >/dev/null || fail "未安装 Docker"
 command -v curl >/dev/null || fail "未安装 curl"
+command -v flock >/dev/null || fail "未安装 flock，无法保证发布互斥"
+require_release_database_password
+
+exec 9>/tmp/quant-backtest-deploy.lock
+flock -n 9 || fail "已有部署或回滚流程正在执行"
 
 cd "$project_root"
 [[ "$(git branch --show-current)" == "main" ]] || fail "当前分支不是 main"
 [[ -z "$(git status --porcelain)" ]] || fail "工作区有未提交改动，请先处理后再发布"
 
+release_activated=false
+trap report_incomplete_release EXIT
+close_submission_gate
 git fetch origin main
 git pull --ff-only origin main
+
+APPLICATION_BUILD_ID="$(git rev-parse HEAD)"
+CLIENT_COMPATIBILITY_VERSION="$(read_client_compatibility_version)"
+export APPLICATION_BUILD_ID CLIENT_COMPATIBILITY_VERSION
+deployment_id="$(cat /proc/sys/kernel/random/uuid)"
+echo "目标构建：${APPLICATION_BUILD_ID}，客户端兼容版本：${CLIENT_COMPATIBILITY_VERSION}"
 
 compose=(docker compose --env-file "$env_file" -f "$compose_file" -f "$clickhouse_compose_file")
 bar_runner_replicas="$(read_runner_replicas TREND_GRID_BAR_RUNNER_REPLICAS)"
@@ -147,7 +237,8 @@ validate_clickhouse_network
 "${compose[@]}" config >/dev/null || fail "Docker Compose 配置校验失败"
 "${compose[@]}" up -d postgres
 wait_for_postgres
-check_active_backtests
+stop_submission_and_wait_for_backtests
+check_active_backtests || fail "回测任务未完全排空；backend 保持停止"
 "${compose[@]}" --profile migration run --rm migrate
 "${compose[@]}" --profile calendar-sync run --rm --build calendar-sync
 verify_trade_calendar || fail "交易日历同步后校验失败"
@@ -155,8 +246,30 @@ verify_trade_calendar || fail "交易日历同步后校验失败"
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \
   strategy-worker backend bar-runner l2-runner
+if ! docker image inspect quant-backtest-release-admin:1 >/dev/null 2>&1; then
+  "${compose[@]}" --profile release-admin build release-admin
+fi
 # Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。
 "${compose[@]}" up -d --build --force-recreate frontend
 verify_clickhouse_connectivity
 "${compose[@]}" ps
-wait_for_application "$(read_http_port)" "$bar_runner_replicas" "$l2_runner_replicas"
+http_port="$(read_http_port)"
+wait_for_application "$http_port" "$bar_runner_replicas" "$l2_runner_replicas"
+verify_frontend_build "$http_port"
+
+generation="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT generation FROM app_deployment_state WHERE singleton_key=true;"')"
+if [[ -z "$generation" ]]; then
+  "${compose[@]}" --profile release-admin run --rm --no-deps release-admin \
+    bootstrap --build-id "$APPLICATION_BUILD_ID" \
+    --client-version "$CLIENT_COMPATIBILITY_VERSION" --deployment-id "$deployment_id"
+  generation="0"
+fi
+"${compose[@]}" --profile release-admin run --rm --no-deps release-admin \
+  activate --manifest /app/deploy/release-manifest.json \
+  --build-id "$APPLICATION_BUILD_ID" --deployment-id "$deployment_id" \
+  --expected-generation "$generation"
+active_build="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT trim(current_build_id) FROM app_deployment_state WHERE singleton_key=true;"')"
+[[ "$active_build" == "$APPLICATION_BUILD_ID" ]] || fail "发布激活后数据库构建标识不一致"
+release_activated=true
+open_submission_gate
+echo "版本通知已激活：buildId=${APPLICATION_BUILD_ID}"

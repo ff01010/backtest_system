@@ -304,7 +304,7 @@ def test_runtime_error_stat_keeps_only_minimal_platform_fields() -> None:
 
   assert len(cursor.calls) == 1
   assert cursor.calls[0][1] == (
-    "runtime.contract_missing", "python3.12-runtime-v2", "tuple",
+    "runtime.contract_missing", "python3.12-runtime-v2", "tuple", None,
   )
   assert "run-secret" not in str(cursor.calls)
   assert "private strategy" not in str(cursor.calls)
@@ -318,6 +318,60 @@ def test_user_defined_name_is_not_written_to_runtime_error_stat() -> None:
   })
 
   assert cursor.calls == []
+
+
+def test_dependency_stat_keeps_only_module_from_supported_package() -> None:
+  cursor = _RecordingCursor()
+  _insert_strategy_runtime_error_stat(cursor, {
+    "code": "runtime.dependency_missing",
+    "context": {
+      "runtimeVersion": "python3.12-runtime-v3",
+      "supportedPackage": "TA-Lib",
+      "missingModule": "talib._ta_lib",
+    },
+  })
+
+  assert cursor.calls[0][1] == (
+    "runtime.dependency_missing", "python3.12-runtime-v3", None, "talib",
+  )
+
+
+def test_dependency_stat_normalizes_user_controlled_submodule_suffix() -> None:
+  cursor = _RecordingCursor()
+  _insert_strategy_runtime_error_stat(cursor, {
+    "code": "runtime.dependency_missing",
+    "context": {
+      "runtimeVersion": "python3.12-runtime-v3",
+      "supportedPackage": "TA-Lib",
+      "missingModule": "talib.user_controlled",
+    },
+  })
+
+  assert cursor.calls[0][1] == (
+    "runtime.dependency_missing", "python3.12-runtime-v3", None, "talib",
+  )
+
+
+@pytest.mark.parametrize(
+  "module_name",
+  ["backend.settings", f"talib.{('x' * 128)}"],
+)
+def test_dependency_stat_rejects_unrelated_or_oversized_module_name(
+  module_name: str,
+) -> None:
+  cursor = _RecordingCursor()
+  _insert_strategy_runtime_error_stat(cursor, {
+    "code": "runtime.dependency_missing",
+    "context": {
+      "runtimeVersion": "python3.12-runtime-v3",
+      "supportedPackage": "TA-Lib",
+      "missingModule": module_name,
+    },
+  })
+
+  assert cursor.calls[0][1] == (
+    "runtime.dependency_missing", "python3.12-runtime-v3", None, None,
+  )
 
 
 def test_runtime_error_stat_migration_has_no_business_identity_foreign_key() -> None:

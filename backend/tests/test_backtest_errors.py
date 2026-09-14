@@ -24,6 +24,9 @@ def test_unknown_error_is_sanitized() -> None:
     "missingName": None,
     "strategyLine": None,
     "runtimeVersion": None,
+    "requestedModule": None,
+    "missingModule": None,
+    "supportedPackage": None,
   }
   assert "internal-host" not in str(summary)
 

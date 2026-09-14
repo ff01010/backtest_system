@@ -14,6 +14,7 @@ services:
       APP_DB_NAME: ${APP_DB_NAME}
       APP_DB_USER: ${APP_DB_USER}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      RELEASE_DB_PASSWORD: ${RELEASE_DB_PASSWORD:-}
     volumes:
       - quant-backtest-postgres-data:/var/lib/postgresql/data
       - ../db/init:/docker-entrypoint-initdb.d:ro
@@ -40,6 +41,7 @@ services:
       PGUSER: ${POSTGRES_USER}
       PGPASSWORD: ${POSTGRES_PASSWORD}
       APP_DB_USER: ${APP_DB_USER}
+      RELEASE_DB_PASSWORD: ${RELEASE_DB_PASSWORD:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -49,6 +51,23 @@ services:
       - sh
       - -ec
       - |
+        psql -v ON_ERROR_STOP=1 --dbname="$${POSTGRES_DB}" \
+          --set=release_db_password="$${RELEASE_DB_PASSWORD}" \
+          --set=app_db_name="$${APP_DB_NAME}" <<'EOSQL'
+        SELECT format(
+          'CREATE ROLE quant_backtest_release_admin LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT',
+          :'release_db_password'
+        )
+        WHERE NOT EXISTS (
+          SELECT 1 FROM pg_roles WHERE rolname = 'quant_backtest_release_admin'
+        )
+        \gexec
+        SELECT format(
+          'ALTER ROLE quant_backtest_release_admin PASSWORD %L', :'release_db_password'
+        )
+        \gexec
+        GRANT CONNECT ON DATABASE :"app_db_name" TO quant_backtest_release_admin;
+        EOSQL
         for file in /migrations/*.sql; do
           psql -v ON_ERROR_STOP=1 --set=app_db_user="$${APP_DB_USER}" \
             -c 'SET ROLE quant_backtest_owner' \
@@ -61,6 +80,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
     profiles: ['calendar-sync']
     restart: 'no'
     env_file:
@@ -79,6 +101,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
     container_name: quant-backtest-backend
     extra_hosts:
       - 'host.docker.internal:host-gateway'
@@ -88,6 +113,8 @@ services:
     environment:
       TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
       TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+      TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
       TREND_GRID_KLINE_ROOT: /data/kline
       TREND_GRID_SIGNAL_ROOT: /data/signals
       TREND_GRID_OUTPUT_ROOT: /runtime/artifacts
@@ -166,6 +193,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
     restart: unless-stopped
     env_file:
       - .env
@@ -197,6 +227,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     restart: unless-stopped
@@ -230,6 +263,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.frontend
+      args:
+        VITE_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        VITE_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
     container_name: quant-backtest-frontend
     restart: unless-stopped
     depends_on:
@@ -237,6 +273,32 @@ services:
         condition: service_healthy
     ports:
       - '${APP_HTTP_PORT:-8080}:80'
+    volumes:
+      - ./submission-gate:/var/run/quant-backtest-submission-gate:ro
+    networks:
+      - quant-backtest-net
+
+  release-admin:
+    image: quant-backtest-release-admin:1
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    profiles: ['release-admin']
+    restart: 'no'
+    env_file:
+      - .env
+    environment:
+      TREND_GRID_DATABASE_URL: postgresql://quant_backtest_release_admin:${RELEASE_DB_PASSWORD:-}@postgres:5432/${APP_DB_NAME}
+      TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+      TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ['python', '-m', 'backend.release_publish']
     networks:
       - quant-backtest-net
 

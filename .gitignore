@@ -18,6 +18,8 @@ storage/
 artifacts/
 backend/strategies/*
 !backend/strategies/runtime_contract.py
+!backend/strategies/generate_runtime_manifest.py
+!backend/strategies/runtime_manifest.json
 
 # Secrets and local configuration
 .env

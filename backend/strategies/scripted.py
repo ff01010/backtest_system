@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 from typing import Any, Sequence
 
 from backend.backtesting.models import (
@@ -17,9 +18,15 @@ from backend.services.backtest_errors import StrategyExecutionError
 from backend.strategies.runtime_contract import (
   BLOCKED_BUILTIN_NAMES,
   RUNTIME_BUILTINS,
+  SUPPORTED_QUANT_IMPORTS,
+  SUPPORTED_STANDARD_LIBRARY_MODULES,
+  RuntimeDependencyLoadError,
+  RuntimeDependencyMissingError,
+  StrategyModuleUnavailableError,
+  StrategyRuntimeCapabilityError,
   StrategyRuntimePolicyError,
   StrategyRuntimeVersionError,
-  validate_runtime_version,
+  validate_runtime_capability,
 )
 from backend.strategies.script_time_context import ScriptTimeContextError, normalize_script_bar_time
 
@@ -76,6 +83,39 @@ class _ScriptValidator(ast.NodeVisitor):
     self.generic_visit(node)
 
 
+def _static_imports(tree: ast.Module) -> list[str]:
+  modules: set[str] = set()
+  for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+      modules.update(alias.name for alias in node.names)
+    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+      modules.add(node.module)
+  return sorted(modules)
+
+
+def _validate_static_imports(tree: ast.Module) -> None:
+  """只预检静态模块是否可发现，不执行用户源码或维护允许名单。"""
+  for requested_module in _static_imports(tree):
+    top_level = requested_module.partition(".")[0]
+    try:
+      available = importlib.util.find_spec(top_level) is not None
+    except (ImportError, AttributeError, ValueError) as error:
+      if top_level in SUPPORTED_QUANT_IMPORTS:
+        raise RuntimeDependencyLoadError(
+          requested_module, SUPPORTED_QUANT_IMPORTS[top_level],
+        ) from error
+      raise StrategyModuleUnavailableError(requested_module) from error
+    if available:
+      continue
+    if top_level in SUPPORTED_QUANT_IMPORTS:
+      raise RuntimeDependencyMissingError(
+        requested_module, top_level, SUPPORTED_QUANT_IMPORTS[top_level],
+      )
+    if top_level in SUPPORTED_STANDARD_LIBRARY_MODULES:
+      raise RuntimeDependencyMissingError(requested_module, top_level, "python-stdlib")
+    raise StrategyModuleUnavailableError(requested_module)
+
+
 def validate_script_code(code: str) -> None:
   """校验脚本语法及可选的 L2 事件回调接口。"""
   try:
@@ -84,6 +124,7 @@ def validate_script_code(code: str) -> None:
     raise ValueError(f"Python 语法错误: 第 {error.lineno} 行 {error.msg}") from error
   warmup_trading_days_for_script(code)
   _ScriptValidator().visit(tree)
+  _validate_static_imports(tree)
   callback = next(
     (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "on_bar"),
     None,
@@ -172,12 +213,19 @@ class ScriptedBarStrategy:
     params: dict[str, Any],
     quote_mode: str | None = None,
     runtime_version: str | None = None,
+    capability_digest: str | None = None,
   ) -> None:
     try:
-      validate_runtime_version(runtime_version)
+      validate_runtime_capability(runtime_version, capability_digest)
       validate_script_code(code)
       self._quote_mode = quote_mode_for_script(code, quote_mode)
-    except (ValueError, StrategyRuntimeVersionError) as error:
+    except (
+      RuntimeDependencyLoadError,
+      RuntimeDependencyMissingError,
+      StrategyRuntimeCapabilityError,
+      StrategyRuntimeVersionError,
+      ValueError,
+    ) as error:
       raise StrategyExecutionError.from_exception(error) from error
     namespace: dict[str, Any] = {
       "__builtins__": RUNTIME_BUILTINS,

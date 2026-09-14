@@ -477,6 +477,7 @@ def _max_drawdown_amount(initial_capital: float, holdings: Iterable[dict[str, An
 def _build_manifest(raw_result: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
   script = payload.get("savedScriptSnapshot") or payload.get("versionScriptSnapshot")
   runtime_version = script.get("runtimeVersion") if isinstance(script, dict) else None
+  capability_digest = script.get("capabilityDigest") if isinstance(script, dict) else None
   return {
     "engineVersion": "l2-quote-v1",
     "signalModel": "on_bar_script",
@@ -494,6 +495,9 @@ def _build_manifest(raw_result: dict[str, Any], payload: dict[str, Any]) -> dict
     "t0Enabled": bool(payload.get("t0Enabled", False)),
     "executionEnvironment": "l2-runner",
     "strategyRuntimeVersion": str(runtime_version or "legacy"),
+    "strategyRuntimeCapabilityDigest": str(
+      capability_digest or payload.get("capabilityDigest") or "legacy"
+    ),
     "executionAlgorithm": str(payload.get("executionAlgorithm") or "immediate"),
     "executionParameters": _mapping(payload.get("executionParameters")),
     "orderEventCount": len(_records(raw_result.get("orders"))),

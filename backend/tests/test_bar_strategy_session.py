@@ -5,6 +5,7 @@ import time
 import pytest
 
 from backend.bar_strategy_session import BarStrategySession
+from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
 
 
 def _payload(code: str) -> dict[str, object]:
@@ -27,7 +28,8 @@ def _payload(code: str) -> dict[str, object]:
     "baseCostPrice": 0,
     "t0Enabled": False,
     "warmupBarCount": 0,
-    "runtimeVersion": "python3.12-runtime-v2",
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
 
 
@@ -50,6 +52,36 @@ def on_bar(bar, state):
 """))
 
   assert len(result["portfolioSnapshots"]) == 1
+
+
+def test_bar_strategy_session_supports_talib_with_bounded_numeric_threads() -> None:
+  payload = _payload("""
+import os
+import numpy as np
+import talib
+
+NUMERIC_THREAD_NAMES = (
+  'OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS',
+)
+
+
+def on_bar(bar, state):
+  values = np.asarray([1.0, 2.0, 3.0], dtype=float)
+  sma = talib.SMA(values, timeperiod=3)[-1]
+  threads_are_bounded = all(os.environ.get(name) == '1' for name in NUMERIC_THREAD_NAMES)
+  if bar['time'] == '20260901093500' and np.isfinite(sma) and threads_are_bounded:
+    return [{'action': 'buy_open', 'quantity': int(np.int64(200)), 'reason': 'TA-Lib SMA'}]
+  return []
+""")
+  payload["bars"].append({
+    "time": "20260901094000", "symbol": "688981.SH", "open": 10,
+    "high": 10, "low": 10, "close": 10, "volume": 1000,
+  })
+
+  result = BarStrategySession().run_script(payload)
+
+  assert len(result["trades"]) == 1
+  assert result["trades"][0]["quantity"] == 200
 
 
 def test_bar_strategy_session_terminates_blocked_strategy_on_cancel() -> None:

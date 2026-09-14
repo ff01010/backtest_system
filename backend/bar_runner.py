@@ -14,6 +14,11 @@ from backend.bar_strategy_session import BarStrategySession
 from backend.services import backtest_runner, research_result_outbox, state_store
 from backend.services.backtest_errors import error_summary
 from backend.services.system_error_log import system_error_log_record
+from backend.strategies.runtime_contract import (
+  RUNTIME_CAPABILITY_DIGEST,
+  SCRIPT_RUNTIME_VERSION,
+  run_runtime_deep_probe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +43,10 @@ class BarRunner:
     backoff_seconds = 1.0
     while True:
       try:
-        job = state_store.claim_bar_backtest_job(self._worker_id, settings.L2_JOB_LEASE_SECONDS)
+        job = state_store.claim_bar_backtest_job(
+          self._worker_id, settings.L2_JOB_LEASE_SECONDS,
+          SCRIPT_RUNTIME_VERSION, RUNTIME_CAPABILITY_DIGEST,
+        )
       except state_store.DatabaseError as error:
         self._handle_database_error(error, backoff_seconds)
         backoff_seconds = min(
@@ -77,6 +85,7 @@ class BarRunner:
     try:
       state_store.record_backtest_runner_heartbeat(
         self._worker_id, "bar", status, current_run_id, error_code,
+        SCRIPT_RUNTIME_VERSION, RUNTIME_CAPABILITY_DIGEST,
       )
       self._health_signature = signature
       self._health_written_at = now
@@ -84,7 +93,10 @@ class BarRunner:
       logger.exception("Bar Runner 健康心跳写入失败")
 
   def run_once(self) -> bool:
-    job = state_store.claim_bar_backtest_job(self._worker_id, settings.L2_JOB_LEASE_SECONDS)
+    job = state_store.claim_bar_backtest_job(
+      self._worker_id, settings.L2_JOB_LEASE_SECONDS,
+      SCRIPT_RUNTIME_VERSION, RUNTIME_CAPABILITY_DIGEST,
+    )
     if job is None:
       return False
     self._run_job(job)
@@ -168,6 +180,7 @@ class _BarJobLeaseKeeper:
 
 def main() -> None:
   logging.basicConfig(level=os.getenv("TREND_GRID_LOG_LEVEL", "INFO"))
+  run_runtime_deep_probe()
   state_store.ensure_schema()
   BarRunner().run_forever()
 

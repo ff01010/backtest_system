@@ -323,12 +323,16 @@ export interface BacktestErrorDetail {
   missingName?: string | null;
   strategyLine?: number | null;
   runtimeVersion?: string | null;
+  requestedModule?: string | null;
+  missingModule?: string | null;
+  supportedPackage?: string | null;
 }
 
 export interface ExperimentManifest {
   experimentHash: string;
   engineVersion: string;
   strategyRuntimeVersion?: string;
+  strategyRuntimeCapabilityDigest?: string;
   signalModel: string;
   fillModel: string;
   randomSeed: number;
@@ -498,4 +502,27 @@ export interface DataStatus {
   gapDates: DataGapDate[];
   preview: KlinePreviewRow[];
   error?: string;
+}
+
+export interface ReleaseNotice {
+  id: string;
+  releaseNo: number;
+  version: string;
+  title: string;
+  summary: string;
+  highlights: string[];
+  level: 'normal' | 'important' | 'mandatory';
+  publishedAt: string;
+}
+
+export interface ReleaseStatus {
+  serverBuildId: string;
+  requiredClientCompatibilityVersion: number;
+  clientOutdated: boolean;
+  activationKind: 'release' | 'silent' | 'rollback';
+  presentationMode: 'mandatory_gate' | 'release_notice' | 'version_mismatch' | 'rollback_mismatch' | 'none';
+  acknowledged: boolean;
+  unread: boolean;
+  upgradeRequired: boolean;
+  release: ReleaseNotice | null;
 }

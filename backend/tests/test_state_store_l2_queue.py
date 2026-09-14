@@ -71,7 +71,14 @@ def test_claim_l2_job_uses_transaction_scoped_fair_scheduler_lock(monkeypatch: A
   assert "UNION ALL" in claim_query
   assert "ORDER BY owner_active_count" in claim_query
   assert "%s::text IS NULL" in claim_query
-  assert claim_params == (None, None)
+  assert claim_params == (
+    state_store.SCRIPT_RUNTIME_VERSION,
+    state_store.RUNTIME_CAPABILITY_DIGEST,
+    state_store.SCRIPT_RUNTIME_VERSION,
+    state_store.RUNTIME_CAPABILITY_DIGEST,
+    None,
+    None,
+  )
 
 
 def test_runner_availability_uses_fresh_ready_or_running_heartbeat(monkeypatch: Any) -> None:
@@ -84,7 +91,12 @@ def test_runner_availability_uses_fresh_ready_or_running_heartbeat(monkeypatch: 
   query, params = cursor.commands[0]
   assert "status IN ('ready', 'running')" in query
   assert "heartbeat_at >=" in query
-  assert params == ("bar", state_store.settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS)
+  assert params == (
+    "bar",
+    state_store.SCRIPT_RUNTIME_VERSION,
+    state_store.RUNTIME_CAPABILITY_DIGEST,
+    state_store.settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS,
+  )
 
 
 def test_runner_availability_accepts_visible_healthy_heartbeat(monkeypatch: Any) -> None:
@@ -136,6 +148,51 @@ def test_claim_l2_job_preserves_attempt_token_result_contract(monkeypatch: Any) 
   assert "INSERT INTO backtest_execution_slot" in cursor.commands[7][0]
   assert "UPDATE backtest_run SET status='running'" in cursor.commands[8][0]
   assert cursor.commands[8][1] == ("run-1",)
+
+  claim_update, claim_params = cursor.commands[6]
+  assert "runtime_version=%s AND capability_digest=%s" in claim_update
+  assert claim_params is not None
+  assert claim_params[-2:] == (
+    state_store.SCRIPT_RUNTIME_VERSION,
+    state_store.RUNTIME_CAPABILITY_DIGEST,
+  )
+
+
+def test_queued_job_freezes_runtime_route_in_columns_and_payload(monkeypatch: Any) -> None:
+  cursor = FakeCursor(None)
+  monkeypatch.setattr(
+    state_store, "_create_backtest_run_row", lambda *_: ("run-42", 42),
+  )
+  monkeypatch.setattr(state_store, "_save_research_signal_snapshot", lambda *_: None)
+
+  result = state_store._create_queued_backtest_job(
+    cursor, {"symbol": "688981.SH"}, "user-1", "bar_backtest_job", "bar_next_open",
+  )
+
+  assert result == ("run-42", 42)
+  insert_query, insert_params = cursor.commands[1]
+  assert "runtime_version, capability_digest" in insert_query
+  assert insert_params is not None
+  assert insert_params[-2:] == (
+    state_store.SCRIPT_RUNTIME_VERSION,
+    state_store.RUNTIME_CAPABILITY_DIGEST,
+  )
+  assert insert_params[2].obj["runtimeVersion"] == state_store.SCRIPT_RUNTIME_VERSION
+  assert insert_params[2].obj["capabilityDigest"] == state_store.RUNTIME_CAPABILITY_DIGEST
+
+
+def test_runtime_routing_migration_is_idempotent_and_indexes_both_job_types() -> None:
+  migration = (
+    Path(__file__).resolve().parents[2]
+    / "db" / "migrations" / "026_strategy_runtime_capability_routing.sql"
+  ).read_text(encoding="utf-8")
+
+  assert migration.count("ADD COLUMN IF NOT EXISTS runtime_version") == 3
+  assert migration.count("ADD COLUMN IF NOT EXISTS capability_digest") == 3
+  assert "ix_bar_backtest_job_runtime_claim" in migration
+  assert "ix_l2_backtest_job_runtime_claim" in migration
+  assert "runtime.dependency_missing" in migration
+  assert "runtime.dependency_load_failed" in migration
 
 
 def test_global_scheduler_uses_fairness_burst_for_user_without_slot(monkeypatch: Any) -> None:
@@ -300,7 +357,14 @@ def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypa
   assert "DELETE FROM backtest_execution_slot" in cursor.commands[3][0]
   claim_query, claim_params = cursor.commands[4]
   assert "UNION ALL" in claim_query
-  assert claim_params == (None, None)
+  assert claim_params == (
+    state_store.SCRIPT_RUNTIME_VERSION,
+    state_store.RUNTIME_CAPABILITY_DIGEST,
+    state_store.SCRIPT_RUNTIME_VERSION,
+    state_store.RUNTIME_CAPABILITY_DIGEST,
+    None,
+    None,
+  )
 
 def test_save_research_signal_snapshot_reuses_matching_artifact(
   tmp_path: Path,

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """数据路径和 PostgreSQL 连接配置。"""
 
+import json
 import os
 import re
+from pathlib import Path
 
 
 def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -76,6 +78,29 @@ BACKTEST_BASE_CONCURRENCY = _read_bounded_int("TREND_GRID_BACKTEST_BASE_CONCURRE
 BACKTEST_BURST_MAX_CONCURRENCY = _read_bounded_int(
   "TREND_GRID_BACKTEST_BURST_MAX_CONCURRENCY", 12, BACKTEST_BASE_CONCURRENCY, 12,
 )
+
+# 应用构建标识用于识别浏览器是否仍在运行旧 frontend。
+APPLICATION_BUILD_ID = os.getenv("TREND_GRID_APPLICATION_BUILD_ID", "dev").strip().lower()
+CLIENT_COMPATIBILITY_VERSION = _read_bounded_int(
+  "TREND_GRID_CLIENT_COMPATIBILITY_VERSION", 1, 1, 1_000_000,
+)
+
+
+def validate_application_build_configuration() -> None:
+  """生产构建必须使用完整 Git SHA，开发环境允许固定 dev。"""
+  if APPLICATION_BUILD_ID != "dev" and not re.fullmatch(r"[0-9a-f]{40}", APPLICATION_BUILD_ID):
+    raise ValueError("TREND_GRID_APPLICATION_BUILD_ID 必须为 dev 或 40 位小写 Git SHA")
+  image_metadata_path = Path("/app/build-info.json")
+  if not image_metadata_path.is_file():
+    return
+  try:
+    image_metadata = json.loads(image_metadata_path.read_text(encoding="utf-8"))
+  except (OSError, json.JSONDecodeError) as error:
+    raise ValueError("backend 镜像 build-info.json 无效") from error
+  if image_metadata.get("buildId") != APPLICATION_BUILD_ID:
+    raise ValueError("backend 运行时 buildId 与镜像内建 buildId 不一致")
+  if image_metadata.get("clientCompatibilityVersion") != CLIENT_COMPATIBILITY_VERSION:
+    raise ValueError("backend 运行时客户端兼容版本与镜像内建版本不一致")
 BACKTEST_USER_GUARANTEED_CONCURRENCY = _read_bounded_int(
   "TREND_GRID_BACKTEST_USER_GUARANTEED_CONCURRENCY", 1, 1, BACKTEST_BASE_CONCURRENCY,
 )

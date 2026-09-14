@@ -14,6 +14,8 @@ import type {
   StrategyConfigVersion,
   StrategyScript,
   StrategySource,
+  ReleaseNotice,
+  ReleaseStatus,
 } from '../types';
 
 const BASE = '/api';
@@ -25,6 +27,16 @@ export class BacktestRequestError extends Error {
     super(detail.message);
     this.name = 'BacktestRequestError';
     this.detail = detail;
+  }
+}
+
+export class ReleaseApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ReleaseApiError';
+    this.status = status;
   }
 }
 
@@ -46,20 +58,73 @@ async function sendJson<T>(url: string, method: string, payload: unknown): Promi
   });
   if (!res.ok) {
     const text = await res.text();
-    let message = text;
-    try {
-      const body = JSON.parse(text) as { detail?: unknown };
-      if (typeof body.detail === 'string') message = body.detail;
-    } catch {
-      // 非 JSON 错误保留服务端原文，便于诊断代理层问题。
-    }
+    const message = getApiErrorMessage(text);
     throw new Error(message || `API ${res.status}: 请求失败`);
   }
   return res.json();
 }
 
+function getApiErrorMessage(text: string): string {
+  try {
+    const body = JSON.parse(text) as { detail?: unknown };
+    if (typeof body.detail === 'string') return body.detail;
+    if (!body.detail || typeof body.detail !== 'object') return text;
+    const detail = body.detail as {
+      message?: unknown;
+      errorDetail?: { message?: unknown; hint?: unknown };
+    };
+    const message = typeof detail.errorDetail?.message === 'string'
+      ? detail.errorDetail.message.trim()
+      : '';
+    const hint = typeof detail.errorDetail?.hint === 'string'
+      ? detail.errorDetail.hint.trim()
+      : '';
+    if (message) return hint && hint !== message ? `${message}；${hint}` : message;
+    return typeof detail.message === 'string' ? detail.message : text;
+  } catch {
+    // 非 JSON 错误保留服务端原文，便于诊断代理层问题。
+    return text;
+  }
+}
+
 export async function fetchHealth(): Promise<{ status: string }> {
   return fetchJson(`${BASE}/health`);
+}
+
+export async function fetchReleaseStatus(
+  clientBuildId: string,
+  clientCompatibilityVersion: number,
+  etag?: string,
+): Promise<{ status: ReleaseStatus | null; etag: string | null }> {
+  const query = new URLSearchParams({
+    clientBuildId,
+    clientCompatibilityVersion: String(clientCompatibilityVersion),
+  });
+  const res = await fetch(`${BASE}/releases/status?${query}`, {
+    credentials: 'include',
+    headers: etag ? { 'If-None-Match': etag } : {},
+  });
+  if (res.status === 304) return { status: null, etag: etag ?? null };
+  if (!res.ok) throw new ReleaseApiError(res.status, `API ${res.status}: ${await res.text()}`);
+  return { status: await res.json() as ReleaseStatus, etag: res.headers.get('ETag') };
+}
+
+export async function acknowledgeRelease(releaseId: string, clientBuildId: string): Promise<void> {
+  const res = await fetch(`${BASE}/releases/${encodeURIComponent(releaseId)}/acknowledge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clientBuildId }),
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new ReleaseApiError(res.status, getApiErrorMessage(body) || `API ${res.status}: 请求失败`);
+  }
+}
+
+export async function fetchReleaseHistory(): Promise<ReleaseNotice[]> {
+  const data = await fetchJson<{ items: ReleaseNotice[] }>(`${BASE}/releases?limit=50`);
+  return data.items;
 }
 
 export async function fetchStrategyGuide(): Promise<{ title: string; content: string }> {
@@ -120,9 +185,11 @@ export interface SystemErrorLogEntry {
 
 export interface StrategyRuntimeErrorStat {
   date: string;
-  code: 'runtime.contract_missing' | 'runtime.version_mismatch';
+  code: 'runtime.contract_missing' | 'runtime.version_mismatch'
+    | 'runtime.dependency_missing' | 'runtime.dependency_load_failed';
   runtimeVersion: string;
   missingName: string | null;
+  missingModule: string | null;
   count: number;
   lastOccurredAt: string;
 }

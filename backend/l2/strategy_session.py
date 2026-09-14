@@ -17,9 +17,11 @@ from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot, TradeEvent
 from backend.services.backtest_errors import RemoteBacktestError, error_detail
 from backend.strategies.runtime_contract import (
+  RUNTIME_CAPABILITY_DIGEST,
   SCRIPT_RUNTIME_VERSION,
   drop_strategy_process_privileges,
   missing_name,
+  restore_numeric_thread_environment,
   strategy_source_line,
 )
 from backend.strategies.scripted import ScriptedBarStrategy
@@ -202,11 +204,13 @@ def _engine_process_main(connection: Connection, payload: dict[str, Any]) -> Non
   """策略子进程入口；不继承服务配置，只处理父进程提供的数据块。"""
   try:
     os.environ.clear()
+    restore_numeric_thread_environment()
     drop_strategy_process_privileges()
     strategy = ScriptedBarStrategy(
       str(payload["scriptId"]), str(payload["code"]), dict(payload.get("params") or {}),
       str(payload.get("quoteMode") or "order_driven"),
       str(payload.get("runtimeVersion") or "legacy"),
+      str(payload.get("capabilityDigest") or "legacy"),
     )
     engine = _build_engine(payload, strategy)
     engine.initialize_base_position(str(payload["symbol"]))
@@ -316,6 +320,7 @@ def _error_diagnostic(error: Exception) -> dict[str, str]:
     "reason": _redact_diagnostic_text(str(cause))[:500],
     "trace": _trace_summary(cause),
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "__internal_raw_message": str(cause),
     "__internal_raw_traceback": "".join(traceback.format_exception(type(cause), cause, cause.__traceback__)),
   }
@@ -357,6 +362,7 @@ def _session_payload(payload: dict[str, Any]) -> dict[str, Any]:
     "params": dict(payload.get("params") or {}),
     "quoteMode": str(payload.get("quoteMode") or "order_driven"),
     "runtimeVersion": str(payload.get("runtimeVersion") or "legacy"),
+    "capabilityDigest": str(payload.get("capabilityDigest") or "legacy"),
     "symbol": str(payload["symbol"]),
     "initialCapital": float(payload["initialCapital"]),
     "commissionRate": float(payload["commissionRate"]),

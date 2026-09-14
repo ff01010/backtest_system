@@ -39,13 +39,23 @@ from backend.strategies.scripted import (
   warmup_trading_days_for_script,
   validate_script_code,
 )
-from backend.strategies.runtime_contract import SCRIPT_RUNTIME_VERSION, StrategyRuntimePolicyError
+from backend.strategies.runtime_contract import (
+  RUNTIME_CAPABILITY_DIGEST,
+  RuntimeDependencyLoadError,
+  RuntimeDependencyMissingError,
+  SCRIPT_RUNTIME_VERSION,
+  StrategyModuleUnavailableError,
+  StrategyRuntimePolicyError,
+  declared_runtime_capabilities,
+  run_runtime_deep_probe,
+)
 from backend.services import (
   backtest_preflight,
   backtest_runner,
   market_data,
   qmt_instrument_directory,
   data_repository,
+  release_notifications,
   research_signal_snapshot,
   state_store,
   strategy_adapters,
@@ -58,6 +68,7 @@ from backend.services.user_context import get_current_user, reset_current_user, 
 
 app = FastAPI(title="Trend Grid Viewer", version="0.1.0")
 logger = logging.getLogger(__name__)
+_verified_runtime_capabilities = declared_runtime_capabilities()
 
 
 def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, Any]:
@@ -66,7 +77,10 @@ def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, A
 
 def _backtest_failure_response(error: Exception, run_id: str | None) -> HTTPException:
   detail = error_detail(error, run_id).to_dict()
-  status_code = 404 if detail["code"] == "data.unavailable" else 422
+  if detail["code"] == "data.unavailable":
+    status_code = 404
+  else:
+    status_code = 503 if detail["category"] == "system_error" else 422
   return HTTPException(status_code, {"errorDetail": detail})
 
 
@@ -76,14 +90,14 @@ def _sync_system_error_record(error: Exception, run_id: str) -> dict[str, Any] |
 
 
 @app.on_event("startup")
-def sync_qmt_instrument_directory() -> None:
-  """用已预置的 QMT 快照刷新 PostgreSQL 搜索目录。"""
+def sync_instrument_directory() -> None:
+  """用统一证券主数据刷新 PostgreSQL 搜索目录。"""
   try:
     count = qmt_instrument_directory.sync_market_instruments()
   except Exception as error:
-    logger.warning("QMT 证券目录同步跳过: %s", error)
+    logger.warning("统一证券目录同步跳过: %s", error)
   else:
-    logger.info("QMT 证券目录已同步 %s 条", count)
+    logger.info("统一证券目录已同步 %s 条", count)
 
 app.add_middleware(
   CORSMiddleware,
@@ -269,6 +283,14 @@ def _validate_strategy_script(payload: dict) -> None:
   except StrategyRuntimePolicyError as error:
     detail = StrategyExecutionError.from_exception(error).detail.to_dict()
     raise HTTPException(422, {"errorDetail": detail}) from error
+  except (
+    RuntimeDependencyLoadError,
+    RuntimeDependencyMissingError,
+    StrategyModuleUnavailableError,
+  ) as error:
+    detail = StrategyExecutionError.from_exception(error).detail
+    status_code = 503 if detail.category == "system_error" else 422
+    raise HTTPException(status_code, {"errorDetail": detail.to_dict()}) from error
   except ValueError as error:
     raise HTTPException(422, str(error)) from error
   except SyntaxError as error:
@@ -364,6 +386,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "signalRequired": signal_required,
     "codeHash": hashlib.sha256(script["code"].encode("utf-8")).hexdigest(),
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
   request["savedScriptSnapshot"] = request["versionScriptSnapshot"]
   request["savedConfigSnapshot"] = {
@@ -375,6 +398,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "warmupTradingDays": warmup_days,
     "signalRequired": signal_required,
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "execution": execution_algorithm_snapshot(
       str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
     ),
@@ -591,8 +615,11 @@ def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
 
 @app.on_event("startup")
 def startup():
+  global _verified_runtime_capabilities
+  _verified_runtime_capabilities = run_runtime_deep_probe()
   settings.validate_public_api_configuration()
   settings.validate_research_integration_configuration()
+  settings.validate_application_build_configuration()
   state_store.ensure_schema()
   state_store.prune_strategy_runtime_error_stats()
 
@@ -604,7 +631,68 @@ def health():
     "status": runner_health["status"],
     "backtest": "ok" if runner_health["status"] == "ok" else "unavailable",
     "strategyRuntimeVersion": SCRIPT_RUNTIME_VERSION,
+    "applicationBuildId": settings.APPLICATION_BUILD_ID,
+    "clientCompatibilityVersion": settings.CLIENT_COMPATIBILITY_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    "runtimeCapabilities": _verified_runtime_capabilities,
   }
+
+
+def _release_cache_headers() -> dict[str, str]:
+  return {
+    "Cache-Control": "private, no-cache",
+    "Vary": "Cookie",
+  }
+
+
+@app.get("/api/releases/status", response_model=schemas.ReleaseStatusResponse)
+def release_status(
+  request: Request,
+  response: Response,
+  clientBuildId: str = Query(pattern=r"^(dev|[0-9a-f]{40})$"),
+  clientCompatibilityVersion: int = Query(ge=1),
+):
+  try:
+    payload, etag = release_notifications.get_release_status(
+      clientBuildId, clientCompatibilityVersion,
+    )
+  except release_notifications.ReleaseStateUnavailable:
+    return JSONResponse(
+      status_code=503,
+      content={
+        "detail": {
+          "code": "release.state_unavailable",
+          "message": "版本通知暂不可用",
+        },
+      },
+      headers=_release_cache_headers(),
+    )
+  if request.headers.get("if-none-match") == etag:
+    return Response(status_code=304, headers={**_release_cache_headers(), "ETag": etag})
+  for name, value in _release_cache_headers().items():
+    response.headers[name] = value
+  response.headers["ETag"] = etag
+  return payload
+
+
+@app.post("/api/releases/{release_id}/acknowledge")
+def release_acknowledge(release_id: str, payload: schemas.ReleaseAcknowledgeRequest):
+  try:
+    result = release_notifications.acknowledge_release(release_id, payload.clientBuildId)
+  except state_store.ConflictError as error:
+    if str(error) == "release.notice_stale":
+      raise HTTPException(409, {"code": "release.notice_stale", "message": "公告已更新"}) from error
+    raise
+  return JSONResponse(content=result, headers=_release_cache_headers())
+
+
+@app.get("/api/releases", response_model=schemas.ReleaseHistoryResponse)
+def release_history(limit: int = Query(default=20, ge=1, le=50), cursor: str | None = None):
+  try:
+    result = release_notifications.list_published_releases(limit, cursor)
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
+  return JSONResponse(content=result, headers=_release_cache_headers())
 
 
 def _require_backtest_runner(fill_model: str) -> None:
@@ -988,7 +1076,11 @@ def create_strategy_script(payload: schemas.StrategyScriptCreate):
   _validate_strategy_script(request)
   try:
     script = state_store.create_strategy_script(request)
-    return {"script": {**script, "runtimeVersion": SCRIPT_RUNTIME_VERSION}}
+    return {"script": {
+      **script,
+      "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+      "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    }}
   except state_store.ConflictError as error:
     raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as e:
@@ -1001,7 +1093,11 @@ def update_strategy_script(script_id: str, payload: schemas.StrategyScriptUpdate
   _validate_strategy_script(request)
   try:
     script = state_store.update_strategy_script(script_id, request)
-    return {"script": {**script, "runtimeVersion": SCRIPT_RUNTIME_VERSION}}
+    return {"script": {
+      **script,
+      "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+      "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    }}
   except KeyError:
     raise HTTPException(404, f"策略脚本不存在: {script_id}")
   except state_store.ConflictError as error:
@@ -1073,7 +1169,11 @@ def save_complete_strategy(payload: schemas.CompleteStrategySave):
       script_request, config_request, payload.scriptId, payload.configId,
       payload.expectedRevision,
     )
-    return {**saved, "runtimeVersion": SCRIPT_RUNTIME_VERSION}
+    return {
+      **saved,
+      "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+      "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    }
   except KeyError as error:
     raise HTTPException(404, "策略脚本或策略配置不存在") from error
   except state_store.ConflictError as error:

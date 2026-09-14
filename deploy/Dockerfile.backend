@@ -1,14 +1,33 @@
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
 WORKDIR /app
 
-COPY backend/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+ARG APPLICATION_BUILD_ID=dev
+ARG CLIENT_COMPATIBILITY_VERSION=1
+
+LABEL io.trend-grid.application-build-id=$APPLICATION_BUILD_ID \
+  io.trend-grid.client-compatibility-version=$CLIENT_COMPATIBILITY_VERSION
+
+ENV OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
+
+COPY backend/requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir --only-binary=:all: --require-hashes -r /tmp/requirements.lock \
+  && pip check
 
 COPY backend /app/backend
+COPY deploy/release-manifest.json /app/deploy/release-manifest.json
 COPY docs/玄龄回测系统使用手册.md /app/docs/玄龄回测系统使用手册.md
+RUN printf '{"buildId":"%s","clientCompatibilityVersion":%s}\n' \
+      "$APPLICATION_BUILD_ID" "$CLIENT_COMPATIBILITY_VERSION" \
+      > /app/build-info.json \
+  && python -m backend.strategies.runtime_contract --deep-probe
 
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app \
+    TREND_GRID_APPLICATION_BUILD_ID=$APPLICATION_BUILD_ID \
+    TREND_GRID_CLIENT_COMPATIBILITY_VERSION=$CLIENT_COMPATIBILITY_VERSION
 EXPOSE 8000
 
 CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]

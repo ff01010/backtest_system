@@ -8,7 +8,9 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Iterator
+from uuid import uuid4
 
 import psycopg
 from psycopg.errors import IntegrityError
@@ -17,7 +19,15 @@ from psycopg.types.json import Jsonb
 
 from backend import settings
 from backend.services.user_context import get_current_user
-from backend.strategies.runtime_contract import SCRIPT_RUNTIME_VERSION, is_standard_builtin_name
+from backend.strategies.runtime_contract import (
+  RUNTIME_CAPABILITY_DIGEST,
+  SCRIPT_RUNTIME_VERSION,
+  SUPPORTED_QUANT_IMPORTS,
+  SUPPORTED_QUANT_PACKAGE_VERSIONS,
+  SUPPORTED_STANDARD_LIBRARY_MODULES,
+  is_safe_module_name,
+  is_standard_builtin_name,
+)
 from backend.time_utils import format_shanghai_datetime
 
 
@@ -64,11 +74,11 @@ def _db() -> Iterator[psycopg.Connection[Any]]:
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
       with conn.cursor() as cur:
         cur.execute(
-          "SELECT set_config('app.current_user_id', %s, false)",
+          "SELECT set_config('app.current_user_id', %s, true)",
           (current_user_id(),),
         )
         cur.execute(
-          "SELECT set_config('app.current_is_admin', %s, false)",
+          "SELECT set_config('app.current_is_admin', %s, true)",
           ("true" if current_user_is_admin() else "false",),
         )
       yield conn
@@ -92,6 +102,16 @@ def ensure_schema() -> None:
       cur.execute("SELECT to_regclass('public.backtest_runner_health') AS health_table")
       if cur.fetchone()["health_table"] is None:
         raise DatabaseError("数据库缺少 Runner 健康迁移 022，请先运行 deploy 的 migrate 服务")
+      cur.execute("SELECT to_regclass('public.app_release') AS release_table")
+      if cur.fetchone()["release_table"] is None:
+        raise DatabaseError("数据库缺少发布通知迁移 027，请先运行 deploy 的 migrate 服务")
+      cur.execute("""
+        SELECT to_regprocedure(
+          'app.acknowledge_release(uuid,uuid,character varying)'
+        ) AS acknowledge_function
+      """)
+      if cur.fetchone()["acknowledge_function"] is None:
+        raise DatabaseError("数据库缺少发布权限迁移 028，请先运行 deploy 的 migrate 服务")
       cur.execute("""
         SELECT EXISTS (
           SELECT 1 FROM information_schema.columns
@@ -104,6 +124,136 @@ def ensure_schema() -> None:
       cur.execute("SELECT to_regclass('public.strategy_runtime_error_stat') AS runtime_error_table")
       if cur.fetchone()["runtime_error_table"] is None:
         raise DatabaseError("数据库缺少策略运行时错误统计迁移 025，请先运行 deploy 的 migrate 服务")
+
+
+def get_release_status_record() -> dict[str, Any] | None:
+  """返回当前部署、有效公告和当前用户回执。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT d.current_build_id, d.required_client_version,
+          d.current_notice_id, d.activation_kind, d.generation, d.activated_at,
+          r.release_no, r.version, r.title, r.summary, r.highlights,
+          r.level, r.status, r.manifest_digest, r.published_at,
+          (receipt.user_id IS NOT NULL) AS acknowledged
+        FROM app_deployment_state d
+        LEFT JOIN app_release r ON r.id=d.current_notice_id
+        LEFT JOIN app_release_receipt receipt
+          ON receipt.release_id=r.id AND receipt.user_id=%s
+        WHERE d.singleton_key=true
+      """, (current_user_id(),))
+      return cur.fetchone()
+
+
+def acknowledge_release(release_id: str, client_build_id: str) -> bool:
+  """确认当前有效公告；公告已切换时返回 False。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT app.acknowledge_release(%s, %s, %s) AS acknowledged",
+        (release_id, current_user_id(), client_build_id),
+      )
+      return bool(cur.fetchone()["acknowledged"])
+
+
+def list_release_records(
+  limit: int, cursor: tuple[datetime, int] | None,
+) -> list[dict[str, Any]]:
+  """按发布序号倒序返回用户可见公告。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      if cursor is None:
+        cur.execute("""
+          SELECT id, release_no, version, title, summary, highlights, level, published_at
+          FROM app_release
+          WHERE status='published' AND notify_users
+          ORDER BY published_at DESC, release_no DESC LIMIT %s
+        """, (limit,))
+      else:
+        cur.execute("""
+          SELECT id, release_no, version, title, summary, highlights, level, published_at
+          FROM app_release
+          WHERE status='published' AND notify_users
+            AND (published_at, release_no) < (%s, %s)
+          ORDER BY published_at DESC, release_no DESC LIMIT %s
+        """, (cursor[0], cursor[1], limit))
+      return list(cur.fetchall())
+
+
+def bootstrap_deployment(build_id: str, client_version: int, deployment_id: str) -> dict[str, Any]:
+  """首次上线时创建唯一部署状态。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT app.bootstrap_deployment(%s, %s, %s) AS result",
+        (build_id, client_version, deployment_id),
+      )
+      return dict(cur.fetchone()["result"])
+
+
+def activate_release_record(
+  manifest: dict[str, Any], build_id: str, manifest_digest: str,
+  deployment_id: str, expected_generation: int,
+) -> dict[str, Any]:
+  """幂等登记公告，并用代际 CAS 激活部署。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT app.activate_release(
+          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        ) AS result
+      """, (
+        str(uuid4()), build_id, manifest_digest, manifest["version"],
+        manifest["clientCompatibilityVersion"], manifest["title"],
+        manifest["summary"], Jsonb(manifest["highlights"]), manifest["level"],
+        deployment_id, expected_generation,
+      ))
+      return dict(cur.fetchone()["result"])
+
+
+def activate_deployment_without_notice(
+  build_id: str, client_version: int, deployment_id: str,
+  expected_generation: int, activation_kind: str, keep_notice: bool,
+) -> dict[str, Any]:
+  """激活静默构建或回滚构建。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT app.activate_deployment_without_notice(
+          %s, %s, %s, %s, %s, %s
+        ) AS result
+      """, (
+        build_id, client_version, deployment_id, expected_generation,
+        activation_kind, keep_notice,
+      ))
+      return dict(cur.fetchone()["result"])
+
+
+def rollback_deployment(
+  build_id: str, client_version: int, deployment_id: str,
+  expected_generation: int, release_id: str | None,
+) -> dict[str, Any]:
+  """回滚到显式构建和公告，不根据历史顺序猜测。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT app.rollback_deployment(%s, %s, %s, %s, %s) AS result",
+        (build_id, client_version, deployment_id, expected_generation, release_id),
+      )
+      return dict(cur.fetchone()["result"])
+
+
+def withdraw_release_record(
+  release_id: str, deployment_id: str, expected_generation: int,
+) -> dict[str, Any]:
+  """撤回公告，并在其当前生效时清空公告指针。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT app.withdraw_release(%s, %s, %s) AS result",
+        (release_id, deployment_id, expected_generation),
+      )
+      return dict(cur.fetchone()["result"])
 
 
 def replace_trade_calendar(
@@ -266,18 +416,9 @@ def _instrument_id(cur: Any, symbol: str, name: str = "") -> int:
 def search_market_instruments(query: str, limit: int = 20) -> list[dict[str, Any]]:
   """按代码或名称搜索全局证券目录，不受当前用户范围限制。"""
   keyword = query.strip()
-  pattern = f"%{keyword}%"
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        SELECT symbol, exchange, display_name, instrument_type, board
-        FROM market_instrument
-        WHERE is_active=true
-          AND (%s = '' OR symbol ILIKE %s OR display_name ILIKE %s)
-        ORDER BY CASE WHEN symbol = %s THEN 0 WHEN symbol ILIKE %s THEN 1 ELSE 2 END,
-                 exchange, symbol
-        LIMIT %s
-      """, (keyword, pattern, pattern, keyword, f"{keyword}%", limit))
+      _execute_instrument_search(cur, keyword, limit)
       return [{
         "symbol": f"{row['symbol']}.{row['exchange']}",
         "name": row["display_name"],
@@ -285,6 +426,39 @@ def search_market_instruments(query: str, limit: int = 20) -> list[dict[str, Any
         "instrumentType": row["instrument_type"],
         "board": row["board"],
       } for row in cur.fetchall()]
+
+
+def _execute_instrument_search(cur: Any, keyword: str, limit: int) -> None:
+  code_match = re.fullmatch(r"(\d{6})(?:\.(SH|SZ|BJ))?", keyword.upper())
+  if code_match:
+    code, exchange = code_match.groups()
+    if exchange:
+      cur.execute("""
+        SELECT symbol, exchange, display_name, instrument_type, board
+        FROM market_instrument
+        WHERE is_active=true AND symbol=%s AND exchange=%s
+        ORDER BY exchange, symbol
+        LIMIT %s
+      """, (code, exchange, limit))
+      return
+    cur.execute("""
+      SELECT symbol, exchange, display_name, instrument_type, board
+      FROM market_instrument
+      WHERE is_active=true AND symbol=%s
+      ORDER BY exchange, symbol
+      LIMIT %s
+    """, (code, limit))
+    return
+  pattern = f"%{keyword}%"
+  cur.execute("""
+    SELECT symbol, exchange, display_name, instrument_type, board
+    FROM market_instrument
+    WHERE is_active=true
+      AND (%s = '' OR symbol ILIKE %s OR display_name ILIKE %s)
+    ORDER BY CASE WHEN symbol = %s THEN 0 WHEN symbol ILIKE %s THEN 1 ELSE 2 END,
+             exchange, symbol
+    LIMIT %s
+  """, (keyword, pattern, pattern, keyword, f"{keyword}%", limit))
 
 
 def upsert_market_instruments(items: list[Any]) -> int:
@@ -309,15 +483,15 @@ def upsert_market_instruments(items: list[Any]) -> int:
   return len(rows)
 
 
-def replace_market_instruments_from_qmt(items: list[dict[str, str | None]]) -> int:
-  """以完整 QMT 快照替换 PostgreSQL 中的有效股票目录。"""
+def replace_market_instruments_from_directory(items: list[dict[str, str | None]]) -> int:
+  """以完整证券主数据快照替换 PostgreSQL 中的有效股票目录。"""
   if not items:
     return 0
   rows = [
     (
       item["symbol"], item["exchange"], item["display_name"], item["instrument_type"],
-      item["board"], _qmt_secid(item["symbol"], item["exchange"]), item["list_date"],
-      item["delist_date"], Jsonb({"source": "qmt"}),
+      item["board"], _legacy_secid(item["symbol"], item["exchange"]), item["list_date"],
+      item["delist_date"], Jsonb({"source": item.get("source") or "unknown"}),
     )
     for item in items
   ]
@@ -348,9 +522,9 @@ def replace_market_instruments_from_qmt(items: list[dict[str, str | None]]) -> i
     raise DatabaseError(str(error)) from error
 
 
-def _qmt_secid(symbol: str | None, exchange: str | None) -> str:
+def _legacy_secid(symbol: str | None, exchange: str | None) -> str:
   if not symbol or not exchange:
-    raise DatabaseError("QMT 证券目录缺少代码或交易所")
+    raise DatabaseError("证券目录缺少代码或交易所")
   return f"{'1' if exchange == 'SH' else '0'}.{symbol}"
 
 
@@ -821,6 +995,7 @@ def _config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
     "entryType": config.get("entryType", "on_bar"),
     "signalRequired": bool(config.get("signalRequired", False)),
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
   return {
     "name": config["name"], "scriptId": config.get("scriptId"),
@@ -1057,6 +1232,7 @@ def _with_script_code_hash(payload: dict[str, Any]) -> dict[str, Any]:
       "entryType": script["entryType"],
       "signalRequired": bool(script.get("signalRequired", False)),
       "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+      "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     }
   normalized["paramsJson"] = params
   return normalized
@@ -1119,15 +1295,26 @@ def _create_queued_backtest_job(
   job_table: str,
   fill_model: str,
 ) -> tuple[str, int]:
-  run_id, display_no = _create_backtest_run_row(cur, payload, "queued", owner_user_id)
+  routed_payload = {
+    **payload,
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+  }
+  run_id, display_no = _create_backtest_run_row(cur, routed_payload, "queued", owner_user_id)
   cur.execute("UPDATE backtest_run SET fill_model=%s WHERE id=%s AND owner_user_id=%s", (
     fill_model, run_id, owner_user_id,
   ))
   cur.execute(f"""
-    INSERT INTO {job_table} (run_id, owner_user_id, payload)
-    VALUES (%s, %s, %s)
-  """, (run_id, owner_user_id, Jsonb(payload)))
-  _save_research_signal_snapshot(cur, run_id, owner_user_id, payload.get("researchSignalSnapshot"))
+    INSERT INTO {job_table} (
+      run_id, owner_user_id, payload, runtime_version, capability_digest
+    ) VALUES (%s, %s, %s, %s, %s)
+  """, (
+    run_id, owner_user_id, Jsonb(routed_payload),
+    SCRIPT_RUNTIME_VERSION, RUNTIME_CAPABILITY_DIGEST,
+  ))
+  _save_research_signal_snapshot(
+    cur, run_id, owner_user_id, routed_payload.get("researchSignalSnapshot"),
+  )
   return run_id, display_no
 
 
@@ -1288,7 +1475,12 @@ def _finalize_expired_backtest_jobs(cur: Any) -> None:
   cur.execute("DELETE FROM backtest_execution_slot WHERE lease_expires_at < now()")
 
 
-def _next_backtest_candidate(cur: Any, job_kind: str | None = None) -> dict[str, Any] | None:
+def _next_backtest_candidate(
+  cur: Any,
+  job_kind: str | None = None,
+  runtime_version: str = SCRIPT_RUNTIME_VERSION,
+  capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
+) -> dict[str, Any] | None:
   """在全局锁内按用户当前占用数、提交时间选择下一条任务。"""
   cur.execute("""
     SELECT candidate.*,
@@ -1299,16 +1491,21 @@ def _next_backtest_candidate(cur: Any, job_kind: str | None = None) -> dict[str,
       FROM bar_backtest_job
       WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
         AND NOT cancel_requested
+        AND runtime_version=%s AND capability_digest=%s
       UNION ALL
       SELECT 'l2' AS job_kind, run_id, owner_user_id, created_at
       FROM l2_backtest_job
       WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
         AND NOT cancel_requested
+        AND runtime_version=%s AND capability_digest=%s
     ) AS candidate
     WHERE (%s::text IS NULL OR candidate.job_kind=%s::text)
     ORDER BY owner_active_count, candidate.created_at, candidate.run_id
     LIMIT 1
-  """, (job_kind, job_kind))
+  """, (
+    runtime_version, capability_digest, runtime_version, capability_digest,
+    job_kind, job_kind,
+  ))
   return cur.fetchone()
 
 
@@ -1330,23 +1527,31 @@ def _record_backtest_runner_heartbeat(
   status: str,
   current_run_id: str | None = None,
   error_code: str | None = None,
+  runtime_version: str = SCRIPT_RUNTIME_VERSION,
+  capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
 ) -> None:
   """限频写入 Runner 心跳，不保存异常正文或敏感诊断。"""
   cur.execute("""
     INSERT INTO backtest_runner_health (
-      worker_id, job_kind, status, current_run_id, last_error_code
-    ) VALUES (%s, %s, %s, %s, %s)
+      worker_id, job_kind, status, current_run_id, last_error_code,
+      runtime_version, capability_digest
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (worker_id) DO UPDATE SET
       job_kind=EXCLUDED.job_kind, status=EXCLUDED.status,
       current_run_id=EXCLUDED.current_run_id, last_error_code=EXCLUDED.last_error_code,
+      runtime_version=EXCLUDED.runtime_version,
+      capability_digest=EXCLUDED.capability_digest,
       heartbeat_at=now()
     WHERE backtest_runner_health.heartbeat_at
         < now() - make_interval(secs => %s)
       OR backtest_runner_health.status IS DISTINCT FROM EXCLUDED.status
       OR backtest_runner_health.current_run_id IS DISTINCT FROM EXCLUDED.current_run_id
       OR backtest_runner_health.last_error_code IS DISTINCT FROM EXCLUDED.last_error_code
+      OR backtest_runner_health.runtime_version IS DISTINCT FROM EXCLUDED.runtime_version
+      OR backtest_runner_health.capability_digest IS DISTINCT FROM EXCLUDED.capability_digest
   """, (
     worker_id, job_kind, status, current_run_id, error_code,
+    runtime_version, capability_digest,
     settings.BACKTEST_RUNNER_HEARTBEAT_WRITE_SECONDS,
   ))
 
@@ -1357,6 +1562,8 @@ def record_backtest_runner_heartbeat(
   status: str,
   current_run_id: str | None = None,
   error_code: str | None = None,
+  runtime_version: str = SCRIPT_RUNTIME_VERSION,
+  capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
 ) -> None:
   if job_kind not in {"bar", "l2"} or status not in {"ready", "running", "error"}:
     raise ValueError("Runner 心跳类型或状态无效")
@@ -1364,6 +1571,7 @@ def record_backtest_runner_heartbeat(
     with conn.cursor() as cur:
       _record_backtest_runner_heartbeat(
         cur, worker_id, job_kind, status, current_run_id, error_code,
+        runtime_version, capability_digest,
       )
 
 
@@ -1381,9 +1589,13 @@ def _has_healthy_backtest_runner(cur: Any, job_kind: str) -> bool:
     SELECT EXISTS (
       SELECT 1 FROM backtest_runner_health
       WHERE job_kind=%s AND status IN ('ready', 'running')
+        AND runtime_version=%s AND capability_digest=%s
         AND heartbeat_at >= now() - make_interval(secs => %s)
     ) AS available
-  """, (job_kind, settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS))
+  """, (
+    job_kind, SCRIPT_RUNTIME_VERSION, RUNTIME_CAPABILITY_DIGEST,
+    settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS,
+  ))
   return bool(cur.fetchone()["available"])
 
 
@@ -1403,16 +1615,26 @@ def get_backtest_runner_health() -> dict[str, Any]:
               AND health.heartbeat_at >= now() - make_interval(secs => %s)
           ) AS error_count,
           CASE WHEN kinds.job_kind='bar'
-            THEN (SELECT count(*) FROM bar_backtest_job WHERE status='queued')
-            ELSE (SELECT count(*) FROM l2_backtest_job WHERE status='queued')
+            THEN (SELECT count(*) FROM bar_backtest_job
+                  WHERE status='queued' AND runtime_version=%s AND capability_digest=%s)
+            ELSE (SELECT count(*) FROM l2_backtest_job
+                  WHERE status='queued' AND runtime_version=%s AND capability_digest=%s)
           END AS queued_count
         FROM kinds
-        LEFT JOIN backtest_runner_health health ON health.job_kind=kinds.job_kind
+        LEFT JOIN backtest_runner_health health
+          ON health.job_kind=kinds.job_kind
+          AND health.runtime_version=%s AND health.capability_digest=%s
         GROUP BY kinds.job_kind
         ORDER BY kinds.job_kind
       """, (
         settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS,
         settings.BACKTEST_RUNNER_HEALTH_TTL_SECONDS,
+        SCRIPT_RUNTIME_VERSION,
+        RUNTIME_CAPABILITY_DIGEST,
+        SCRIPT_RUNTIME_VERSION,
+        RUNTIME_CAPABILITY_DIGEST,
+        SCRIPT_RUNTIME_VERSION,
+        RUNTIME_CAPABILITY_DIGEST,
       ))
       rows = cur.fetchall()
   runners = {
@@ -1439,13 +1661,17 @@ def _claim_backtest_job(
   job_kind: str,
   worker_id: str,
   lease_seconds: int,
+  runtime_version: str = SCRIPT_RUNTIME_VERSION,
+  capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
 ) -> dict[str, Any] | None:
   """领取 Bar/L2 共用容量中的一个槽位。"""
   if job_kind not in {"bar", "l2"}:
     raise ValueError("回测任务类型无效")
   cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BACKTEST_SCHEDULER_LOCK_KEY,))
   _finalize_expired_backtest_jobs(cur)
-  candidate = _next_backtest_candidate(cur)
+  candidate = _next_backtest_candidate(
+    cur, runtime_version=runtime_version, capability_digest=capability_digest,
+  )
   if not candidate:
     return None
   if candidate["job_kind"] != job_kind:
@@ -1453,7 +1679,9 @@ def _claim_backtest_job(
       "全局最优先任务等待对应执行器: kind=%s reason=%s",
       candidate["job_kind"], f"{candidate['job_kind']}_executor_wait",
     )
-    candidate = _next_backtest_candidate(cur, job_kind)
+    candidate = _next_backtest_candidate(
+      cur, job_kind, runtime_version, capability_digest,
+    )
     if not candidate:
       return None
 
@@ -1478,9 +1706,12 @@ def _claim_backtest_job(
       lease_expires_at=now() + make_interval(secs => %s), worker_id=%s,
       started_at=COALESCE(started_at, now()), updated_at=now()
     WHERE run_id=%s AND NOT cancel_requested
+      AND runtime_version=%s AND capability_digest=%s
       AND (status='queued' OR (status='running' AND lease_expires_at < now()))
     RETURNING run_id, owner_user_id, payload, attempt_no, attempt_token, lease_expires_at
-  """, (lease_seconds, worker_id, candidate["run_id"]))
+  """, (
+    lease_seconds, worker_id, candidate["run_id"], runtime_version, capability_digest,
+  ))
   row = cur.fetchone()
   if not row:
     return None
@@ -1498,13 +1729,20 @@ def _claim_backtest_job(
   return row
 
 
-def claim_l2_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
+def claim_l2_backtest_job(
+  worker_id: str,
+  lease_seconds: int,
+  runtime_version: str = SCRIPT_RUNTIME_VERSION,
+  capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
+) -> dict[str, Any] | None:
   """从统一容量中原子领取一个 L2 任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("L2 runner 标识和租约时长必须有效")
   with _db() as conn:
     with conn.cursor() as cur:
-      row = _claim_backtest_job(cur, "l2", worker_id, lease_seconds)
+      row = _claim_backtest_job(
+        cur, "l2", worker_id, lease_seconds, runtime_version, capability_digest,
+      )
       if not row:
         return None
       cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
@@ -1517,13 +1755,20 @@ def claim_l2_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] 
       }
 
 
-def claim_bar_backtest_job(worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
+def claim_bar_backtest_job(
+  worker_id: str,
+  lease_seconds: int,
+  runtime_version: str = SCRIPT_RUNTIME_VERSION,
+  capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
+) -> dict[str, Any] | None:
   """从统一容量中原子领取一个标准 Bar 回测任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("Bar runner 标识和租约时长必须有效")
   with _db() as conn:
     with conn.cursor() as cur:
-      row = _claim_backtest_job(cur, "bar", worker_id, lease_seconds)
+      row = _claim_backtest_job(
+        cur, "bar", worker_id, lease_seconds, runtime_version, capability_digest,
+      )
       if not row:
         return None
       cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
@@ -2037,10 +2282,11 @@ def list_strategy_runtime_error_stats(
     with conn.cursor() as cur:
       cur.execute(f"""
         SELECT occurred_at::date AS error_date, error_code, runtime_version,
-          missing_name, count(*) AS occurrence_count, max(occurred_at) AS last_occurred_at
+          missing_name, missing_module, count(*) AS occurrence_count,
+          max(occurred_at) AS last_occurred_at
         FROM strategy_runtime_error_stat
         {where}
-        GROUP BY occurred_at::date, error_code, runtime_version, missing_name
+        GROUP BY occurred_at::date, error_code, runtime_version, missing_name, missing_module
         ORDER BY last_occurred_at DESC
         LIMIT %s
       """, params)
@@ -2049,6 +2295,7 @@ def list_strategy_runtime_error_stats(
         "code": row["error_code"],
         "runtimeVersion": row["runtime_version"],
         "missingName": row["missing_name"],
+        "missingModule": row["missing_module"],
         "count": int(row["occurrence_count"]),
         "lastOccurredAt": _format_time(row["last_occurred_at"]),
       } for row in cur.fetchall()]
@@ -2119,16 +2366,49 @@ def _insert_system_error(
 
 def _insert_strategy_runtime_error_stat(cur: Any, record: dict[str, Any]) -> None:
   """只为平台运行时缺陷留存不可反查用户的最小统计。"""
-  if record.get("code") not in {"runtime.contract_missing", "runtime.version_mismatch"}:
+  if record.get("code") not in {
+    "runtime.contract_missing",
+    "runtime.version_mismatch",
+    "runtime.dependency_missing",
+    "runtime.dependency_load_failed",
+  }:
     return
   context = record.get("context") if isinstance(record.get("context"), dict) else {}
   runtime_version = str(context.get("runtimeVersion") or "legacy")[:64]
   missing_value = context.get("missingName")
   missing = missing_value if isinstance(missing_value, str) and is_standard_builtin_name(missing_value) else None
+  supported_package = context.get("supportedPackage")
+  module_value = context.get("missingModule")
+  missing_module = _safe_supported_missing_module(module_value, supported_package)
   cur.execute("""
-    INSERT INTO strategy_runtime_error_stat (error_code, runtime_version, missing_name)
-    VALUES (%s, %s, %s)
-  """, (record["code"], runtime_version, missing))
+    INSERT INTO strategy_runtime_error_stat (
+      error_code, runtime_version, missing_name, missing_module
+    ) VALUES (%s, %s, %s, %s)
+  """, (record["code"], runtime_version, missing, missing_module))
+
+
+def _safe_supported_missing_module(
+  module_value: Any,
+  supported_package: Any,
+) -> str | None:
+  """仅保留平台能力清单可证明归属的短模块名。"""
+  if (
+    not isinstance(module_value, str)
+    or len(module_value) > 128
+    or not is_safe_module_name(module_value)
+  ):
+    return None
+  top_level = module_value.split(".", 1)[0]
+  if supported_package == "python-stdlib":
+    return top_level if top_level in SUPPORTED_STANDARD_LIBRARY_MODULES else None
+  if supported_package not in SUPPORTED_QUANT_PACKAGE_VERSIONS:
+    return None
+  promised_imports = {
+    import_name
+    for import_name, distribution in SUPPORTED_QUANT_IMPORTS.items()
+    if distribution == supported_package
+  }
+  return top_level if top_level in promised_imports else None
 
 
 def _normalize_system_error(row: dict[str, Any]) -> dict[str, Any]:

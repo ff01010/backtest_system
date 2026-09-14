@@ -24,6 +24,11 @@ from backend.services.backtest_errors import RemoteBacktestError, error_summary
 from backend.services import bar_data, state_store
 from backend.services.system_error_log import system_error_log_record
 from backend.strategies.scripted import quote_mode_for_script
+from backend.strategies.runtime_contract import (
+  RUNTIME_CAPABILITY_DIGEST,
+  SCRIPT_RUNTIME_VERSION,
+  run_runtime_deep_probe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +46,10 @@ class L2Runner:
     backoff_seconds = 1.0
     while True:
       try:
-        job = state_store.claim_l2_backtest_job(self._worker_id, settings.L2_JOB_LEASE_SECONDS)
+        job = state_store.claim_l2_backtest_job(
+          self._worker_id, settings.L2_JOB_LEASE_SECONDS,
+          SCRIPT_RUNTIME_VERSION, RUNTIME_CAPABILITY_DIGEST,
+        )
       except state_store.DatabaseError as error:
         self._handle_database_error(error, backoff_seconds)
         backoff_seconds = min(
@@ -80,6 +88,7 @@ class L2Runner:
     try:
       state_store.record_backtest_runner_heartbeat(
         self._worker_id, "l2", status, current_run_id, error_code,
+        SCRIPT_RUNTIME_VERSION, RUNTIME_CAPABILITY_DIGEST,
       )
       self._health_signature = signature
       self._health_written_at = now
@@ -88,7 +97,10 @@ class L2Runner:
 
   def run_once(self) -> bool:
     """处理一个任务，便于容器健康检查和单元测试。"""
-    job = state_store.claim_l2_backtest_job(self._worker_id, settings.L2_JOB_LEASE_SECONDS)
+    job = state_store.claim_l2_backtest_job(
+      self._worker_id, settings.L2_JOB_LEASE_SECONDS,
+      SCRIPT_RUNTIME_VERSION, RUNTIME_CAPABILITY_DIGEST,
+    )
     if job is None:
       return False
     self._run_job(job)
@@ -197,6 +209,9 @@ class L2Runner:
       "t0Enabled": bool(payload.get("t0Enabled", False)),
       "quoteMode": _quote_mode(payload),
       "runtimeVersion": str(script.get("runtimeVersion") or "legacy"),
+      "capabilityDigest": str(
+        script.get("capabilityDigest") or payload.get("capabilityDigest") or "legacy"
+      ),
       "instrumentRules": instrument_rules,
       "executionAlgorithm": str(payload.get("executionAlgorithm") or "immediate"),
       "executionParameters": dict(payload.get("executionParameters") or {}),
@@ -591,6 +606,7 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
   logging.basicConfig(level=os.getenv("TREND_GRID_LOG_LEVEL", "INFO"))
+  run_runtime_deep_probe()
   state_store.ensure_schema()
   L2Runner().run_forever()
 

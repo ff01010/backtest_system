@@ -30,7 +30,10 @@ def test_bar_runner_claim_failure_reports_error_without_false_ready(
   with pytest.raises(StopLoop):
     bar_runner.BarRunner("test-worker").run_forever()
 
-  assert heartbeats == [("test-worker", "bar", "error", None, "DatabaseError")]
+  assert heartbeats == [(
+    "test-worker", "bar", "error", None, "DatabaseError",
+    bar_runner.SCRIPT_RUNTIME_VERSION, bar_runner.RUNTIME_CAPABILITY_DIGEST,
+  )]
 
 
 def test_bar_runner_finishes_queued_job(monkeypatch: pytest.MonkeyPatch) -> None:
