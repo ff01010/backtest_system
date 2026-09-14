@@ -14,6 +14,8 @@ import type {
   StrategyConfigVersion,
   StrategyScript,
   StrategySource,
+  ReleaseNotice,
+  ReleaseStatus,
 } from '../types';
 
 const BASE = '/api';
@@ -25,6 +27,16 @@ export class BacktestRequestError extends Error {
     super(detail.message);
     this.name = 'BacktestRequestError';
     this.detail = detail;
+  }
+}
+
+export class ReleaseApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ReleaseApiError';
+    this.status = status;
   }
 }
 
@@ -77,6 +89,42 @@ function getApiErrorMessage(text: string): string {
 
 export async function fetchHealth(): Promise<{ status: string }> {
   return fetchJson(`${BASE}/health`);
+}
+
+export async function fetchReleaseStatus(
+  clientBuildId: string,
+  clientCompatibilityVersion: number,
+  etag?: string,
+): Promise<{ status: ReleaseStatus | null; etag: string | null }> {
+  const query = new URLSearchParams({
+    clientBuildId,
+    clientCompatibilityVersion: String(clientCompatibilityVersion),
+  });
+  const res = await fetch(`${BASE}/releases/status?${query}`, {
+    credentials: 'include',
+    headers: etag ? { 'If-None-Match': etag } : {},
+  });
+  if (res.status === 304) return { status: null, etag: etag ?? null };
+  if (!res.ok) throw new ReleaseApiError(res.status, `API ${res.status}: ${await res.text()}`);
+  return { status: await res.json() as ReleaseStatus, etag: res.headers.get('ETag') };
+}
+
+export async function acknowledgeRelease(releaseId: string, clientBuildId: string): Promise<void> {
+  const res = await fetch(`${BASE}/releases/${encodeURIComponent(releaseId)}/acknowledge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clientBuildId }),
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new ReleaseApiError(res.status, getApiErrorMessage(body) || `API ${res.status}: 请求失败`);
+  }
+}
+
+export async function fetchReleaseHistory(): Promise<ReleaseNotice[]> {
+  const data = await fetchJson<{ items: ReleaseNotice[] }>(`${BASE}/releases?limit=50`);
+  return data.items;
 }
 
 export async function fetchStrategyGuide(): Promise<{ title: string; content: string }> {

@@ -69,6 +69,11 @@ interface Props {
   strategies: string[];
   instruments: InstrumentItem[];
   isAdmin: boolean;
+  onWorkspaceSafetyStateChange?: (state: {
+    hasUnsavedStrategy: boolean;
+    isStrategySavePending: boolean;
+  }) => void;
+  onStrategySaveActionChange?: (action: () => Promise<boolean>) => void;
   onViewTradeChart: (selection: {
     runId: string;
     symbol: string;
@@ -1192,6 +1197,8 @@ export default function BacktestPage({
   strategies,
   instruments,
   isAdmin,
+  onWorkspaceSafetyStateChange,
+  onStrategySaveActionChange,
   onViewTradeChart,
 }: Props) {
   const [instrumentList, setInstrumentList] = useState<InstrumentItem[]>(instruments);
@@ -1246,11 +1253,35 @@ export default function BacktestPage({
   const [selectedScriptId, setSelectedScriptId] = useState<string>('');
   const [selectedConfigId, setSelectedConfigId] = useState<string>('');
   const [versionDirty, setVersionDirty] = useState(false);
+  const [strategySavePending, setStrategySavePending] = useState(false);
+  const strategySaveActionRef = useRef<() => Promise<string | null>>(async () => null);
   const [publishedFingerprint, setPublishedFingerprint] = useState('');
   const [configName, setConfigName] = useState('');
   const [scriptForm, setScriptForm] = useState(createEmptyScriptForm());
   const [strategyGuideOpen, setStrategyGuideOpen] = useState(false);
   const hasSelectedConfig = hasSavedStrategyId(selectedConfigId);
+
+  useEffect(() => {
+    onWorkspaceSafetyStateChange?.({
+      hasUnsavedStrategy: versionDirty,
+      isStrategySavePending: strategySavePending,
+    });
+  }, [onWorkspaceSafetyStateChange, strategySavePending, versionDirty]);
+
+  useEffect(() => {
+    onStrategySaveActionChange?.(async () => (await strategySaveActionRef.current()) != null);
+  }, [onStrategySaveActionChange]);
+
+  useEffect(() => {
+    if (!versionDirty) return undefined;
+    const preventUnsavedReload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', preventUnsavedReload);
+    return () => window.removeEventListener('beforeunload', preventUnsavedReload);
+  }, [versionDirty]);
+
   const [activePanel, setActivePanel] = useState<WorkbenchPanel>('overview');
   const [chartRange, setChartRange] = useState<ChartRange>('all');
   const [showStrategyCurve, setShowStrategyCurve] = useState(true);
@@ -2007,6 +2038,7 @@ export default function BacktestPage({
       showPreflightNotice(selectedPreflight?.reason || '正在检查当前策略的数据可用性');
       return null;
     }
+    setStrategySavePending(true);
     try {
       const isCustomScript = isCustomScriptStrategy(selectedStrategy);
       const sourceCode = isCustomScript ? scriptForm.code : (strategySourceCode || scriptForm.code);
@@ -2058,8 +2090,12 @@ export default function BacktestPage({
     } catch (e) {
       setError(e instanceof Error ? e.message : '保存策略失败');
       return null;
+    } finally {
+      setStrategySavePending(false);
     }
   };
+
+  strategySaveActionRef.current = handleSaveConfig;
 
   const handleDeleteConfig = async () => {
     if (!hasSelectedConfig) return;

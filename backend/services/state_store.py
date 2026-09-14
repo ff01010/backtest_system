@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 import re
 from typing import Any, Iterator
+from uuid import uuid4
 
 import psycopg
 from psycopg.errors import IntegrityError
@@ -73,11 +74,11 @@ def _db() -> Iterator[psycopg.Connection[Any]]:
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
       with conn.cursor() as cur:
         cur.execute(
-          "SELECT set_config('app.current_user_id', %s, false)",
+          "SELECT set_config('app.current_user_id', %s, true)",
           (current_user_id(),),
         )
         cur.execute(
-          "SELECT set_config('app.current_is_admin', %s, false)",
+          "SELECT set_config('app.current_is_admin', %s, true)",
           ("true" if current_user_is_admin() else "false",),
         )
       yield conn
@@ -101,6 +102,16 @@ def ensure_schema() -> None:
       cur.execute("SELECT to_regclass('public.backtest_runner_health') AS health_table")
       if cur.fetchone()["health_table"] is None:
         raise DatabaseError("数据库缺少 Runner 健康迁移 022，请先运行 deploy 的 migrate 服务")
+      cur.execute("SELECT to_regclass('public.app_release') AS release_table")
+      if cur.fetchone()["release_table"] is None:
+        raise DatabaseError("数据库缺少发布通知迁移 027，请先运行 deploy 的 migrate 服务")
+      cur.execute("""
+        SELECT to_regprocedure(
+          'app.acknowledge_release(uuid,uuid,character varying)'
+        ) AS acknowledge_function
+      """)
+      if cur.fetchone()["acknowledge_function"] is None:
+        raise DatabaseError("数据库缺少发布权限迁移 028，请先运行 deploy 的 migrate 服务")
       cur.execute("""
         SELECT EXISTS (
           SELECT 1 FROM information_schema.columns
@@ -113,6 +124,136 @@ def ensure_schema() -> None:
       cur.execute("SELECT to_regclass('public.strategy_runtime_error_stat') AS runtime_error_table")
       if cur.fetchone()["runtime_error_table"] is None:
         raise DatabaseError("数据库缺少策略运行时错误统计迁移 025，请先运行 deploy 的 migrate 服务")
+
+
+def get_release_status_record() -> dict[str, Any] | None:
+  """返回当前部署、有效公告和当前用户回执。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT d.current_build_id, d.required_client_version,
+          d.current_notice_id, d.activation_kind, d.generation, d.activated_at,
+          r.release_no, r.version, r.title, r.summary, r.highlights,
+          r.level, r.status, r.manifest_digest, r.published_at,
+          (receipt.user_id IS NOT NULL) AS acknowledged
+        FROM app_deployment_state d
+        LEFT JOIN app_release r ON r.id=d.current_notice_id
+        LEFT JOIN app_release_receipt receipt
+          ON receipt.release_id=r.id AND receipt.user_id=%s
+        WHERE d.singleton_key=true
+      """, (current_user_id(),))
+      return cur.fetchone()
+
+
+def acknowledge_release(release_id: str, client_build_id: str) -> bool:
+  """确认当前有效公告；公告已切换时返回 False。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT app.acknowledge_release(%s, %s, %s) AS acknowledged",
+        (release_id, current_user_id(), client_build_id),
+      )
+      return bool(cur.fetchone()["acknowledged"])
+
+
+def list_release_records(
+  limit: int, cursor: tuple[datetime, int] | None,
+) -> list[dict[str, Any]]:
+  """按发布序号倒序返回用户可见公告。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      if cursor is None:
+        cur.execute("""
+          SELECT id, release_no, version, title, summary, highlights, level, published_at
+          FROM app_release
+          WHERE status='published' AND notify_users
+          ORDER BY published_at DESC, release_no DESC LIMIT %s
+        """, (limit,))
+      else:
+        cur.execute("""
+          SELECT id, release_no, version, title, summary, highlights, level, published_at
+          FROM app_release
+          WHERE status='published' AND notify_users
+            AND (published_at, release_no) < (%s, %s)
+          ORDER BY published_at DESC, release_no DESC LIMIT %s
+        """, (cursor[0], cursor[1], limit))
+      return list(cur.fetchall())
+
+
+def bootstrap_deployment(build_id: str, client_version: int, deployment_id: str) -> dict[str, Any]:
+  """首次上线时创建唯一部署状态。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT app.bootstrap_deployment(%s, %s, %s) AS result",
+        (build_id, client_version, deployment_id),
+      )
+      return dict(cur.fetchone()["result"])
+
+
+def activate_release_record(
+  manifest: dict[str, Any], build_id: str, manifest_digest: str,
+  deployment_id: str, expected_generation: int,
+) -> dict[str, Any]:
+  """幂等登记公告，并用代际 CAS 激活部署。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT app.activate_release(
+          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        ) AS result
+      """, (
+        str(uuid4()), build_id, manifest_digest, manifest["version"],
+        manifest["clientCompatibilityVersion"], manifest["title"],
+        manifest["summary"], Jsonb(manifest["highlights"]), manifest["level"],
+        deployment_id, expected_generation,
+      ))
+      return dict(cur.fetchone()["result"])
+
+
+def activate_deployment_without_notice(
+  build_id: str, client_version: int, deployment_id: str,
+  expected_generation: int, activation_kind: str, keep_notice: bool,
+) -> dict[str, Any]:
+  """激活静默构建或回滚构建。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT app.activate_deployment_without_notice(
+          %s, %s, %s, %s, %s, %s
+        ) AS result
+      """, (
+        build_id, client_version, deployment_id, expected_generation,
+        activation_kind, keep_notice,
+      ))
+      return dict(cur.fetchone()["result"])
+
+
+def rollback_deployment(
+  build_id: str, client_version: int, deployment_id: str,
+  expected_generation: int, release_id: str | None,
+) -> dict[str, Any]:
+  """回滚到显式构建和公告，不根据历史顺序猜测。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT app.rollback_deployment(%s, %s, %s, %s, %s) AS result",
+        (build_id, client_version, deployment_id, expected_generation, release_id),
+      )
+      return dict(cur.fetchone()["result"])
+
+
+def withdraw_release_record(
+  release_id: str, deployment_id: str, expected_generation: int,
+) -> dict[str, Any]:
+  """撤回公告，并在其当前生效时清空公告指针。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT app.withdraw_release(%s, %s, %s) AS result",
+        (release_id, deployment_id, expected_generation),
+      )
+      return dict(cur.fetchone()["result"])
 
 
 def replace_trade_calendar(

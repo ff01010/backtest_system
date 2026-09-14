@@ -55,6 +55,7 @@ from backend.services import (
   market_data,
   qmt_instrument_directory,
   data_repository,
+  release_notifications,
   research_signal_snapshot,
   state_store,
   strategy_adapters,
@@ -618,6 +619,7 @@ def startup():
   _verified_runtime_capabilities = run_runtime_deep_probe()
   settings.validate_public_api_configuration()
   settings.validate_research_integration_configuration()
+  settings.validate_application_build_configuration()
   state_store.ensure_schema()
   state_store.prune_strategy_runtime_error_stats()
 
@@ -629,9 +631,68 @@ def health():
     "status": runner_health["status"],
     "backtest": "ok" if runner_health["status"] == "ok" else "unavailable",
     "strategyRuntimeVersion": SCRIPT_RUNTIME_VERSION,
+    "applicationBuildId": settings.APPLICATION_BUILD_ID,
+    "clientCompatibilityVersion": settings.CLIENT_COMPATIBILITY_VERSION,
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "runtimeCapabilities": _verified_runtime_capabilities,
   }
+
+
+def _release_cache_headers() -> dict[str, str]:
+  return {
+    "Cache-Control": "private, no-cache",
+    "Vary": "Cookie",
+  }
+
+
+@app.get("/api/releases/status", response_model=schemas.ReleaseStatusResponse)
+def release_status(
+  request: Request,
+  response: Response,
+  clientBuildId: str = Query(pattern=r"^(dev|[0-9a-f]{40})$"),
+  clientCompatibilityVersion: int = Query(ge=1),
+):
+  try:
+    payload, etag = release_notifications.get_release_status(
+      clientBuildId, clientCompatibilityVersion,
+    )
+  except release_notifications.ReleaseStateUnavailable:
+    return JSONResponse(
+      status_code=503,
+      content={
+        "detail": {
+          "code": "release.state_unavailable",
+          "message": "版本通知暂不可用",
+        },
+      },
+      headers=_release_cache_headers(),
+    )
+  if request.headers.get("if-none-match") == etag:
+    return Response(status_code=304, headers={**_release_cache_headers(), "ETag": etag})
+  for name, value in _release_cache_headers().items():
+    response.headers[name] = value
+  response.headers["ETag"] = etag
+  return payload
+
+
+@app.post("/api/releases/{release_id}/acknowledge")
+def release_acknowledge(release_id: str, payload: schemas.ReleaseAcknowledgeRequest):
+  try:
+    result = release_notifications.acknowledge_release(release_id, payload.clientBuildId)
+  except state_store.ConflictError as error:
+    if str(error) == "release.notice_stale":
+      raise HTTPException(409, {"code": "release.notice_stale", "message": "公告已更新"}) from error
+    raise
+  return JSONResponse(content=result, headers=_release_cache_headers())
+
+
+@app.get("/api/releases", response_model=schemas.ReleaseHistoryResponse)
+def release_history(limit: int = Query(default=20, ge=1, le=50), cursor: str | None = None):
+  try:
+    result = release_notifications.list_published_releases(limit, cursor)
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
+  return JSONResponse(content=result, headers=_release_cache_headers())
 
 
 def _require_backtest_runner(fill_model: str) -> None:

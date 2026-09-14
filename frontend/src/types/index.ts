@@ -503,3 +503,26 @@ export interface DataStatus {
   preview: KlinePreviewRow[];
   error?: string;
 }
+
+export interface ReleaseNotice {
+  id: string;
+  releaseNo: number;
+  version: string;
+  title: string;
+  summary: string;
+  highlights: string[];
+  level: 'normal' | 'important' | 'mandatory';
+  publishedAt: string;
+}
+
+export interface ReleaseStatus {
+  serverBuildId: string;
+  requiredClientCompatibilityVersion: number;
+  clientOutdated: boolean;
+  activationKind: 'release' | 'silent' | 'rollback';
+  presentationMode: 'mandatory_gate' | 'release_notice' | 'version_mismatch' | 'rollback_mismatch' | 'none';
+  acknowledged: boolean;
+  unread: boolean;
+  upgradeRequired: boolean;
+  release: ReleaseNotice | null;
+}

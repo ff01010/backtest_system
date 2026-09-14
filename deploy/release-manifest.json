@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "version": "2026.09.12",
+  "clientCompatibilityVersion": 1,
+  "title": "版本更新通知上线",
+  "summary": "现在发布新功能后，系统会在工作区主动展示版本更新说明。",
+  "highlights": [
+    "登录后自动检测新版本",
+    "支持查看历史更新记录",
+    "刷新前保护未保存的策略内容"
+  ],
+  "level": "normal",
+  "notifyUsers": true
+}
