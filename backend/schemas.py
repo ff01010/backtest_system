@@ -514,6 +514,10 @@ class SharedBacktestPublicationCreate(BaseModel):
     return tags
 
 
+class SharedBacktestMetaUpdate(SharedBacktestPublicationCreate):
+  """作者可修改的共享展示信息。"""
+
+
 class SharedBacktestListItem(BaseModel):
   id: str
   title: str
@@ -529,6 +533,16 @@ class SharedBacktestListItem(BaseModel):
   annualSharpe: float | None
   copyCount: int
   firstPublishedAt: str
+
+
+class SharedBacktestManagementItem(SharedBacktestListItem):
+  description: str
+  status: str
+  withdrawnAt: str | None
+  removedAt: str | None
+  removalReason: str | None
+  updatedAt: str
+  sourceRunAvailable: bool
 
 
 class SharedBacktestDetail(SharedBacktestListItem):

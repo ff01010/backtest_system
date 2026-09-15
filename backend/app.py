@@ -57,6 +57,7 @@ from backend.services import (
   data_repository,
   release_notifications,
   research_signal_snapshot,
+  shared_backtest_lifecycle,
   state_store,
   strategy_adapters,
 )
@@ -108,7 +109,7 @@ app.add_middleware(
     "http://localhost:5177", "http://127.0.0.1:5177",
   ],
   allow_credentials=True,
-  allow_methods=["GET", "POST", "PUT", "DELETE"],
+  allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
   allow_headers=["*"],
 )
 
@@ -1307,6 +1308,15 @@ def shared_backtests(
   return state_store.list_shared_backtests(limit=limit, offset=offset)
 
 
+@app.get("/api/shared-backtests/mine")
+def my_shared_backtests(
+  limit: int = Query(20, ge=1, le=100),
+  offset: int = Query(0, ge=0),
+  status: str | None = Query(default=None, pattern=r"^(active|withdrawn|removed)$"),
+):
+  return shared_backtest_lifecycle.list_my_shared_backtests(limit, offset, status)
+
+
 @app.get("/api/shared-backtests/{publication_id}")
 def shared_backtest_detail(publication_id: str):
   try:
@@ -1315,6 +1325,52 @@ def shared_backtest_detail(publication_id: str):
     raise HTTPException(404, "该共享回测已不可用") from error
   except ValueError as error:
     raise HTTPException(409, str(error)) from error
+
+
+@app.patch("/api/shared-backtests/{publication_id}")
+def update_shared_backtest_metadata(
+  publication_id: str,
+  payload: schemas.SharedBacktestMetaUpdate,
+):
+  try:
+    publication = shared_backtest_lifecycle.update_publication_metadata(
+      publication_id,
+      payload.title,
+      payload.description,
+      payload.tags,
+    )
+    return {"publication": publication}
+  except KeyError as error:
+    raise HTTPException(404, "共享回测不存在或无管理权限") from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"共享展示信息更新失败: {error}") from error
+
+
+@app.post("/api/shared-backtests/{publication_id}/withdraw")
+def withdraw_shared_backtest(publication_id: str):
+  return _author_publication_transition(
+    publication_id,
+    shared_backtest_lifecycle.withdraw_publication,
+  )
+
+
+@app.post("/api/shared-backtests/{publication_id}/relist")
+def relist_shared_backtest(publication_id: str):
+  return _author_publication_transition(
+    publication_id,
+    shared_backtest_lifecycle.relist_publication,
+  )
+
+
+def _author_publication_transition(publication_id: str, transition: Any):
+  try:
+    return {"publication": transition(publication_id)}
+  except KeyError as error:
+    raise HTTPException(404, "共享回测不存在或无管理权限") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"共享回测状态更新失败: {error}") from error
 
 
 @app.get("/api/backtest/runs/{run_id}")

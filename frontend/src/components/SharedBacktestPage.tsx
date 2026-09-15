@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { fetchSharedBacktest, fetchSharedBacktests } from '../api/client';
 import type { SharedBacktestDetail, SharedBacktestListItem } from '../types';
 import { typography } from '../styles/typography';
+import MySharedBacktestsPanel from './MySharedBacktestsPanel';
 
 interface Props {
   initialPublicationId?: string | null;
@@ -28,6 +29,8 @@ export default function SharedBacktestPage({ initialPublicationId = null }: Prop
   const [items, setItems] = useState<SharedBacktestListItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(initialPublicationId);
   const [detail, setDetail] = useState<SharedBacktestDetail | null>(null);
+  const [section, setSection] = useState<'all' | 'mine'>('all');
+  const [refreshKey, setRefreshKey] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -42,7 +45,7 @@ export default function SharedBacktestPage({ initialPublicationId = null }: Prop
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, []);
+  }, [refreshKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -118,24 +121,34 @@ export default function SharedBacktestPage({ initialPublicationId = null }: Prop
       <div style={{ maxWidth: 1180, margin: '0 auto' }}>
         <h1 style={{ marginTop: 0 }}>策略广场</h1>
         <p style={{ color: '#64748b' }}>浏览内部用户主动共享的成功回测快照。</p>
-        {loading && <div>正在加载共享回测...</div>}
-        {error && <div role="alert" style={{ color: '#b91c1c' }}>{error}</div>}
-        {!loading && !error && items.length === 0 && <div style={cardStyle}>暂无共享回测。</div>}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 }}>
-          {items.map((item) => (
-            <article key={item.id} style={cardStyle}>
-              <h2 style={{ marginTop: 0, fontSize: 18 }}>{item.title}</h2>
-              <div style={{ color: '#64748b' }}>{item.authorName} · {item.symbol} · {item.timeframe}</div>
-              <div style={{ margin: '10px 0' }}>{item.startDate} 至 {item.endDate}</div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 14 }}>
-                <span>收益 {formatPercent(item.totalReturn)}</span>
-                <span>回撤 {formatPercent(item.maxDrawdownRate)}</span>
-                <span>夏普 {formatNumber(item.annualSharpe)}</span>
-              </div>
-              <button type="button" onClick={() => setSelectedId(item.id)}>查看详情</button>
-            </article>
-          ))}
+        <div role="tablist" aria-label="策略广场分区" style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
+          <button type="button" role="tab" aria-selected={section === 'all'} onClick={() => setSection('all')}>全部共享</button>
+          <button type="button" role="tab" aria-selected={section === 'mine'} onClick={() => setSection('mine')}>我的共享</button>
         </div>
+        {section === 'mine' ? (
+          <MySharedBacktestsPanel onPublicationChanged={() => setRefreshKey((value) => value + 1)} />
+        ) : (
+          <>
+            {loading && <div>正在加载共享回测...</div>}
+            {error && <div role="alert" style={{ color: '#b91c1c' }}>{error}</div>}
+            {!loading && !error && items.length === 0 && <div style={cardStyle}>暂无共享回测。</div>}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 }}>
+              {items.map((item) => (
+                <article key={item.id} style={cardStyle}>
+                  <h2 style={{ marginTop: 0, fontSize: 18 }}>{item.title}</h2>
+                  <div style={{ color: '#64748b' }}>{item.authorName} · {item.symbol} · {item.timeframe}</div>
+                  <div style={{ margin: '10px 0' }}>{item.startDate} 至 {item.endDate}</div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 14 }}>
+                    <span>收益 {formatPercent(item.totalReturn)}</span>
+                    <span>回撤 {formatPercent(item.maxDrawdownRate)}</span>
+                    <span>夏普 {formatNumber(item.annualSharpe)}</span>
+                  </div>
+                  <button type="button" onClick={() => setSelectedId(item.id)}>查看详情</button>
+                </article>
+              ))}
+            </div>
+          </>
+        )}
       </div>
     </main>
   );

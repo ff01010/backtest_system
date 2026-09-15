@@ -18,6 +18,8 @@ import type {
   ReleaseStatus,
   SharedBacktestDetail,
   SharedBacktestListItem,
+  SharedBacktestManagementItem,
+  SharedBacktestStatus,
 } from '../types';
 
 const BASE = '/api';
@@ -531,6 +533,50 @@ export async function fetchSharedBacktests(limit = 20, offset = 0): Promise<Shar
 export async function fetchSharedBacktest(publicationId: string): Promise<SharedBacktestDetail> {
   const data = await fetchJson<{ publication: SharedBacktestDetail }>(
     `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}`,
+  );
+  return data.publication;
+}
+
+export async function fetchMySharedBacktests(
+  limit = 20,
+  offset = 0,
+  status?: SharedBacktestStatus,
+): Promise<{ items: SharedBacktestManagementItem[]; total: number; limit: number; offset: number }> {
+  const search = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (status) search.set('status', status);
+  return fetchJson(`${BASE}/shared-backtests/mine?${search.toString()}`);
+}
+
+export async function updateSharedBacktestMetadata(
+  publicationId: string,
+  payload: { title: string; description: string; tags: string[] },
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}`,
+    'PATCH',
+    payload,
+  );
+  return data.publication;
+}
+
+export async function withdrawSharedBacktest(
+  publicationId: string,
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/withdraw`,
+    'POST',
+    {},
+  );
+  return data.publication;
+}
+
+export async function relistSharedBacktest(
+  publicationId: string,
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/relist`,
+    'POST',
+    {},
   );
   return data.publication;
 }

@@ -501,6 +501,18 @@ export interface SharedBacktestDetail extends SharedBacktestListItem {
   riskNotice: string;
 }
 
+export type SharedBacktestStatus = 'active' | 'withdrawn' | 'removed';
+
+export interface SharedBacktestManagementItem extends SharedBacktestListItem {
+  description: string;
+  status: SharedBacktestStatus;
+  withdrawnAt: string | null;
+  removedAt: string | null;
+  removalReason: string | null;
+  updatedAt: string;
+  sourceRunAvailable: boolean;
+}
+
 export interface DataGapDate {
   date: string;
   barCount: number;
