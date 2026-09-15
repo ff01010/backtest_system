@@ -43,6 +43,7 @@ describe('SharedBacktestPage', () => {
       snapshotDigest: 'a'.repeat(64),
       strategy: {
         code: '<img src=x onerror="window.__unsafe = true">',
+        codeHash: 'c'.repeat(64),
         entryType: 'on_bar',
         runtimeVersion: 'runtime-1',
       },
@@ -116,6 +117,7 @@ describe('SharedBacktestPage', () => {
     expect(screen.getByText('样本期较短')).toBeTruthy();
     fireEvent.click(screen.getByRole('tab', { name: '策略代码' }));
     expect(screen.getByText(/window.__unsafe/)).toBeTruthy();
+    expect(screen.getByText(`代码校验值（SHA-256）：${'c'.repeat(64)}`)).toBeTruthy();
     expect(document.querySelector('img')).toBeNull();
     expect(screen.getByRole('link', { name: 'signals.ndjson' }).getAttribute('href')).toContain(
       '/artifacts/artifact-1',

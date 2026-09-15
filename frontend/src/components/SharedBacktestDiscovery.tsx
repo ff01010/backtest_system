@@ -93,12 +93,27 @@ interface CardProps {
   formatNumber: (value: number | null) => string;
 }
 
+function strategyCategoryLabel(value: string): string {
+  if (value === 'core_position_overlay') return '底仓叠加';
+  if (value === 'directional_holding') return '方向持仓';
+  return value || '--';
+}
+
 export function SharedBacktestCard(props: CardProps) {
   const { item } = props;
   return (
     <article style={props.cardStyle}>
       <h2 style={{ marginTop: 0, fontSize: 18 }}>{item.title}</h2>
       <div style={{ color: '#64748b' }}>{item.authorName} · {item.symbol} · {item.timeframe}</div>
+      <div style={{ color: '#64748b', marginTop: 6 }}>
+        首次上架：{item.firstPublishedAt} · 策略类别：{strategyCategoryLabel(item.strategyCategory)}
+      </div>
+      {item.sourcePublicationId && (
+        <div style={{ color: '#475569', marginTop: 6 }}>
+          衍生自：{item.sourceTitle || item.sourcePublicationId}
+          {item.sourceAuthorName ? ` · 原作者 ${item.sourceAuthorName}` : ''}
+        </div>
+      )}
       <div style={{ margin: '10px 0' }}>{item.startDate} 至 {item.endDate}</div>
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
         {item.tags.map((tag) => <span key={tag}>#{tag}</span>)}

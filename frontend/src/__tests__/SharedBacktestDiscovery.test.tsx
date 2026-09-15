@@ -70,6 +70,26 @@ describe('SharedBacktestPage discovery', () => {
     }));
     expect(screen.getByText('已复制 7 次')).toBeTruthy();
     expect(screen.getAllByText('已复制').length).toBeGreaterThan(0);
+    expect(screen.getByText(/首次上架：2026-09-15/)).toBeTruthy();
+    expect(screen.getByText(/策略类别：方向持仓/)).toBeTruthy();
+  });
+
+  it('shows immutable attribution for a derived publication card', async () => {
+    apiMocks.fetchSharedBacktests.mockResolvedValue({
+      items: [{
+        ...listItem,
+        sourcePublicationId: 'origin-1',
+        sourceTitle: '原始共享',
+        sourceAuthorName: '原作者',
+      }],
+      total: 1,
+      limit: 12,
+      offset: 0,
+    });
+
+    render(<SharedBacktestPage />);
+
+    expect(await screen.findByText('衍生自：原始共享 · 原作者 原作者')).toBeTruthy();
   });
 
   it('loads personal favorites and removes an unfavorited card', async () => {

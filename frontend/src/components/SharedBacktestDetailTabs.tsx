@@ -196,6 +196,7 @@ export default function SharedBacktestDetailTabs({ detail }: { detail: SharedBac
         <section style={cardStyle}>
           <h2>策略代码</h2>
           <p>入口：{displayValue(detail.strategy.entryType)} · 运行时：{displayValue(detail.strategy.runtimeVersion)}</p>
+          <p>代码校验值（SHA-256）：{displayValue(detail.strategy.codeHash)}</p>
           <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
             {displayValue(detail.strategy.code)}
           </pre>
