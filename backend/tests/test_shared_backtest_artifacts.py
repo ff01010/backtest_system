@@ -85,6 +85,37 @@ def test_copy_digest_failure_cleans_prior_files(
   assert not shared_dir.exists() or not list(shared_dir.rglob("*.ndjson"))
 
 
+def test_publication_reproduction_hash_failure_cleans_copied_files(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  copied = [{
+    "artifact_type": "research_signal",
+    "original_filename": "signals.ndjson",
+    "storage_key": "shared_backtests/publication-1/signals.ndjson",
+    "reproduction_metadata": {"snapshotHash": "a" * 64},
+  }]
+  cleaned: list[dict[str, Any]] = []
+  monkeypatch.setattr(state_store, "_shared_artifact_sources", lambda *_: [])
+  monkeypatch.setattr(shared_backtest_artifacts, "copy_artifacts", lambda *_: copied)
+  monkeypatch.setattr(
+    shared_backtest_artifacts,
+    "research_signal_snapshot_hash",
+    lambda *_: "b" * 64,
+  )
+  monkeypatch.setattr(
+    shared_backtest_artifacts,
+    "cleanup_artifacts",
+    lambda artifacts: cleaned.extend(artifacts),
+  )
+
+  with pytest.raises(ValueError, match="摘要不一致"):
+    state_store._copy_publication_artifacts(
+      object(), "run-1", "publication-1", {"data": {"dependencies": []}},
+    )
+
+  assert cleaned == copied
+
+
 def test_shared_metadata_exposes_download_but_not_storage_key() -> None:
   metadata = state_store._shared_artifact_metadata({
     "id": "11111111-1111-4111-8111-111111111111",

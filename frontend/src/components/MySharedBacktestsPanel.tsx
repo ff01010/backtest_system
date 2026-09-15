@@ -6,26 +6,20 @@ import {
   withdrawSharedBacktest,
 } from '../api/client';
 import type { SharedBacktestManagementItem, SharedBacktestStatus } from '../types';
+import {
+  MANAGEMENT_PAGE_SIZE,
+  managementCardStyle,
+  managementErrorMessage,
+  managementFieldStyle,
+  managementStatusLabels,
+  nextManagementItems,
+  SharedBacktestManagementPagination,
+  SharedBacktestStatusFilter,
+} from './SharedBacktestManagementUi';
 
 interface Props {
   onPublicationChanged: () => void;
 }
-
-const PAGE_SIZE = 20;
-
-const statusLabels: Record<SharedBacktestStatus, string> = {
-  active: '已上架',
-  withdrawn: '已撤回',
-  removed: '已下架',
-};
-
-const fieldStyle = {
-  width: '100%',
-  boxSizing: 'border-box',
-  border: '1px solid #cbd5e1',
-  borderRadius: 6,
-  padding: '8px 10px',
-} as const;
 
 export default function MySharedBacktestsPanel({ onPublicationChanged }: Props) {
   const [items, setItems] = useState<SharedBacktestManagementItem[]>([]);
@@ -45,14 +39,14 @@ export default function MySharedBacktestsPanel({ onPublicationChanged }: Props) 
     let cancelled = false;
     setLoading(true);
     setError('');
-    fetchMySharedBacktests(PAGE_SIZE, offset, status || undefined)
+    fetchMySharedBacktests(MANAGEMENT_PAGE_SIZE, offset, status || undefined)
       .then((page) => {
         if (cancelled) return;
         setItems(page.items);
         setTotal(page.total);
       })
       .catch((reason: unknown) => {
-        if (!cancelled) setError(errorMessage(reason, '我的共享加载失败'));
+        if (!cancelled) setError(managementErrorMessage(reason, '我的共享加载失败'));
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -81,7 +75,7 @@ export default function MySharedBacktestsPanel({ onPublicationChanged }: Props) 
       setEditing(null);
       onPublicationChanged();
     } catch (reason) {
-      setError(errorMessage(reason, '共享展示信息更新失败'));
+      setError(managementErrorMessage(reason, '共享展示信息更新失败'));
     } finally {
       setSaving(false);
     }
@@ -97,7 +91,7 @@ export default function MySharedBacktestsPanel({ onPublicationChanged }: Props) 
       replaceItem(updated);
       onPublicationChanged();
     } catch (reason) {
-      setError(errorMessage(reason, '共享回测状态更新失败'));
+      setError(managementErrorMessage(reason, '共享回测状态更新失败'));
     } finally {
       setSaving(false);
     }
@@ -109,39 +103,26 @@ export default function MySharedBacktestsPanel({ onPublicationChanged }: Props) 
       setTotal((current) => Math.max(0, current - 1));
       return;
     }
-    setItems((current) => current.map((item) => item.id === updated.id ? updated : item));
+    setItems((current) => nextManagementItems(current, updated, status));
   }
-
-  const cardStyle = {
-    border: '1px solid #d7dde8', borderRadius: 8, background: '#ffffff', padding: 18,
-  } as const;
 
   return (
     <section aria-label="我的共享" style={{ display: 'grid', gap: 14 }}>
-      <label style={{ maxWidth: 220 }}>
-        状态
-        <select
-          aria-label="共享状态"
-          value={status}
-          onChange={(event) => { setStatus(event.target.value as SharedBacktestStatus | ''); setOffset(0); }}
-          style={fieldStyle}
-        >
-          <option value="">全部状态</option>
-          <option value="active">已上架</option>
-          <option value="withdrawn">已撤回</option>
-          <option value="removed">已下架</option>
-        </select>
-      </label>
+      <SharedBacktestStatusFilter
+        ariaLabel="共享状态"
+        value={status}
+        onChange={(value) => { setStatus(value); setOffset(0); }}
+      />
       {loading && <div>正在加载我的共享...</div>}
       {error && <div role="alert" style={{ color: '#b91c1c' }}>{error}</div>}
-      {!loading && items.length === 0 && <div style={cardStyle}>暂无共享记录。</div>}
+      {!loading && items.length === 0 && <div style={managementCardStyle}>暂无共享记录。</div>}
       {items.map((item) => (
-        <article key={item.id} style={cardStyle}>
+        <article key={item.id} style={managementCardStyle}>
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}>
             <div>
               <h2 style={{ margin: 0, fontSize: 18 }}>{item.title}</h2>
               <div style={{ marginTop: 6, color: '#64748b' }}>
-                {statusLabels[item.status]} · {item.symbol} · {item.timeframe} · 首次上架 {item.firstPublishedAt}
+                {managementStatusLabels[item.status]} · {item.symbol} · {item.timeframe} · 首次上架 {item.firstPublishedAt}
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'start', gap: 8 }}>
@@ -166,21 +147,19 @@ export default function MySharedBacktestsPanel({ onPublicationChanged }: Props) 
           )}
         </article>
       ))}
-      {total > PAGE_SIZE && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <button type="button" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>上一页</button>
-          <span>{Math.floor(offset / PAGE_SIZE) + 1} / {Math.ceil(total / PAGE_SIZE)}</span>
-          <button type="button" disabled={offset + PAGE_SIZE >= total} onClick={() => setOffset(offset + PAGE_SIZE)}>下一页</button>
-          <button type="button" onClick={() => setReloadKey((value) => value + 1)}>刷新</button>
-        </div>
-      )}
+      <SharedBacktestManagementPagination
+        total={total}
+        offset={offset}
+        onOffsetChange={setOffset}
+        trailingAction={<button type="button" onClick={() => setReloadKey((value) => value + 1)}>刷新</button>}
+      />
       {editing && (
-        <div role="dialog" aria-modal="true" aria-label="编辑共享展示信息" style={{ ...cardStyle, position: 'fixed', inset: '15% 20%', zIndex: 20, overflow: 'auto', boxShadow: '0 18px 48px #0f172a55' }}>
+        <div role="dialog" aria-modal="true" aria-label="编辑共享展示信息" style={{ ...managementCardStyle, position: 'fixed', inset: '15% 20%', zIndex: 20, overflow: 'auto', boxShadow: '0 18px 48px #0f172a55' }}>
           <form onSubmit={(event) => void saveMetadata(event)} style={{ display: 'grid', gap: 12 }}>
             <h2 style={{ margin: 0 }}>编辑共享展示信息</h2>
-            <label>共享标题<input required maxLength={128} value={title} onChange={(event) => setTitle(event.target.value)} style={fieldStyle} /></label>
-            <label>策略说明<textarea required maxLength={4000} rows={6} value={description} onChange={(event) => setDescription(event.target.value)} style={fieldStyle} /></label>
-            <label>标签（逗号分隔）<input value={tags} onChange={(event) => setTags(event.target.value)} style={fieldStyle} /></label>
+            <label>共享标题<input required maxLength={128} value={title} onChange={(event) => setTitle(event.target.value)} style={managementFieldStyle} /></label>
+            <label>策略说明<textarea required maxLength={4000} rows={6} value={description} onChange={(event) => setDescription(event.target.value)} style={managementFieldStyle} /></label>
+            <label>标签（逗号分隔）<input value={tags} onChange={(event) => setTags(event.target.value)} style={managementFieldStyle} /></label>
             <p style={{ margin: 0, color: '#64748b' }}>策略快照、结果、署名、首次上架时间和统计数据不会被修改。</p>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
               <button type="button" disabled={saving} onClick={() => setEditing(null)}>取消</button>
@@ -191,8 +170,4 @@ export default function MySharedBacktestsPanel({ onPublicationChanged }: Props) 
       )}
     </section>
   );
-}
-
-function errorMessage(reason: unknown, fallback: string): string {
-  return reason instanceof Error ? reason.message : fallback;
 }

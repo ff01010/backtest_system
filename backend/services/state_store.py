@@ -66,6 +66,11 @@ def current_user_is_admin() -> bool:
   return get_current_user().is_admin
 
 
+def strategy_name_max_length() -> int:
+  """返回完整策略名称的持久化长度上限。"""
+  return _STRATEGY_NAME_MAX_LENGTH
+
+
 @contextmanager
 def _db() -> Iterator[psycopg.Connection[Any]]:
   if not settings.DATABASE_URL:
@@ -84,6 +89,13 @@ def _db() -> Iterator[psycopg.Connection[Any]]:
       yield conn
   except psycopg.Error as error:
     raise _translate_error(error) from error
+
+
+@contextmanager
+def database_session() -> Iterator[psycopg.Connection[Any]]:
+  """为需要跨仓储原子写入的领域服务提供用户上下文连接。"""
+  with _db() as conn:
+    yield conn
 
 
 def ensure_schema() -> None:
@@ -1069,6 +1081,39 @@ def _get_strategy_config_with_cursor(
   if not row:
     raise KeyError(config_id)
   return _normalize_config(row)
+
+
+def get_strategy_config_in_transaction(
+  cur: Any,
+  config_id: str,
+) -> dict[str, Any]:
+  """在调用方事务中读取当前用户的完整策略。"""
+  return _get_strategy_config_with_cursor(cur, config_id)
+
+
+def create_published_strategy_in_transaction(
+  cur: Any,
+  script_payload: dict[str, Any],
+  config_payload: dict[str, Any],
+) -> dict[str, Any]:
+  """在调用方事务中创建并发布一套独立完整策略。"""
+  resolved_name = _resolve_unique_strategy_name(
+    cur, str(config_payload["name"]), None,
+  )
+  resolved_script = {**script_payload, "name": resolved_name}
+  resolved_config = {**config_payload, "name": resolved_name}
+  params_json = dict(resolved_config.get("paramsJson") or {})
+  params_json["scriptName"] = resolved_name
+  resolved_config["paramsJson"] = params_json
+  script_id, strategy_version_id, _ = _write_strategy_script(
+    cur, None, resolved_script,
+  )
+  config_id = _write_config(
+    cur, None, resolved_config, script_id, strategy_version_id,
+  )
+  config = _get_strategy_config_with_cursor(cur, config_id)
+  _publish_strategy_config_with_cursor(cur, config)
+  return config
 
 
 
@@ -2504,6 +2549,87 @@ def _publication_detail(
   }
 
 
+def _copy_publication_artifacts(
+  cur: Any,
+  run_id: str,
+  publication_id: str,
+  snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+  sources = _shared_artifact_sources(cur, run_id, snapshot)
+  artifacts = shared_backtest_artifacts.copy_artifacts(
+    sources, f"shared_backtests/{publication_id}",
+  )
+  try:
+    for artifact in artifacts:
+      artifact["publication_id"] = publication_id
+      artifact["display_name"] = artifact["original_filename"]
+      artifact["snapshot_schema_version"] = 1
+      if artifact["artifact_type"] != "research_signal":
+        continue
+      expected_hash = artifact.get("reproduction_metadata", {}).get("snapshotHash")
+      actual_hash = shared_backtest_artifacts.research_signal_snapshot_hash(
+        artifact["storage_key"],
+      )
+      if expected_hash != actual_hash:
+        raise ValueError("历史任务的研究信号内容摘要不一致，无法共享")
+    return artifacts
+  except Exception:
+    shared_backtest_artifacts.cleanup_artifacts(artifacts)
+    raise
+
+
+def _insert_publication_record(
+  cur: Any,
+  publication_id: str,
+  user_id: str,
+  run_id: str,
+  title: str,
+  description: str,
+  tags: list[str],
+  snapshot: dict[str, Any],
+) -> dict[str, Any] | None:
+  summary = snapshot["result"].get("summary", {})
+  configuration = snapshot["configuration"]
+  origin = snapshot.get("origin") or {}
+  cur.execute("""
+    INSERT INTO backtest_publication (
+      id, owner_user_id, author_name_snapshot, source_run_id, title, description,
+      tags, status, snapshot_schema_version, snapshot_json, snapshot_digest,
+      symbol, timeframe, strategy_category, start_date, end_date,
+      total_return, max_drawdown_rate, annual_sharpe,
+      source_publication_id, source_author_name_snapshot, source_title_snapshot
+    ) VALUES (
+      %s, %s, %s, %s, %s, %s, %s, 'active', 1, %s, %s,
+      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+    )
+    ON CONFLICT (source_run_id) WHERE source_run_id IS NOT NULL DO NOTHING
+    RETURNING *
+  """, (
+    publication_id, user_id, get_current_user().display_name, run_id, title,
+    description, Jsonb(tags), Jsonb(snapshot), _shared_snapshot_digest(snapshot),
+    configuration["symbol"], configuration["timeframe"],
+    configuration["strategyCategory"], configuration["startDate"],
+    configuration["endDate"], summary.get("totalReturn"),
+    summary.get("maxDrawdownRate"), summary.get("annualSharpe"),
+    origin.get("publicationId"), origin.get("authorName"), origin.get("title"),
+  ))
+  return cur.fetchone()
+
+
+def _publication_for_source(
+  cur: Any,
+  run_id: str,
+  user_id: str | None = None,
+) -> dict[str, Any] | None:
+  owner_filter = " AND owner_user_id=%s" if user_id is not None else ""
+  params = (run_id, user_id) if user_id is not None else (run_id,)
+  cur.execute(
+    f"SELECT * FROM backtest_publication WHERE source_run_id=%s{owner_filter}",
+    params,
+  )
+  return cur.fetchone()
+
+
 def create_shared_backtest_publication(
   run_id: str,
   title: str,
@@ -2517,11 +2643,7 @@ def create_shared_backtest_publication(
   try:
     with _db() as conn:
       with conn.cursor() as cur:
-        cur.execute(
-          "SELECT * FROM backtest_publication WHERE source_run_id=%s AND owner_user_id=%s",
-          (run_id, user_id),
-        )
-        existing = cur.fetchone()
+        existing = _publication_for_source(cur, run_id, user_id)
         if existing:
           artifacts = _publication_artifact_rows(cur, str(existing["id"]))
           return _publication_detail(existing, artifacts), False
@@ -2531,59 +2653,19 @@ def create_shared_backtest_publication(
           raise KeyError(run_id)
         run = _normalize_run(row)
         snapshot = _build_shared_backtest_snapshot(run)
-        sources = _shared_artifact_sources(cur, run_id, snapshot)
-        copied_artifacts = shared_backtest_artifacts.copy_artifacts(
-          sources, f"shared_backtests/{publication_id}",
+        copied_artifacts = _copy_publication_artifacts(
+          cur, run_id, publication_id, snapshot,
         )
-        for artifact in copied_artifacts:
-          artifact["publication_id"] = publication_id
-          artifact["display_name"] = artifact["original_filename"]
-          artifact["snapshot_schema_version"] = 1
-          if artifact["artifact_type"] == "research_signal":
-            expected_hash = artifact.get("reproduction_metadata", {}).get("snapshotHash")
-            actual_hash = shared_backtest_artifacts.research_signal_snapshot_hash(
-              artifact["storage_key"],
-            )
-            if expected_hash != actual_hash:
-              raise ValueError("历史任务的研究信号内容摘要不一致，无法共享")
         snapshot["data"]["dependencies"] = [
           _shared_artifact_metadata(artifact) for artifact in copied_artifacts
         ]
-        summary = snapshot["result"].get("summary", {})
-        configuration = snapshot["configuration"]
-        digest = _shared_snapshot_digest(snapshot)
-        origin = snapshot.get("origin") or {}
-        cur.execute("""
-          INSERT INTO backtest_publication (
-            id, owner_user_id, author_name_snapshot, source_run_id, title, description,
-            tags, status, snapshot_schema_version, snapshot_json, snapshot_digest,
-            symbol, timeframe, strategy_category, start_date, end_date,
-            total_return, max_drawdown_rate, annual_sharpe,
-            source_publication_id, source_author_name_snapshot, source_title_snapshot
-          ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, 'active', 1, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-          )
-          ON CONFLICT (source_run_id) WHERE source_run_id IS NOT NULL DO NOTHING
-          RETURNING *
-        """, (
-          publication_id, user_id, get_current_user().display_name, run_id, title,
-          description, Jsonb(tags), Jsonb(snapshot), digest, configuration["symbol"],
-          configuration["timeframe"], configuration["strategyCategory"],
-          configuration["startDate"], configuration["endDate"],
-          summary.get("totalReturn"), summary.get("maxDrawdownRate"),
-          summary.get("annualSharpe"), origin.get("publicationId"),
-          origin.get("authorName"), origin.get("title"),
-        ))
-        publication = cur.fetchone()
+        publication = _insert_publication_record(
+          cur, publication_id, user_id, run_id, title, description, tags, snapshot,
+        )
         if publication is None:
           shared_backtest_artifacts.cleanup_artifacts(copied_artifacts)
           copied_artifacts = []
-          cur.execute(
-            "SELECT * FROM backtest_publication WHERE source_run_id=%s",
-            (run_id,),
-          )
-          publication = cur.fetchone()
+          publication = _publication_for_source(cur, run_id)
           if publication is None:
             raise DatabaseError("共享回测创建失败")
           artifacts = _publication_artifact_rows(cur, str(publication["id"]))
