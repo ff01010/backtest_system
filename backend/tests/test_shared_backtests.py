@@ -190,6 +190,28 @@ def test_snapshot_rejects_legacy_run_without_explicit_contract_field(
     state_store._build_shared_backtest_snapshot(run)
 
 
+@pytest.mark.parametrize(
+  ("container", "field", "invalid_value"),
+  [
+    ("paramsSnapshot", "params", []),
+    ("paramsJson", "strategyParams", []),
+    ("resultJson", "equity", {}),
+    ("resultJson", "experimentManifest", []),
+    ("resultJson", "warnings", {}),
+  ],
+)
+def test_snapshot_rejects_history_with_invalid_contract_shape(
+  container: str,
+  field: str,
+  invalid_value: object,
+) -> None:
+  run = complete_run()
+  run[container][field] = invalid_value
+
+  with pytest.raises(ValueError, match=rf"{container}\.{field}"):
+    state_store._build_shared_backtest_snapshot(run)
+
+
 def test_snapshot_rejects_non_successful_run() -> None:
   run = complete_run()
   run["status"] = "error"

@@ -172,6 +172,12 @@ def _required(mapping: Any, names: tuple[str, ...], prefix: str) -> dict[str, An
   return mapping
 
 
+def _require_type(value: Any, expected: type, field: str) -> Any:
+  if not isinstance(value, expected):
+    raise ValueError(INCOMPLETE_HISTORY_MESSAGE.format(fields=field))
+  return value
+
+
 def _project_manifest(value: Any) -> dict[str, Any]:
   manifest = project_fields(value, MANIFEST_FIELDS)
   manifest["barRange"] = project_fields(manifest.get("barRange"), BAR_RANGE_FIELDS)
@@ -265,11 +271,18 @@ def build_snapshot(run: dict[str, Any]) -> dict[str, Any]:
     ("name", "code", "entryType", "codeHash", "signalRequired", "runtimeVersion"),
     "scriptSnapshot",
   )
+  if not str(script["code"]).strip():
+    raise ValueError(INCOMPLETE_HISTORY_MESSAGE.format(fields="scriptSnapshot.code"))
+  code_hash = str(script["codeHash"])
+  if len(code_hash) != 64 or any(character not in "0123456789abcdef" for character in code_hash):
+    raise ValueError(INCOMPLETE_HISTORY_MESSAGE.format(fields="scriptSnapshot.codeHash"))
   saved = _required(
     run.get("paramsSnapshot"),
     ("name", "strategy", "symbol", "timeframe", "params", "runParams", "execution"),
     "paramsSnapshot",
   )
+  for field in ("params", "runParams", "execution"):
+    _require_type(saved[field], dict, f"paramsSnapshot.{field}")
   request = _required(
     run.get("paramsJson"),
     (
@@ -278,6 +291,7 @@ def build_snapshot(run: dict[str, Any]) -> dict[str, Any]:
     ),
     "paramsJson",
   )
+  _require_type(request["strategyParams"], dict, "paramsJson.strategyParams")
   result = _required(
     run.get("resultJson"),
     (
@@ -287,6 +301,10 @@ def build_snapshot(run: dict[str, Any]) -> dict[str, Any]:
     "resultJson",
   )
   _required(result.get("summary"), ("totalReturn", "maxDrawdownRate", "annualSharpe"), "resultJson.summary")
+  for field in ("equity", "dailyHoldings", "trades", "skippedSignals", "warnings"):
+    _require_type(result[field], list, f"resultJson.{field}")
+  for field in ("experimentManifest", "dataSnapshot"):
+    _require_type(result[field], dict, f"resultJson.{field}")
   data_version = _required(run.get("dataVersion"), ("barSnapshot",), "dataVersion")
   market_data = _required(data_version["barSnapshot"], ("provider", "hash"), "dataVersion.barSnapshot")
   configuration = {
