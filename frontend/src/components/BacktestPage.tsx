@@ -83,6 +83,7 @@ interface Props {
     date: string;
   }) => void;
   onViewSharedBacktest?: (publicationId: string) => void;
+  requestedConfigId?: string | null;
 }
 
 const panelStyle = {
@@ -1215,6 +1216,7 @@ export default function BacktestPage({
   onStrategySaveActionChange,
   onViewTradeChart,
   onViewSharedBacktest,
+  requestedConfigId = null,
 }: Props) {
   const [instrumentList, setInstrumentList] = useState<InstrumentItem[]>(instruments);
   const [accounts, setAccounts] = useState<BacktestAccount[]>([]);
@@ -1282,6 +1284,7 @@ export default function BacktestPage({
   const [publishingRun, setPublishingRun] = useState(false);
   const [selectedScriptId, setSelectedScriptId] = useState<string>('');
   const [selectedConfigId, setSelectedConfigId] = useState<string>('');
+  const lastRequestedConfigIdRef = useRef<string | null>(null);
   const [versionDirty, setVersionDirty] = useState(false);
   const [strategySavePending, setStrategySavePending] = useState(false);
   const strategySaveActionRef = useRef<() => Promise<string | null>>(async () => null);
@@ -1839,6 +1842,29 @@ export default function BacktestPage({
     setStatus(`已加载策略 ${config.name}`);
     setError('');
   };
+
+  useEffect(() => {
+    if (!requestedConfigId || lastRequestedConfigIdRef.current === requestedConfigId) return;
+    let cancelled = false;
+    fetchStrategyConfigs()
+      .then((configs) => {
+        if (cancelled) return;
+        setStrategyConfigs(configs);
+        const requested = configs.find((item) => item.id === requestedConfigId);
+        if (!requested) {
+          setError('复制的策略当前不可用');
+          return;
+        }
+        lastRequestedConfigIdRef.current = requestedConfigId;
+        applyStrategyConfig(requested);
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setError(reason instanceof Error ? reason.message : '加载复制策略失败');
+        }
+      });
+    return () => { cancelled = true; };
+  }, [requestedConfigId]);
 
   const buildStrategyConfigPayload = (
     scriptId: string,
@@ -3407,6 +3433,11 @@ export default function BacktestPage({
                   <div>名称：{activeConfig?.name || configName || '未选择策略方案'}</div>
                   <div>模式：回测</div>
                   <div>脚本版本：{activeConfig ? `v${activeConfig.scriptVersionNo}` : '未绑定'}</div>
+                  {activeConfig?.sharedSource && (
+                    <div>
+                      来源：{activeConfig.sharedSource.title} · 原作者 {activeConfig.sharedSource.authorName}
+                    </div>
+                  )}
                   <div>标的：{selectedSymbol}</div>
                   <div>基准：{selectedBenchmarkSymbol}</div>
                 </div>

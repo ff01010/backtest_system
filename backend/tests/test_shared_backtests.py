@@ -116,6 +116,19 @@ def test_snapshot_uses_business_whitelist_and_removes_system_fields() -> None:
     assert forbidden not in serialized
 
 
+def test_derived_snapshot_keeps_immutable_shared_origin() -> None:
+  run = complete_run()
+  run["paramsSnapshot"]["sharedSource"] = {
+    "publicationId": "publication-1",
+    "authorName": "原作者",
+    "title": "原共享策略",
+  }
+
+  snapshot = state_store._build_shared_backtest_snapshot(run)
+
+  assert snapshot["origin"] == run["paramsSnapshot"]["sharedSource"]
+
+
 @pytest.mark.parametrize("field", ["scriptSnapshot", "paramsSnapshot", "resultJson"])
 def test_snapshot_rejects_incomplete_history(field: str) -> None:
   run = complete_run()

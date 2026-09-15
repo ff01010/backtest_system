@@ -417,6 +417,11 @@ export interface StrategyConfig {
   published: boolean;
   publishedVersionId: string | null;
   revision: number;
+  sharedSource?: {
+    publicationId: string;
+    authorName: string;
+    title: string;
+  } | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -487,6 +492,10 @@ export interface SharedBacktestListItem {
   annualSharpe: number | null;
   copyCount: number;
   firstPublishedAt: string;
+  sourcePublicationId?: string | null;
+  sourceAuthorName?: string | null;
+  sourceTitle?: string | null;
+  hasCopied?: boolean;
 }
 
 export interface SharedBacktestDetail extends SharedBacktestListItem {
@@ -511,6 +520,19 @@ export interface SharedBacktestManagementItem extends SharedBacktestListItem {
   removalReason: string | null;
   updatedAt: string;
   sourceRunAvailable: boolean;
+}
+
+export interface SharedBacktestCopyResponse {
+  configId: string;
+  scriptId: string;
+  name: string;
+  created: boolean;
+  accountCleared: boolean;
+  sharedSource: {
+    publicationId: string;
+    authorName: string;
+    title: string;
+  };
 }
 
 export interface DataGapDate {

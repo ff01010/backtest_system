@@ -562,6 +562,7 @@ def _normalize_script(row: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
   runtime = _json(row.get("runtime_config"), {})
+  source_publication_id = _uuid(row.get("source_publication_id"))
   return {
     "id": _uuid(row["id"]),
     "name": row["name"],
@@ -583,6 +584,11 @@ def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
     "published": bool(row["published"]),
     "publishedVersionId": _uuid(row.get("published_version_id")),
     "revision": int(row.get("revision") or 1),
+    "sharedSource": {
+      "publicationId": source_publication_id,
+      "authorName": row.get("source_author_name_snapshot"),
+      "title": row.get("source_title_snapshot"),
+    } if source_publication_id else None,
     "createdAt": _format_time(row["created_at"]),
     "updatedAt": _format_time(row["updated_at"]),
   }
@@ -1002,6 +1008,7 @@ def _config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
     "strategy": config["strategy"], "mode": config["mode"], "symbol": config["symbol"],
     "timeframe": config.get("timeframe", "5m"), "benchmarkSymbol": config.get("benchmarkSymbol"),
     "accountId": config.get("accountId"), "paramsJson": params_json,
+    "sharedSource": config.get("sharedSource"),
   }
 
 
@@ -1018,12 +1025,15 @@ def _write_config(
     cur.execute("""
       INSERT INTO strategy_config (
         owner_user_id, name, strategy_id, strategy_version_id, strategy_key, mode, instrument_id, timeframe,
-        benchmark_instrument_id, account_id, params, enabled, published
-      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true) RETURNING id
+        benchmark_instrument_id, account_id, params, enabled, published,
+        source_publication_id, source_author_name_snapshot, source_title_snapshot
+      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s) RETURNING id
     """, (current_user_id(), payload["name"], strategy_id, strategy_version_id,
            payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
-           payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True)))
+           payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True),
+           payload.get("sourcePublicationId"), payload.get("sourceAuthorName"),
+           payload.get("sourceTitle")))
   else:
     cur.execute("""
       UPDATE strategy_config SET name=%s, strategy_version_id=%s, strategy_key=%s, mode=%s,
@@ -2345,6 +2355,8 @@ def _build_shared_backtest_snapshot(run: dict[str, Any]) -> dict[str, Any]:
       "type": "research_signal",
       "summary": _safe_shared_value(params["researchSignal"]),
     })
+  source = params.get("sharedSource")
+  origin = _safe_shared_value(source) if isinstance(source, dict) else {}
   return {
     "strategy": _shared_strategy_snapshot(run),
     "configuration": _shared_configuration_snapshot(run),
@@ -2352,7 +2364,7 @@ def _build_shared_backtest_snapshot(run: dict[str, Any]) -> dict[str, Any]:
     "result": _safe_shared_value({
       key: result[key] for key in _SHARED_RESULT_KEYS if key in result
     }),
-    "origin": {},
+    "origin": origin,
   }
 
 
@@ -2377,6 +2389,9 @@ def _publication_list_item(row: dict[str, Any]) -> dict[str, Any]:
     "annualSharpe": _to_float(row.get("annual_sharpe")),
     "copyCount": int(row.get("copy_count") or 0),
     "firstPublishedAt": _format_time(row["first_published_at"]),
+    "sourcePublicationId": _uuid(row.get("source_publication_id")),
+    "sourceAuthorName": row.get("source_author_name_snapshot"),
+    "sourceTitle": row.get("source_title_snapshot"),
   }
 
 
@@ -2428,15 +2443,17 @@ def create_shared_backtest_publication(
       summary = snapshot["result"].get("summary", {})
       configuration = snapshot["configuration"]
       digest = _shared_snapshot_digest(snapshot)
+      origin = snapshot.get("origin") or {}
       cur.execute("""
         INSERT INTO backtest_publication (
           owner_user_id, author_name_snapshot, source_run_id, title, description,
           tags, status, snapshot_schema_version, snapshot_json, snapshot_digest,
           symbol, timeframe, strategy_category, start_date, end_date,
-          total_return, max_drawdown_rate, annual_sharpe
+          total_return, max_drawdown_rate, annual_sharpe,
+          source_publication_id, source_author_name_snapshot, source_title_snapshot
         ) VALUES (
           %s, %s, %s, %s, %s, %s, 'active', 1, %s, %s,
-          %s, %s, %s, %s, %s, %s, %s, %s
+          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         )
         ON CONFLICT (source_run_id) WHERE source_run_id IS NOT NULL DO NOTHING
         RETURNING *
@@ -2446,7 +2463,8 @@ def create_shared_backtest_publication(
         configuration["timeframe"], configuration["strategyCategory"],
         configuration["startDate"], configuration["endDate"],
         summary.get("totalReturn"), summary.get("maxDrawdownRate"),
-        summary.get("annualSharpe"),
+        summary.get("annualSharpe"), origin.get("publicationId"),
+        origin.get("authorName"), origin.get("title"),
       ))
       publication = cur.fetchone()
       created = publication is not None

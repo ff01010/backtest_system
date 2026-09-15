@@ -17,6 +17,7 @@ import type {
   ReleaseNotice,
   ReleaseStatus,
   SharedBacktestDetail,
+  SharedBacktestCopyResponse,
   SharedBacktestListItem,
   SharedBacktestManagementItem,
   SharedBacktestStatus,
@@ -579,6 +580,16 @@ export async function relistSharedBacktest(
     {},
   );
   return data.publication;
+}
+
+export async function copySharedBacktest(
+  publicationId: string,
+): Promise<SharedBacktestCopyResponse> {
+  return sendJson<SharedBacktestCopyResponse>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/copy`,
+    'POST',
+    {},
+  );
 }
 
 export async function cancelBacktestRun(runId: string): Promise<{

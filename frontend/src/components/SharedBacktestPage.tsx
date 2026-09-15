@@ -4,9 +4,11 @@ import { fetchSharedBacktest, fetchSharedBacktests } from '../api/client';
 import type { SharedBacktestDetail, SharedBacktestListItem } from '../types';
 import { typography } from '../styles/typography';
 import MySharedBacktestsPanel from './MySharedBacktestsPanel';
+import SharedBacktestCopyAction from './SharedBacktestCopyAction';
 
 interface Props {
   initialPublicationId?: string | null;
+  onOpenCopiedStrategy?: (configId: string) => void;
 }
 
 function formatPercent(value: number | null): string {
@@ -25,7 +27,10 @@ function JsonBlock({ value }: { value: unknown }) {
   );
 }
 
-export default function SharedBacktestPage({ initialPublicationId = null }: Props) {
+export default function SharedBacktestPage({
+  initialPublicationId = null,
+  onOpenCopiedStrategy = () => {},
+}: Props) {
   const [items, setItems] = useState<SharedBacktestListItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(initialPublicationId);
   const [detail, setDetail] = useState<SharedBacktestDetail | null>(null);
@@ -90,6 +95,16 @@ export default function SharedBacktestPage({ initialPublicationId = null }: Prop
                 {detail.tags.map((tag) => <span key={tag}>#{tag}</span>)}
               </div>
             </section>
+            {detail.sourcePublicationId && (
+              <section style={cardStyle}>
+                来源：{detail.sourceTitle} · 原作者 {detail.sourceAuthorName}
+              </section>
+            )}
+            <SharedBacktestCopyAction
+              publicationId={detail.id}
+              hasCopied={detail.hasCopied}
+              onOpenStrategy={onOpenCopiedStrategy}
+            />
             <section style={{ ...cardStyle, borderColor: '#f59e0b', background: '#fffbeb' }}>
               <ShieldCheck size={18} /> {detail.riskNotice}
             </section>

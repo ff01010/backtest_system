@@ -42,6 +42,7 @@ async function enterResearchCenter(): Promise<void> {
 function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogout: () => void }) {
   const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'sharedBacktests' | 'apiKeys' | 'users' | 'systemErrors'>('backtest');
   const [sharedPublicationId, setSharedPublicationId] = useState<string | null>(null);
+  const [strategyConfigToOpen, setStrategyConfigToOpen] = useState<string | null>(null);
   const [urlParams, setUrlParams] = useUrlState();
   const [researchError, setResearchError] = useState<string | null>(null);
   const [researchStarting, setResearchStarting] = useState(false);
@@ -286,11 +287,18 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
             setSharedPublicationId(publicationId);
             setActivePage('sharedBacktests');
           }}
+          requestedConfigId={strategyConfigToOpen}
         />
       </div>
 
       {activePage === 'sharedBacktests' && (
-        <SharedBacktestPage initialPublicationId={sharedPublicationId} />
+        <SharedBacktestPage
+          initialPublicationId={sharedPublicationId}
+          onOpenCopiedStrategy={(configId) => {
+            setStrategyConfigToOpen(configId);
+            setActivePage('backtest');
+          }}
+        />
       )}
 
       {activePage === 'users' && (

@@ -58,6 +58,7 @@ from backend.services import (
   release_notifications,
   research_signal_snapshot,
   shared_backtest_lifecycle,
+  shared_backtest_copy,
   state_store,
   strategy_adapters,
 )
@@ -403,6 +404,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "execution": execution_algorithm_snapshot(
       str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
     ),
+    "sharedSource": config.get("sharedSource"),
   }
 
 
@@ -1315,6 +1317,20 @@ def my_shared_backtests(
   status: str | None = Query(default=None, pattern=r"^(active|withdrawn|removed)$"),
 ):
   return shared_backtest_lifecycle.list_my_shared_backtests(limit, offset, status)
+
+
+@app.post("/api/shared-backtests/{publication_id}/copy")
+def copy_shared_backtest(publication_id: str):
+  try:
+    return shared_backtest_copy.copy_shared_backtest(publication_id)
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"复制共享回测失败: {error}") from error
 
 
 @app.get("/api/shared-backtests/{publication_id}")

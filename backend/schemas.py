@@ -432,6 +432,7 @@ class StrategyConfig(BaseModel):
   published: bool = True
   publishedVersionId: str | None = None
   revision: int = 1
+  sharedSource: dict[str, Any] | None = None
   createdAt: str
   updatedAt: str
 
@@ -533,6 +534,9 @@ class SharedBacktestListItem(BaseModel):
   annualSharpe: float | None
   copyCount: int
   firstPublishedAt: str
+  sourcePublicationId: str | None = None
+  sourceAuthorName: str | None = None
+  sourceTitle: str | None = None
 
 
 class SharedBacktestManagementItem(SharedBacktestListItem):
@@ -555,6 +559,15 @@ class SharedBacktestDetail(SharedBacktestListItem):
   result: dict[str, Any]
   origin: dict[str, Any]
   riskNotice: str
+
+
+class SharedBacktestCopyResponse(BaseModel):
+  configId: str
+  scriptId: str
+  name: str
+  created: bool
+  accountCleared: bool
+  sharedSource: dict[str, Any]
 
 
 class BacktestRunMetaUpdate(BaseModel):
