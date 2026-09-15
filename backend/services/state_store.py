@@ -2090,11 +2090,12 @@ def _scheduler_audit_snapshot(cur: Any) -> dict[str, int]:
 
 def _run_query(where: str = "") -> str:
   return f"""
-    SELECT r.*, s.id AS strategy_id,
+    SELECT r.*, s.id AS strategy_id, c.name AS config_name,
       i.symbol || '.' || i.exchange AS symbol,
       b.symbol || '.' || b.exchange AS benchmark_symbol,
       COALESCE(bar_job.cancel_requested, l2_job.cancel_requested, false) AS cancel_requested
     FROM backtest_run r
+    LEFT JOIN strategy_config c ON c.id=r.config_id
     LEFT JOIN user_strategy_version sv ON sv.id=r.strategy_version_id
     LEFT JOIN user_strategy s ON s.id=sv.strategy_id
     LEFT JOIN market_instrument i ON i.id=r.instrument_id
@@ -2126,6 +2127,102 @@ def list_backtest_runs(
       )
       cur.execute(query, params)
       return [_normalize_run(row) for row in cur.fetchall()]
+
+
+def _backtest_run_filter_clause(
+  query: str,
+  symbol: str | None,
+  config_id: str | None,
+) -> tuple[str, tuple[Any, ...]]:
+  clauses: list[str] = []
+  params: list[Any] = []
+  if config_id:
+    clauses.append("r.config_id=%s")
+    params.append(config_id)
+  if symbol:
+    clauses.append(
+      "COALESCE(i.symbol || '.' || i.exchange, r.requested_params->>'symbol')=%s"
+    )
+    params.append(symbol)
+  normalized_query = query.strip()
+  if normalized_query:
+    query_pattern = f"%{normalized_query}%"
+    is_display_number = (
+      normalized_query.startswith("#") and normalized_query[1:].isdigit()
+    )
+    display_predicate = (
+      "r.display_no=%s" if is_display_number else "r.display_no::text ILIKE %s"
+    )
+    display_value: Any = (
+      int(normalized_query[1:]) if is_display_number else query_pattern
+    )
+    clauses.append(f"""
+      (r.id::text ILIKE %s OR {display_predicate}
+        OR COALESCE(i.symbol || '.' || i.exchange, r.requested_params->>'symbol', '') ILIKE %s
+        OR COALESCE(r.requested_params->>'strategy', '') ILIKE %s
+        OR COALESCE(c.name, '') ILIKE %s OR COALESCE(r.tags::text, '') ILIKE %s)
+    """)
+    params.extend([
+      query_pattern,
+      display_value,
+      query_pattern,
+      query_pattern,
+      query_pattern,
+      query_pattern,
+    ])
+  clause = "" if not clauses else " AND " + " AND ".join(clauses)
+  return clause, tuple(params)
+
+
+def list_backtest_run_page(
+  limit: int,
+  offset: int,
+  query: str = "",
+  symbol: str | None = None,
+  config_id: str | None = None,
+) -> dict[str, Any]:
+  """返回当前用户的历史回测分页及分页所需的索引信息。"""
+  if limit < 1 or limit > 100 or offset < 0:
+    raise ValueError("分页参数无效")
+  user_id = current_user_id()
+  filter_clause, filter_params = _backtest_run_filter_clause(query, symbol, config_id)
+  base_params = (user_id, *filter_params)
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(f"""
+        SELECT count(*) AS value
+        FROM backtest_run r
+        LEFT JOIN strategy_config c ON c.id=r.config_id
+        LEFT JOIN market_instrument i ON i.id=r.instrument_id
+        WHERE r.owner_user_id=%s {filter_clause}
+      """, base_params)
+      total = int(cur.fetchone()["value"])
+      cur.execute(
+        _run_query(
+          f"{filter_clause} ORDER BY r.created_at DESC, r.id DESC LIMIT %s OFFSET %s"
+        ),
+        (*base_params, limit, offset),
+      )
+      runs = [_normalize_run(row) for row in cur.fetchall()]
+      symbol_config_clause = " AND r.config_id=%s" if config_id else ""
+      symbol_params = (user_id, config_id) if config_id else (user_id,)
+      cur.execute(f"""
+        SELECT DISTINCT COALESCE(
+          i.symbol || '.' || i.exchange, r.requested_params->>'symbol'
+        ) AS symbol
+        FROM backtest_run r
+        LEFT JOIN market_instrument i ON i.id=r.instrument_id
+        WHERE r.owner_user_id=%s {symbol_config_clause}
+        ORDER BY symbol
+      """, symbol_params)
+      symbols = [str(row["symbol"]) for row in cur.fetchall() if row.get("symbol")]
+      return {
+        "runs": runs,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "symbols": symbols,
+      }
 
 
 def get_backtest_run(run_id: str) -> dict[str, Any]:

@@ -469,6 +469,35 @@ export async function fetchBacktestRuns(
   return data.runs;
 }
 
+export interface BacktestRunPageQuery {
+  limit: number;
+  offset: number;
+  query?: string;
+  symbol?: string;
+  configId?: string | null;
+}
+
+export interface BacktestRunPage {
+  runs: BacktestRunHistory[];
+  total: number;
+  limit: number;
+  offset: number;
+  symbols: string[];
+}
+
+export async function fetchBacktestRunPage(
+  params: BacktestRunPageQuery
+): Promise<BacktestRunPage> {
+  const search = new URLSearchParams({
+    limit: String(params.limit),
+    offset: String(params.offset),
+  });
+  if (params.query?.trim()) search.set('query', params.query.trim());
+  if (params.symbol) search.set('symbol', params.symbol);
+  if (params.configId) search.set('configId', params.configId);
+  return fetchJson<BacktestRunPage>(`${BASE}/backtest/runs?${search.toString()}`);
+}
+
 export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistory> {
   const data = await fetchJson<{ run: BacktestRunHistory }>(`${BASE}/backtest/runs/${runId}`);
   return data.run;

@@ -1264,9 +1264,18 @@ def strategy_config_versions(config_id: str):
 @app.get("/api/backtest/runs")
 def backtest_runs(
   limit: int = Query(30, ge=1, le=100),
+  offset: int = Query(0, ge=0),
+  query: str = Query("", max_length=100),
+  symbol: str | None = Query(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   config_id: str | None = Query(default=None, alias="configId"),
 ):
-  return {"runs": state_store.list_backtest_runs(limit, config_id)}
+  return state_store.list_backtest_run_page(
+    limit=limit,
+    offset=offset,
+    query=query,
+    symbol=symbol,
+    config_id=config_id,
+  )
 
 
 @app.get("/api/backtest/runs/{run_id}")
