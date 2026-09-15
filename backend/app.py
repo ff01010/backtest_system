@@ -56,6 +56,7 @@ from backend.services import (
   qmt_instrument_directory,
   data_repository,
   release_notifications,
+  shared_backtest_admin,
   research_signal_snapshot,
   shared_backtest_lifecycle,
   shared_backtest_copy,
@@ -1305,6 +1306,7 @@ def publish_backtest_run(
 
 @app.get("/api/shared-backtests")
 def shared_backtests(
+  response: Response,
   limit: int = Query(20, ge=1, le=100),
   offset: int = Query(0, ge=0),
   query: str = Query("", max_length=100),
@@ -1313,6 +1315,7 @@ def shared_backtests(
   sort: Literal["latest", "copies"] = Query("latest"),
   favorites_only: bool = Query(False, alias="favoritesOnly"),
 ):
+  response.headers["Cache-Control"] = "private, no-store"
   return shared_backtest_discovery.list_shared_backtests(
     limit=limit,
     offset=offset,
@@ -1339,6 +1342,48 @@ def unfavorite_shared_backtest(publication_id: str):
   return {"favorited": False, "deleted": deleted}
 
 
+@app.get("/api/admin/shared-backtests")
+def admin_shared_backtests(
+  request: Request,
+  limit: int = Query(20, ge=1, le=100),
+  offset: int = Query(0, ge=0),
+  status: str | None = Query(default=None, pattern=r"^(active|withdrawn|removed)$"),
+):
+  _require_admin(request)
+  return shared_backtest_admin.list_shared_backtests_for_admin(limit, offset, status)
+
+
+@app.post("/api/admin/shared-backtests/{publication_id}/remove")
+def admin_remove_shared_backtest(
+  publication_id: str,
+  payload: schemas.SharedBacktestRemovalRequest,
+  request: Request,
+):
+  _require_admin(request)
+  return _admin_publication_transition(
+    lambda: shared_backtest_admin.remove_publication(publication_id, payload.reason),
+  )
+
+
+@app.post("/api/admin/shared-backtests/{publication_id}/restore")
+def admin_restore_shared_backtest(publication_id: str, request: Request):
+  _require_admin(request)
+  return _admin_publication_transition(
+    lambda: shared_backtest_admin.restore_publication(publication_id),
+  )
+
+
+def _admin_publication_transition(transition: Any):
+  try:
+    return {"publication": transition()}
+  except KeyError as error:
+    raise HTTPException(404, "共享回测不存在") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"共享回测管理员状态更新失败: {error}") from error
+
+
 @app.get("/api/shared-backtests/mine")
 def my_shared_backtests(
   limit: int = Query(20, ge=1, le=100),
@@ -1363,7 +1408,8 @@ def copy_shared_backtest(publication_id: str):
 
 
 @app.get("/api/shared-backtests/{publication_id}")
-def shared_backtest_detail(publication_id: str):
+def shared_backtest_detail(publication_id: str, response: Response):
+  response.headers["Cache-Control"] = "private, no-store"
   try:
     return {"publication": state_store.get_shared_backtest(publication_id)}
   except KeyError as error:

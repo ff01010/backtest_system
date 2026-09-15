@@ -5,6 +5,7 @@ import SharedBacktestPage from '../components/SharedBacktestPage';
 const apiMocks = vi.hoisted(() => ({
   fetchSharedBacktest: vi.fn(),
   fetchSharedBacktests: vi.fn(),
+  fetchAdminSharedBacktests: vi.fn(),
   copySharedBacktest: vi.fn(),
 }));
 
@@ -57,6 +58,9 @@ describe('SharedBacktestPage', () => {
         title: '均线回测',
       },
     });
+    apiMocks.fetchAdminSharedBacktests.mockResolvedValue({
+      items: [], total: 0, limit: 20, offset: 0,
+    });
   });
 
   it('shows the safe list projection and opens the basic detail', async () => {
@@ -87,5 +91,26 @@ describe('SharedBacktestPage', () => {
       expect(apiMocks.copySharedBacktest).toHaveBeenCalledWith('publication-1');
       expect(onOpenCopiedStrategy).toHaveBeenCalledWith('config-copy-1');
     });
+  });
+
+  it('clears the prior detail when an old link becomes unavailable', async () => {
+    render(<SharedBacktestPage initialPublicationId="publication-1" />);
+    expect(await screen.findByText(/def on_bar/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /返回策略广场/ }));
+    apiMocks.fetchSharedBacktest.mockRejectedValueOnce(new Error('该共享回测已不可用'));
+    fireEvent.click(await screen.findByRole('button', { name: '查看详情' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain('该共享回测已不可用');
+    expect(screen.queryByText(/def on_bar/)).toBeNull();
+  });
+
+  it('shows the management section only to administrators', async () => {
+    const { rerender } = render(<SharedBacktestPage />);
+    await screen.findByRole('heading', { name: '均线回测' });
+    expect(screen.queryByRole('tab', { name: '共享管理' })).toBeNull();
+
+    rerender(<SharedBacktestPage isAdmin />);
+    fireEvent.click(screen.getByRole('tab', { name: '共享管理' }));
+    expect(await screen.findByLabelText('共享回测管理')).toBeTruthy();
   });
 });

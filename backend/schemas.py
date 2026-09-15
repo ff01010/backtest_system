@@ -519,6 +519,18 @@ class SharedBacktestMetaUpdate(SharedBacktestPublicationCreate):
   """作者可修改的共享展示信息。"""
 
 
+class SharedBacktestRemovalRequest(BaseModel):
+  reason: str = Field(min_length=1, max_length=1000)
+
+  @field_validator("reason")
+  @classmethod
+  def normalize_reason(cls, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+      raise ValueError("下架原因不能为空")
+    return normalized
+
+
 class SharedBacktestListItem(BaseModel):
   id: str
   title: str

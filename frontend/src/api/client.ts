@@ -54,6 +54,16 @@ async function fetchJson<T>(url: string): Promise<T> {
   return res.json();
 }
 
+async function fetchNoStoreJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { credentials: 'include', cache: 'no-store' });
+  if (!res.ok) {
+    const text = await res.text();
+    const message = getApiErrorMessage(text);
+    throw new Error(message || `API ${res.status}: 请求失败`);
+  }
+  return res.json();
+}
+
 async function sendJson<T>(url: string, method: string, payload: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
@@ -548,11 +558,11 @@ export async function fetchSharedBacktests(
   if (params.timeframe) search.set('timeframe', params.timeframe);
   if (params.sort) search.set('sort', params.sort);
   if (params.favoritesOnly) search.set('favoritesOnly', 'true');
-  return fetchJson<SharedBacktestPage>(`${BASE}/shared-backtests?${search.toString()}`);
+  return fetchNoStoreJson<SharedBacktestPage>(`${BASE}/shared-backtests?${search.toString()}`);
 }
 
 export async function fetchSharedBacktest(publicationId: string): Promise<SharedBacktestDetail> {
-  const data = await fetchJson<{ publication: SharedBacktestDetail }>(
+  const data = await fetchNoStoreJson<{ publication: SharedBacktestDetail }>(
     `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}`,
   );
   return data.publication;
@@ -630,6 +640,39 @@ export async function unfavoriteSharedBacktest(
     'DELETE',
     {},
   );
+}
+
+export async function fetchAdminSharedBacktests(
+  limit = 20,
+  offset = 0,
+  status?: SharedBacktestStatus,
+): Promise<{ items: SharedBacktestManagementItem[]; total: number; limit: number; offset: number }> {
+  const search = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (status) search.set('status', status);
+  return fetchNoStoreJson(`${BASE}/admin/shared-backtests?${search.toString()}`);
+}
+
+export async function removeSharedBacktest(
+  publicationId: string,
+  reason: string,
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/admin/shared-backtests/${encodeURIComponent(publicationId)}/remove`,
+    'POST',
+    { reason },
+  );
+  return data.publication;
+}
+
+export async function restoreSharedBacktest(
+  publicationId: string,
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/admin/shared-backtests/${encodeURIComponent(publicationId)}/restore`,
+    'POST',
+    {},
+  );
+  return data.publication;
 }
 
 export async function cancelBacktestRun(runId: string): Promise<{

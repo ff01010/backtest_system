@@ -8,6 +8,7 @@ import {
 } from '../api/client';
 import type { SharedBacktestDetail, SharedBacktestListItem } from '../types';
 import { typography } from '../styles/typography';
+import AdminSharedBacktestsPanel from './AdminSharedBacktestsPanel';
 import MySharedBacktestsPanel from './MySharedBacktestsPanel';
 import SharedBacktestCopyAction from './SharedBacktestCopyAction';
 import {
@@ -18,6 +19,7 @@ import {
 
 interface Props {
   initialPublicationId?: string | null;
+  isAdmin?: boolean;
   onOpenCopiedStrategy?: (configId: string) => void;
 }
 
@@ -114,11 +116,12 @@ function SharedBacktestDetailView(props: {
 
 export default function SharedBacktestPage({
   initialPublicationId = null,
+  isAdmin = false,
   onOpenCopiedStrategy = () => {},
 }: Props) {
   const [items, setItems] = useState<SharedBacktestListItem[]>([]);
   const [total, setTotal] = useState(0);
-  const [section, setSection] = useState<'all' | 'favorites' | 'mine'>('all');
+  const [section, setSection] = useState<'all' | 'favorites' | 'mine' | 'admin'>('all');
   const [filters, setFilters] = useState<DiscoveryFilters>(INITIAL_FILTERS);
   const [draftQuery, setDraftQuery] = useState('');
   const [offset, setOffset] = useState(0);
@@ -154,6 +157,7 @@ export default function SharedBacktestPage({
     }).catch((reason: unknown) => {
       if (!cancelled) {
         const message = reason instanceof Error ? reason.message : '';
+        setDetail(null);
         setError(message.includes('404') ? '该共享回测已不可用' : message || '共享回测加载失败');
       }
     }).finally(() => { if (!cancelled) setLoading(false); });
@@ -200,8 +204,21 @@ export default function SharedBacktestPage({
           <button type="button" role="tab" aria-selected={section === 'all'} onClick={() => { setSection('all'); setOffset(0); }}>全部共享</button>
           <button type="button" role="tab" aria-selected={section === 'favorites'} onClick={() => { setSection('favorites'); setOffset(0); }}>我的收藏</button>
           <button type="button" role="tab" aria-selected={section === 'mine'} onClick={() => { setSection('mine'); setOffset(0); }}>我的共享</button>
+          {isAdmin && (
+            <button type="button" role="tab" aria-selected={section === 'admin'} onClick={() => { setSection('admin'); setOffset(0); }}>共享管理</button>
+          )}
         </div>
-        {section === 'mine' ? (
+        {section === 'admin' ? (
+          <AdminSharedBacktestsPanel
+            onPublicationChanged={(publication) => {
+              setRefreshKey((value) => value + 1);
+              if (publication.status !== 'active' && detail?.id === publication.id) {
+                setDetail(null);
+                setSelectedId(null);
+              }
+            }}
+          />
+        ) : section === 'mine' ? (
           <MySharedBacktestsPanel onPublicationChanged={() => setRefreshKey((value) => value + 1)} />
         ) : (
           <>

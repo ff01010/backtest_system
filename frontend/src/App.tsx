@@ -294,6 +294,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
       {activePage === 'sharedBacktests' && (
         <SharedBacktestPage
           initialPublicationId={sharedPublicationId}
+          isAdmin={currentUser.role === 'admin'}
           onOpenCopiedStrategy={(configId) => {
             setStrategyConfigToOpen(configId);
             setActivePage('backtest');
