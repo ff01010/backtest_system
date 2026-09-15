@@ -29,13 +29,18 @@ def complete_run() -> dict[str, Any]:
       "code": "def on_bar(bar, state):\n  return []",
       "entryType": "on_bar",
       "codeHash": "a" * 64,
+      "signalRequired": False,
       "runtimeVersion": "1",
     },
     "paramsSnapshot": {
       "name": "均线方案",
+      "strategy": "user_script",
+      "symbol": "688981.SH",
+      "timeframe": "5m",
       "accountId": 42,
       "params": {"window": 20},
       "runParams": {"window": 20},
+      "execution": {"algorithm": "immediate"},
       "researchSignal": {
         "snapshotHash": "b" * 64,
         "artifactFile": "C:/private/signals.ndjson",
@@ -43,6 +48,7 @@ def complete_run() -> dict[str, Any]:
     },
     "paramsJson": {
       "accountId": 42,
+      "strategyCategory": "directional_holding",
       "symbol": "688981.SH",
       "timeframe": "5m",
       "startDate": "2026-01-01",
@@ -55,25 +61,28 @@ def complete_run() -> dict[str, Any]:
       "strategyParams": {"window": 20},
       "requestKey": "private-request",
     },
-    "dataVersion": {
-      "provider": "qmt_kline",
-      "hash": "c" * 64,
+    "dataVersion": {"barSnapshot": {
+      "provider": "qmt_kline", "hash": "c" * 64,
       "sourcePath": "C:/private/bars.parquet",
-    },
+    }},
     "resultJson": {
       "runId": "run-1",
       "outputDir": "C:/private/output",
+      "resultSchemaVersion": 3,
       "summary": {
         "totalReturn": 0.12,
         "maxDrawdownRate": 0.04,
         "annualSharpe": 1.5,
       },
       "equity": [{"date": "2026-01-02", "value": 1_010_000, "pnl": 10_000}],
+      "dailyHoldings": [],
       "trades": [{"time": "2026-01-02", "price": 10, "accountId": 42}],
+      "skippedSignals": [],
       "experimentManifest": {
         "resultSchemaVersion": 3,
         "attemptToken": "private-attempt",
       },
+      "dataSnapshot": {"provider": "qmt_kline", "hash": "d" * 64},
       "warnings": [],
     },
   }
@@ -116,6 +125,27 @@ def test_snapshot_uses_business_whitelist_and_removes_system_fields() -> None:
     assert forbidden not in serialized
 
 
+def test_snapshot_nested_contract_does_not_leak_system_diagnostics() -> None:
+  run = complete_run()
+  run["paramsJson"]["strategyParams"] = {
+    "window": 20,
+    "nested": {"loginName": "secret", "sessionId": "secret", "kept": 1},
+  }
+  run["resultJson"]["summary"]["diagnostic"] = {"rawException": "secret"}
+  run["resultJson"]["experimentManifest"]["internalServiceUrl"] = "http://private"
+  run["resultJson"]["trades"][0]["attributionSegments"] = [{
+    "quantity": 1, "path": "C:/private", "rawException": "secret",
+  }]
+
+  snapshot = state_store._build_shared_backtest_snapshot(run)
+
+  assert snapshot["configuration"]["strategyParams"]["nested"] == {"kept": 1}
+  assert snapshot["result"]["trades"][0]["attributionSegments"] == [{"quantity": 1}]
+  serialized = str(snapshot)
+  for forbidden in ("loginName", "sessionId", "diagnostic", "internalServiceUrl", "rawException", "C:/private"):
+    assert forbidden not in serialized
+
+
 def test_derived_snapshot_keeps_immutable_shared_origin() -> None:
   run = complete_run()
   run["paramsSnapshot"]["sharedSource"] = {
@@ -129,12 +159,34 @@ def test_derived_snapshot_keeps_immutable_shared_origin() -> None:
   assert snapshot["origin"] == run["paramsSnapshot"]["sharedSource"]
 
 
-@pytest.mark.parametrize("field", ["scriptSnapshot", "paramsSnapshot", "resultJson"])
+@pytest.mark.parametrize("field", ["scriptSnapshot", "paramsSnapshot", "dataVersion", "resultJson"])
 def test_snapshot_rejects_incomplete_history(field: str) -> None:
   run = complete_run()
   run[field] = None
 
-  with pytest.raises(ValueError, match="历史任务资料不完整"):
+  with pytest.raises(ValueError, match="请重新运行该任务后共享"):
+    state_store._build_shared_backtest_snapshot(run)
+
+
+@pytest.mark.parametrize(
+  ("container", "field"),
+  [
+    ("scriptSnapshot", "entryType"),
+    ("scriptSnapshot", "codeHash"),
+    ("paramsSnapshot", "strategy"),
+    ("paramsSnapshot", "timeframe"),
+    ("paramsJson", "strategyCategory"),
+    ("resultJson", "resultSchemaVersion"),
+  ],
+)
+def test_snapshot_rejects_legacy_run_without_explicit_contract_field(
+  container: str,
+  field: str,
+) -> None:
+  run = complete_run()
+  del run[container][field]
+
+  with pytest.raises(ValueError, match=rf"{container}\.{field}"):
     state_store._build_shared_backtest_snapshot(run)
 
 

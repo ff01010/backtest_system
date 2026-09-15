@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-import re
 from typing import Any, Iterator
 from uuid import uuid4
 
@@ -18,7 +17,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend import settings
-from backend.services import shared_backtest_artifacts
+from backend.services import shared_backtest_artifacts, shared_backtest_snapshot
 from backend.services.user_context import get_current_user
 from backend.strategies.runtime_contract import (
   RUNTIME_CAPABILITY_DIGEST,
@@ -2301,91 +2300,29 @@ _SHARED_DETAIL_MANIFEST_KEYS = (
   "initialPositionEnabled", "baseQuantity", "baseCostPrice", "t0Enabled",
   "resultSchemaVersion", "executionEnvironment",
 )
-_SHARED_FORBIDDEN_KEYS = {
-  "userid", "owneruserid", "accountid", "accountname", "username", "email",
-  "outputdir", "storagekey", "artifactfile", "requestid", "requestkey",
-  "attempttoken", "leasetoken", "workerid", "errormessage", "traceback",
-  "stacktrace", "apikey", "authorization", "credential", "internalpath",
-}
 _SHARED_RISK_NOTICE = "历史回测结果不代表未来表现"
 
 
-def _is_shared_system_key(key: object) -> bool:
-  normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-  return (
-    normalized in _SHARED_FORBIDDEN_KEYS
-    or normalized.endswith("path")
-    or normalized.endswith("dir")
-    or normalized.endswith("token")
-  )
-
-
-def _safe_shared_value(value: Any) -> Any:
-  """递归剔除系统字段，避免嵌套结果绕过共享白名单。"""
-  if isinstance(value, dict):
-    return {
-      key: _safe_shared_value(item)
-      for key, item in value.items()
-      if not _is_shared_system_key(key)
-    }
-  if isinstance(value, list):
-    return [_safe_shared_value(item) for item in value]
-  return value
-
-
 def _shared_mapping_projection(value: Any, keys: tuple[str, ...]) -> dict[str, Any]:
-  if not isinstance(value, dict):
-    return {}
-  return _safe_shared_value({key: value[key] for key in keys if key in value})
+  return shared_backtest_snapshot.project_fields(value, keys)
 
 
 def _shared_data_detail_projection(value: Any) -> dict[str, Any]:
-  if not isinstance(value, dict):
-    return {}
-  market_data = _shared_mapping_projection(
-    value.get("marketData"), _SHARED_DETAIL_MARKET_DATA_KEYS,
-  )
-  raw_market_data = value.get("marketData")
+  projected = shared_backtest_snapshot.project_data(value)
+  market_data = projected["marketData"]
+  raw_value = value if isinstance(value, dict) else {}
+  raw_market_data = raw_value.get("marketData")
   if isinstance(raw_market_data, dict):
     dates = raw_market_data.get("formalDates")
     if isinstance(dates, list) and dates:
       market_data["formalDateRange"] = {
         "start": dates[0], "end": dates[-1], "count": len(dates),
       }
-  result_data = _shared_mapping_projection(
-    value.get("resultData"), _SHARED_DETAIL_RESULT_DATA_KEYS,
-  )
-  dependencies: list[dict[str, Any]] = []
-  raw_dependencies = value.get("dependencies")
-  if isinstance(raw_dependencies, list):
-    for dependency in raw_dependencies:
-      if not isinstance(dependency, dict):
-        continue
-      item = {"type": dependency.get("type")}
-      item["summary"] = _shared_mapping_projection(
-        dependency.get("summary"), _SHARED_DETAIL_DEPENDENCY_KEYS,
-      )
-      dependencies.append(item)
-  return {
-    "marketData": market_data,
-    "resultData": result_data,
-    "dependencies": dependencies,
-  }
+  return projected
 
 
 def _shared_result_detail_projection(value: Any) -> dict[str, Any]:
-  if not isinstance(value, dict):
-    return {}
-  projected = {
-    key: value[key]
-    for key in _SHARED_DETAIL_RESULT_KEYS
-    if key in value and key != "experimentManifest"
-  }
-  if "experimentManifest" in value:
-    projected["experimentManifest"] = _shared_mapping_projection(
-      value["experimentManifest"], _SHARED_DETAIL_MANIFEST_KEYS,
-    )
-  return _safe_shared_value(projected)
+  return shared_backtest_snapshot.project_result(value, detail=True)
 
 
 def _shared_artifact_sources(
@@ -2419,7 +2356,7 @@ def _shared_artifact_sources(
   for row in rows:
     metadata: dict[str, Any] = {}
     if row.get("dataset_id"):
-      metadata = _safe_shared_value({
+      metadata = shared_backtest_snapshot.project_reproduction({
         **research_summary,
         "datasetId": _uuid(row["dataset_id"]),
         "datasetVersion": int(row["dataset_version"]),
@@ -2445,7 +2382,9 @@ def _shared_artifact_metadata(row: dict[str, Any], include_download: bool = Fals
     "byteSize": int(row.get("byte_size") or 0),
     "contentSha256": row["content_sha256"],
     "snapshotSchemaVersion": int(row.get("snapshot_schema_version") or 1),
-    "reproduction": _json(row.get("reproduction_metadata"), {}),
+    "reproduction": shared_backtest_snapshot.project_reproduction(
+      _json(row.get("reproduction_metadata"), {}),
+    ),
   }
   if include_download:
     result["downloadUrl"] = (
@@ -2480,76 +2419,16 @@ def _publication_artifact_rows(cur: Any, publication_id: str) -> list[dict[str, 
 
 
 def _shared_strategy_snapshot(run: dict[str, Any]) -> dict[str, Any]:
-  script = run.get("scriptSnapshot")
-  if not isinstance(script, dict) or not str(script.get("code") or "").strip():
-    raise ValueError("历史任务资料不完整，请重新运行后共享")
-  return _safe_shared_value({
-    "name": script.get("name") or run.get("paramsSnapshot", {}).get("name") or "",
-    "description": script.get("description") or "",
-    "entryType": script.get("entryType") or "on_bar",
-    "code": script["code"],
-    "codeHash": script.get("codeHash") or hashlib.sha256(
-      str(script["code"]).encode("utf-8"),
-    ).hexdigest(),
-    "signalRequired": bool(script.get("signalRequired", False)),
-    "runtimeVersion": script.get("runtimeVersion"),
-    "capabilityDigest": script.get("capabilityDigest"),
-  })
+  return shared_backtest_snapshot.build_snapshot(run)["strategy"]
 
 
 def _shared_configuration_snapshot(run: dict[str, Any]) -> dict[str, Any]:
-  request = run.get("paramsJson")
-  saved = run.get("paramsSnapshot")
-  if not isinstance(request, dict) or not isinstance(saved, dict) or not saved:
-    raise ValueError("历史任务资料不完整，请重新运行后共享")
-  configuration = {
-    "strategyName": saved.get("name") or "",
-    "strategy": run.get("strategy") or request.get("strategy") or "user_script",
-    "strategyCategory": run.get("strategyCategory") or "directional_holding",
-    "symbol": run.get("symbol") or request.get("symbol") or "",
-    "timeframe": run.get("timeframe") or request.get("timeframe") or "5m",
-    "benchmarkSymbol": run.get("benchmarkSymbol") or request.get("benchmarkSymbol"),
-    "startDate": run.get("startDate") or request.get("startDate") or "",
-    "endDate": run.get("endDate") or request.get("endDate") or "",
-    "params": saved.get("params") or {},
-    "runParams": saved.get("runParams") or request.get("strategyParams") or {},
-    "execution": saved.get("execution") or {},
-  }
-  configuration.update({key: request.get(key) for key in _SHARED_CONFIGURATION_KEYS})
-  return _safe_shared_value(configuration)
+  return shared_backtest_snapshot.build_snapshot(run)["configuration"]
 
 
 def _build_shared_backtest_snapshot(run: dict[str, Any]) -> dict[str, Any]:
-  """从历史回测规范化结果构造版本 1 业务白名单快照。"""
-  result = run.get("resultJson")
-  if run.get("status") not in {"ok", "succeeded"}:
-    raise ValueError("只有成功完成的回测可以共享")
-  if not isinstance(result, dict) or not result:
-    raise ValueError("历史任务资料不完整，请重新运行后共享")
-  params = run.get("paramsSnapshot")
-  if not isinstance(params, dict):
-    raise ValueError("历史任务资料不完整，请重新运行后共享")
-  data = {
-    "marketData": _safe_shared_value(run.get("dataVersion") or {}),
-    "resultData": _safe_shared_value(result.get("dataSnapshot") or {}),
-    "dependencies": [],
-  }
-  if isinstance(params.get("researchSignal"), dict):
-    data["dependencies"].append({
-      "type": "research_signal",
-      "summary": _safe_shared_value(params["researchSignal"]),
-    })
-  source = params.get("sharedSource")
-  origin = _safe_shared_value(source) if isinstance(source, dict) else {}
-  return {
-    "strategy": _shared_strategy_snapshot(run),
-    "configuration": _shared_configuration_snapshot(run),
-    "data": data,
-    "result": _safe_shared_value({
-      key: result[key] for key in _SHARED_RESULT_KEYS if key in result
-    }),
-    "origin": origin,
-  }
+  """从保存证据构造版本 1 业务白名单快照。"""
+  return shared_backtest_snapshot.build_snapshot(run)
 
 
 def _shared_snapshot_digest(snapshot: dict[str, Any]) -> str:
@@ -2592,6 +2471,17 @@ def _publication_detail(
   result = snapshot.get("result", {})
   if not isinstance(result, dict):
     result = {}
+  configuration = _shared_mapping_projection(
+    snapshot.get("configuration"), _SHARED_DETAIL_CONFIGURATION_KEYS,
+  )
+  for key in (
+    "params", "runParams", "execution", "strategyParams",
+    "executionParameters", "feeProfile",
+  ):
+    if key in configuration:
+      configuration[key] = shared_backtest_snapshot.project_author_json(
+        configuration[key],
+      )
   return {
     **_publication_list_item(row),
     "description": row["description"],
@@ -2600,9 +2490,7 @@ def _publication_detail(
     "strategy": _shared_mapping_projection(
       snapshot.get("strategy"), _SHARED_DETAIL_STRATEGY_KEYS,
     ),
-    "configuration": _shared_mapping_projection(
-      snapshot.get("configuration"), _SHARED_DETAIL_CONFIGURATION_KEYS,
-    ),
+    "configuration": configuration,
     "data": _shared_data_detail_projection(snapshot.get("data")),
     "result": _shared_result_detail_projection(result),
     "artifacts": [

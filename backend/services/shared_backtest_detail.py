@@ -3,7 +3,7 @@
 
 from typing import Any, Literal
 
-from backend.services import state_store
+from backend.services import shared_backtest_snapshot, state_store
 
 
 SharedResultSection = Literal[
@@ -81,8 +81,12 @@ def _load_snapshot(publication_id: str) -> dict[str, Any]:
 def _project_record(value: Any, fields: tuple[str, ...]) -> dict[str, Any] | None:
   if not isinstance(value, dict):
     return None
-  projected = {key: value[key] for key in fields if key in value}
-  return state_store._safe_shared_value(projected)
+  projected = shared_backtest_snapshot.project_fields(value, fields)
+  if "attributionSegments" in projected:
+    projected["attributionSegments"] = _project_records(
+      projected["attributionSegments"], shared_backtest_snapshot.ATTRIBUTION_FIELDS,
+    )
+  return projected
 
 
 def _project_records(value: Any, fields: tuple[str, ...]) -> list[dict[str, Any]]:
