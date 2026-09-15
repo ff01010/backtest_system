@@ -194,3 +194,27 @@ def test_publication_foreign_keys_keep_snapshot_after_source_or_owner_delete() -
 
   assert "owner_user_id uuid REFERENCES app_user(id) ON DELETE SET NULL" in migration
   assert "source_run_id uuid REFERENCES backtest_run(id) ON DELETE SET NULL" in migration
+
+
+def test_status_audit_migration_is_append_only_and_covers_every_transition() -> None:
+  migration = (
+    Path(__file__).resolve().parents[2]
+    / "db"
+    / "migrations"
+    / "037_shared_backtest_status_audit.sql"
+  ).read_text(encoding="utf-8")
+
+  for event_type in (
+    "initial_published", "author_withdrawn", "author_relisted",
+    "admin_removed", "admin_restored",
+  ):
+    assert event_type in migration
+  assert "AFTER INSERT OR UPDATE OF status" in migration
+  assert "BEFORE UPDATE OR DELETE" in migration
+  assert "ENABLE ROW LEVEL SECURITY" in migration
+  assert "FORCE ROW LEVEL SECURITY" in migration
+  assert "GRANT SELECT ON backtest_publication_status_audit" in migration
+  assert "backtest_publication_status_audit_append" in migration
+  assert "GRANT INSERT" not in migration
+  assert "GRANT UPDATE" not in migration
+  assert "GRANT DELETE" not in migration
