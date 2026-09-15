@@ -184,7 +184,8 @@ def test_repeat_copy_returns_existing_without_increment(monkeypatch: pytest.Monk
   response = shared_backtest_copy.copy_shared_backtest(publication_row()["id"])
 
   assert response["created"] is False
-  assert any("FOR UPDATE" in item for item in cursor.statements)
+  assert "pg_advisory_xact_lock" in cursor.statements[0]
+  assert not any("FOR UPDATE" in item for item in cursor.statements)
   assert not any("record_backtest_publication_copy" in item for item in cursor.statements)
   assert not any("copy_count" in item for item in cursor.statements)
 
@@ -370,3 +371,19 @@ def test_copy_migration_enforces_idempotency_and_source_immutability() -> None:
   assert "prevent_backtest_publication_source_update" in migration
   assert "record_backtest_publication_copy" in migration
   assert "REVOKE INSERT, UPDATE, DELETE ON backtest_publication_copy" in migration
+
+
+def test_function_rls_migration_keeps_privileged_updates_narrow() -> None:
+  migration = (
+    Path(__file__).resolve().parents[2]
+    / "db"
+    / "migrations"
+    / "036_shared_backtest_function_rls.sql"
+  ).read_text(encoding="utf-8")
+
+  assert "backtest_publication_function_update" in migration
+  assert "viewer.status='active'" in migration
+  assert "SET search_path = pg_catalog, public, app" in migration
+  assert "UPDATE public.backtest_publication" in migration
+  assert "REVOKE UPDATE, DELETE ON backtest_publication" in migration
+  assert "GRANT UPDATE ON backtest_publication" not in migration

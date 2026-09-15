@@ -265,8 +265,13 @@ def copy_shared_backtest(publication_id: str) -> dict[str, Any]:
   try:
     with state_store._db() as conn:
       with conn.cursor() as cur:
+        lock_key = f"shared-backtest-copy:{publication_id}:{recipient_user_id}"
         cur.execute(
-          "SELECT * FROM backtest_publication WHERE id=%s AND status='active' FOR UPDATE",
+          "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+          (lock_key,),
+        )
+        cur.execute(
+          "SELECT * FROM backtest_publication WHERE id=%s AND status='active'",
           (publication_id,),
         )
         publication = cur.fetchone()
