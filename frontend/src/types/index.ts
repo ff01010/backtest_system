@@ -511,6 +511,25 @@ export interface SharedBacktestDetail extends SharedBacktestListItem {
   riskNotice: string;
 }
 
+export interface SharedBacktestChart {
+  equity: Array<Record<string, unknown>>;
+  benchmarkSymbol: string | null;
+  benchmarkEquity: Array<Record<string, unknown>>;
+}
+
+export type SharedBacktestResultSection =
+  | 'holdings'
+  | 'trades'
+  | 'signals'
+  | 'execution-plans'
+  | 'cycles';
+
+export interface SharedBacktestResultPage {
+  items: Array<Record<string, unknown>>;
+  nextCursor: string | null;
+  total: number;
+}
+
 export type SharedBacktestStatus = 'active' | 'withdrawn' | 'removed';
 
 export interface SharedBacktestManagementItem extends SharedBacktestListItem {

@@ -1,4 +1,4 @@
-import { ArrowLeft, Code2, LineChart, ShieldCheck } from 'lucide-react';
+import { ArrowLeft, ShieldCheck } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import {
   favoriteSharedBacktest,
@@ -11,6 +11,7 @@ import { typography } from '../styles/typography';
 import AdminSharedBacktestsPanel from './AdminSharedBacktestsPanel';
 import MySharedBacktestsPanel from './MySharedBacktestsPanel';
 import SharedBacktestCopyAction from './SharedBacktestCopyAction';
+import SharedBacktestDetailTabs from './SharedBacktestDetailTabs';
 import {
   SharedBacktestCard,
   SharedBacktestFilters,
@@ -34,14 +35,6 @@ function formatPercent(value: number | null): string {
 
 function formatNumber(value: number | null): string {
   return value == null ? '--' : value.toFixed(2);
-}
-
-function JsonBlock({ value }: { value: unknown }) {
-  return (
-    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12 }}>
-      {JSON.stringify(value, null, 2)}
-    </pre>
-  );
 }
 
 const shellStyle = {
@@ -96,18 +89,7 @@ function SharedBacktestDetailView(props: {
             <div><small>最大回撤</small><strong style={{ display: 'block' }}>{formatPercent(props.detail.maxDrawdownRate)}</strong></div>
             <div><small>夏普比率</small><strong style={{ display: 'block' }}>{formatNumber(props.detail.annualSharpe)}</strong></div>
           </section>
-          <section style={cardStyle}>
-            <h2><Code2 size={18} />策略代码</h2>
-            <JsonBlock value={props.detail.strategy} />
-          </section>
-          <section style={cardStyle}>
-            <h2>回测配置与数据摘要</h2>
-            <JsonBlock value={{ configuration: props.detail.configuration, data: props.detail.data }} />
-          </section>
-          <section style={cardStyle}>
-            <h2><LineChart size={18} />结果摘要</h2>
-            <JsonBlock value={props.detail.result} />
-          </section>
+          <SharedBacktestDetailTabs detail={props.detail} />
         </div>
       )}
     </main>

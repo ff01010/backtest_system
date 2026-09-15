@@ -60,6 +60,7 @@ from backend.services import (
   research_signal_snapshot,
   shared_backtest_lifecycle,
   shared_backtest_copy,
+  shared_backtest_detail as shared_backtest_detail_service,
   shared_backtest_discovery,
   state_store,
   strategy_adapters,
@@ -1405,6 +1406,36 @@ def copy_shared_backtest(publication_id: str):
     raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as error:
     raise HTTPException(500, f"复制共享回测失败: {error}") from error
+
+
+@app.get("/api/shared-backtests/{publication_id}/chart")
+def shared_backtest_chart(publication_id: str):
+  try:
+    return shared_backtest_detail_service.get_shared_backtest_chart(publication_id)
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/shared-backtests/{publication_id}/{section}")
+def shared_backtest_result_page(
+  publication_id: str,
+  section: Literal["holdings", "trades", "signals", "execution-plans", "cycles"],
+  cursor: int = Query(0, ge=0),
+  limit: int = Query(50, ge=1, le=200),
+):
+  try:
+    return shared_backtest_detail_service.get_shared_backtest_result_page(
+      publication_id,
+      section,
+      cursor,
+      limit,
+    )
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
 
 
 @app.get("/api/shared-backtests/{publication_id}")

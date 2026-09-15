@@ -2263,6 +2263,38 @@ _SHARED_CONFIGURATION_KEYS = (
   "executionAlgorithm", "executionParameters", "baseQuantity", "baseCostPrice",
   "initialPositionEnabled", "t0Enabled", "warmupTradingDays", "strategyParams",
 )
+_SHARED_DETAIL_STRATEGY_KEYS = (
+  "name", "description", "entryType", "code", "codeHash", "signalRequired",
+  "runtimeVersion", "capabilityDigest",
+)
+_SHARED_DETAIL_CONFIGURATION_KEYS = (
+  "strategyName", "strategy", "strategyCategory", "symbol", "timeframe",
+  "benchmarkSymbol", "startDate", "endDate", "params", "runParams", "execution",
+  *_SHARED_CONFIGURATION_KEYS,
+)
+_SHARED_DETAIL_ORIGIN_KEYS = ("publicationId", "authorName", "title")
+_SHARED_DETAIL_MARKET_DATA_KEYS = (
+  "provider", "symbol", "timeframe", "sourcePeriod", "derivation",
+  "warmupTradingDays", "barCount", "lastImportedAt", "adjustment",
+  "manifestHash", "hash",
+)
+_SHARED_DETAIL_RESULT_DATA_KEYS = (
+  "startDate", "endDate", "actualStartDate", "actualEndDate", "barCount",
+  "sourcePeriod", "aggregationVersion", "mappingVersion", "quality",
+)
+_SHARED_DETAIL_DEPENDENCY_KEYS = (
+  "symbol", "sourceTimeframe", "timeframe", "startDate", "endDate",
+  "rowCount", "snapshotHash", "signalOrder", "alignment",
+)
+_SHARED_DETAIL_MANIFEST_KEYS = (
+  "experimentHash", "engineVersion", "strategyRuntimeVersion",
+  "strategyRuntimeCapabilityDigest", "signalModel", "fillModel",
+  "executionAlgorithm", "executionParameters", "randomSeed", "strategyCodeHash",
+  "configHash", "dataHash", "barCount", "barRange", "costModel",
+  "holdingPolicy", "overlaySettlementPolicy", "strategyCategory",
+  "initialPositionEnabled", "baseQuantity", "baseCostPrice", "t0Enabled",
+  "resultSchemaVersion", "executionEnvironment",
+)
 _SHARED_FORBIDDEN_KEYS = {
   "userid", "owneruserid", "accountid", "accountname", "username", "email",
   "outputdir", "storagekey", "artifactfile", "requestid", "requestkey",
@@ -2293,6 +2325,61 @@ def _safe_shared_value(value: Any) -> Any:
   if isinstance(value, list):
     return [_safe_shared_value(item) for item in value]
   return value
+
+
+def _shared_mapping_projection(value: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+  if not isinstance(value, dict):
+    return {}
+  return _safe_shared_value({key: value[key] for key in keys if key in value})
+
+
+def _shared_data_detail_projection(value: Any) -> dict[str, Any]:
+  if not isinstance(value, dict):
+    return {}
+  market_data = _shared_mapping_projection(
+    value.get("marketData"), _SHARED_DETAIL_MARKET_DATA_KEYS,
+  )
+  raw_market_data = value.get("marketData")
+  if isinstance(raw_market_data, dict):
+    dates = raw_market_data.get("formalDates")
+    if isinstance(dates, list) and dates:
+      market_data["formalDateRange"] = {
+        "start": dates[0], "end": dates[-1], "count": len(dates),
+      }
+  result_data = _shared_mapping_projection(
+    value.get("resultData"), _SHARED_DETAIL_RESULT_DATA_KEYS,
+  )
+  dependencies: list[dict[str, Any]] = []
+  raw_dependencies = value.get("dependencies")
+  if isinstance(raw_dependencies, list):
+    for dependency in raw_dependencies:
+      if not isinstance(dependency, dict):
+        continue
+      item = {"type": dependency.get("type")}
+      item["summary"] = _shared_mapping_projection(
+        dependency.get("summary"), _SHARED_DETAIL_DEPENDENCY_KEYS,
+      )
+      dependencies.append(item)
+  return {
+    "marketData": market_data,
+    "resultData": result_data,
+    "dependencies": dependencies,
+  }
+
+
+def _shared_result_detail_projection(value: Any) -> dict[str, Any]:
+  if not isinstance(value, dict):
+    return {}
+  projected = {
+    key: value[key]
+    for key in _SHARED_DETAIL_RESULT_KEYS
+    if key in value and key != "experimentManifest"
+  }
+  if "experimentManifest" in value:
+    projected["experimentManifest"] = _shared_mapping_projection(
+      value["experimentManifest"], _SHARED_DETAIL_MANIFEST_KEYS,
+    )
+  return _safe_shared_value(projected)
 
 
 def _shared_strategy_snapshot(run: dict[str, Any]) -> dict[str, Any]:
@@ -2400,19 +2487,27 @@ def _publication_detail(row: dict[str, Any]) -> dict[str, Any]:
   if version != 1:
     raise ValueError(f"暂不支持共享快照版本: {version}")
   snapshot = _json(row["snapshot_json"], {})
+  if not isinstance(snapshot, dict):
+    raise ValueError("共享快照格式无效")
   result = snapshot.get("result", {})
+  if not isinstance(result, dict):
+    result = {}
   return {
     **_publication_list_item(row),
     "description": row["description"],
     "snapshotSchemaVersion": version,
     "snapshotDigest": row["snapshot_digest"],
-    "strategy": snapshot.get("strategy", {}),
-    "configuration": snapshot.get("configuration", {}),
-    "data": snapshot.get("data", {}),
-    "result": {
-      key: result[key] for key in _SHARED_DETAIL_RESULT_KEYS if key in result
-    },
-    "origin": snapshot.get("origin", {}),
+    "strategy": _shared_mapping_projection(
+      snapshot.get("strategy"), _SHARED_DETAIL_STRATEGY_KEYS,
+    ),
+    "configuration": _shared_mapping_projection(
+      snapshot.get("configuration"), _SHARED_DETAIL_CONFIGURATION_KEYS,
+    ),
+    "data": _shared_data_detail_projection(snapshot.get("data")),
+    "result": _shared_result_detail_projection(result),
+    "origin": _shared_mapping_projection(
+      snapshot.get("origin"), _SHARED_DETAIL_ORIGIN_KEYS,
+    ),
     "riskNotice": _SHARED_RISK_NOTICE,
   }
 

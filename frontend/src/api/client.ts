@@ -17,10 +17,13 @@ import type {
   ReleaseNotice,
   ReleaseStatus,
   SharedBacktestDetail,
+  SharedBacktestChart,
   SharedBacktestCopyResponse,
   SharedBacktestListItem,
   SharedBacktestManagementItem,
   SharedBacktestStatus,
+  SharedBacktestResultPage,
+  SharedBacktestResultSection,
 } from '../types';
 
 const BASE = '/api';
@@ -566,6 +569,26 @@ export async function fetchSharedBacktest(publicationId: string): Promise<Shared
     `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}`,
   );
   return data.publication;
+}
+
+export async function fetchSharedBacktestChart(
+  publicationId: string,
+): Promise<SharedBacktestChart> {
+  return fetchJson<SharedBacktestChart>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/chart`,
+  );
+}
+
+export async function fetchSharedBacktestResultPage(
+  publicationId: string,
+  section: SharedBacktestResultSection,
+  cursor = '0',
+  limit = 50,
+): Promise<SharedBacktestResultPage> {
+  const search = new URLSearchParams({ cursor, limit: String(limit) });
+  return fetchJson<SharedBacktestResultPage>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/${section}?${search.toString()}`,
+  );
 }
 
 export async function fetchMySharedBacktests(
