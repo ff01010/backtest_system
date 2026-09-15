@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
-from backend.services import state_store
+from psycopg.types.json import Jsonb
+
+from backend.services import shared_backtest_artifacts, state_store
 
 
 _COPIED_PARAM_KEYS = (
@@ -45,7 +48,10 @@ def _copy_params(configuration: dict[str, Any]) -> dict[str, Any]:
   return params
 
 
-def _copy_payloads(publication: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _copy_payloads(
+  publication: dict[str, Any],
+  signal_dataset_id: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
   version = int(publication["snapshot_schema_version"])
   if version != 1:
     raise ValueError(f"暂不支持共享快照版本: {version}")
@@ -77,6 +83,7 @@ def _copy_payloads(publication: dict[str, Any]) -> tuple[dict[str, Any], dict[st
     "paramsJson": {
       "params": _copy_params(configuration),
       "scriptName": name,
+      **({"signalDatasetId": signal_dataset_id} if signal_dataset_id else {}),
     },
     "enabled": True,
     "sourcePublicationId": state_store._uuid(publication["id"]),
@@ -117,8 +124,113 @@ def _existing_copy(cur: Any, publication_id: str, recipient_user_id: str) -> dic
     raise state_store.ConflictError("已有策略副本当前不可用") from error
 
 
-def _create_copy(cur: Any, publication: dict[str, Any]) -> dict[str, Any]:
-  script_payload, config_payload = _copy_payloads(publication)
+def _prepare_imported_artifacts(
+  cur: Any,
+  publication: dict[str, Any],
+  recipient_user_id: str,
+) -> list[dict[str, Any]]:
+  sources = state_store._publication_artifact_rows(cur, str(publication["id"]))
+  prepared = shared_backtest_artifacts.copy_artifacts(
+    [{
+      **source,
+      "original_filename": source["display_name"],
+      "source_publication_artifact_id": state_store._uuid(source["id"]),
+    } for source in sources],
+    f"shared_imports/{recipient_user_id}/{publication['id']}",
+  )
+  for artifact in prepared:
+    if artifact["artifact_type"] == "research_signal":
+      artifact["imported_dataset_id"] = str(uuid4())
+  return prepared
+
+
+def _research_dataset_id(
+  publication: dict[str, Any],
+  artifacts: list[dict[str, Any]],
+) -> str | None:
+  research_artifacts = [
+    artifact for artifact in artifacts
+    if artifact["artifact_type"] == "research_signal"
+  ]
+  snapshot = state_store._json(publication["snapshot_json"], {})
+  strategy = snapshot.get("strategy", {})
+  if bool(strategy.get("signalRequired")) and len(research_artifacts) != 1:
+    raise ValueError("共享回测的研究信号附件不完整，暂时无法复制")
+  if len(research_artifacts) > 1:
+    raise ValueError("共享回测包含多个研究信号附件，暂时无法复制")
+  return (
+    str(research_artifacts[0]["imported_dataset_id"])
+    if research_artifacts else None
+  )
+
+
+def _persist_imported_artifacts(
+  cur: Any,
+  publication: dict[str, Any],
+  config_id: str,
+  recipient_user_id: str,
+  artifacts: list[dict[str, Any]],
+) -> None:
+  snapshot = state_store._json(publication["snapshot_json"], {})
+  configuration = snapshot.get("configuration", {})
+  for artifact in artifacts:
+    cur.execute("""
+      INSERT INTO artifact_file (
+        id, owner_user_id, run_id, artifact_type, storage_key,
+        original_filename, content_type, byte_size, content_sha256
+      ) VALUES (%s, %s, NULL, %s, %s, %s, %s, %s, %s)
+    """, (
+      artifact["id"], recipient_user_id, artifact["artifact_type"],
+      artifact["storage_key"], artifact["original_filename"],
+      artifact.get("content_type"), artifact["byte_size"], artifact["content_sha256"],
+    ))
+    source_artifact_id = artifact.get("source_publication_artifact_id")
+    cur.execute("""
+      INSERT INTO strategy_config_artifact (
+        strategy_config_id, artifact_file_id,
+        source_publication_artifact_id, artifact_role
+      ) VALUES (%s, %s, %s, %s)
+    """, (config_id, artifact["id"], source_artifact_id, artifact["artifact_type"]))
+    if artifact["artifact_type"] != "research_signal":
+      continue
+    metadata = state_store._json(artifact.get("reproduction_metadata"), {})
+    snapshot_hash = shared_backtest_artifacts.research_signal_snapshot_hash(
+      artifact["storage_key"],
+    )
+    if metadata.get("snapshotHash") != snapshot_hash:
+      raise ValueError("共享回测的研究信号内容摘要不一致，暂时无法复制")
+    manifest = state_store._json(metadata.get("manifest"), {})
+    dataset_version = int(metadata.get("datasetVersion") or manifest.get("version") or 1)
+    source_timeframe = str(
+      metadata.get("sourceTimeframe") or configuration.get("timeframe") or "5m"
+    )
+    cur.execute("""
+      INSERT INTO imported_research_signal_dataset (
+        id, owner_user_id, artifact_file_id, source_publication_artifact_id,
+        display_name, dataset_key, dataset_version, symbol, timeframe,
+        start_date, end_date, row_count, snapshot_hash, manifest, source_partitions
+      ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+      artifact["imported_dataset_id"], recipient_user_id, artifact["id"],
+      source_artifact_id, f"{publication['title']}-研究信号"[:255],
+      f"shared:{source_artifact_id}", dataset_version,
+      configuration.get("symbol") or publication["symbol"], source_timeframe,
+      configuration.get("startDate") or publication["start_date"],
+      configuration.get("endDate") or publication["end_date"],
+      int(metadata.get("rowCount") or 0),
+      snapshot_hash,
+      Jsonb(manifest), Jsonb(metadata.get("sourcePartitions") or []),
+    ))
+
+
+def _create_copy(
+  cur: Any,
+  publication: dict[str, Any],
+  recipient_user_id: str,
+  imported_artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+  signal_dataset_id = _research_dataset_id(publication, imported_artifacts)
+  script_payload, config_payload = _copy_payloads(publication, signal_dataset_id)
   resolved_name = state_store._resolve_unique_strategy_name(
     cur, str(config_payload["name"]), None,
   )
@@ -130,6 +242,9 @@ def _create_copy(cur: Any, publication: dict[str, Any]) -> dict[str, Any]:
   )
   config_id = state_store._write_config(
     cur, None, config_payload, script_id, strategy_version_id,
+  )
+  _persist_imported_artifacts(
+    cur, publication, config_id, recipient_user_id, imported_artifacts,
   )
   config = state_store._get_strategy_config_with_cursor(cur, config_id)
   state_store._publish_strategy_config_with_cursor(cur, config)
@@ -146,16 +261,27 @@ def _create_copy(cur: Any, publication: dict[str, Any]) -> dict[str, Any]:
 def copy_shared_backtest(publication_id: str) -> dict[str, Any]:
   """幂等创建当前用户独立拥有的普通策略副本。"""
   recipient_user_id = state_store.current_user_id()
-  with state_store._db() as conn:
-    with conn.cursor() as cur:
-      cur.execute(
-        "SELECT * FROM backtest_publication WHERE id=%s AND status='active' FOR UPDATE",
-        (publication_id,),
-      )
-      publication = cur.fetchone()
-      if not publication:
-        raise KeyError(publication_id)
-      existing = _existing_copy(cur, publication_id, recipient_user_id)
-      if existing:
-        return _copy_response(existing, False)
-      return _copy_response(_create_copy(cur, publication), True)
+  imported_artifacts: list[dict[str, Any]] = []
+  try:
+    with state_store._db() as conn:
+      with conn.cursor() as cur:
+        cur.execute(
+          "SELECT * FROM backtest_publication WHERE id=%s AND status='active' FOR UPDATE",
+          (publication_id,),
+        )
+        publication = cur.fetchone()
+        if not publication:
+          raise KeyError(publication_id)
+        existing = _existing_copy(cur, publication_id, recipient_user_id)
+        if existing:
+          return _copy_response(existing, False)
+        imported_artifacts = _prepare_imported_artifacts(
+          cur, publication, recipient_user_id,
+        )
+        config = _create_copy(
+          cur, publication, recipient_user_id, imported_artifacts,
+        )
+        return _copy_response(config, True)
+  except Exception:
+    shared_backtest_artifacts.cleanup_artifacts(imported_artifacts)
+    raise

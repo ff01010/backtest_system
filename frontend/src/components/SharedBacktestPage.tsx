@@ -89,6 +89,21 @@ function SharedBacktestDetailView(props: {
             <div><small>最大回撤</small><strong style={{ display: 'block' }}>{formatPercent(props.detail.maxDrawdownRate)}</strong></div>
             <div><small>夏普比率</small><strong style={{ display: 'block' }}>{formatNumber(props.detail.annualSharpe)}</strong></div>
           </section>
+          {props.detail.artifacts.length > 0 && (
+            <section style={cardStyle}>
+              <h2>复现附件</h2>
+              <div style={{ display: 'grid', gap: 10 }}>
+                {props.detail.artifacts.map((artifact) => (
+                  <div key={artifact.id}>
+                    <a href={artifact.downloadUrl}>{artifact.displayName}</a>
+                    <span style={{ marginLeft: 8, color: '#64748b' }}>
+                      {artifact.type} · {artifact.byteSize} 字节 · SHA-256 {artifact.contentSha256}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
           <SharedBacktestDetailTabs detail={props.detail} />
         </div>
       )}

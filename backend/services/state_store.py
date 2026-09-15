@@ -18,6 +18,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend import settings
+from backend.services import shared_backtest_artifacts
 from backend.services.user_context import get_current_user
 from backend.strategies.runtime_contract import (
   RUNTIME_CAPABILITY_DIGEST,
@@ -1338,6 +1339,11 @@ def _save_research_signal_snapshot(cur: Any, run_id: str, owner_user_id: str, sn
   if not path.is_file():
     raise DatabaseError("研究信号冻结文件不存在")
   content_sha256 = hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+  try:
+    storage_key = shared_backtest_artifacts.storage_key_for_path(path)
+  except shared_backtest_artifacts.SharedArtifactError:
+    # 兼容测试和旧调用方传入的显式快照路径；正常运行仍由受控根目录生成。
+    storage_key = f"research_signals/{path.name}"
   cur.execute(
     """INSERT INTO artifact_file
       (id, owner_user_id, run_id, artifact_type, storage_key, original_filename, content_type, byte_size, content_sha256)
@@ -1350,7 +1356,7 @@ def _save_research_signal_snapshot(cur: Any, run_id: str, owner_user_id: str, sn
         AND artifact_file.byte_size=EXCLUDED.byte_size
         AND artifact_file.content_sha256=EXCLUDED.content_sha256
       RETURNING id""",
-    (owner_user_id, run_id, f"research_signals/{path.name}", path.name, path.stat().st_size, content_sha256),
+    (owner_user_id, run_id, storage_key, path.name, path.stat().st_size, content_sha256),
   )
   artifact_row = cur.fetchone()
   if artifact_row is None:
@@ -2382,6 +2388,97 @@ def _shared_result_detail_projection(value: Any) -> dict[str, Any]:
   return _safe_shared_value(projected)
 
 
+def _shared_artifact_sources(
+  cur: Any,
+  run_id: str,
+  snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+  """读取原任务附件，并补齐复现研究信号所需的不可变元数据。"""
+  cur.execute("""
+    SELECT artifact.*, signal.dataset_id, signal.dataset_version,
+      signal.snapshot_hash, signal.manifest, signal.source_partitions
+    FROM artifact_file artifact
+    LEFT JOIN research_signal_snapshot signal
+      ON signal.artifact_file_id=artifact.id AND signal.run_id=artifact.run_id
+    WHERE artifact.run_id=%s
+    ORDER BY artifact.created_at, artifact.id
+  """, (run_id,))
+  rows = list(cur.fetchall())
+  dependencies = snapshot.get("data", {}).get("dependencies", [])
+  research_summary = next((
+    item.get("summary", {}) for item in dependencies
+    if isinstance(item, dict) and item.get("type") == "research_signal"
+  ), {})
+  research_rows = [
+    row for row in rows
+    if row.get("artifact_type") == "research_signal" and row.get("dataset_id")
+  ]
+  if research_summary and len(research_rows) != 1:
+    raise ValueError("历史任务的研究信号快照不完整，请重新运行后共享")
+  sources: list[dict[str, Any]] = []
+  for row in rows:
+    metadata: dict[str, Any] = {}
+    if row.get("dataset_id"):
+      metadata = _safe_shared_value({
+        **research_summary,
+        "datasetId": _uuid(row["dataset_id"]),
+        "datasetVersion": int(row["dataset_version"]),
+        "snapshotHash": row["snapshot_hash"],
+        "manifest": _json(row.get("manifest"), {}),
+        "sourcePartitions": _json(row.get("source_partitions"), []),
+      })
+    sources.append({
+      **row,
+      "source_artifact_file_id": _uuid(row["id"]),
+      "reproduction_metadata": metadata,
+    })
+  return sources
+
+
+def _shared_artifact_metadata(row: dict[str, Any], include_download: bool = False) -> dict[str, Any]:
+  artifact_id = _uuid(row["id"]) or ""
+  result = {
+    "id": artifact_id,
+    "type": row["artifact_type"],
+    "displayName": row.get("display_name") or row.get("original_filename") or "附件",
+    "contentType": row.get("content_type"),
+    "byteSize": int(row.get("byte_size") or 0),
+    "contentSha256": row["content_sha256"],
+    "snapshotSchemaVersion": int(row.get("snapshot_schema_version") or 1),
+    "reproduction": _json(row.get("reproduction_metadata"), {}),
+  }
+  if include_download:
+    result["downloadUrl"] = (
+      f"/api/shared-backtests/{_uuid(row['publication_id'])}/artifacts/{artifact_id}"
+    )
+  return result
+
+
+def _insert_shared_artifacts(cur: Any, artifacts: list[dict[str, Any]], publication_id: str) -> None:
+  for artifact in artifacts:
+    cur.execute("""
+      INSERT INTO backtest_publication_artifact (
+        id, publication_id, artifact_type, display_name, content_type,
+        byte_size, content_sha256, storage_key, source_artifact_file_id,
+        snapshot_schema_version, reproduction_metadata
+      ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s)
+    """, (
+      artifact["id"], publication_id, artifact["artifact_type"],
+      artifact["original_filename"], artifact.get("content_type"),
+      artifact["byte_size"], artifact["content_sha256"], artifact["storage_key"],
+      artifact.get("source_artifact_file_id"),
+      Jsonb(artifact.get("reproduction_metadata") or {}),
+    ))
+
+
+def _publication_artifact_rows(cur: Any, publication_id: str) -> list[dict[str, Any]]:
+  cur.execute("""
+    SELECT * FROM backtest_publication_artifact
+    WHERE publication_id=%s ORDER BY artifact_type, id
+  """, (publication_id,))
+  return list(cur.fetchall())
+
+
 def _shared_strategy_snapshot(run: dict[str, Any]) -> dict[str, Any]:
   script = run.get("scriptSnapshot")
   if not isinstance(script, dict) or not str(script.get("code") or "").strip():
@@ -2482,7 +2579,10 @@ def _publication_list_item(row: dict[str, Any]) -> dict[str, Any]:
   }
 
 
-def _publication_detail(row: dict[str, Any]) -> dict[str, Any]:
+def _publication_detail(
+  row: dict[str, Any],
+  artifacts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
   version = int(row["snapshot_schema_version"])
   if version != 1:
     raise ValueError(f"暂不支持共享快照版本: {version}")
@@ -2505,6 +2605,10 @@ def _publication_detail(row: dict[str, Any]) -> dict[str, Any]:
     ),
     "data": _shared_data_detail_projection(snapshot.get("data")),
     "result": _shared_result_detail_projection(result),
+    "artifacts": [
+      _shared_artifact_metadata(artifact, include_download=True)
+      for artifact in artifacts or []
+    ],
     "origin": _shared_mapping_projection(
       snapshot.get("origin"), _SHARED_DETAIL_ORIGIN_KEYS,
     ),
@@ -2520,58 +2624,87 @@ def create_shared_backtest_publication(
 ) -> tuple[dict[str, Any], bool]:
   """幂等地将当前用户的一次完整成功回测冻结为共享回测。"""
   user_id = current_user_id()
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute(
-        "SELECT * FROM backtest_publication WHERE source_run_id=%s AND owner_user_id=%s",
-        (run_id, user_id),
-      )
-      existing = cur.fetchone()
-      if existing:
-        return _publication_detail(existing), False
-      cur.execute(_run_query("AND r.id=%s FOR UPDATE OF r"), (user_id, run_id))
-      row = cur.fetchone()
-      if not row:
-        raise KeyError(run_id)
-      run = _normalize_run(row)
-      snapshot = _build_shared_backtest_snapshot(run)
-      summary = snapshot["result"].get("summary", {})
-      configuration = snapshot["configuration"]
-      digest = _shared_snapshot_digest(snapshot)
-      origin = snapshot.get("origin") or {}
-      cur.execute("""
-        INSERT INTO backtest_publication (
-          owner_user_id, author_name_snapshot, source_run_id, title, description,
-          tags, status, snapshot_schema_version, snapshot_json, snapshot_digest,
-          symbol, timeframe, strategy_category, start_date, end_date,
-          total_return, max_drawdown_rate, annual_sharpe,
-          source_publication_id, source_author_name_snapshot, source_title_snapshot
-        ) VALUES (
-          %s, %s, %s, %s, %s, %s, 'active', 1, %s, %s,
-          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-        )
-        ON CONFLICT (source_run_id) WHERE source_run_id IS NOT NULL DO NOTHING
-        RETURNING *
-      """, (
-        user_id, get_current_user().display_name, run_id, title, description,
-        Jsonb(tags), Jsonb(snapshot), digest, configuration["symbol"],
-        configuration["timeframe"], configuration["strategyCategory"],
-        configuration["startDate"], configuration["endDate"],
-        summary.get("totalReturn"), summary.get("maxDrawdownRate"),
-        summary.get("annualSharpe"), origin.get("publicationId"),
-        origin.get("authorName"), origin.get("title"),
-      ))
-      publication = cur.fetchone()
-      created = publication is not None
-      if publication is None:
+  publication_id = str(uuid4())
+  copied_artifacts: list[dict[str, Any]] = []
+  try:
+    with _db() as conn:
+      with conn.cursor() as cur:
         cur.execute(
-          "SELECT * FROM backtest_publication WHERE source_run_id=%s",
-          (run_id,),
+          "SELECT * FROM backtest_publication WHERE source_run_id=%s AND owner_user_id=%s",
+          (run_id, user_id),
         )
+        existing = cur.fetchone()
+        if existing:
+          artifacts = _publication_artifact_rows(cur, str(existing["id"]))
+          return _publication_detail(existing, artifacts), False
+        cur.execute(_run_query("AND r.id=%s FOR UPDATE OF r"), (user_id, run_id))
+        row = cur.fetchone()
+        if not row:
+          raise KeyError(run_id)
+        run = _normalize_run(row)
+        snapshot = _build_shared_backtest_snapshot(run)
+        sources = _shared_artifact_sources(cur, run_id, snapshot)
+        copied_artifacts = shared_backtest_artifacts.copy_artifacts(
+          sources, f"shared_backtests/{publication_id}",
+        )
+        for artifact in copied_artifacts:
+          artifact["publication_id"] = publication_id
+          artifact["display_name"] = artifact["original_filename"]
+          artifact["snapshot_schema_version"] = 1
+          if artifact["artifact_type"] == "research_signal":
+            expected_hash = artifact.get("reproduction_metadata", {}).get("snapshotHash")
+            actual_hash = shared_backtest_artifacts.research_signal_snapshot_hash(
+              artifact["storage_key"],
+            )
+            if expected_hash != actual_hash:
+              raise ValueError("历史任务的研究信号内容摘要不一致，无法共享")
+        snapshot["data"]["dependencies"] = [
+          _shared_artifact_metadata(artifact) for artifact in copied_artifacts
+        ]
+        summary = snapshot["result"].get("summary", {})
+        configuration = snapshot["configuration"]
+        digest = _shared_snapshot_digest(snapshot)
+        origin = snapshot.get("origin") or {}
+        cur.execute("""
+          INSERT INTO backtest_publication (
+            id, owner_user_id, author_name_snapshot, source_run_id, title, description,
+            tags, status, snapshot_schema_version, snapshot_json, snapshot_digest,
+            symbol, timeframe, strategy_category, start_date, end_date,
+            total_return, max_drawdown_rate, annual_sharpe,
+            source_publication_id, source_author_name_snapshot, source_title_snapshot
+          ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, 'active', 1, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+          )
+          ON CONFLICT (source_run_id) WHERE source_run_id IS NOT NULL DO NOTHING
+          RETURNING *
+        """, (
+          publication_id, user_id, get_current_user().display_name, run_id, title,
+          description, Jsonb(tags), Jsonb(snapshot), digest, configuration["symbol"],
+          configuration["timeframe"], configuration["strategyCategory"],
+          configuration["startDate"], configuration["endDate"],
+          summary.get("totalReturn"), summary.get("maxDrawdownRate"),
+          summary.get("annualSharpe"), origin.get("publicationId"),
+          origin.get("authorName"), origin.get("title"),
+        ))
         publication = cur.fetchone()
-      if publication is None:
-        raise DatabaseError("共享回测创建失败")
-      return _publication_detail(publication), created
+        if publication is None:
+          shared_backtest_artifacts.cleanup_artifacts(copied_artifacts)
+          copied_artifacts = []
+          cur.execute(
+            "SELECT * FROM backtest_publication WHERE source_run_id=%s",
+            (run_id,),
+          )
+          publication = cur.fetchone()
+          if publication is None:
+            raise DatabaseError("共享回测创建失败")
+          artifacts = _publication_artifact_rows(cur, str(publication["id"]))
+          return _publication_detail(publication, artifacts), False
+        _insert_shared_artifacts(cur, copied_artifacts, publication_id)
+        return _publication_detail(publication, copied_artifacts), True
+  except Exception:
+    shared_backtest_artifacts.cleanup_artifacts(copied_artifacts)
+    raise
 
 
 def list_shared_backtests(limit: int = 20, offset: int = 0) -> dict[str, Any]:
@@ -2613,10 +2746,63 @@ def get_shared_backtest(publication_id: str) -> dict[str, Any]:
       if not row:
         raise KeyError(publication_id)
       return {
-        **_publication_detail(row),
+        **_publication_detail(row, _publication_artifact_rows(cur, publication_id)),
         "isFavorited": bool(row.get("is_favorited")),
         "hasCopied": bool(row.get("has_copied")),
       }
+
+
+def get_shared_backtest_artifact(publication_id: str, artifact_id: str) -> dict[str, Any]:
+  """读取当前仍已上架共享附件的内部定位信息。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT artifact.*
+        FROM backtest_publication_artifact artifact
+        JOIN backtest_publication publication ON publication.id=artifact.publication_id
+        WHERE artifact.id=%s AND artifact.publication_id=%s
+          AND publication.status='active'
+      """, (artifact_id, publication_id))
+      row = cur.fetchone()
+      if not row:
+        raise KeyError(artifact_id)
+      return row
+
+
+def list_imported_research_signal_datasets() -> list[dict[str, Any]]:
+  """列出当前用户从共享回测导入的可运行研究信号数据集。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT dataset.*
+        FROM imported_research_signal_dataset dataset
+        WHERE dataset.owner_user_id=%s
+        ORDER BY dataset.created_at DESC, dataset.id DESC
+      """, (current_user_id(),))
+      return [{
+        "id": _uuid(row["id"]),
+        "name": row["display_name"],
+        "datasetKey": row["dataset_key"],
+        "version": int(row["dataset_version"]),
+        "timeframe": row["timeframe"],
+        "recordCount": int(row["row_count"]),
+        "imported": True,
+      } for row in cur.fetchall()]
+
+
+def get_imported_research_signal_dataset(dataset_id: str) -> dict[str, Any] | None:
+  """返回当前用户拥有的导入数据集；不允许沿用原作者数据身份。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT dataset.*, artifact.storage_key, artifact.byte_size,
+          artifact.content_sha256
+        FROM imported_research_signal_dataset dataset
+        JOIN artifact_file artifact ON artifact.id=dataset.artifact_file_id
+        WHERE dataset.id=%s AND dataset.owner_user_id=%s
+      """, (dataset_id, current_user_id()))
+      row = cur.fetchone()
+      return dict(row) if row else None
 
 
 def delete_backtest_run(run_id: str) -> bool:

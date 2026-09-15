@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -64,8 +66,15 @@ def copied_config() -> dict[str, Any]:
 
 
 class CopyCursor:
-  def __init__(self, existing: bool = False) -> None:
+  def __init__(
+    self,
+    existing: bool = False,
+    publication: dict[str, Any] | None = None,
+    artifacts: list[dict[str, Any]] | None = None,
+  ) -> None:
     self.existing = existing
+    self.publication = publication or publication_row()
+    self.artifacts = artifacts or []
     self.query = ""
     self.statements: list[str] = []
 
@@ -81,7 +90,7 @@ class CopyCursor:
 
   def fetchone(self) -> dict[str, Any] | None:
     if "FROM backtest_publication WHERE" in self.query:
-      return publication_row()
+      return self.publication
     if "FROM backtest_publication_copy" in self.query:
       return {
         "strategy_config_id": "22222222-2222-4222-8222-222222222222",
@@ -89,6 +98,11 @@ class CopyCursor:
     if "record_backtest_publication_copy" in self.query:
       return {"created": True}
     raise AssertionError(f"unexpected fetchone: {self.query}")
+
+  def fetchall(self) -> list[dict[str, Any]]:
+    if "FROM backtest_publication_artifact" in self.query:
+      return self.artifacts
+    raise AssertionError(f"unexpected fetchall: {self.query}")
 
 
 class CopyConnection:
@@ -189,6 +203,101 @@ def test_copy_failure_rolls_back_without_increment(monkeypatch: pytest.MonkeyPat
 
   assert captured["connection"].rolled_back is True
   assert not any("copy_count" in item for item in cursor.statements)
+
+
+def _signal_row() -> dict[str, Any]:
+  return {
+    "signalId": "signal-1",
+    "instrument": "688981.SH",
+    "timeframe": "5m",
+    "signalTime": "2026-01-02T09:30:00+08:00",
+    "availableAt": "2026-01-02T09:30:00+08:00",
+    "effectiveAt": "2026-01-02T09:30:00+08:00",
+    "sequence": 1,
+    "predictedLabelId": "UP",
+    "action": "long",
+    "modelVersionId": "model-1",
+    "sourceHash": "a" * 64,
+    "diagnostic": {},
+  }
+
+
+def _research_publication_artifact(root: Path) -> dict[str, Any]:
+  source = root / "shared_backtests" / "publication" / "signals.ndjson"
+  source.parent.mkdir(parents=True)
+  source.write_text(json.dumps(_signal_row(), ensure_ascii=False) + "\n", encoding="utf-8")
+  digest = hashlib.sha256(source.read_bytes()).hexdigest()
+  snapshot_hash = hashlib.sha256(
+    json.dumps(_signal_row(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+  ).hexdigest()
+  return {
+    "id": "55555555-5555-4555-8555-555555555555",
+    "publication_id": publication_row()["id"],
+    "artifact_type": "research_signal",
+    "display_name": "signals.ndjson",
+    "content_type": "application/x-ndjson",
+    "byte_size": source.stat().st_size,
+    "content_sha256": digest,
+    "storage_key": "shared_backtests/publication/signals.ndjson",
+    "snapshot_schema_version": 1,
+    "reproduction_metadata": {
+      "datasetVersion": 3,
+      "snapshotHash": snapshot_hash,
+      "sourceTimeframe": "5m",
+      "rowCount": 1,
+      "manifest": {"version": 3, "timeframe": "5m"},
+      "sourcePartitions": [],
+    },
+  }
+
+
+def test_copy_imports_research_signal_with_new_dataset_identity(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setenv("TREND_GRID_OUTPUT_ROOT", str(tmp_path))
+  publication = publication_row()
+  publication["snapshot_json"]["strategy"]["signalRequired"] = True
+  artifact = _research_publication_artifact(tmp_path)
+  cursor = CopyCursor(publication=publication, artifacts=[artifact])
+  captured = install_created_copy_mocks(monkeypatch, cursor)
+
+  response = shared_backtest_copy.copy_shared_backtest(publication["id"])
+
+  imported_dataset_id = captured["config"]["paramsJson"]["signalDatasetId"]
+  assert response["created"] is True
+  assert imported_dataset_id != artifact["reproduction_metadata"].get("datasetId")
+  assert any("INSERT INTO imported_research_signal_dataset" in item for item in cursor.statements)
+  assert any("INSERT INTO strategy_config_artifact" in item for item in cursor.statements)
+  imported_files = list((tmp_path / "shared_imports").rglob("*.ndjson"))
+  assert len(imported_files) == 1
+  Path(tmp_path / artifact["storage_key"]).unlink()
+  assert imported_files[0].is_file()
+
+
+def test_research_import_failure_cleans_file_and_does_not_increment(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setenv("TREND_GRID_OUTPUT_ROOT", str(tmp_path))
+  publication = publication_row()
+  publication["snapshot_json"]["strategy"]["signalRequired"] = True
+  artifact = _research_publication_artifact(tmp_path)
+  cursor = CopyCursor(publication=publication, artifacts=[artifact])
+  install_created_copy_mocks(monkeypatch, cursor)
+  monkeypatch.setattr(
+    state_store,
+    "_write_config",
+    lambda *_: (_ for _ in ()).throw(state_store.DatabaseError("write failed")),
+  )
+
+  with pytest.raises(state_store.DatabaseError, match="write failed"):
+    shared_backtest_copy.copy_shared_backtest(publication["id"])
+
+  assert not (tmp_path / "shared_imports").exists() or not list(
+    (tmp_path / "shared_imports").rglob("*.ndjson")
+  )
+  assert not any("record_backtest_publication_copy" in item for item in cursor.statements)
 
 
 def test_copy_endpoint_maps_unavailable_publication(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -507,6 +507,17 @@ export interface SharedBacktestDetail extends SharedBacktestListItem {
   configuration: Record<string, unknown>;
   data: Record<string, unknown>;
   result: Record<string, unknown>;
+  artifacts: Array<{
+    id: string;
+    type: string;
+    displayName: string;
+    contentType: string | null;
+    byteSize: number;
+    contentSha256: string;
+    snapshotSchemaVersion: number;
+    reproduction: Record<string, unknown>;
+    downloadUrl: string;
+  }>;
   origin: Record<string, unknown>;
   riskNotice: string;
 }

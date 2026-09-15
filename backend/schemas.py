@@ -563,6 +563,18 @@ class SharedBacktestManagementItem(SharedBacktestListItem):
   sourceRunAvailable: bool
 
 
+class SharedBacktestArtifactMetadata(BaseModel):
+  id: str
+  type: str
+  displayName: str
+  contentType: str | None
+  byteSize: int
+  contentSha256: str
+  snapshotSchemaVersion: int
+  reproduction: dict[str, Any]
+  downloadUrl: str
+
+
 class SharedBacktestDetail(SharedBacktestListItem):
   description: str
   snapshotSchemaVersion: int
@@ -571,6 +583,7 @@ class SharedBacktestDetail(SharedBacktestListItem):
   configuration: dict[str, Any]
   data: dict[str, Any]
   result: dict[str, Any]
+  artifacts: list[SharedBacktestArtifactMetadata] = Field(default_factory=list)
   origin: dict[str, Any]
   riskNotice: str
 

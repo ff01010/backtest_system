@@ -63,6 +63,17 @@ describe('SharedBacktestPage', () => {
         benchmarkReturn: 0.08,
         warnings: ['样本期较短'],
       },
+      artifacts: [{
+        id: 'artifact-1',
+        type: 'research_signal',
+        displayName: 'signals.ndjson',
+        contentType: 'application/x-ndjson',
+        byteSize: 128,
+        contentSha256: 'b'.repeat(64),
+        snapshotSchemaVersion: 1,
+        reproduction: { rowCount: 1 },
+        downloadUrl: '/api/shared-backtests/publication-1/artifacts/artifact-1',
+      }],
       origin: {},
       riskNotice: '历史回测结果不代表未来表现',
     });
@@ -106,6 +117,9 @@ describe('SharedBacktestPage', () => {
     fireEvent.click(screen.getByRole('tab', { name: '策略代码' }));
     expect(screen.getByText(/window.__unsafe/)).toBeTruthy();
     expect(document.querySelector('img')).toBeNull();
+    expect(screen.getByRole('link', { name: 'signals.ndjson' }).getAttribute('href')).toContain(
+      '/artifacts/artifact-1',
+    );
     expect(apiMocks.fetchSharedBacktest).toHaveBeenCalledWith('publication-1');
   });
 

@@ -401,6 +401,7 @@ export interface ResearchSignalDataset {
   version: number | null;
   timeframe: string | null;
   recordCount: number;
+  imported?: boolean;
 }
 
 export async function fetchResearchSignalDatasets(): Promise<ResearchSignalDataset[]> {

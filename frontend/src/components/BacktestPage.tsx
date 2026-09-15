@@ -1837,7 +1837,11 @@ export default function BacktestPage({
       entryType: config.entryType,
       signalRequired: config.signalRequired,
     });
-    if (!config.signalRequired) setSelectedSignalDatasetId('');
+    setSelectedSignalDatasetId(
+      config.signalRequired && typeof config.paramsJson.signalDatasetId === 'string'
+        ? config.paramsJson.signalDatasetId
+        : ''
+    );
     setPublishedFingerprint(buildSavedStrategyFingerprint(config));
     setStatus(`已加载策略 ${config.name}`);
     setError('');
@@ -1846,6 +1850,22 @@ export default function BacktestPage({
   useEffect(() => {
     if (!requestedConfigId || lastRequestedConfigIdRef.current === requestedConfigId) return;
     let cancelled = false;
+    setLoadingResearchSignals(true);
+    setResearchSignalLoadError('');
+    fetchResearchSignalDatasets()
+      .then((items) => {
+        if (!cancelled) setResearchSignalDatasets(items);
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setResearchSignalLoadError(
+            reason instanceof Error ? reason.message : '加载研究信号列表失败',
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingResearchSignals(false);
+      });
     fetchStrategyConfigs()
       .then((configs) => {
         if (cancelled) return;

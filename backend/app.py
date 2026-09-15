@@ -26,7 +26,7 @@ _STRATEGY_GUIDE_PATH = os.path.join(_viewer_dir, "docs", "玄龄回测系统使�
 from fastapi import FastAPI, Query, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from backend import settings
 from backend.execution import execution_algorithm_snapshot, validate_execution_request
@@ -58,6 +58,7 @@ from backend.services import (
   release_notifications,
   shared_backtest_admin,
   research_signal_snapshot,
+  shared_backtest_artifacts,
   shared_backtest_lifecycle,
   shared_backtest_copy,
   shared_backtest_detail as shared_backtest_detail_service,
@@ -460,11 +461,27 @@ def _prepare_research_signal_attachment(request: dict[str, Any]) -> None:
   try:
     bars, warmup_bar_count, _ = backtest_runner._load_user_script_bars(request)
     bar_times = [str(row.time) for row in bars.iloc[warmup_bar_count:].itertuples(index=False)]
-    snapshot = research_signal_snapshot.freeze_signal_snapshot(
-      dataset_id, str(state_store.current_user_id()), request["symbol"], request["startDate"],
-      request["endDate"], request["timeframe"], bar_times,
-    )
-  except research_signal_snapshot.ResearchSignalSnapshotError as error:
+    imported = state_store.get_imported_research_signal_dataset(dataset_id)
+    if imported:
+      artifact_path = shared_backtest_artifacts.verified_artifact_path(
+        str(imported["storage_key"]),
+        str(imported["content_sha256"]),
+        int(imported["byte_size"]),
+      )
+      imported["artifactFile"] = str(artifact_path)
+      snapshot = research_signal_snapshot.freeze_imported_signal_snapshot(
+        imported, request["symbol"], request["startDate"], request["endDate"],
+        request["timeframe"], bar_times,
+      )
+    else:
+      snapshot = research_signal_snapshot.freeze_signal_snapshot(
+        dataset_id, str(state_store.current_user_id()), request["symbol"], request["startDate"],
+        request["endDate"], request["timeframe"], bar_times,
+      )
+  except (
+    research_signal_snapshot.ResearchSignalSnapshotError,
+    shared_backtest_artifacts.SharedArtifactError,
+  ) as error:
     raise HTTPException(422, str(error)) from error
   request["researchSignalSnapshot"] = snapshot
   saved_snapshot = dict(request.get("savedConfigSnapshot") or {})
@@ -716,11 +733,16 @@ def _require_backtest_runner(fill_model: str) -> None:
 def research_signal_datasets() -> dict[str, Any]:
   """供回测工作台选择当前用户可用的已发布研究信号。"""
 
+  imported_items = state_store.list_imported_research_signal_datasets()
   try:
-    items = research_signal_snapshot.list_published_signal_datasets(str(state_store.current_user_id()))
+    remote_items = research_signal_snapshot.list_published_signal_datasets(
+      str(state_store.current_user_id()),
+    )
   except research_signal_snapshot.ResearchSignalSnapshotError as error:
-    raise HTTPException(422, str(error)) from error
-  return {"items": items}
+    if not imported_items:
+      raise HTTPException(422, str(error)) from error
+    remote_items = []
+  return {"items": [*imported_items, *remote_items]}
 
 
 def _load_strategy_guide() -> str:
@@ -1447,6 +1469,27 @@ def shared_backtest_detail(publication_id: str, response: Response):
     raise HTTPException(404, "该共享回测已不可用") from error
   except ValueError as error:
     raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/shared-backtests/{publication_id}/artifacts/{artifact_id}")
+def download_shared_backtest_artifact(publication_id: str, artifact_id: str):
+  """鉴权下载仍处于已上架状态的共享附件。"""
+  try:
+    artifact = state_store.get_shared_backtest_artifact(publication_id, artifact_id)
+    path = shared_backtest_artifacts.verified_artifact_path(
+      str(artifact["storage_key"]),
+      str(artifact["content_sha256"]),
+      int(artifact["byte_size"]),
+    )
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except shared_backtest_artifacts.SharedArtifactError as error:
+    raise HTTPException(409, str(error)) from error
+  return FileResponse(
+    path,
+    media_type=artifact.get("content_type") or "application/octet-stream",
+    filename=shared_backtest_artifacts.safe_filename(artifact.get("display_name")),
+  )
 
 
 @app.patch("/api/shared-backtests/{publication_id}")
