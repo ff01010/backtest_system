@@ -267,15 +267,38 @@ describe('BacktestPage history pagination', () => {
 
   it('publishes a complete successful history run from the share form', async () => {
     const run = makeRun(1);
+    const summary = {
+      totalPnl: 0,
+      totalReturn: 0,
+      maxDrawdown: 0,
+      maxDrawdownRate: 0,
+      annualVolatility: 0,
+      winRate: 0,
+      dailyWinRate: 0,
+      tradeCount: 0,
+      winningTrades: 0,
+      losingTrades: 0,
+      avgWin: 0,
+      avgLoss: 0,
+      profitLossRatio: null,
+      finalEquity: 100000,
+      annualReturn: 0,
+      annualSharpe: null,
+      sortino: null,
+    };
     run.scriptSnapshot = {
       code: 'def on_bar(bar, state):\n  return []',
       name: '测试策略',
     };
     run.paramsSnapshot = { name: '测试方案', params: { window: 20 } };
+    run.summaryJson = summary;
     run.resultJson = {
       runId: run.id,
+      configId: run.configId,
+      configVersionId: run.configVersionId,
+      scriptId: run.scriptId,
       outputDir: '',
-      summary: run.summaryJson,
+      summary,
       equity: [],
       dailyHoldings: [],
       cycles: [],
@@ -286,10 +309,29 @@ describe('BacktestPage history pagination', () => {
       excessReturn: null,
       trades: [],
       skippedSignals: [],
-      experimentManifest: {},
+      experimentManifest: {
+        experimentHash: 'experiment-hash',
+        engineVersion: 'test-engine',
+        signalModel: 'on_bar',
+        fillModel: run.fillModel,
+        randomSeed: 0,
+        strategyCodeHash: 'strategy-code-hash',
+        configHash: 'config-hash',
+        dataHash: 'data-hash',
+        barCount: 0,
+        barRange: {
+          start: run.startDate,
+          end: run.endDate,
+          timeframe: run.timeframe,
+        },
+        costModel: {
+          commissionRate: 0,
+          slippage: 0,
+        },
+      },
       dataSnapshot: {},
       warnings: [],
-    } as BacktestRunHistory['resultJson'];
+    } satisfies NonNullable<BacktestRunHistory['resultJson']>;
     apiMocks.fetchBacktestRunPage.mockResolvedValue({
       runs: [run], total: 1, limit: 10, offset: 0, symbols: [run.symbol],
     });
