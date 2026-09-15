@@ -13,7 +13,7 @@ import hmac
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Literal
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -59,6 +59,7 @@ from backend.services import (
   research_signal_snapshot,
   shared_backtest_lifecycle,
   shared_backtest_copy,
+  shared_backtest_discovery,
   state_store,
   strategy_adapters,
 )
@@ -1306,8 +1307,36 @@ def publish_backtest_run(
 def shared_backtests(
   limit: int = Query(20, ge=1, le=100),
   offset: int = Query(0, ge=0),
+  query: str = Query("", max_length=100),
+  strategy_category: str | None = Query(default=None, alias="strategyCategory", max_length=32),
+  timeframe: str | None = Query(default=None, max_length=16),
+  sort: Literal["latest", "copies"] = Query("latest"),
+  favorites_only: bool = Query(False, alias="favoritesOnly"),
 ):
-  return state_store.list_shared_backtests(limit=limit, offset=offset)
+  return shared_backtest_discovery.list_shared_backtests(
+    limit=limit,
+    offset=offset,
+    query=query,
+    strategy_category=strategy_category,
+    timeframe=timeframe,
+    sort=sort,
+    favorites_only=favorites_only,
+  )
+
+
+@app.post("/api/shared-backtests/{publication_id}/favorite")
+def favorite_shared_backtest(publication_id: str):
+  try:
+    created = shared_backtest_discovery.favorite_shared_backtest(publication_id)
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  return {"favorited": True, "created": created}
+
+
+@app.delete("/api/shared-backtests/{publication_id}/favorite")
+def unfavorite_shared_backtest(publication_id: str):
+  deleted = shared_backtest_discovery.unfavorite_shared_backtest(publication_id)
+  return {"favorited": False, "deleted": deleted}
 
 
 @app.get("/api/shared-backtests/mine")

@@ -2501,16 +2501,27 @@ def list_shared_backtests(limit: int = 20, offset: int = 0) -> dict[str, Any]:
 
 def get_shared_backtest(publication_id: str) -> dict[str, Any]:
   """读取 active 共享回测的安全详情投影。"""
+  viewer_id = current_user_id()
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(
-        "SELECT * FROM backtest_publication WHERE id=%s AND status='active'",
-        (publication_id,),
-      )
+      cur.execute("""
+        SELECT p.*, favorite.user_id IS NOT NULL AS is_favorited,
+          copied.recipient_user_id IS NOT NULL AS has_copied
+        FROM backtest_publication p
+        LEFT JOIN backtest_publication_favorite favorite
+          ON favorite.publication_id=p.id AND favorite.user_id=%s
+        LEFT JOIN backtest_publication_copy copied
+          ON copied.publication_id=p.id AND copied.recipient_user_id=%s
+        WHERE p.id=%s AND p.status='active'
+      """, (viewer_id, viewer_id, publication_id))
       row = cur.fetchone()
       if not row:
         raise KeyError(publication_id)
-      return _publication_detail(row)
+      return {
+        **_publication_detail(row),
+        "isFavorited": bool(row.get("is_favorited")),
+        "hasCopied": bool(row.get("has_copied")),
+      }
 
 
 def delete_backtest_run(run_id: str) -> bool:

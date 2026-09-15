@@ -515,6 +515,16 @@ export interface SharedBacktestPage {
   offset: number;
 }
 
+export interface SharedBacktestQuery {
+  limit?: number;
+  offset?: number;
+  query?: string;
+  strategyCategory?: string;
+  timeframe?: string;
+  sort?: 'latest' | 'copies';
+  favoritesOnly?: boolean;
+}
+
 export async function publishBacktestRun(
   runId: string,
   payload: { title: string; description: string; tags: string[] }
@@ -526,8 +536,18 @@ export async function publishBacktestRun(
   );
 }
 
-export async function fetchSharedBacktests(limit = 20, offset = 0): Promise<SharedBacktestPage> {
-  const search = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+export async function fetchSharedBacktests(
+  params: SharedBacktestQuery = {},
+): Promise<SharedBacktestPage> {
+  const search = new URLSearchParams({
+    limit: String(params.limit ?? 20),
+    offset: String(params.offset ?? 0),
+  });
+  if (params.query?.trim()) search.set('query', params.query.trim());
+  if (params.strategyCategory) search.set('strategyCategory', params.strategyCategory);
+  if (params.timeframe) search.set('timeframe', params.timeframe);
+  if (params.sort) search.set('sort', params.sort);
+  if (params.favoritesOnly) search.set('favoritesOnly', 'true');
   return fetchJson<SharedBacktestPage>(`${BASE}/shared-backtests?${search.toString()}`);
 }
 
@@ -588,6 +608,26 @@ export async function copySharedBacktest(
   return sendJson<SharedBacktestCopyResponse>(
     `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/copy`,
     'POST',
+    {},
+  );
+}
+
+export async function favoriteSharedBacktest(
+  publicationId: string,
+): Promise<{ favorited: true; created: boolean }> {
+  return sendJson(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/favorite`,
+    'POST',
+    {},
+  );
+}
+
+export async function unfavoriteSharedBacktest(
+  publicationId: string,
+): Promise<{ favorited: false; deleted: boolean }> {
+  return sendJson(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/favorite`,
+    'DELETE',
     {},
   );
 }

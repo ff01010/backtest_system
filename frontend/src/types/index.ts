@@ -495,6 +495,7 @@ export interface SharedBacktestListItem {
   sourcePublicationId?: string | null;
   sourceAuthorName?: string | null;
   sourceTitle?: string | null;
+  isFavorited?: boolean;
   hasCopied?: boolean;
 }
 

@@ -537,6 +537,8 @@ class SharedBacktestListItem(BaseModel):
   sourcePublicationId: str | None = None
   sourceAuthorName: str | None = None
   sourceTitle: str | None = None
+  isFavorited: bool = False
+  hasCopied: bool = False
 
 
 class SharedBacktestManagementItem(SharedBacktestListItem):
