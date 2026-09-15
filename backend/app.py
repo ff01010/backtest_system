@@ -13,6 +13,7 @@ import hmac
 import json
 import logging
 import re
+from collections.abc import Callable
 from typing import Any, Literal
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -1310,7 +1311,7 @@ def backtest_runs(
 def publish_backtest_run(
   run_id: str,
   payload: schemas.SharedBacktestPublicationCreate,
-):
+) -> dict[str, Any]:
   try:
     publication, created = state_store.create_shared_backtest_publication(
       run_id,
@@ -1337,7 +1338,7 @@ def shared_backtests(
   timeframe: str | None = Query(default=None, max_length=16),
   sort: Literal["latest", "copies"] = Query("latest"),
   favorites_only: bool = Query(False, alias="favoritesOnly"),
-):
+) -> dict[str, Any]:
   response.headers["Cache-Control"] = "private, no-store"
   return shared_backtest_discovery.list_shared_backtests(
     limit=limit,
@@ -1351,7 +1352,7 @@ def shared_backtests(
 
 
 @app.post("/api/shared-backtests/{publication_id}/favorite")
-def favorite_shared_backtest(publication_id: str):
+def favorite_shared_backtest(publication_id: str) -> dict[str, bool]:
   try:
     created = shared_backtest_discovery.favorite_shared_backtest(publication_id)
   except KeyError as error:
@@ -1360,7 +1361,7 @@ def favorite_shared_backtest(publication_id: str):
 
 
 @app.delete("/api/shared-backtests/{publication_id}/favorite")
-def unfavorite_shared_backtest(publication_id: str):
+def unfavorite_shared_backtest(publication_id: str) -> dict[str, bool]:
   deleted = shared_backtest_discovery.unfavorite_shared_backtest(publication_id)
   return {"favorited": False, "deleted": deleted}
 
@@ -1371,7 +1372,7 @@ def admin_shared_backtests(
   limit: int = Query(20, ge=1, le=100),
   offset: int = Query(0, ge=0),
   status: str | None = Query(default=None, pattern=r"^(active|withdrawn|removed)$"),
-):
+) -> dict[str, Any]:
   _require_admin(request)
   return shared_backtest_admin.list_shared_backtests_for_admin(limit, offset, status)
 
@@ -1381,7 +1382,7 @@ def admin_remove_shared_backtest(
   publication_id: str,
   payload: schemas.SharedBacktestRemovalRequest,
   request: Request,
-):
+) -> dict[str, Any]:
   _require_admin(request)
   return _admin_publication_transition(
     lambda: shared_backtest_admin.remove_publication(publication_id, payload.reason),
@@ -1389,14 +1390,19 @@ def admin_remove_shared_backtest(
 
 
 @app.post("/api/admin/shared-backtests/{publication_id}/restore")
-def admin_restore_shared_backtest(publication_id: str, request: Request):
+def admin_restore_shared_backtest(
+  publication_id: str,
+  request: Request,
+) -> dict[str, Any]:
   _require_admin(request)
   return _admin_publication_transition(
     lambda: shared_backtest_admin.restore_publication(publication_id),
   )
 
 
-def _admin_publication_transition(transition: Any):
+def _admin_publication_transition(
+  transition: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
   try:
     return {"publication": transition()}
   except KeyError as error:
@@ -1412,12 +1418,12 @@ def my_shared_backtests(
   limit: int = Query(20, ge=1, le=100),
   offset: int = Query(0, ge=0),
   status: str | None = Query(default=None, pattern=r"^(active|withdrawn|removed)$"),
-):
+) -> dict[str, Any]:
   return shared_backtest_lifecycle.list_my_shared_backtests(limit, offset, status)
 
 
 @app.post("/api/shared-backtests/{publication_id}/copy")
-def copy_shared_backtest(publication_id: str):
+def copy_shared_backtest(publication_id: str) -> dict[str, Any]:
   try:
     return shared_backtest_copy.copy_shared_backtest(publication_id)
   except KeyError as error:
@@ -1431,7 +1437,7 @@ def copy_shared_backtest(publication_id: str):
 
 
 @app.get("/api/shared-backtests/{publication_id}/chart")
-def shared_backtest_chart(publication_id: str):
+def shared_backtest_chart(publication_id: str) -> dict[str, Any]:
   try:
     return shared_backtest_detail_service.get_shared_backtest_chart(publication_id)
   except KeyError as error:
@@ -1446,7 +1452,7 @@ def shared_backtest_result_page(
   section: Literal["holdings", "trades", "signals", "execution-plans", "cycles"],
   cursor: int = Query(0, ge=0),
   limit: int = Query(50, ge=1, le=200),
-):
+) -> dict[str, Any]:
   try:
     return shared_backtest_detail_service.get_shared_backtest_result_page(
       publication_id,
@@ -1461,7 +1467,10 @@ def shared_backtest_result_page(
 
 
 @app.get("/api/shared-backtests/{publication_id}")
-def shared_backtest_detail(publication_id: str, response: Response):
+def shared_backtest_detail(
+  publication_id: str,
+  response: Response,
+) -> dict[str, Any]:
   response.headers["Cache-Control"] = "private, no-store"
   try:
     return {"publication": state_store.get_shared_backtest(publication_id)}
@@ -1472,7 +1481,10 @@ def shared_backtest_detail(publication_id: str, response: Response):
 
 
 @app.get("/api/shared-backtests/{publication_id}/artifacts/{artifact_id}")
-def download_shared_backtest_artifact(publication_id: str, artifact_id: str):
+def download_shared_backtest_artifact(
+  publication_id: str,
+  artifact_id: str,
+) -> FileResponse:
   """鉴权下载仍处于已上架状态的共享附件。"""
   try:
     artifact = state_store.get_shared_backtest_artifact(publication_id, artifact_id)
@@ -1496,7 +1508,7 @@ def download_shared_backtest_artifact(publication_id: str, artifact_id: str):
 def update_shared_backtest_metadata(
   publication_id: str,
   payload: schemas.SharedBacktestMetaUpdate,
-):
+) -> dict[str, Any]:
   try:
     publication = shared_backtest_lifecycle.update_publication_metadata(
       publication_id,
@@ -1512,7 +1524,7 @@ def update_shared_backtest_metadata(
 
 
 @app.post("/api/shared-backtests/{publication_id}/withdraw")
-def withdraw_shared_backtest(publication_id: str):
+def withdraw_shared_backtest(publication_id: str) -> dict[str, Any]:
   return _author_publication_transition(
     publication_id,
     shared_backtest_lifecycle.withdraw_publication,
@@ -1520,14 +1532,17 @@ def withdraw_shared_backtest(publication_id: str):
 
 
 @app.post("/api/shared-backtests/{publication_id}/relist")
-def relist_shared_backtest(publication_id: str):
+def relist_shared_backtest(publication_id: str) -> dict[str, Any]:
   return _author_publication_transition(
     publication_id,
     shared_backtest_lifecycle.relist_publication,
   )
 
 
-def _author_publication_transition(publication_id: str, transition: Any):
+def _author_publication_transition(
+  publication_id: str,
+  transition: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
   try:
     return {"publication": transition(publication_id)}
   except KeyError as error:
