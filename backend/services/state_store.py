@@ -124,8 +124,6 @@ def ensure_schema() -> None:
       cur.execute("SELECT to_regclass('public.strategy_runtime_error_stat') AS runtime_error_table")
       if cur.fetchone()["runtime_error_table"] is None:
         raise DatabaseError("数据库缺少策略运行时错误统计迁移 025，请先运行 deploy 的 migrate 服务")
-
-
 def get_release_status_record() -> dict[str, Any] | None:
   """返回当前部署、有效公告和当前用户回执。"""
   with _db() as conn:
@@ -658,6 +656,7 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
     "cancelRequested": bool(row.get("cancel_requested", False)),
     "createdAt": _format_time(row["created_at"]),
     "finishedAt": _format_time(row.get("finished_at")),
+    "publicationId": _uuid(row.get("publication_id")),
   }
 
 
@@ -2093,7 +2092,8 @@ def _run_query(where: str = "") -> str:
     SELECT r.*, s.id AS strategy_id, c.name AS config_name,
       i.symbol || '.' || i.exchange AS symbol,
       b.symbol || '.' || b.exchange AS benchmark_symbol,
-      COALESCE(bar_job.cancel_requested, l2_job.cancel_requested, false) AS cancel_requested
+      COALESCE(bar_job.cancel_requested, l2_job.cancel_requested, false) AS cancel_requested,
+      publication.id AS publication_id
     FROM backtest_run r
     LEFT JOIN strategy_config c ON c.id=r.config_id
     LEFT JOIN user_strategy_version sv ON sv.id=r.strategy_version_id
@@ -2102,6 +2102,7 @@ def _run_query(where: str = "") -> str:
     LEFT JOIN market_instrument b ON b.id=r.benchmark_instrument_id
     LEFT JOIN bar_backtest_job bar_job ON bar_job.run_id=r.id
     LEFT JOIN l2_backtest_job l2_job ON l2_job.run_id=r.id
+    LEFT JOIN backtest_publication publication ON publication.source_run_id=r.id
     WHERE r.owner_user_id=%s {where}
   """
 
@@ -2233,6 +2234,265 @@ def get_backtest_run(run_id: str) -> dict[str, Any]:
       if not row:
         raise KeyError(run_id)
       return _normalize_run(row)
+
+
+_SHARED_RESULT_KEYS = (
+  "strategyCategory", "resultSchemaVersion", "strategyMetrics", "summary",
+  "equity", "dailyHoldings", "cycles", "executionPlans", "benchmarkSymbol",
+  "benchmarkEquity", "benchmarkReturn", "excessReturn", "trades",
+  "skippedSignals", "experimentManifest", "dataSnapshot", "warnings",
+)
+_SHARED_DETAIL_RESULT_KEYS = (
+  "strategyCategory", "resultSchemaVersion", "strategyMetrics", "summary",
+  "benchmarkSymbol", "benchmarkReturn", "excessReturn", "experimentManifest",
+  "warnings",
+)
+_SHARED_CONFIGURATION_KEYS = (
+  "initialCapital", "commissionRate", "slippage", "feeProfile", "allowLong",
+  "allowShort", "holdingPolicy", "overlaySettlementPolicy", "fillModel",
+  "executionAlgorithm", "executionParameters", "baseQuantity", "baseCostPrice",
+  "initialPositionEnabled", "t0Enabled", "warmupTradingDays", "strategyParams",
+)
+_SHARED_FORBIDDEN_KEYS = {
+  "userid", "owneruserid", "accountid", "accountname", "username", "email",
+  "outputdir", "storagekey", "artifactfile", "requestid", "requestkey",
+  "attempttoken", "leasetoken", "workerid", "errormessage", "traceback",
+  "stacktrace", "apikey", "authorization", "credential", "internalpath",
+}
+_SHARED_RISK_NOTICE = "历史回测结果不代表未来表现"
+
+
+def _is_shared_system_key(key: object) -> bool:
+  normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+  return (
+    normalized in _SHARED_FORBIDDEN_KEYS
+    or normalized.endswith("path")
+    or normalized.endswith("dir")
+    or normalized.endswith("token")
+  )
+
+
+def _safe_shared_value(value: Any) -> Any:
+  """递归剔除系统字段，避免嵌套结果绕过共享白名单。"""
+  if isinstance(value, dict):
+    return {
+      key: _safe_shared_value(item)
+      for key, item in value.items()
+      if not _is_shared_system_key(key)
+    }
+  if isinstance(value, list):
+    return [_safe_shared_value(item) for item in value]
+  return value
+
+
+def _shared_strategy_snapshot(run: dict[str, Any]) -> dict[str, Any]:
+  script = run.get("scriptSnapshot")
+  if not isinstance(script, dict) or not str(script.get("code") or "").strip():
+    raise ValueError("历史任务资料不完整，请重新运行后共享")
+  return _safe_shared_value({
+    "name": script.get("name") or run.get("paramsSnapshot", {}).get("name") or "",
+    "description": script.get("description") or "",
+    "entryType": script.get("entryType") or "on_bar",
+    "code": script["code"],
+    "codeHash": script.get("codeHash") or hashlib.sha256(
+      str(script["code"]).encode("utf-8"),
+    ).hexdigest(),
+    "signalRequired": bool(script.get("signalRequired", False)),
+    "runtimeVersion": script.get("runtimeVersion"),
+    "capabilityDigest": script.get("capabilityDigest"),
+  })
+
+
+def _shared_configuration_snapshot(run: dict[str, Any]) -> dict[str, Any]:
+  request = run.get("paramsJson")
+  saved = run.get("paramsSnapshot")
+  if not isinstance(request, dict) or not isinstance(saved, dict) or not saved:
+    raise ValueError("历史任务资料不完整，请重新运行后共享")
+  configuration = {
+    "strategyName": saved.get("name") or "",
+    "strategy": run.get("strategy") or request.get("strategy") or "user_script",
+    "strategyCategory": run.get("strategyCategory") or "directional_holding",
+    "symbol": run.get("symbol") or request.get("symbol") or "",
+    "timeframe": run.get("timeframe") or request.get("timeframe") or "5m",
+    "benchmarkSymbol": run.get("benchmarkSymbol") or request.get("benchmarkSymbol"),
+    "startDate": run.get("startDate") or request.get("startDate") or "",
+    "endDate": run.get("endDate") or request.get("endDate") or "",
+    "params": saved.get("params") or {},
+    "runParams": saved.get("runParams") or request.get("strategyParams") or {},
+    "execution": saved.get("execution") or {},
+  }
+  configuration.update({key: request.get(key) for key in _SHARED_CONFIGURATION_KEYS})
+  return _safe_shared_value(configuration)
+
+
+def _build_shared_backtest_snapshot(run: dict[str, Any]) -> dict[str, Any]:
+  """从历史回测规范化结果构造版本 1 业务白名单快照。"""
+  result = run.get("resultJson")
+  if run.get("status") not in {"ok", "succeeded"}:
+    raise ValueError("只有成功完成的回测可以共享")
+  if not isinstance(result, dict) or not result:
+    raise ValueError("历史任务资料不完整，请重新运行后共享")
+  params = run.get("paramsSnapshot")
+  if not isinstance(params, dict):
+    raise ValueError("历史任务资料不完整，请重新运行后共享")
+  data = {
+    "marketData": _safe_shared_value(run.get("dataVersion") or {}),
+    "resultData": _safe_shared_value(result.get("dataSnapshot") or {}),
+    "dependencies": [],
+  }
+  if isinstance(params.get("researchSignal"), dict):
+    data["dependencies"].append({
+      "type": "research_signal",
+      "summary": _safe_shared_value(params["researchSignal"]),
+    })
+  return {
+    "strategy": _shared_strategy_snapshot(run),
+    "configuration": _shared_configuration_snapshot(run),
+    "data": data,
+    "result": _safe_shared_value({
+      key: result[key] for key in _SHARED_RESULT_KEYS if key in result
+    }),
+    "origin": {},
+  }
+
+
+def _shared_snapshot_digest(snapshot: dict[str, Any]) -> str:
+  canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+  return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _publication_list_item(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "id": _uuid(row["id"]),
+    "title": row["title"],
+    "authorName": row["author_name_snapshot"],
+    "tags": _json(row.get("tags"), []),
+    "symbol": row["symbol"],
+    "timeframe": row["timeframe"],
+    "strategyCategory": row["strategy_category"],
+    "startDate": row["start_date"],
+    "endDate": row["end_date"],
+    "totalReturn": _to_float(row.get("total_return")),
+    "maxDrawdownRate": _to_float(row.get("max_drawdown_rate")),
+    "annualSharpe": _to_float(row.get("annual_sharpe")),
+    "copyCount": int(row.get("copy_count") or 0),
+    "firstPublishedAt": _format_time(row["first_published_at"]),
+  }
+
+
+def _publication_detail(row: dict[str, Any]) -> dict[str, Any]:
+  version = int(row["snapshot_schema_version"])
+  if version != 1:
+    raise ValueError(f"暂不支持共享快照版本: {version}")
+  snapshot = _json(row["snapshot_json"], {})
+  result = snapshot.get("result", {})
+  return {
+    **_publication_list_item(row),
+    "description": row["description"],
+    "snapshotSchemaVersion": version,
+    "snapshotDigest": row["snapshot_digest"],
+    "strategy": snapshot.get("strategy", {}),
+    "configuration": snapshot.get("configuration", {}),
+    "data": snapshot.get("data", {}),
+    "result": {
+      key: result[key] for key in _SHARED_DETAIL_RESULT_KEYS if key in result
+    },
+    "origin": snapshot.get("origin", {}),
+    "riskNotice": _SHARED_RISK_NOTICE,
+  }
+
+
+def create_shared_backtest_publication(
+  run_id: str,
+  title: str,
+  description: str,
+  tags: list[str],
+) -> tuple[dict[str, Any], bool]:
+  """幂等地将当前用户的一次完整成功回测冻结为共享回测。"""
+  user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT * FROM backtest_publication WHERE source_run_id=%s AND owner_user_id=%s",
+        (run_id, user_id),
+      )
+      existing = cur.fetchone()
+      if existing:
+        return _publication_detail(existing), False
+      cur.execute(_run_query("AND r.id=%s FOR UPDATE OF r"), (user_id, run_id))
+      row = cur.fetchone()
+      if not row:
+        raise KeyError(run_id)
+      run = _normalize_run(row)
+      snapshot = _build_shared_backtest_snapshot(run)
+      summary = snapshot["result"].get("summary", {})
+      configuration = snapshot["configuration"]
+      digest = _shared_snapshot_digest(snapshot)
+      cur.execute("""
+        INSERT INTO backtest_publication (
+          owner_user_id, author_name_snapshot, source_run_id, title, description,
+          tags, status, snapshot_schema_version, snapshot_json, snapshot_digest,
+          symbol, timeframe, strategy_category, start_date, end_date,
+          total_return, max_drawdown_rate, annual_sharpe
+        ) VALUES (
+          %s, %s, %s, %s, %s, %s, 'active', 1, %s, %s,
+          %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        ON CONFLICT (source_run_id) WHERE source_run_id IS NOT NULL DO NOTHING
+        RETURNING *
+      """, (
+        user_id, get_current_user().display_name, run_id, title, description,
+        Jsonb(tags), Jsonb(snapshot), digest, configuration["symbol"],
+        configuration["timeframe"], configuration["strategyCategory"],
+        configuration["startDate"], configuration["endDate"],
+        summary.get("totalReturn"), summary.get("maxDrawdownRate"),
+        summary.get("annualSharpe"),
+      ))
+      publication = cur.fetchone()
+      created = publication is not None
+      if publication is None:
+        cur.execute(
+          "SELECT * FROM backtest_publication WHERE source_run_id=%s",
+          (run_id,),
+        )
+        publication = cur.fetchone()
+      if publication is None:
+        raise DatabaseError("共享回测创建失败")
+      return _publication_detail(publication), created
+
+
+def list_shared_backtests(limit: int = 20, offset: int = 0) -> dict[str, Any]:
+  """返回当前正常登录用户可见的已上架共享回测。"""
+  if limit < 1 or limit > 100 or offset < 0:
+    raise ValueError("分页参数无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT count(*) AS value FROM backtest_publication WHERE status='active'")
+      total = int(cur.fetchone()["value"])
+      cur.execute("""
+        SELECT * FROM backtest_publication WHERE status='active'
+        ORDER BY first_published_at DESC, id DESC LIMIT %s OFFSET %s
+      """, (limit, offset))
+      return {
+        "items": [_publication_list_item(row) for row in cur.fetchall()],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+      }
+
+
+def get_shared_backtest(publication_id: str) -> dict[str, Any]:
+  """读取 active 共享回测的安全详情投影。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT * FROM backtest_publication WHERE id=%s AND status='active'",
+        (publication_id,),
+      )
+      row = cur.fetchone()
+      if not row:
+        raise KeyError(publication_id)
+      return _publication_detail(row)
 
 
 def delete_backtest_run(run_id: str) -> bool:

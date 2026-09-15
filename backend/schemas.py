@@ -482,6 +482,65 @@ class BacktestRunHistory(BaseModel):
   cancelRequested: bool = False
   createdAt: str
   finishedAt: str
+  publicationId: str | None = None
+
+
+class SharedBacktestPublicationCreate(BaseModel):
+  title: str = Field(min_length=1, max_length=128)
+  description: str = Field(min_length=1, max_length=4000)
+  tags: list[str] = Field(default_factory=list, max_length=10)
+
+  @field_validator("title", "description")
+  @classmethod
+  def normalize_required_text(cls, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+      raise ValueError("内容不能为空")
+    return normalized
+
+  @field_validator("tags")
+  @classmethod
+  def normalize_tags(cls, value: list[str]) -> list[str]:
+    tags: list[str] = []
+    for item in value:
+      normalized = item.strip()
+      if not normalized or normalized in tags:
+        continue
+      if len(normalized) > 32:
+        raise ValueError("单个标签不能超过 32 个字符")
+      tags.append(normalized)
+    if len(tags) > 10:
+      raise ValueError("标签不能超过 10 个")
+    return tags
+
+
+class SharedBacktestListItem(BaseModel):
+  id: str
+  title: str
+  authorName: str
+  tags: list[str]
+  symbol: str
+  timeframe: str
+  strategyCategory: str
+  startDate: str
+  endDate: str
+  totalReturn: float | None
+  maxDrawdownRate: float | None
+  annualSharpe: float | None
+  copyCount: int
+  firstPublishedAt: str
+
+
+class SharedBacktestDetail(SharedBacktestListItem):
+  description: str
+  snapshotSchemaVersion: int
+  snapshotDigest: str
+  strategy: dict[str, Any]
+  configuration: dict[str, Any]
+  data: dict[str, Any]
+  result: dict[str, Any]
+  origin: dict[str, Any]
+  riskNotice: str
 
 
 class BacktestRunMetaUpdate(BaseModel):

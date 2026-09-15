@@ -469,6 +469,36 @@ export interface BacktestRunHistory {
   resultJson: BacktestRunResponse | null;
   createdAt: string;
   finishedAt: string;
+  publicationId?: string | null;
+}
+
+export interface SharedBacktestListItem {
+  id: string;
+  title: string;
+  authorName: string;
+  tags: string[];
+  symbol: string;
+  timeframe: string;
+  strategyCategory: string;
+  startDate: string;
+  endDate: string;
+  totalReturn: number | null;
+  maxDrawdownRate: number | null;
+  annualSharpe: number | null;
+  copyCount: number;
+  firstPublishedAt: string;
+}
+
+export interface SharedBacktestDetail extends SharedBacktestListItem {
+  description: string;
+  snapshotSchemaVersion: number;
+  snapshotDigest: string;
+  strategy: Record<string, unknown>;
+  configuration: Record<string, unknown>;
+  data: Record<string, unknown>;
+  result: Record<string, unknown>;
+  origin: Record<string, unknown>;
+  riskNotice: string;
 }
 
 export interface DataGapDate {

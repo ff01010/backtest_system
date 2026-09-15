@@ -16,6 +16,8 @@ import type {
   StrategySource,
   ReleaseNotice,
   ReleaseStatus,
+  SharedBacktestDetail,
+  SharedBacktestListItem,
 } from '../types';
 
 const BASE = '/api';
@@ -501,6 +503,36 @@ export async function fetchBacktestRunPage(
 export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistory> {
   const data = await fetchJson<{ run: BacktestRunHistory }>(`${BASE}/backtest/runs/${runId}`);
   return data.run;
+}
+
+export interface SharedBacktestPage {
+  items: SharedBacktestListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export async function publishBacktestRun(
+  runId: string,
+  payload: { title: string; description: string; tags: string[] }
+): Promise<{ publication: SharedBacktestDetail; created: boolean }> {
+  return sendJson(
+    `${BASE}/backtest/runs/${encodeURIComponent(runId)}/publication`,
+    'POST',
+    payload,
+  );
+}
+
+export async function fetchSharedBacktests(limit = 20, offset = 0): Promise<SharedBacktestPage> {
+  const search = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  return fetchJson<SharedBacktestPage>(`${BASE}/shared-backtests?${search.toString()}`);
+}
+
+export async function fetchSharedBacktest(publicationId: string): Promise<SharedBacktestDetail> {
+  const data = await fetchJson<{ publication: SharedBacktestDetail }>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}`,
+  );
+  return data.publication;
 }
 
 export async function cancelBacktestRun(runId: string): Promise<{

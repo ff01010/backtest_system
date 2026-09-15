@@ -1278,6 +1278,45 @@ def backtest_runs(
   )
 
 
+@app.post("/api/backtest/runs/{run_id}/publication")
+def publish_backtest_run(
+  run_id: str,
+  payload: schemas.SharedBacktestPublicationCreate,
+):
+  try:
+    publication, created = state_store.create_shared_backtest_publication(
+      run_id,
+      payload.title,
+      payload.description,
+      payload.tags,
+    )
+    return {"publication": publication, "created": created}
+  except KeyError as error:
+    raise HTTPException(404, "回测记录不存在或无权共享") from error
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"共享回测创建失败: {error}") from error
+
+
+@app.get("/api/shared-backtests")
+def shared_backtests(
+  limit: int = Query(20, ge=1, le=100),
+  offset: int = Query(0, ge=0),
+):
+  return state_store.list_shared_backtests(limit=limit, offset=offset)
+
+
+@app.get("/api/shared-backtests/{publication_id}")
+def shared_backtest_detail(publication_id: str):
+  try:
+    return {"publication": state_store.get_shared_backtest(publication_id)}
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+
+
 @app.get("/api/backtest/runs/{run_id}")
 def backtest_run_detail(run_id: str):
   try:

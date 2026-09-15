@@ -9,9 +9,10 @@ import {
   Plus,
   RotateCcw,
   Save,
+  Share2,
   Trash2,
 } from 'lucide-react';
-import type { ReactNode } from 'react';
+import type { FormEvent, ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createAccount,
@@ -33,6 +34,7 @@ import {
   BacktestRequestError,
   runBacktest,
   saveCompleteStrategy,
+  publishBacktestRun,
   updateBacktestRunMeta,
 } from '../api/client';
 import type {
@@ -80,6 +82,7 @@ interface Props {
     timeframe: string;
     date: string;
   }) => void;
+  onViewSharedBacktest?: (publicationId: string) => void;
 }
 
 const panelStyle = {
@@ -237,6 +240,17 @@ type HistoryParamKey =
   | 'baseCostPrice'
   | 'initialPositionEnabled'
   | 't0Enabled';
+
+export function getPublicationEligibilityError(run: BacktestRunHistory): string {
+  if (run.status !== 'ok' && run.status !== 'succeeded') return '只有成功完成的回测可以共享';
+  if (!run.scriptSnapshot || typeof run.scriptSnapshot.code !== 'string' || !run.scriptSnapshot.code.trim()) {
+    return '历史任务缺少策略代码快照，请重新运行后共享';
+  }
+  if (!run.paramsSnapshot || Object.keys(run.paramsSnapshot).length === 0 || !run.resultJson) {
+    return '历史任务资料不完整，请重新运行后共享';
+  }
+  return '';
+}
 
 const HISTORY_PARAM_LABELS: Record<HistoryParamKey, string> = {
   configId: '策略方案 ID',
@@ -1200,6 +1214,7 @@ export default function BacktestPage({
   onWorkspaceSafetyStateChange,
   onStrategySaveActionChange,
   onViewTradeChart,
+  onViewSharedBacktest,
 }: Props) {
   const [instrumentList, setInstrumentList] = useState<InstrumentItem[]>(instruments);
   const [accounts, setAccounts] = useState<BacktestAccount[]>([]);
@@ -1259,6 +1274,12 @@ export default function BacktestPage({
   const historyCompareRequestIdRef = useRef(0);
   const [historyNoteDraft, setHistoryNoteDraft] = useState('');
   const [historyTagsDraft, setHistoryTagsDraft] = useState('');
+  const [publicationRun, setPublicationRun] = useState<BacktestRunHistory | null>(null);
+  const [publicationTitle, setPublicationTitle] = useState('');
+  const [publicationDescription, setPublicationDescription] = useState('');
+  const [publicationTags, setPublicationTags] = useState('');
+  const [publicationError, setPublicationError] = useState('');
+  const [publishingRun, setPublishingRun] = useState(false);
   const [selectedScriptId, setSelectedScriptId] = useState<string>('');
   const [selectedConfigId, setSelectedConfigId] = useState<string>('');
   const [versionDirty, setVersionDirty] = useState(false);
@@ -3042,6 +3063,52 @@ export default function BacktestPage({
     }
   };
 
+  const openPublicationDialog = (run: BacktestRunHistory) => {
+    if (run.publicationId) {
+      onViewSharedBacktest?.(run.publicationId);
+      return;
+    }
+    const eligibilityError = getPublicationEligibilityError(run);
+    if (eligibilityError) {
+      setError(eligibilityError);
+      return;
+    }
+    setPublicationRun(run);
+    setPublicationTitle(`${run.symbol} ${formatStrategyName(run.strategy)}回测`);
+    setPublicationDescription('');
+    setPublicationTags('');
+    setPublicationError('');
+  };
+
+  const handlePublishBacktest = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!publicationRun) return;
+    setPublishingRun(true);
+    setPublicationError('');
+    try {
+      const response = await publishBacktestRun(publicationRun.id, {
+        title: publicationTitle.trim(),
+        description: publicationDescription.trim(),
+        tags: publicationTags.split(/[,，]/).map((item) => item.trim()).filter(Boolean),
+      });
+      const publicationId = response.publication.id;
+      setBacktestRuns((runs) => runs.map((run) => (
+        run.id === publicationRun.id ? { ...run, publicationId } : run
+      )));
+      setHistoryRunDetails((runs) => ({
+        ...runs,
+        [publicationRun.id]: { ...(runs[publicationRun.id] || publicationRun), publicationId },
+      }));
+      setPublicationRun(null);
+      setStatus(response.created ? '已共享到策略广场' : '该回测已经共享，已打开现有条目');
+      onViewSharedBacktest?.(publicationId);
+    } catch (reason) {
+      setPublicationError(reason instanceof Error ? reason.message : '共享回测失败');
+    } finally {
+      setPublishingRun(false);
+    }
+  };
+
   const handleDeleteBacktestRun = async (run: BacktestRunHistory) => {
     if (run.status === 'queued' || run.status === 'running' || run.status === 'cancelling') {
       setError('排队或运行中的回测不能删除，请先取消任务。');
@@ -3121,6 +3188,64 @@ export default function BacktestPage({
           color: '#92400e', boxShadow: '0 8px 24px rgba(15, 23, 42, 0.16)', fontSize: 13, lineHeight: 1.5,
         }}>
           {preflightNotice}
+        </div>
+      )}
+
+      {publicationRun && (
+        <div
+          role="presentation"
+          style={{
+            position: 'fixed', inset: 0, zIndex: 80, display: 'grid', placeItems: 'center',
+            padding: 20, background: 'rgba(15, 23, 42, 0.58)',
+          }}
+        >
+          <form
+            role="dialog"
+            aria-modal="true"
+            aria-label="共享到策略广场"
+            onSubmit={handlePublishBacktest}
+            style={{
+              width: 'min(620px, 100%)', display: 'grid', gap: 14, padding: 22,
+              borderRadius: 8, background: '#ffffff', boxShadow: '0 20px 48px rgba(15, 23, 42, 0.3)',
+            }}
+          >
+            <div>
+              <h2 style={{ margin: 0 }}>共享到策略广场</h2>
+              <p style={{ marginBottom: 0, color: '#64748b' }}>
+                回测 {formatRunReference(publicationRun.displayNo)} 的代码、业务参数、结果与依赖摘要将对全体内部登录用户可见。
+              </p>
+            </div>
+            <label>
+              <div style={labelStyle}>共享标题</div>
+              <input required maxLength={128} value={publicationTitle} onChange={(event) => setPublicationTitle(event.target.value)} style={fieldStyle} />
+            </label>
+            <label>
+              <div style={labelStyle}>策略说明</div>
+              <textarea
+                required
+                maxLength={4000}
+                rows={6}
+                value={publicationDescription}
+                onChange={(event) => setPublicationDescription(event.target.value)}
+                placeholder="说明策略思路、适用范围和已知限制"
+                style={{ ...fieldStyle, height: 'auto', padding: 10, resize: 'vertical' }}
+              />
+            </label>
+            <label>
+              <div style={labelStyle}>标签（可选，逗号分隔）</div>
+              <input value={publicationTags} onChange={(event) => setPublicationTags(event.target.value)} style={fieldStyle} />
+            </label>
+            <div style={{ padding: 10, borderRadius: 6, background: '#fffbeb', color: '#92400e', fontSize: 12 }}>
+              请先检查策略代码中是否包含凭据或其他敏感文字。账户关联、内部路径和系统诊断不会被共享。
+            </div>
+            {publicationError && <div role="alert" style={{ color: '#b91c1c' }}>{publicationError}</div>}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button type="button" disabled={publishingRun} onClick={() => setPublicationRun(null)}>取消</button>
+              <button type="submit" disabled={publishingRun || !publicationTitle.trim() || !publicationDescription.trim()}>
+                {publishingRun ? '正在共享...' : '确认共享'}
+              </button>
+            </div>
+          </form>
         </div>
       )}
 
@@ -4888,6 +5013,17 @@ export default function BacktestPage({
                               }}>复制参数新建</button>
                               <button onClick={() => handleRerunHistory(selectedHistoryRun)} disabled={running}>
                                 {running ? '运行中...' : '重新运行'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => openPublicationDialog(selectedHistoryRun)}
+                                disabled={!selectedHistoryRun.publicationId && Boolean(getPublicationEligibilityError(selectedHistoryRun))}
+                                title={selectedHistoryRun.publicationId
+                                  ? '查看已经上架的共享回测'
+                                  : getPublicationEligibilityError(selectedHistoryRun) || '将这次成功回测共享给内部用户'}
+                              >
+                                <Share2 size={14} />
+                                {selectedHistoryRun.publicationId ? '查看共享' : '共享到策略广场'}
                               </button>
                               <button onClick={handleSaveHistoryMeta}>保存备注</button>
                             </div>

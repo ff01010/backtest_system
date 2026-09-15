@@ -15,6 +15,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchBacktestTimeframes: vi.fn(),
   fetchBacktestPreflight: vi.fn(),
   searchMarketInstruments: vi.fn(),
+  publishBacktestRun: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
@@ -262,5 +263,68 @@ describe('BacktestPage history pagination', () => {
       symbol: '',
     }));
     expect(await screen.findByRole('option', { name: /#01/ })).toBeTruthy();
+  });
+
+  it('publishes a complete successful history run from the share form', async () => {
+    const run = makeRun(1);
+    run.scriptSnapshot = {
+      code: 'def on_bar(bar, state):\n  return []',
+      name: '测试策略',
+    };
+    run.paramsSnapshot = { name: '测试方案', params: { window: 20 } };
+    run.resultJson = {
+      runId: run.id,
+      outputDir: '',
+      summary: run.summaryJson,
+      equity: [],
+      dailyHoldings: [],
+      cycles: [],
+      executionPlans: [],
+      benchmarkSymbol: null,
+      benchmarkEquity: [],
+      benchmarkReturn: null,
+      excessReturn: null,
+      trades: [],
+      skippedSignals: [],
+      experimentManifest: {},
+      dataSnapshot: {},
+      warnings: [],
+    } as BacktestRunHistory['resultJson'];
+    apiMocks.fetchBacktestRunPage.mockResolvedValue({
+      runs: [run], total: 1, limit: 10, offset: 0, symbols: [run.symbol],
+    });
+    apiMocks.fetchBacktestRun.mockResolvedValue(run);
+    apiMocks.publishBacktestRun.mockResolvedValue({
+      publication: { id: 'publication-1' }, created: true,
+    });
+    const onViewSharedBacktest = vi.fn();
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+        onViewSharedBacktest={onViewSharedBacktest}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
+    fireEvent.click(await screen.findByRole('button', { name: '#01' }));
+    fireEvent.click(await screen.findByRole('button', { name: /共享到策略广场/ }));
+    const dialog = screen.getByRole('dialog', { name: '共享到策略广场' });
+    fireEvent.change(screen.getByRole('textbox', { name: '策略说明' }), {
+      target: { value: '适合震荡行情，需关注回撤。' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '确认共享' }));
+
+    await waitFor(() => expect(apiMocks.publishBacktestRun).toHaveBeenCalledWith('run-1', {
+      title: '688981.SH 自定义脚本回测',
+      description: '适合震荡行情，需关注回撤。',
+      tags: [],
+    }));
+    expect(dialog.textContent).toContain('账户关联、内部路径和系统诊断不会被共享');
+    await waitFor(() => expect(onViewSharedBacktest).toHaveBeenCalledWith('publication-1'));
   });
 });
