@@ -279,7 +279,7 @@ services:
       - quant-backtest-net
 
   release-admin:
-    image: quant-backtest-release-admin:1
+    image: ${RELEASE_ADMIN_IMAGE:-quant-backtest-release-admin:recovery-v1}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend

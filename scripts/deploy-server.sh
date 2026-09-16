@@ -6,6 +6,25 @@ env_file="$project_root/deploy/.env"
 compose_file="$project_root/deploy/compose.infrastructure.yml"
 clickhouse_compose_file="$project_root/deploy/compose.clickhouse.yml"
 submission_gate_dir="$project_root/deploy/submission-gate"
+deploy_lock_file="/tmp/quant-backtest-deploy.lock"
+
+# 让 flock 父进程持有整段发布锁，脚本更新后可在同一把锁内安全重启。
+if [[ "${QUANT_DEPLOY_LOCK_HELD:-}" != "1" ]]; then
+  command -v flock >/dev/null || {
+    echo "发布终止：未安装 flock，无法保证发布互斥" >&2
+    exit 1
+  }
+  if flock -n -E 75 "$deploy_lock_file" \
+    env QUANT_DEPLOY_LOCK_HELD=1 bash "$project_root/scripts/deploy-server.sh"; then
+    exit 0
+  else
+    status=$?
+    if [[ "$status" == "75" ]]; then
+      echo "发布终止：已有部署或回滚流程正在执行" >&2
+    fi
+    exit "$status"
+  fi
+fi
 
 fail() {
   echo "发布终止：$1" >&2
@@ -204,29 +223,82 @@ verify_frontend_build() {
   echo "frontend 实际入口验证通过：asset=${asset_path}, sha256=${asset_digest}"
 }
 
+verify_market_instrument_directory() {
+  local counts active_count beijing_count code_920_count
+  counts="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT count(*) FILTER (WHERE is_active=true AND instrument_type='"'"'stock'"'"'), count(*) FILTER (WHERE is_active=true AND instrument_type='"'"'stock'"'"' AND exchange='"'"'BJ'"'"'), count(*) FILTER (WHERE is_active=true AND instrument_type='"'"'stock'"'"' AND exchange='"'"'BJ'"'"' AND symbol LIKE '"'"'920%'"'"') FROM market_instrument;"')"
+  IFS='|' read -r active_count beijing_count code_920_count <<< "$counts"
+  [[ "$active_count" =~ ^[1-9][0-9]*$ ]] \
+    || fail "证券目录验收失败：没有活跃股票"
+  [[ "$beijing_count" =~ ^[1-9][0-9]*$ ]] \
+    || fail "证券目录验收失败：没有活跃北交所股票"
+  [[ "$code_920_count" =~ ^[1-9][0-9]*$ ]] \
+    || fail "证券目录验收失败：没有 920 开头的活跃北交所股票"
+  echo "证券目录验收通过：active=${active_count}, BJ=${beijing_count}, 920=${code_920_count}"
+}
+
+verify_release_admin_image() {
+  local image_build_id image_client_version host_digest image_digest
+  image_build_id="$(docker image inspect --format \
+    '{{ index .Config.Labels "io.trend-grid.application-build-id" }}' \
+    "$RELEASE_ADMIN_IMAGE")"
+  image_client_version="$(docker image inspect --format \
+    '{{ index .Config.Labels "io.trend-grid.client-compatibility-version" }}' \
+    "$RELEASE_ADMIN_IMAGE")"
+  [[ "$image_build_id" == "$APPLICATION_BUILD_ID" ]] \
+    || fail "release-admin 镜像 buildId 与目标提交不一致"
+  [[ "$image_client_version" == "$CLIENT_COMPATIBILITY_VERSION" ]] \
+    || fail "release-admin 镜像客户端兼容版本不一致"
+  host_digest="$(sha256sum "$project_root/deploy/release-manifest.json" | cut -d' ' -f1)"
+  image_digest="$(docker run --rm --entrypoint sha256sum \
+    "$RELEASE_ADMIN_IMAGE" /app/deploy/release-manifest.json | cut -d' ' -f1)"
+  [[ "$image_digest" == "$host_digest" ]] \
+    || fail "release-admin 镜像公告清单与目标提交不一致"
+  docker run --rm --entrypoint python "$RELEASE_ADMIN_IMAGE" \
+    -m backend.release_publish --help >/dev/null \
+    || fail "release-admin 镜像命令入口不可用"
+  echo "release-admin 镜像验证通过：image=${RELEASE_ADMIN_IMAGE}, manifest=${host_digest}"
+}
+
+preserve_recovery_image() {
+  local recovery_image="quant-backtest-release-admin:recovery-v1"
+  if docker image inspect "$recovery_image" >/dev/null 2>&1; then
+    echo "保留既有恢复镜像：${recovery_image}"
+    return
+  fi
+  docker image tag "$RELEASE_ADMIN_IMAGE" "$recovery_image"
+  echo "已建立恢复镜像基线：${recovery_image}"
+}
+
 [[ -f "$env_file" ]] || fail "缺少服务器环境文件：$env_file"
 [[ -f "$clickhouse_compose_file" ]] || fail "缺少 ClickHouse 网络配置：$clickhouse_compose_file"
 command -v docker >/dev/null || fail "未安装 Docker"
 command -v curl >/dev/null || fail "未安装 curl"
-command -v flock >/dev/null || fail "未安装 flock，无法保证发布互斥"
-require_release_database_password
-
-exec 9>/tmp/quant-backtest-deploy.lock
-flock -n 9 || fail "已有部署或回滚流程正在执行"
+command -v sha256sum >/dev/null || fail "未安装 sha256sum，无法校验发布镜像"
 
 cd "$project_root"
 [[ "$(git branch --show-current)" == "main" ]] || fail "当前分支不是 main"
 [[ -z "$(git status --porcelain)" ]] || fail "工作区有未提交改动，请先处理后再发布"
 
+script_digest_before="$(sha256sum "$project_root/scripts/deploy-server.sh" | cut -d' ' -f1)"
+git fetch origin main
+git pull --ff-only origin main
+script_digest_after="$(sha256sum "$project_root/scripts/deploy-server.sh" | cut -d' ' -f1)"
+if [[ "$script_digest_before" != "$script_digest_after" \
+  && "${QUANT_DEPLOY_REEXECUTED:-}" != "1" ]]; then
+  echo "部署脚本已更新，在同一发布锁内重新执行新版本"
+  exec env QUANT_DEPLOY_LOCK_HELD=1 QUANT_DEPLOY_REEXECUTED=1 \
+    bash "$project_root/scripts/deploy-server.sh"
+fi
+
+require_release_database_password
 release_activated=false
 trap report_incomplete_release EXIT
 close_submission_gate
-git fetch origin main
-git pull --ff-only origin main
 
 APPLICATION_BUILD_ID="$(git rev-parse HEAD)"
 CLIENT_COMPATIBILITY_VERSION="$(read_client_compatibility_version)"
-export APPLICATION_BUILD_ID CLIENT_COMPATIBILITY_VERSION
+RELEASE_ADMIN_IMAGE="quant-backtest-release-admin:${APPLICATION_BUILD_ID}"
+export APPLICATION_BUILD_ID CLIENT_COMPATIBILITY_VERSION RELEASE_ADMIN_IMAGE
 deployment_id="$(cat /proc/sys/kernel/random/uuid)"
 echo "目标构建：${APPLICATION_BUILD_ID}，客户端兼容版本：${CLIENT_COMPATIBILITY_VERSION}"
 
@@ -246,9 +318,8 @@ verify_trade_calendar || fail "交易日历同步后校验失败"
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \
   strategy-worker backend bar-runner l2-runner
-if ! docker image inspect quant-backtest-release-admin:1 >/dev/null 2>&1; then
-  "${compose[@]}" --profile release-admin build release-admin
-fi
+"${compose[@]}" --profile release-admin build release-admin
+verify_release_admin_image
 # Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。
 "${compose[@]}" up -d --build --force-recreate frontend
 verify_clickhouse_connectivity
@@ -256,6 +327,7 @@ verify_clickhouse_connectivity
 http_port="$(read_http_port)"
 wait_for_application "$http_port" "$bar_runner_replicas" "$l2_runner_replicas"
 verify_frontend_build "$http_port"
+verify_market_instrument_directory
 
 generation="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT generation FROM app_deployment_state WHERE singleton_key=true;"')"
 if [[ -z "$generation" ]]; then
@@ -270,6 +342,7 @@ fi
   --expected-generation "$generation"
 active_build="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT trim(current_build_id) FROM app_deployment_state WHERE singleton_key=true;"')"
 [[ "$active_build" == "$APPLICATION_BUILD_ID" ]] || fail "发布激活后数据库构建标识不一致"
+preserve_recovery_image
 release_activated=true
 open_submission_gate
 echo "版本通知已激活：buildId=${APPLICATION_BUILD_ID}"

@@ -2,60 +2,17 @@
 """可信部署环境使用的发布状态管理命令。"""
 
 import argparse
-import hashlib
 import json
-from pathlib import Path
 import re
 import sys
 from typing import Any
 
+from backend.release_manifest import (
+  canonical_manifest_bytes,
+  read_manifest,
+  validate_manifest,
+)
 from backend.services import state_store
-
-
-def canonical_manifest_bytes(manifest: dict[str, Any]) -> bytes:
-  """返回跨环境稳定的 manifest 规范字节。"""
-  return json.dumps(
-    manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-  ).encode("utf-8")
-
-
-def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-  """校验用户公告清单，不允许部署时猜测缺失字段。"""
-  required = {
-    "schemaVersion", "version", "clientCompatibilityVersion", "title",
-    "summary", "highlights", "level", "notifyUsers",
-  }
-  if set(manifest) != required:
-    raise ValueError("发布清单字段不完整或包含未知字段")
-  if manifest["schemaVersion"] != 1:
-    raise ValueError("schemaVersion 只能为 1")
-  if not isinstance(manifest["version"], str) or not 1 <= len(manifest["version"]) <= 32:
-    raise ValueError("version 长度必须为 1 至 32")
-  if not isinstance(manifest["clientCompatibilityVersion"], int) or manifest["clientCompatibilityVersion"] < 1:
-    raise ValueError("clientCompatibilityVersion 必须为正整数")
-  if not isinstance(manifest["title"], str) or not 1 <= len(manifest["title"]) <= 128:
-    raise ValueError("title 长度必须为 1 至 128")
-  if not isinstance(manifest["summary"], str) or len(manifest["summary"]) > 1000:
-    raise ValueError("summary 长度不能超过 1000")
-  highlights = manifest["highlights"]
-  if not isinstance(highlights, list) or len(highlights) > 20:
-    raise ValueError("highlights 必须为不超过 20 条的数组")
-  if any(not isinstance(item, str) or not 1 <= len(item) <= 300 for item in highlights):
-    raise ValueError("每条 highlight 长度必须为 1 至 300")
-  if manifest["level"] not in {"normal", "important", "mandatory"}:
-    raise ValueError("level 无效")
-  if not isinstance(manifest["notifyUsers"], bool):
-    raise ValueError("notifyUsers 必须为布尔值")
-  if manifest["level"] == "mandatory" and not manifest["notifyUsers"]:
-    raise ValueError("mandatory 发布必须通知用户")
-  return manifest
-
-
-def read_manifest(path: str) -> tuple[dict[str, Any], str]:
-  """读取并计算发布清单摘要。"""
-  manifest = validate_manifest(json.loads(Path(path).read_text(encoding="utf-8")))
-  digest = hashlib.sha256(canonical_manifest_bytes(manifest)).hexdigest()
-  return manifest, digest
 
 
 def validate_build_id(build_id: str) -> str:
