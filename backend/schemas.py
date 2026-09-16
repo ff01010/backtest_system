@@ -478,6 +478,8 @@ class BacktestRunHistory(BaseModel):
   outputDir: str
   note: str
   tags: list[str]
+  isFavorited: bool = False
+  favoritedAt: str | None = None
   queuedAt: str = ""
   startedAt: str = ""
   cancelRequested: bool = False
@@ -600,6 +602,10 @@ class SharedBacktestCopyResponse(BaseModel):
 class BacktestRunMetaUpdate(BaseModel):
   note: str = ""
   tags: list[str] = Field(default_factory=list)
+
+
+class BacktestRunFavoriteUpdate(BaseModel):
+  favorited: bool
 
 
 class BacktestRunBatchDeleteRequest(BaseModel):

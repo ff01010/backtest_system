@@ -10,6 +10,7 @@ import {
   RotateCcw,
   Save,
   Share2,
+  Star,
   Trash2,
 } from 'lucide-react';
 import type { FormEvent, ReactNode } from 'react';
@@ -35,6 +36,7 @@ import {
   runBacktest,
   saveCompleteStrategy,
   publishBacktestRun,
+  setBacktestRunFavorite,
   updateBacktestRunMeta,
 } from '../api/client';
 import type {
@@ -1264,6 +1266,8 @@ export default function BacktestPage({
   const [compareHistoryRunId, setCompareHistoryRunId] = useState<string | ''>('');
   const [historyQuery, setHistoryQuery] = useState('');
   const [historySymbolFilter, setHistorySymbolFilter] = useState('');
+  const [historyFavoritesOnly, setHistoryFavoritesOnly] = useState(false);
+  const [favoritingHistoryRunIds, setFavoritingHistoryRunIds] = useState<Set<string>>(new Set());
   const [historyCompareQuery, setHistoryCompareQuery] = useState('');
   const [historyCompareOptions, setHistoryCompareOptions] = useState<BacktestRunHistory[]>([]);
   const [historyPage, setHistoryPage] = useState(1);
@@ -1420,7 +1424,7 @@ export default function BacktestPage({
       historyQuery.trim() ? 250 : 0,
     );
     return () => window.clearTimeout(timer);
-  }, [historyPage, historyPageSize, historyQuery, historySymbolFilter]);
+  }, [historyPage, historyPageSize, historyQuery, historySymbolFilter, historyFavoritesOnly]);
 
   useEffect(() => {
     if (historyCompareQuery.trim()) return;
@@ -1751,6 +1755,7 @@ export default function BacktestPage({
         offset: (targetPage - 1) * historyPageSize,
         query: historyQuery,
         symbol: historySymbolFilter,
+        ...(historyFavoritesOnly ? { favoritesOnly: true } : {}),
       });
       if (requestId !== historyRequestIdRef.current) return;
       const lastPage = Math.max(1, Math.ceil(page.total / historyPageSize));
@@ -2893,7 +2898,7 @@ export default function BacktestPage({
   const pagedHistoryRuns = filteredHistoryRuns;
   const historyRangeStart = historyTotal > 0 ? historyPageStart + 1 : 0;
   const historyRangeEnd = Math.min(historyPageStart + filteredHistoryRuns.length, historyTotal);
-  const historyGridColumns = '32px minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 88px';
+  const historyGridColumns = '32px 36px minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 88px';
   const activePanelLabel = resultTabs.find((item) => item.id === activePanel)?.label || '概览';
   const runDisabled = running || activeRun != null || !hasSelectedConfig || versionDirty;
   const statusMessage = error || status || (versionDirty
@@ -3179,6 +3184,48 @@ export default function BacktestPage({
       setStatus(`已永久删除历史回测 ${formatRunReference(run.displayNo)}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '删除历史回测失败');
+    }
+  };
+
+  const handleSetHistoryFavorite = async (run: BacktestRunHistory) => {
+    const favorited = !run.isFavorited;
+    setError('');
+    setStatus('');
+    setFavoritingHistoryRunIds((current) => new Set(current).add(run.id));
+    try {
+      const favoriteState = await setBacktestRunFavorite(run.id, favorited);
+      const updateFavorite = (item: BacktestRunHistory): BacktestRunHistory => (
+        item.id === run.id
+          ? {
+            ...item,
+            isFavorited: favoriteState.isFavorited,
+            favoritedAt: favoriteState.favoritedAt,
+          }
+          : item
+      );
+      setBacktestRuns((current) => (
+        historyFavoritesOnly && !favoriteState.isFavorited
+          ? current.filter((item) => item.id !== run.id)
+          : current.map(updateFavorite)
+      ));
+      setHistoryRunDetails((current) => {
+        const detail = current[run.id];
+        return detail ? { ...current, [run.id]: updateFavorite(detail) } : current;
+      });
+      if (historyFavoritesOnly && !favoriteState.isFavorited) {
+        await refreshBacktestRuns();
+      }
+      setStatus(
+        `${favoriteState.isFavorited ? '已收藏' : '已取消收藏'}历史回测 ${formatRunReference(run.displayNo)}`,
+      );
+    } catch (favoriteError) {
+      setError(favoriteError instanceof Error ? favoriteError.message : '更新收藏状态失败');
+    } finally {
+      setFavoritingHistoryRunIds((current) => {
+        const next = new Set(current);
+        next.delete(run.id);
+        return next;
+      });
     }
   };
 
@@ -4864,6 +4911,18 @@ export default function BacktestPage({
                       <option value="">全部标的</option>
                       {historySymbols.map((symbol) => <option key={symbol} value={symbol}>{symbol}</option>)}
                     </select>
+                    <button
+                      type="button"
+                      className={`history-favorites-filter${historyFavoritesOnly ? ' is-active' : ''}`}
+                      aria-pressed={historyFavoritesOnly}
+                      onClick={() => {
+                        setHistoryFavoritesOnly((current) => !current);
+                        setHistoryPage(1);
+                      }}
+                    >
+                      <Star size={15} fill={historyFavoritesOnly ? 'currentColor' : 'none'} />
+                      只看收藏
+                    </button>
                   </div>
                   {historyLoadError && (
                     <div style={{ color: '#b91c1c', fontSize: 12, marginBottom: 12 }}>
@@ -4883,6 +4942,7 @@ export default function BacktestPage({
                     <div className="history-experiment-table" style={{ minWidth: 0 }}>
                       <div className="history-experiment-head" style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, color: '#64748b', fontSize: 12, borderBottom: '1px solid #d7dde8', padding: '0 10px 8px' }}>
                         <input type="checkbox" checked={allDeletableHistoryRunsSelected} disabled={deletableFilteredHistoryRuns.length === 0} onChange={(event) => toggleAllHistoryRunSelections(event.target.checked)} aria-label="选择当前页中的全部可删除回测" />
+                        <span>收藏</span>
                         <span>编号</span>
                         <span>策略</span>
                         <span>标的/基准</span>
@@ -4900,6 +4960,18 @@ export default function BacktestPage({
                           return (
                             <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} onDoubleClick={() => handleViewHistoryResult(run)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
                               <input type="checkbox" checked={selectedHistoryRunIds.has(run.id)} disabled={!deletable} onClick={(event) => event.stopPropagation()} onChange={(event) => toggleHistoryRunSelection(run.id, event.target.checked)} aria-label={`选择历史回测 ${formatRunReference(run.displayNo)}`} />
+                              <button
+                                type="button"
+                                className={`history-favorite-button${run.isFavorited ? ' is-active' : ''}`}
+                                aria-label={`${run.isFavorited ? '取消收藏' : '收藏'}历史回测 ${formatRunReference(run.displayNo)}`}
+                                disabled={favoritingHistoryRunIds.has(run.id)}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void handleSetHistoryFavorite(run);
+                                }}
+                              >
+                                <Star size={16} fill={run.isFavorited ? 'currentColor' : 'none'} />
+                              </button>
                               <button onClick={() => setSelectedHistoryRunId(run.id)} style={{ textAlign: 'left', border: 'none', background: 'transparent', padding: 0, color: '#0f172a', cursor: 'pointer', fontWeight: isSelected ? 700 : 500 }}>
                                 {formatRunReference(run.displayNo)}
                               </button>

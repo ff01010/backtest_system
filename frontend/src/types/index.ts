@@ -468,6 +468,8 @@ export interface BacktestRunHistory {
   outputDir: string;
   note: string;
   tags: string[];
+  isFavorited: boolean;
+  favoritedAt: string | null;
   queuedAt: string;
   startedAt: string;
   cancelRequested: boolean;

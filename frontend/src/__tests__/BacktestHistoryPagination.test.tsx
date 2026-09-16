@@ -16,6 +16,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchBacktestPreflight: vi.fn(),
   searchMarketInstruments: vi.fn(),
   publishBacktestRun: vi.fn(),
+  setBacktestRunFavorite: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
@@ -32,6 +33,7 @@ vi.mock('../api/client', () => ({
   fetchStrategySource: vi.fn(),
   runBacktest: vi.fn(),
   saveCompleteStrategy: vi.fn(),
+  setBacktestRunFavorite: apiMocks.setBacktestRunFavorite,
   updateBacktestRunMeta: vi.fn(),
 }));
 
@@ -60,6 +62,8 @@ function makeRun(displayNo: number): BacktestRunHistory {
     outputDir: '',
     note: '',
     tags: [],
+    isFavorited: false,
+    favoritedAt: null,
     queuedAt: '',
     startedAt: '',
     cancelRequested: false,
@@ -91,6 +95,11 @@ describe('BacktestPage history pagination', () => {
     apiMocks.fetchBacktestTimeframes.mockResolvedValue([]);
     apiMocks.fetchBacktestPreflight.mockResolvedValue(null);
     apiMocks.searchMarketInstruments.mockResolvedValue([]);
+    apiMocks.setBacktestRunFavorite.mockImplementation(async (runId, favorited) => ({
+      runId,
+      isFavorited: favorited,
+      favoritedAt: favorited ? '2026-09-16T10:30:00+08:00' : null,
+    }));
   });
 
   it('can navigate to records after the first thirty', async () => {
@@ -263,6 +272,93 @@ describe('BacktestPage history pagination', () => {
       symbol: '',
     }));
     expect(await screen.findByRole('option', { name: /#01/ })).toBeTruthy();
+  });
+
+  it('favorites a history run without selecting it', async () => {
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
+    const favoriteButton = await screen.findByRole('button', { name: '收藏历史回测 #34' });
+    const favoriteRow = favoriteButton.closest('.history-run-row');
+    expect(favoriteRow?.className.includes('is-selected')).toBe(false);
+    fireEvent.click(favoriteButton);
+
+    await waitFor(() => expect(apiMocks.setBacktestRunFavorite).toHaveBeenCalledWith('run-34', true));
+    expect(await screen.findByRole('button', { name: '取消收藏历史回测 #34' })).toBeTruthy();
+    expect(favoriteRow?.className.includes('is-selected')).toBe(false);
+  });
+
+  it('resets pagination and requests only favorites', async () => {
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
+    await screen.findByText('显示 1-10 / 35 条实验');
+    fireEvent.click(screen.getByRole('button', { name: '下一页' }));
+    await screen.findByText('显示 11-20 / 35 条实验');
+    fireEvent.click(screen.getByRole('button', { name: '只看收藏' }));
+
+    await waitFor(() => expect(apiMocks.fetchBacktestRunPage).toHaveBeenLastCalledWith({
+      limit: 10,
+      offset: 0,
+      query: '',
+      symbol: '',
+      favoritesOnly: true,
+    }));
+  });
+
+  it('refreshes the filtered page after unfavoriting a run', async () => {
+    const run = {
+      ...makeRun(1),
+      isFavorited: true,
+      favoritedAt: '2026-09-16T10:30:00+08:00',
+    };
+    let favorited = true;
+    apiMocks.fetchBacktestRunPage.mockImplementation(async ({ limit, offset }) => ({
+      runs: favorited ? [{ ...run, isFavorited: favorited }] : [],
+      total: favorited ? 1 : 0,
+      limit,
+      offset,
+      symbols: [run.symbol],
+    }));
+    apiMocks.setBacktestRunFavorite.mockImplementation(async (runId) => {
+      favorited = false;
+      return { runId, isFavorited: false, favoritedAt: null };
+    });
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
+    fireEvent.click(await screen.findByRole('button', { name: '只看收藏' }));
+    fireEvent.click(await screen.findByRole('button', { name: '取消收藏历史回测 #01' }));
+
+    expect(await screen.findByText('没有符合当前筛选条件的历史实验。')).toBeTruthy();
+    expect(apiMocks.setBacktestRunFavorite).toHaveBeenCalledWith('run-1', false);
   });
 
   it('publishes a complete successful history run from the share form', async () => {

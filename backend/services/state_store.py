@@ -668,6 +668,10 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
     "outputDir": row.get("output_dir", ""),
     "note": row.get("note", ""),
     "tags": _json(row.get("tags"), []),
+    "isFavorited": row.get("favorited_at") is not None,
+    "favoritedAt": (
+      _format_time(row["favorited_at"]) if row.get("favorited_at") is not None else None
+    ),
     "resultJson": result,
     "queuedAt": _format_time(row.get("queued_at")),
     "startedAt": _format_time(row.get("started_at")),
@@ -2194,9 +2198,12 @@ def _backtest_run_filter_clause(
   query: str,
   symbol: str | None,
   config_id: str | None,
+  favorites_only: bool,
 ) -> tuple[str, tuple[Any, ...]]:
   clauses: list[str] = []
   params: list[Any] = []
+  if favorites_only:
+    clauses.append("r.favorited_at IS NOT NULL")
   if config_id:
     clauses.append("r.config_id=%s")
     params.append(config_id)
@@ -2241,13 +2248,21 @@ def list_backtest_run_page(
   query: str = "",
   symbol: str | None = None,
   config_id: str | None = None,
+  favorites_only: bool = False,
 ) -> dict[str, Any]:
   """返回当前用户的历史回测分页及分页所需的索引信息。"""
   if limit < 1 or limit > 100 or offset < 0:
     raise ValueError("分页参数无效")
   user_id = current_user_id()
-  filter_clause, filter_params = _backtest_run_filter_clause(query, symbol, config_id)
+  filter_clause, filter_params = _backtest_run_filter_clause(
+    query, symbol, config_id, favorites_only,
+  )
   base_params = (user_id, *filter_params)
+  order_clause = (
+    "r.favorited_at DESC, r.id DESC"
+    if favorites_only
+    else "r.created_at DESC, r.id DESC"
+  )
   with _db() as conn:
     with conn.cursor() as cur:
       cur.execute(f"""
@@ -2260,7 +2275,7 @@ def list_backtest_run_page(
       total = int(cur.fetchone()["value"])
       cur.execute(
         _run_query(
-          f"{filter_clause} ORDER BY r.created_at DESC, r.id DESC LIMIT %s OFFSET %s"
+          f"{filter_clause} ORDER BY {order_clause} LIMIT %s OFFSET %s"
         ),
         (*base_params, limit, offset),
       )
@@ -2957,6 +2972,33 @@ def update_backtest_run_meta(run_id: str, note: str, tags: list[str]) -> dict[st
       if cur.rowcount == 0:
         raise KeyError(run_id)
   return get_backtest_run(run_id)
+
+
+def set_backtest_run_favorite(run_id: str, favorited: bool) -> dict[str, Any]:
+  """幂等设置当前用户历史回测的收藏状态。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_run
+        SET favorited_at=CASE
+          WHEN %s THEN COALESCE(favorited_at, now())
+          ELSE NULL
+        END
+        WHERE id=%s AND owner_user_id=%s
+        RETURNING favorited_at
+      """, (favorited, run_id, current_user_id()))
+      row = cur.fetchone()
+      if row is None:
+        raise KeyError(run_id)
+      return {
+        "runId": run_id,
+        "isFavorited": row["favorited_at"] is not None,
+        "favoritedAt": (
+          _format_time(row["favorited_at"])
+          if row.get("favorited_at") is not None
+          else None
+        ),
+      }
 
 
 def finish_backtest_run(

@@ -712,6 +712,59 @@ button, input, select, textarea {
   padding-bottom: 12px;
 }
 
+.history-favorites-filter {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 34px;
+  padding: 0 11px;
+  border: 1px solid #cbd5e1;
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: #526158;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.history-favorites-filter:hover,
+.history-favorites-filter.is-active {
+  border-color: #b08b49;
+  background: #fff8e8;
+  color: #9a6b12;
+}
+
+.history-favorite-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+}
+
+.history-favorite-button:hover,
+.history-favorite-button.is-active {
+  background: #fff8e8;
+  color: #c28a16;
+}
+
+.history-favorite-button:focus-visible,
+.history-favorites-filter:focus-visible {
+  outline: 2px solid #b08b49;
+  outline-offset: 2px;
+}
+
+.history-favorite-button:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
 .history-experiment-table {
   overflow-x: auto;
   border: 1px solid #e0e7e1;
@@ -720,7 +773,7 @@ button, input, select, textarea {
 
 .history-experiment-head,
 .history-run-row {
-  min-width: 1040px;
+  min-width: 1080px;
 }
 
 .history-experiment-head {

@@ -494,6 +494,7 @@ export interface BacktestRunPageQuery {
   query?: string;
   symbol?: string;
   configId?: string | null;
+  favoritesOnly?: boolean;
 }
 
 export interface BacktestRunPage {
@@ -514,6 +515,7 @@ export async function fetchBacktestRunPage(
   if (params.query?.trim()) search.set('query', params.query.trim());
   if (params.symbol) search.set('symbol', params.symbol);
   if (params.configId) search.set('configId', params.configId);
+  if (params.favoritesOnly) search.set('favoritesOnly', 'true');
   return fetchJson<BacktestRunPage>(`${BASE}/backtest/runs?${search.toString()}`);
 }
 
@@ -748,6 +750,23 @@ export async function updateBacktestRunMeta(
     payload
   );
   return data.run;
+}
+
+export interface BacktestRunFavoriteState {
+  runId: string;
+  isFavorited: boolean;
+  favoritedAt: string | null;
+}
+
+export async function setBacktestRunFavorite(
+  runId: string,
+  favorited: boolean
+): Promise<BacktestRunFavoriteState> {
+  return sendJson<BacktestRunFavoriteState>(
+    `${BASE}/backtest/runs/${runId}/favorite`,
+    'PUT',
+    { favorited }
+  );
 }
 
 export interface StrategyScriptPayload {

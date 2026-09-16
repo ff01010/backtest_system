@@ -1297,6 +1297,7 @@ def backtest_runs(
   query: str = Query("", max_length=100),
   symbol: str | None = Query(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   config_id: str | None = Query(default=None, alias="configId"),
+  favorites_only: bool = Query(False, alias="favoritesOnly"),
 ):
   return state_store.list_backtest_run_page(
     limit=limit,
@@ -1304,6 +1305,7 @@ def backtest_runs(
     query=query,
     symbol=symbol,
     config_id=config_id,
+    favorites_only=favorites_only,
   )
 
 
@@ -1607,6 +1609,17 @@ def update_backtest_run_meta(run_id: str, payload: schemas.BacktestRunMetaUpdate
     return {"run": run}
   except KeyError:
     raise HTTPException(404, f"回测记录不存在: {run_id}")
+
+
+@app.put("/api/backtest/runs/{run_id}/favorite")
+def set_backtest_run_favorite(
+  run_id: str,
+  payload: schemas.BacktestRunFavoriteUpdate,
+) -> dict[str, Any]:
+  try:
+    return state_store.set_backtest_run_favorite(run_id, payload.favorited)
+  except KeyError as error:
+    raise HTTPException(404, "回测记录不存在") from error
 
 
 @app.get("/api/backtest/timeframes")
