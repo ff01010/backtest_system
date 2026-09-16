@@ -3,21 +3,6 @@ import type { SharedBacktestManagementItem, SharedBacktestStatus } from '../type
 
 export const MANAGEMENT_PAGE_SIZE = 20;
 
-export const managementFieldStyle = {
-  width: '100%',
-  boxSizing: 'border-box',
-  border: '1px solid #cbd5e1',
-  borderRadius: 6,
-  padding: '8px 10px',
-} as const;
-
-export const managementCardStyle = {
-  border: '1px solid #d7dde8',
-  borderRadius: 8,
-  background: '#ffffff',
-  padding: 18,
-} as const;
-
 export const managementStatusLabels: Record<SharedBacktestStatus, string> = {
   active: '已上架',
   withdrawn: '已撤回',
@@ -34,13 +19,13 @@ export function SharedBacktestStatusFilter(props: {
   onChange: (value: SharedBacktestStatus | '') => void;
 }) {
   return (
-    <label style={{ maxWidth: 220 }}>
-      状态
+    <label className="shared-field shared-management-filter">
+      <span className="shared-field-label">状态</span>
       <select
         aria-label={props.ariaLabel}
+        className="shared-select"
         value={props.value}
         onChange={(event) => props.onChange(event.target.value as SharedBacktestStatus | '')}
-        style={managementFieldStyle}
       >
         <option value="">全部状态</option>
         <option value="active">已上架</option>
@@ -59,9 +44,10 @@ export function SharedBacktestManagementPagination(props: {
 }) {
   if (props.total <= MANAGEMENT_PAGE_SIZE) return null;
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+    <div className="shared-pagination shared-management-pagination">
       <button
         type="button"
+        className="shared-button is-quiet"
         disabled={props.offset === 0}
         onClick={() => props.onOffsetChange(Math.max(0, props.offset - MANAGEMENT_PAGE_SIZE))}
       >上一页</button>
@@ -72,6 +58,7 @@ export function SharedBacktestManagementPagination(props: {
       </span>
       <button
         type="button"
+        className="shared-button is-quiet"
         disabled={props.offset + MANAGEMENT_PAGE_SIZE >= props.total}
         onClick={() => props.onOffsetChange(props.offset + MANAGEMENT_PAGE_SIZE)}
       >下一页</button>

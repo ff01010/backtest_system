@@ -7,9 +7,7 @@ import {
 import type { SharedBacktestManagementItem, SharedBacktestStatus } from '../types';
 import {
   MANAGEMENT_PAGE_SIZE,
-  managementCardStyle,
   managementErrorMessage,
-  managementFieldStyle,
   managementStatusLabels,
   nextManagementItems,
   SharedBacktestManagementPagination,
@@ -94,35 +92,38 @@ export default function AdminSharedBacktestsPanel({ onPublicationChanged }: Prop
   }
 
   return (
-    <section aria-label="共享回测管理" style={{ display: 'grid', gap: 14 }}>
+    <section aria-label="共享回测管理" className="shared-management">
       <SharedBacktestStatusFilter
         ariaLabel="管理员共享状态"
         value={status}
         onChange={(value) => { setStatus(value); setOffset(0); }}
       />
-      {loading && <div>正在加载共享回测管理列表...</div>}
-      {error && <div role="alert" style={{ color: '#b91c1c' }}>{error}</div>}
-      {!loading && items.length === 0 && <div style={managementCardStyle}>暂无共享记录。</div>}
+      {loading && <div className="shared-state">正在加载共享回测管理列表...</div>}
+      {error && <div role="alert" className="shared-alert is-error">{error}</div>}
+      {!loading && items.length === 0 && <div className="shared-empty-state">暂无共享记录。</div>}
       {items.map((item) => (
-        <article key={item.id} style={managementCardStyle}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}>
+        <article key={item.id} className="shared-management-card">
+          <div className="shared-management-card-head">
             <div>
-              <h2 style={{ margin: 0, fontSize: 18 }}>{item.title}</h2>
-              <div style={{ marginTop: 6, color: '#64748b' }}>
-                {managementStatusLabels[item.status]} · 作者 {item.authorName} · {item.symbol} · {item.timeframe}
+              <div className="shared-management-title-row">
+                <h2>{item.title}</h2>
+                <span className="shared-status-chip" data-status={item.status}>{managementStatusLabels[item.status]}</span>
+              </div>
+              <div className="shared-management-meta">
+                作者 {item.authorName} · {item.symbol} · {item.timeframe}
               </div>
             </div>
-            <div>
+            <div className="shared-management-actions">
               {item.status === 'active' && (
-                <button type="button" disabled={saving} onClick={() => beginRemove(item)}>下架</button>
+                <button type="button" className="shared-button is-danger" disabled={saving} onClick={() => beginRemove(item)}>下架</button>
               )}
               {item.status === 'removed' && (
-                <button type="button" disabled={saving} onClick={() => void restore(item)}>恢复上架</button>
+                <button type="button" className="shared-button is-primary" disabled={saving} onClick={() => void restore(item)}>恢复上架</button>
               )}
             </div>
           </div>
           {item.status === 'removed' && (
-            <p style={{ color: '#b91c1c' }}>
+            <p className="shared-management-note is-error">
               下架时间：{item.removedAt || '--'}；原因：{item.removalReason || '--'}
             </p>
           )}
@@ -134,19 +135,24 @@ export default function AdminSharedBacktestsPanel({ onPublicationChanged }: Prop
         onOffsetChange={setOffset}
       />
       {removing && (
-        <div role="dialog" aria-modal="true" aria-label="下架共享回测" style={{ ...managementCardStyle, position: 'fixed', inset: '20% 25%', zIndex: 20, boxShadow: '0 18px 48px #0f172a55' }}>
-          <form onSubmit={(event) => void submitRemove(event)} style={{ display: 'grid', gap: 12 }}>
-            <h2 style={{ margin: 0 }}>下架“{removing.title}”</h2>
-            <label>
-              下架原因
-              <textarea required maxLength={1000} rows={5} value={reason} onChange={(event) => setReason(event.target.value)} style={managementFieldStyle} />
-            </label>
-            <p style={{ margin: 0, color: '#64748b' }}>下架后普通用户无法查看或复制，作者可在“我的共享”查看此原因。</p>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-              <button type="button" disabled={saving} onClick={() => setRemoving(null)}>取消</button>
-              <button type="submit" disabled={saving || !reason.trim()}>{saving ? '下架中...' : '确认下架'}</button>
-            </div>
-          </form>
+        <div className="shared-modal-backdrop">
+          <div role="dialog" aria-modal="true" aria-label="下架共享回测" className="shared-modal is-compact">
+            <form onSubmit={(event) => void submitRemove(event)} className="shared-form">
+              <div className="shared-modal-heading">
+                <span>ADMIN ACTION</span>
+                <h2>下架“{removing.title}”</h2>
+              </div>
+              <label className="shared-field">
+                <span className="shared-field-label">下架原因</span>
+                <textarea className="shared-textarea" required maxLength={1000} rows={5} value={reason} onChange={(event) => setReason(event.target.value)} />
+              </label>
+              <p className="shared-modal-note">下架后普通用户无法查看或复制，作者可在“我的共享”查看此原因。</p>
+              <div className="shared-modal-actions">
+                <button type="button" className="shared-button is-quiet" disabled={saving} onClick={() => setRemoving(null)}>取消</button>
+                <button type="submit" className="shared-button is-danger-solid" disabled={saving || !reason.trim()}>{saving ? '下架中...' : '确认下架'}</button>
+              </div>
+            </form>
+          </div>
         </div>
       )}
     </section>

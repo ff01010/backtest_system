@@ -12,10 +12,6 @@ import type {
 
 type DetailTab = 'overview' | 'code' | 'context' | 'returns' | 'activity';
 
-const cardStyle = {
-  border: '1px solid #d7dde8', borderRadius: 8, background: '#ffffff', padding: 18,
-} as const;
-
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -30,7 +26,7 @@ function displayValue(value: unknown): string {
 
 function JsonBlock({ value }: { value: unknown }) {
   return (
-    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12 }}>
+    <pre className="shared-json-block">
       {JSON.stringify(value, null, 2)}
     </pre>
   );
@@ -61,11 +57,11 @@ function ContextGrid({ detail }: { detail: SharedBacktestDetail }) {
     ['数据范围', `${displayValue(dataStart)} 至 ${displayValue(dataEnd)}`],
   ];
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+    <div className="shared-context-grid">
       {items.map(([label, value]) => (
-        <div key={String(label)} style={{ padding: 10, background: '#f8fafc', borderRadius: 6 }}>
-          <small style={{ color: '#64748b' }}>{label}</small>
-          <strong style={{ display: 'block', marginTop: 4 }}>{displayValue(value)}</strong>
+        <div key={String(label)} className="shared-context-cell">
+          <small>{label}</small>
+          <strong>{displayValue(value)}</strong>
         </div>
       ))}
     </div>
@@ -84,12 +80,17 @@ function ChartPanel({ publicationId }: { publicationId: string }) {
     });
     return () => { cancelled = true; };
   }, [publicationId]);
-  if (error) return <div role="alert">{error}</div>;
-  if (!chart) return <div>正在加载收益曲线...</div>;
+  if (error) return <div role="alert" className="shared-alert is-error">{error}</div>;
+  if (!chart) return <div className="shared-state">正在加载收益曲线...</div>;
   return (
-    <section style={cardStyle}>
-      <h3>收益与基准曲线</h3>
-      <p>策略 {chart.equity.length} 个点 · 基准 {chart.benchmarkSymbol || '--'} {chart.benchmarkEquity.length} 个点</p>
+    <section className="shared-detail-panel">
+      <div className="shared-panel-heading">
+        <div>
+          <span>PERFORMANCE SERIES</span>
+          <h3>收益与基准曲线</h3>
+        </div>
+        <small>策略 {chart.equity.length} 个点 · 基准 {chart.benchmarkSymbol || '--'} {chart.benchmarkEquity.length} 个点</small>
+      </div>
       <JsonBlock value={chart} />
     </section>
   );
@@ -116,17 +117,23 @@ function PagedResultPanel(props: {
     return () => { cancelled = true; };
   }, [cursor, props.publicationId, props.section, props.title]);
   return (
-    <section style={cardStyle}>
-      <h3>{props.title}</h3>
-      {error && <div role="alert">{error}</div>}
-      {!error && !page && <div>正在加载{props.title}...</div>}
+    <section className="shared-detail-panel">
+      <div className="shared-panel-heading">
+        <div>
+          <span>RESULT DATA</span>
+          <h3>{props.title}</h3>
+        </div>
+        {page && <small>共 {page.total} 条，当前显示 {page.items.length} 条</small>}
+      </div>
+      {error && <div role="alert" className="shared-alert is-error">{error}</div>}
+      {!error && !page && <div className="shared-state is-compact">正在加载{props.title}...</div>}
       {page && (
         <>
-          <p>共 {page.total} 条，当前显示 {page.items.length} 条</p>
-          {page.items.length > 0 ? <JsonBlock value={page.items} /> : <div>暂无数据</div>}
-          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+          {page.items.length > 0 ? <JsonBlock value={page.items} /> : <div className="shared-empty-state is-compact">暂无数据</div>}
+          <div className="shared-inline-actions">
             <button
               type="button"
+              className="shared-button is-quiet"
               disabled={history.length === 0}
               onClick={() => {
                 const previous = history[history.length - 1] ?? '0';
@@ -136,6 +143,7 @@ function PagedResultPanel(props: {
             >上一页</button>
             <button
               type="button"
+              className="shared-button is-quiet"
               disabled={!page.nextCursor}
               onClick={() => {
                 if (!page.nextCursor) return;
@@ -162,21 +170,24 @@ export default function SharedBacktestDetailTabs({ detail }: { detail: SharedBac
     ['activity', '成交与信号'],
   ];
   return (
-    <div style={{ display: 'grid', gap: 14 }}>
-      <div role="tablist" aria-label="共享回测详情" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+    <div className="shared-detail-tabs-wrap">
+      <div role="tablist" aria-label="共享回测详情" className="shared-detail-tabs">
         {tabs.map(([value, label]) => (
           <button
             key={value}
             type="button"
             role="tab"
+            className="shared-detail-tab"
             aria-selected={activeTab === value}
             onClick={() => setActiveTab(value)}
           >{label}</button>
         ))}
       </div>
       {activeTab === 'overview' && (
-        <section style={cardStyle}>
-          <h2>判断上下文</h2>
+        <section className="shared-detail-panel">
+          <div className="shared-panel-heading">
+            <div><span>DECISION CONTEXT</span><h2>判断上下文</h2></div>
+          </div>
           <ContextGrid detail={detail} />
           <h3>收益摘要与基准</h3>
           <JsonBlock value={{
@@ -188,23 +199,27 @@ export default function SharedBacktestDetailTabs({ detail }: { detail: SharedBac
           }} />
           <h3>运行警告</h3>
           {warnings.length > 0
-            ? <ul>{warnings.map((warning, index) => <li key={index}>{displayValue(warning)}</li>)}</ul>
-            : <div>无运行警告</div>}
+            ? <ul className="shared-warning-list">{warnings.map((warning, index) => <li key={index}>{displayValue(warning)}</li>)}</ul>
+            : <div className="shared-success-note">无运行警告</div>}
         </section>
       )}
       {activeTab === 'code' && (
-        <section style={cardStyle}>
-          <h2>策略代码</h2>
-          <p>入口：{displayValue(detail.strategy.entryType)} · 运行时：{displayValue(detail.strategy.runtimeVersion)}</p>
-          <p>代码校验值（SHA-256）：{displayValue(detail.strategy.codeHash)}</p>
-          <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+        <section className="shared-detail-panel">
+          <div className="shared-panel-heading">
+            <div><span>SOURCE SNAPSHOT</span><h2>策略代码</h2></div>
+            <small>入口：{displayValue(detail.strategy.entryType)} · 运行时：{displayValue(detail.strategy.runtimeVersion)}</small>
+          </div>
+          <p className="shared-code-hash">代码校验值（SHA-256）：{displayValue(detail.strategy.codeHash)}</p>
+          <pre className="shared-code-block">
             {displayValue(detail.strategy.code)}
           </pre>
         </section>
       )}
       {activeTab === 'context' && (
-        <section style={cardStyle}>
-          <h2>参数与数据</h2>
+        <section className="shared-detail-panel">
+          <div className="shared-panel-heading">
+            <div><span>CONFIGURATION</span><h2>参数与数据</h2></div>
+          </div>
           <ContextGrid detail={detail} />
           <JsonBlock value={{ configuration: detail.configuration, data: detail.data }} />
         </section>

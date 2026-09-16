@@ -8,9 +8,7 @@ import {
 import type { SharedBacktestManagementItem, SharedBacktestStatus } from '../types';
 import {
   MANAGEMENT_PAGE_SIZE,
-  managementCardStyle,
   managementErrorMessage,
-  managementFieldStyle,
   managementStatusLabels,
   nextManagementItems,
   SharedBacktestManagementPagination,
@@ -107,41 +105,44 @@ export default function MySharedBacktestsPanel({ onPublicationChanged }: Props) 
   }
 
   return (
-    <section aria-label="我的共享" style={{ display: 'grid', gap: 14 }}>
+    <section aria-label="我的共享" className="shared-management">
       <SharedBacktestStatusFilter
         ariaLabel="共享状态"
         value={status}
         onChange={(value) => { setStatus(value); setOffset(0); }}
       />
-      {loading && <div>正在加载我的共享...</div>}
-      {error && <div role="alert" style={{ color: '#b91c1c' }}>{error}</div>}
-      {!loading && items.length === 0 && <div style={managementCardStyle}>暂无共享记录。</div>}
+      {loading && <div className="shared-state">正在加载我的共享...</div>}
+      {error && <div role="alert" className="shared-alert is-error">{error}</div>}
+      {!loading && items.length === 0 && <div className="shared-empty-state">暂无共享记录。</div>}
       {items.map((item) => (
-        <article key={item.id} style={managementCardStyle}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}>
+        <article key={item.id} className="shared-management-card">
+          <div className="shared-management-card-head">
             <div>
-              <h2 style={{ margin: 0, fontSize: 18 }}>{item.title}</h2>
-              <div style={{ marginTop: 6, color: '#64748b' }}>
-                {managementStatusLabels[item.status]} · {item.symbol} · {item.timeframe} · 首次上架 {item.firstPublishedAt}
+              <div className="shared-management-title-row">
+                <h2>{item.title}</h2>
+                <span className="shared-status-chip" data-status={item.status}>{managementStatusLabels[item.status]}</span>
+              </div>
+              <div className="shared-management-meta">
+                {item.symbol} · {item.timeframe} · 首次上架 {item.firstPublishedAt}
               </div>
             </div>
-            <div style={{ display: 'flex', alignItems: 'start', gap: 8 }}>
-              <button type="button" disabled={saving} onClick={() => beginEdit(item)}>编辑展示信息</button>
+            <div className="shared-management-actions">
+              <button type="button" className="shared-button is-quiet" disabled={saving} onClick={() => beginEdit(item)}>编辑展示信息</button>
               {item.status === 'active' && (
-                <button type="button" disabled={saving} onClick={() => void transition(item)}>撤回</button>
+                <button type="button" className="shared-button is-danger" disabled={saving} onClick={() => void transition(item)}>撤回</button>
               )}
               {item.status === 'withdrawn' && (
-                <button type="button" disabled={saving} onClick={() => void transition(item)}>重新上架</button>
+                <button type="button" className="shared-button is-primary" disabled={saving} onClick={() => void transition(item)}>重新上架</button>
               )}
             </div>
           </div>
-          <p>{item.description}</p>
-          <div>{item.tags.map((tag) => <span key={tag} style={{ marginRight: 8 }}>#{tag}</span>)}</div>
+          <p className="shared-management-description">{item.description}</p>
+          <div className="shared-tag-list">{item.tags.map((tag) => <span key={tag}>#{tag}</span>)}</div>
           {!item.sourceRunAvailable && (
-            <p style={{ color: '#64748b' }}>原回测已删除，共享快照仍保留。</p>
+            <p className="shared-management-note">原回测已删除，共享快照仍保留。</p>
           )}
           {item.status === 'removed' && (
-            <p style={{ color: '#b91c1c' }}>
+            <p className="shared-management-note is-error">
               下架时间：{item.removedAt || '--'}；原因：{item.removalReason || '--'}
             </p>
           )}
@@ -151,21 +152,35 @@ export default function MySharedBacktestsPanel({ onPublicationChanged }: Props) 
         total={total}
         offset={offset}
         onOffsetChange={setOffset}
-        trailingAction={<button type="button" onClick={() => setReloadKey((value) => value + 1)}>刷新</button>}
+        trailingAction={<button type="button" className="shared-button is-quiet" onClick={() => setReloadKey((value) => value + 1)}>刷新</button>}
       />
       {editing && (
-        <div role="dialog" aria-modal="true" aria-label="编辑共享展示信息" style={{ ...managementCardStyle, position: 'fixed', inset: '15% 20%', zIndex: 20, overflow: 'auto', boxShadow: '0 18px 48px #0f172a55' }}>
-          <form onSubmit={(event) => void saveMetadata(event)} style={{ display: 'grid', gap: 12 }}>
-            <h2 style={{ margin: 0 }}>编辑共享展示信息</h2>
-            <label>共享标题<input required maxLength={128} value={title} onChange={(event) => setTitle(event.target.value)} style={managementFieldStyle} /></label>
-            <label>策略说明<textarea required maxLength={4000} rows={6} value={description} onChange={(event) => setDescription(event.target.value)} style={managementFieldStyle} /></label>
-            <label>标签（逗号分隔）<input value={tags} onChange={(event) => setTags(event.target.value)} style={managementFieldStyle} /></label>
-            <p style={{ margin: 0, color: '#64748b' }}>策略快照、结果、署名、首次上架时间和统计数据不会被修改。</p>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-              <button type="button" disabled={saving} onClick={() => setEditing(null)}>取消</button>
-              <button type="submit" disabled={saving || !title.trim() || !description.trim()}>{saving ? '保存中...' : '保存'}</button>
-            </div>
-          </form>
+        <div className="shared-modal-backdrop">
+          <div role="dialog" aria-modal="true" aria-label="编辑共享展示信息" className="shared-modal">
+            <form onSubmit={(event) => void saveMetadata(event)} className="shared-form">
+              <div className="shared-modal-heading">
+                <span>PUBLICATION DETAILS</span>
+                <h2>编辑共享展示信息</h2>
+              </div>
+              <label className="shared-field">
+                <span className="shared-field-label">共享标题</span>
+                <input className="shared-input" required maxLength={128} value={title} onChange={(event) => setTitle(event.target.value)} />
+              </label>
+              <label className="shared-field">
+                <span className="shared-field-label">策略说明</span>
+                <textarea className="shared-textarea" required maxLength={4000} rows={6} value={description} onChange={(event) => setDescription(event.target.value)} />
+              </label>
+              <label className="shared-field">
+                <span className="shared-field-label">标签（逗号分隔）</span>
+                <input className="shared-input" value={tags} onChange={(event) => setTags(event.target.value)} />
+              </label>
+              <p className="shared-modal-note">策略快照、结果、署名、首次上架时间和统计数据不会被修改。</p>
+              <div className="shared-modal-actions">
+                <button type="button" className="shared-button is-quiet" disabled={saving} onClick={() => setEditing(null)}>取消</button>
+                <button type="submit" className="shared-button is-primary" disabled={saving || !title.trim() || !description.trim()}>{saving ? '保存中...' : '保存'}</button>
+              </div>
+            </form>
+          </div>
         </div>
       )}
     </section>

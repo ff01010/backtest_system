@@ -7,7 +7,6 @@ import {
   unfavoriteSharedBacktest,
 } from '../api/client';
 import type { SharedBacktestDetail, SharedBacktestListItem } from '../types';
-import { typography } from '../styles/typography';
 import AdminSharedBacktestsPanel from './AdminSharedBacktestsPanel';
 import MySharedBacktestsPanel from './MySharedBacktestsPanel';
 import SharedBacktestCopyAction from './SharedBacktestCopyAction';
@@ -37,14 +36,6 @@ function formatNumber(value: number | null): string {
   return value == null ? '--' : value.toFixed(2);
 }
 
-const shellStyle = {
-  flex: 1, minHeight: 0, overflow: 'auto', background: '#eef3f8', color: '#0f172a',
-  padding: 24, fontSize: typography.base,
-} as const;
-const cardStyle = {
-  border: '1px solid #d7dde8', borderRadius: 8, background: '#ffffff', padding: 18,
-} as const;
-
 function SharedBacktestDetailView(props: {
   detail: SharedBacktestDetail | null;
   loading: boolean;
@@ -53,60 +44,87 @@ function SharedBacktestDetailView(props: {
   onOpenCopiedStrategy: (configId: string) => void;
 }) {
   return (
-    <main style={shellStyle}>
-      <button type="button" onClick={props.onBack} style={{ marginBottom: 16 }}>
-        <ArrowLeft size={14} /> 返回策略广场
-      </button>
-      {props.loading && <div>正在加载共享回测...</div>}
-      {props.error && <div role="alert" style={{ color: '#b91c1c' }}>{props.error}</div>}
-      {props.detail && (
-        <div style={{ maxWidth: 1080, margin: '0 auto', display: 'grid', gap: 16 }}>
-          <section style={cardStyle}>
-            <h1 style={{ margin: 0, fontSize: 24 }}>{props.detail.title}</h1>
-            <div style={{ marginTop: 8, color: '#64748b' }}>
-              {props.detail.authorName} · {props.detail.symbol} · {props.detail.timeframe} · {props.detail.startDate} 至 {props.detail.endDate}
-            </div>
-            <p style={{ lineHeight: 1.8 }}>{props.detail.description}</p>
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              {props.detail.tags.map((tag) => <span key={tag}>#{tag}</span>)}
-            </div>
-          </section>
-          {props.detail.sourcePublicationId && (
-            <section style={cardStyle}>
-              来源：{props.detail.sourceTitle} · 原作者 {props.detail.sourceAuthorName}
-            </section>
-          )}
-          <SharedBacktestCopyAction
-            publicationId={props.detail.id}
-            hasCopied={props.detail.hasCopied}
-            onOpenStrategy={props.onOpenCopiedStrategy}
-          />
-          <section style={{ ...cardStyle, borderColor: '#f59e0b', background: '#fffbeb' }}>
-            <ShieldCheck size={18} /> {props.detail.riskNotice}
-          </section>
-          <section style={{ ...cardStyle, display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
-            <div><small>总收益率</small><strong style={{ display: 'block' }}>{formatPercent(props.detail.totalReturn)}</strong></div>
-            <div><small>最大回撤</small><strong style={{ display: 'block' }}>{formatPercent(props.detail.maxDrawdownRate)}</strong></div>
-            <div><small>夏普比率</small><strong style={{ display: 'block' }}>{formatNumber(props.detail.annualSharpe)}</strong></div>
-          </section>
-          {props.detail.artifacts.length > 0 && (
-            <section style={cardStyle}>
-              <h2>复现附件</h2>
-              <div style={{ display: 'grid', gap: 10 }}>
-                {props.detail.artifacts.map((artifact) => (
-                  <div key={artifact.id}>
-                    <a href={artifact.downloadUrl}>{artifact.displayName}</a>
-                    <span style={{ marginLeft: 8, color: '#64748b' }}>
-                      {artifact.type} · {artifact.byteSize} 字节 · SHA-256 {artifact.contentSha256}
-                    </span>
-                  </div>
-                ))}
+    <main className="shared-square-shell">
+      <div className="shared-detail-container">
+        <button type="button" onClick={props.onBack} className="shared-button is-quiet shared-back-button">
+          <ArrowLeft size={15} /> 返回策略广场
+        </button>
+        {props.loading && <div className="shared-state">正在加载共享回测...</div>}
+        {props.error && <div role="alert" className="shared-alert is-error">{props.error}</div>}
+        {props.detail && (
+          <div className="shared-detail-layout">
+            <section className="shared-detail-hero">
+              <div className="shared-page-eyebrow">共享策略快照</div>
+              <h1 className="shared-detail-title">{props.detail.title}</h1>
+              <div className="shared-detail-meta">
+                <span>{props.detail.authorName}</span>
+                <span>{props.detail.symbol}</span>
+                <span>{props.detail.timeframe}</span>
+                <span>{props.detail.startDate} 至 {props.detail.endDate}</span>
+              </div>
+              <p className="shared-detail-description">{props.detail.description}</p>
+              <div className="shared-tag-list">
+                {props.detail.tags.map((tag) => <span key={tag}>#{tag}</span>)}
               </div>
             </section>
-          )}
-          <SharedBacktestDetailTabs detail={props.detail} />
-        </div>
-      )}
+            {props.detail.sourcePublicationId && (
+              <section className="shared-origin-note">
+                <span>衍生来源</span>
+                <strong>{props.detail.sourceTitle}</strong>
+                <span>原作者 {props.detail.sourceAuthorName}</span>
+              </section>
+            )}
+            <SharedBacktestCopyAction
+              publicationId={props.detail.id}
+              hasCopied={props.detail.hasCopied}
+              onOpenStrategy={props.onOpenCopiedStrategy}
+            />
+            <section className="shared-risk-panel">
+              <ShieldCheck size={19} />
+              <div>
+                <strong>风险提示</strong>
+                <span>{props.detail.riskNotice}</span>
+              </div>
+            </section>
+            <section className="shared-metric-strip" aria-label="核心回测指标">
+              <div className="shared-metric">
+                <small>总收益率</small>
+                <strong>{formatPercent(props.detail.totalReturn)}</strong>
+              </div>
+              <div className="shared-metric">
+                <small>最大回撤</small>
+                <strong>{formatPercent(props.detail.maxDrawdownRate)}</strong>
+              </div>
+              <div className="shared-metric">
+                <small>夏普比率</small>
+                <strong>{formatNumber(props.detail.annualSharpe)}</strong>
+              </div>
+            </section>
+            {props.detail.artifacts.length > 0 && (
+              <section className="shared-detail-panel">
+                <div className="shared-panel-heading">
+                  <div>
+                    <span>REPRODUCTION</span>
+                    <h2>复现附件</h2>
+                  </div>
+                  <small>{props.detail.artifacts.length} 个文件</small>
+                </div>
+                <div className="shared-artifact-list">
+                  {props.detail.artifacts.map((artifact) => (
+                    <div key={artifact.id} className="shared-artifact-row">
+                      <a href={artifact.downloadUrl}>{artifact.displayName}</a>
+                      <span>
+                        {artifact.type} · {artifact.byteSize} 字节 · SHA-256 {artifact.contentSha256}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+            <SharedBacktestDetailTabs detail={props.detail} />
+          </div>
+        )}
+      </div>
     </main>
   );
 }
@@ -193,11 +211,14 @@ export default function SharedBacktestPage({
   const pageNumber = Math.floor(offset / PAGE_SIZE) + 1;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   return (
-    <main style={shellStyle}>
-      <div style={{ maxWidth: 1180, margin: '0 auto' }}>
-        <h1 style={{ marginTop: 0 }}>策略广场</h1>
-        <p style={{ color: '#64748b' }}>浏览内部用户主动共享的成功回测快照。</p>
-        <div role="tablist" aria-label="策略广场分区" style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
+    <main className="shared-square-shell">
+      <div className="shared-square-container">
+        <header className="shared-page-hero">
+          <div className="shared-page-eyebrow">STRATEGY COMMONS</div>
+          <h1 className="shared-page-title">策略广场</h1>
+          <p className="shared-page-description">浏览内部用户主动共享的成功回测快照。</p>
+        </header>
+        <div role="tablist" aria-label="策略广场分区" className="shared-section-tabs">
           <button type="button" role="tab" aria-selected={section === 'all'} onClick={() => { setSection('all'); setOffset(0); }}>全部共享</button>
           <button type="button" role="tab" aria-selected={section === 'favorites'} onClick={() => { setSection('favorites'); setOffset(0); }}>我的收藏</button>
           <button type="button" role="tab" aria-selected={section === 'mine'} onClick={() => { setSection('mine'); setOffset(0); }}>我的共享</button>
@@ -226,18 +247,17 @@ export default function SharedBacktestPage({
               onFilterChange={(next) => { setFilters(next); setOffset(0); }}
               onSearch={() => { setFilters((value) => ({ ...value, query: draftQuery.trim() })); setOffset(0); }}
             />
-            {loading && <div>正在加载共享回测...</div>}
-            {error && <div role="alert" style={{ color: '#b91c1c' }}>{error}</div>}
+            {loading && <div className="shared-state">正在加载共享回测...</div>}
+            {error && <div role="alert" className="shared-alert is-error">{error}</div>}
             {!loading && !error && items.length === 0 && (
-              <div style={cardStyle}>{section === 'favorites' ? '暂无收藏的共享回测。' : '暂无符合条件的共享回测。'}</div>
+              <div className="shared-empty-state">{section === 'favorites' ? '暂无收藏的共享回测。' : '暂无符合条件的共享回测。'}</div>
             )}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 }}>
+            <div className="shared-card-grid">
               {items.map((item) => (
                 <SharedBacktestCard
                   key={item.id}
                   item={item}
                   busy={busyFavoriteId === item.id}
-                  cardStyle={cardStyle}
                   onOpen={() => setSelectedId(item.id)}
                   onToggleFavorite={() => void toggleFavorite(item)}
                   formatPercent={formatPercent}
@@ -246,10 +266,10 @@ export default function SharedBacktestPage({
               ))}
             </div>
             {!loading && !error && total > 0 && (
-              <nav aria-label="策略广场分页" style={{ display: 'flex', gap: 10, justifyContent: 'center', marginTop: 18 }}>
-                <button type="button" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>上一页</button>
+              <nav aria-label="策略广场分页" className="shared-pagination">
+                <button type="button" className="shared-button is-quiet" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>上一页</button>
                 <span>第 {pageNumber} / {pageCount} 页</span>
-                <button type="button" disabled={offset + PAGE_SIZE >= total} onClick={() => setOffset(offset + PAGE_SIZE)}>下一页</button>
+                <button type="button" className="shared-button is-quiet" disabled={offset + PAGE_SIZE >= total} onClick={() => setOffset(offset + PAGE_SIZE)}>下一页</button>
               </nav>
             )}
           </>
