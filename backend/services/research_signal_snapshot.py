@@ -108,6 +108,57 @@ def freeze_signal_snapshot(
   }
 
 
+def freeze_imported_signal_snapshot(
+  dataset: dict[str, Any],
+  symbol: str,
+  start_date: str,
+  end_date: str,
+  timeframe: str,
+  bar_times: list[str],
+) -> dict[str, Any]:
+  """从当前用户拥有的持久化附件重新冻结研究信号，不访问原作者服务授权。"""
+  artifact_file = dataset.get("artifactFile")
+  if not isinstance(artifact_file, str):
+    raise ResearchSignalSnapshotError("导入的研究信号附件不可用")
+  try:
+    with open(artifact_file, "r", encoding="utf-8") as handle:
+      rows = [json.loads(line) for line in handle if line.strip()]
+  except (OSError, json.JSONDecodeError) as error:
+    raise ResearchSignalSnapshotError("导入的研究信号附件不可读取") from error
+  source_timeframe = str(dataset.get("timeframe") or timeframe)
+  _validate_timeframe_alignment(source_timeframe, timeframe)
+  canonical_rows = _select_and_validate_rows(
+    rows, symbol, start_date, end_date, source_timeframe,
+  )
+  manifest = dataset.get("manifest")
+  if not isinstance(manifest, dict):
+    raise ResearchSignalSnapshotError("导入的研究信号 manifest 无效")
+  content_hash = _snapshot_hash(canonical_rows)
+  alignment_plan = _build_alignment_plan(canonical_rows, bar_times)
+  return {
+    "datasetId": str(dataset["id"]),
+    "manifest": manifest,
+    "symbol": symbol,
+    "sourceTimeframe": source_timeframe,
+    "timeframe": timeframe,
+    "startDate": start_date,
+    "endDate": end_date,
+    "rowCount": len(canonical_rows),
+    "snapshotHash": content_hash,
+    "artifactFile": artifact_file,
+    "signalOrder": "instrument,effectiveAt,sequence,signalId",
+    "sourcePartitions": _select_source_partitions(manifest, canonical_rows),
+    "alignment": {
+      "version": "effective-at-first-bar-v1",
+      "sourceTimeframe": source_timeframe,
+      "backtestTimeframe": timeframe,
+      "alignedCount": len(alignment_plan),
+      "unmatchedCount": len(canonical_rows) - len(alignment_plan),
+    },
+    "alignmentPlan": alignment_plan,
+  }
+
+
 def _request_json(path: str, user_id: str) -> Any:
   if not _SIGNAL_API_URL or not _SERVICE_TOKEN:
     raise ResearchSignalSnapshotError("研究信号服务尚未配置")

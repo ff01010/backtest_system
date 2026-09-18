@@ -1,0 +1,93 @@
+[
+  {
+    "name": "directional_numbers_quotes_and_skipped",
+    "requestedParams": {
+      "strategyCategory": "directional_holding"
+    },
+    "result": {
+      "strategyCategory": "directional_holding",
+      "trades": [
+        {
+          "time": "20260102100500",
+          "signalTime": "20260102100000",
+          "executionTime": "20260102100500",
+          "status": "filled",
+          "direction": "SELL_CLOSE",
+          "side": "SELL",
+          "action": "SELL_CLOSE",
+          "price": 9007199254740993,
+          "quantity": 100000000000000000000,
+          "pnl": 198.25,
+          "note": "止盈,\"A\"\n第二行",
+          "researchSignalId": "研究-1",
+          "researchSignalAction": "flat",
+          "researchSignalEffectiveAt": "2026-01-02T10:00:00+08:00"
+        },
+        {
+          "time": "20260102093000",
+          "status": "filled",
+          "direction": "BUY_OPEN",
+          "side": "BUY",
+          "action": "BUY_OPEN",
+          "price": 1e-7,
+          "quantity": 1,
+          "pnl": 0,
+          "note": "开仓"
+        }
+      ],
+      "skippedSignals": [
+        {
+          "time": "20260102094500",
+          "status": "skipped",
+          "direction": "BUY_OPEN",
+          "side": "BUY",
+          "action": "BUY_OPEN",
+          "price": 0,
+          "quantity": 0,
+          "pnl": 0,
+          "note": "资金不足"
+        }
+      ]
+    },
+    "expectedBase64": "77u/c2lnbmFsVGltZSxleGVjdXRpb25UaW1lLHN0YXR1cyxkaXJlY3Rpb24sc2lkZSxhY3Rpb24scHJpY2UscHJpY2VTb3VyY2UscXVhbnRpdHkscG5sLHJlc2VhcmNoU2lnbmFsSWQscmVzZWFyY2hTaWduYWxBY3Rpb24scmVzZWFyY2hTaWduYWxFZmZlY3RpdmVBdCxub3RlCiIyMDI2LTAxLTAyIDA5OjMwIiwiMjAyNi0wMS0wMiAwOTozMCIsIuW3suaIkOS6pCIsIkJVWV9PUEVOIiwiQlVZIiwiQlVZX09QRU4iLCIxZS03Iiwi5oiQ5Lqk5qih5Z6L5Lu35qC8IiwiMSIsIiIsIiIsIiIsIiIsIuW8gOS7kyIKIjIwMjYtMDEtMDIgMDk6NDUiLCIyMDI2LTAxLTAyIDA5OjQ1Iiwi5bey6Lez6L+HIiwiQlVZX09QRU4iLCJCVVkiLCJCVVlfT1BFTiIsIjAiLCLmiJDkuqTmqKHlnovku7fmoLwiLCIwIiwiIiwiIiwiIiwiIiwi6LWE6YeR5LiN6LazIgoiMjAyNi0wMS0wMiAxMDowMCIsIjIwMjYtMDEtMDIgMTA6MDUiLCLlt7LmiJDkuqQiLCJTRUxMX0NMT1NFIiwiU0VMTCIsIlNFTExfQ0xPU0UiLCI5MDA3MTk5MjU0NzQwOTkyIiwi5oiQ5Lqk5qih5Z6L5Lu35qC8IiwiMTAwMDAwMDAwMDAwMDAwMDAwMDAwIiwiMTk4LjI1Iiwi56CU56m2LTEiLCJmbGF0IiwiMjAyNi0wMS0wMlQxMDowMDowMCswODowMCIsIuatouebiCwiIkEiIgrnrKzkuozooYwi"
+  },
+  {
+    "name": "overlay_realized_pnl",
+    "requestedParams": {
+      "strategyCategory": "core_position_overlay"
+    },
+    "result": {
+      "strategyCategory": "core_position_overlay",
+      "trades": [
+        {
+          "time": "20260203100000",
+          "status": "filled",
+          "direction": "SELL_CLOSE",
+          "side": "SELL",
+          "action": "SELL_CLOSE",
+          "price": 12.34,
+          "quantity": 200,
+          "pnl": 99,
+          "cycleEffect": "close",
+          "realizedOverlayPnl": -12.5,
+          "note": "恢复底仓"
+        },
+        {
+          "time": "20260203093000",
+          "status": "filled",
+          "direction": "BUY_OPEN",
+          "side": "BUY",
+          "action": "BUY_OPEN",
+          "price": 12,
+          "quantity": 200,
+          "pnl": 0,
+          "cycleEffect": "increase",
+          "realizedOverlayPnl": 0,
+          "note": "增强"
+        }
+      ],
+      "skippedSignals": []
+    },
+    "expectedBase64": "77u/c2lnbmFsVGltZSxleGVjdXRpb25UaW1lLHN0YXR1cyxkaXJlY3Rpb24sc2lkZSxhY3Rpb24scHJpY2UscHJpY2VTb3VyY2UscXVhbnRpdHkscG5sLHJlc2VhcmNoU2lnbmFsSWQscmVzZWFyY2hTaWduYWxBY3Rpb24scmVzZWFyY2hTaWduYWxFZmZlY3RpdmVBdCxub3RlCiIyMDI2LTAyLTAzIDA5OjMwIiwiMjAyNi0wMi0wMyAwOTozMCIsIuW3suaIkOS6pCIsIkJVWV9PUEVOIiwiQlVZIiwiQlVZX09QRU4iLCIxMiIsIuaIkOS6pOaooeWei+S7t+agvCIsIjIwMCIsIiIsIiIsIiIsIiIsIuWinuW8uiIKIjIwMjYtMDItMDMgMTA6MDAiLCIyMDI2LTAyLTAzIDEwOjAwIiwi5bey5oiQ5LqkIiwiU0VMTF9DTE9TRSIsIlNFTEwiLCJTRUxMX0NMT1NFIiwiMTIuMzQiLCLmiJDkuqTmqKHlnovku7fmoLwiLCIyMDAiLCItMTIuNSIsIiIsIiIsIiIsIuaBouWkjeW6leS7kyI="
+  }
+]

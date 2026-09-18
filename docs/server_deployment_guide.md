@@ -119,20 +119,48 @@ quant-backtest-artifacts       回测输出文件
 
 ### 推荐：使用一键发布脚本
 
-日常升级应优先使用项目内置脚本。脚本会校验当前为 `main` 分支且工作区没有未提交改动，然后依次拉取最新代码、启动并等待 PostgreSQL 健康、执行数据库迁移和交易日历同步、重建并启动策略执行器、后端和前端，最后请求健康检查接口确认发布结果。
+日常升级应优先使用项目内置脚本。脚本会校验当前为 `main` 分支且工作区没有未提交改动，然后依次拉取最新代码、在脚本自身发生更新时于同一发布锁内重新执行、启动并等待 PostgreSQL 健康、执行数据库迁移和交易日历同步、重建并启动策略执行器、后端和前端，最后请求健康检查接口确认发布结果。
 
 ```bash
 cd /opt/projects/quant_backtest_platform_git
-./scripts/deploy-server.sh
+bash scripts/deploy-server.sh
 ```
 
-若首次执行提示没有权限，可授予脚本执行权限后重试：
+首次启用发布通知前，服务器私有 `deploy/.env` 必须增加独立发布角色密码。该密码不得与 `APP_DB_PASSWORD` 相同，长度不得少于 32 位，也不得提交到 Git：
 
 ```bash
-chmod +x scripts/deploy-server.sh
+openssl rand -hex 32
+nano deploy/.env
 ```
 
-脚本会再次执行 `git pull --ff-only origin main`；即使已手动拉取，重复执行也是安全的。若工作区有本地未提交修改，脚本会终止发布，需先确认并处理这些修改，不能直接覆盖。
+在 `deploy/.env` 中保存为 `RELEASE_DB_PASSWORD=<生成值>`。生成值不得复制到工单、文档或聊天记录。
+
+脚本会再次执行 `git pull --ff-only origin main`；即使已手动拉取，重复执行也是安全的。若工作区有本地未提交修改，脚本会终止发布，需先确认并处理这些修改，不能直接覆盖。正常发布会构建 `quant-backtest-release-admin:<完整 Git SHA>`，校验镜像内的构建标识、客户端兼容版本和公告清单，再执行激活。`quant-backtest-release-admin:recovery-v1` 只在首次不存在时建立，日常发布不得覆盖。
+
+从不具备脚本自更新重启能力的旧版本首次升级时，旧进程仍可能按旧逻辑完成第一次运行。若输出中没有 `release-admin 镜像验证通过`，应在确认第一次命令正常结束后再执行一次相同命令；后续版本更新由脚本在同一发布锁内自动重启，不再需要重复执行。
+
+### 发布前生成公告草稿
+
+发布分支合并前，在开发工作区根据相对于 `origin/main` 的提交生成公告草稿：
+
+```bash
+python scripts/generate_release_manifest.py --base origin/main --target HEAD
+```
+
+生成器默认把 `feat` 和 `fix` 提交整理为用户可读条目，忽略 `docs`、`test`、`refactor`、`chore`、`build` 和 `ci`。需要改写或排除时，在提交正文使用：
+
+```text
+Release-Note: 用户可读的更新说明
+Release-Level: important
+```
+
+或：
+
+```text
+Release-Note: skip
+```
+
+生成的 `deploy/release-manifest.json` 必须人工检查并随发布 MR 提交。没有用户可感知改动时生成器会设置 `notifyUsers=false`。`mandatory` 发布必须显式使用 `Release-Level: mandatory`，并通过 `--client-compatibility-version` 递增客户端兼容版本。
 
 交易日历同步优先读取新浪财经的上交所交易日历文件；单个来源最多请求 3 次，并在新浪连续失败后回退到东方财富上证指数日线。两个来源都无法访问时发布会终止，以免写入不完整日历；此时应先检查服务器容器的 HTTPS 出网和 DNS，再重试发布。
 

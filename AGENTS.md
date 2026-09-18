@@ -51,3 +51,17 @@
 - 服务器 deploy/.env 属于私有部署配置。发布、拉取或脚本更新不得用仓库的 .env.example 覆盖它；新增环境变量必须提供安全默认值、启动校验和服务器侧配置说明。
 - Redis 或其他缓存的键、序列化结构、映射、分桶或计算规则变化时，必须递增缓存版本或命名空间，禁止新代码读取旧结构；缓存失效只能影响性能，不得改变回测结果语义。
 - 发布后按改动范围完成健康检查、代表性新功能回测、历史任务兼容检查和必要的缓存命中/回源验证；未实际执行的服务器验证必须明确说明。
+
+## Agent skills
+
+### Issue tracker
+
+工单统一在 OpenProject 管理；默认基于本地工作包清单生成可粘贴内容，不直接修改远程记录。详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+使用五个默认分流标签：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+采用 single-context：读取根目录 `CONTEXT.md`（存在时）及相关 `docs/adr/`。详见 `docs/agents/domain.md`。

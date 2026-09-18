@@ -2,7 +2,8 @@
 """Pydantic 响应模型"""
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
+from uuid import UUID
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.date_codec import TradingDateError, format_api_date
@@ -432,6 +433,7 @@ class StrategyConfig(BaseModel):
   published: bool = True
   publishedVersionId: str | None = None
   revision: int = 1
+  sharedSource: dict[str, Any] | None = None
   createdAt: str
   updatedAt: str
 
@@ -477,11 +479,125 @@ class BacktestRunHistory(BaseModel):
   outputDir: str
   note: str
   tags: list[str]
+  isFavorited: bool = False
+  favoritedAt: str | None = None
   queuedAt: str = ""
   startedAt: str = ""
   cancelRequested: bool = False
   createdAt: str
   finishedAt: str
+  publicationId: str | None = None
+
+
+class SharedBacktestPublicationCreate(BaseModel):
+  title: str = Field(min_length=1, max_length=128)
+  description: str = Field(min_length=1, max_length=4000)
+  tags: list[str] = Field(default_factory=list, max_length=10)
+
+  @field_validator("title", "description")
+  @classmethod
+  def normalize_required_text(cls, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+      raise ValueError("内容不能为空")
+    return normalized
+
+  @field_validator("tags")
+  @classmethod
+  def normalize_tags(cls, value: list[str]) -> list[str]:
+    tags: list[str] = []
+    for item in value:
+      normalized = item.strip()
+      if not normalized or normalized in tags:
+        continue
+      if len(normalized) > 32:
+        raise ValueError("单个标签不能超过 32 个字符")
+      tags.append(normalized)
+    if len(tags) > 10:
+      raise ValueError("标签不能超过 10 个")
+    return tags
+
+
+class SharedBacktestMetaUpdate(SharedBacktestPublicationCreate):
+  """作者可修改的共享展示信息。"""
+
+
+class SharedBacktestRemovalRequest(BaseModel):
+  reason: str = Field(min_length=1, max_length=1000)
+
+  @field_validator("reason")
+  @classmethod
+  def normalize_reason(cls, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+      raise ValueError("下架原因不能为空")
+    return normalized
+
+
+class SharedBacktestListItem(BaseModel):
+  id: str
+  title: str
+  authorName: str
+  tags: list[str]
+  symbol: str
+  timeframe: str
+  strategyCategory: str
+  startDate: str
+  endDate: str
+  totalReturn: float | None
+  maxDrawdownRate: float | None
+  annualSharpe: float | None
+  copyCount: int
+  firstPublishedAt: str
+  sourcePublicationId: str | None = None
+  sourceAuthorName: str | None = None
+  sourceTitle: str | None = None
+  isFavorited: bool = False
+  hasCopied: bool = False
+
+
+class SharedBacktestManagementItem(SharedBacktestListItem):
+  description: str
+  status: str
+  withdrawnAt: str | None
+  removedAt: str | None
+  removalReason: str | None
+  updatedAt: str
+  sourceRunAvailable: bool
+
+
+class SharedBacktestArtifactMetadata(BaseModel):
+  id: str
+  type: str
+  displayName: str
+  contentType: str | None
+  byteSize: int
+  contentSha256: str
+  snapshotSchemaVersion: int
+  reproduction: dict[str, Any]
+  downloadUrl: str
+
+
+class SharedBacktestDetail(SharedBacktestListItem):
+  description: str
+  snapshotSchemaVersion: int
+  snapshotDigest: str
+  strategy: dict[str, Any]
+  configuration: dict[str, Any]
+  data: dict[str, Any]
+  result: dict[str, Any]
+  artifacts: list[SharedBacktestArtifactMetadata] = Field(default_factory=list)
+  origin: dict[str, Any]
+  riskNotice: str
+
+
+class SharedBacktestCopyResponse(BaseModel):
+  configId: str
+  scriptId: str
+  name: str
+  created: bool
+  accountCleared: bool
+  sharedSource: dict[str, Any]
 
 
 class BacktestRunMetaUpdate(BaseModel):
@@ -489,8 +605,55 @@ class BacktestRunMetaUpdate(BaseModel):
   tags: list[str] = Field(default_factory=list)
 
 
+class BacktestRunFavoriteUpdate(BaseModel):
+  favorited: bool
+
+
+class BacktestRunIdSelection(BaseModel):
+  mode: Literal["ids"]
+  runIds: list[UUID] = Field(min_length=1)
+
+
+class BacktestRunFilterSelection(BaseModel):
+  mode: Literal["filter"]
+  query: str = Field(default="", max_length=100)
+  symbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$")
+  configId: str | None = None
+  favoritesOnly: bool = False
+  excludedRunIds: list[UUID] = Field(default_factory=list)
+
+
+BacktestRunSelection = Annotated[
+  BacktestRunIdSelection | BacktestRunFilterSelection,
+  Field(discriminator="mode"),
+]
+
+
 class BacktestRunBatchDeleteRequest(BaseModel):
-  runIds: list[str] = Field(min_length=1, max_length=100)
+  runIds: list[str] | None = Field(default=None, min_length=1, max_length=100)
+  selection: BacktestRunSelection | None = None
+  expectedSelectedRunCount: int | None = Field(default=None, gt=0)
+  expectedSelectionDigest: str | None = Field(
+    default=None, pattern=r"^[0-9a-f]{64}$",
+  )
+
+  @model_validator(mode="after")
+  def validate_delete_shape(self) -> "BacktestRunBatchDeleteRequest":
+    if (self.runIds is None) == (self.selection is None):
+      raise ValueError("runIds 和 selection 必须且只能提供一个")
+    if self.selection is not None and (
+      self.expectedSelectedRunCount is None or self.expectedSelectionDigest is None
+    ):
+      raise ValueError("公共选择删除必须携带已确认的数量和摘要")
+    return self
+
+
+class BacktestRunSelectionRequest(BaseModel):
+  selection: BacktestRunSelection
+
+
+class SignalDetailExportCreateRequest(BaseModel):
+  selection: BacktestRunSelection
 
 
 class BacktestCapacityOverrideRequest(BaseModel):

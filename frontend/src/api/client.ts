@@ -16,6 +16,16 @@ import type {
   StrategySource,
   ReleaseNotice,
   ReleaseStatus,
+  SharedBacktestDetail,
+  SharedBacktestChart,
+  SharedBacktestCopyResponse,
+  SharedBacktestListItem,
+  SharedBacktestManagementItem,
+  SharedBacktestStatus,
+  SharedBacktestResultPage,
+  SharedBacktestResultSection,
+  BacktestRunSelection,
+  SignalDetailExportTask,
 } from '../types';
 
 const BASE = '/api';
@@ -40,6 +50,18 @@ export class ReleaseApiError extends Error {
   }
 }
 
+export class ApiResponseError extends Error {
+  status: number;
+  code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = 'ApiResponseError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { credentials: 'include' });
   if (!res.ok) {
@@ -47,6 +69,38 @@ async function fetchJson<T>(url: string): Promise<T> {
     throw new Error(`API ${res.status}: ${text}`);
   }
   return res.json();
+}
+
+async function fetchNoStoreJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { credentials: 'include', cache: 'no-store' });
+  if (!res.ok) {
+    const text = await res.text();
+    const detail = getStructuredApiError(text);
+    throw new ApiResponseError(
+      res.status, detail.code, detail.message || `API ${res.status}: 请求失败`,
+    );
+  }
+  return res.json();
+}
+
+function getStructuredApiError(text: string): { code: string; message: string } {
+  try {
+    const body = JSON.parse(text) as {
+      detail?: string | { code?: unknown; message?: unknown };
+    };
+    if (typeof body.detail === 'string') return { code: '', message: body.detail };
+    if (body.detail && typeof body.detail === 'object') {
+      return {
+        code: typeof body.detail.code === 'string' ? body.detail.code : '',
+        message: typeof body.detail.message === 'string'
+          ? body.detail.message
+          : getApiErrorMessage(text),
+      };
+    }
+  } catch {
+    // 由通用错误解析器保留原始响应。
+  }
+  return { code: '', message: getApiErrorMessage(text) };
 }
 
 async function sendJson<T>(url: string, method: string, payload: unknown): Promise<T> {
@@ -58,8 +112,10 @@ async function sendJson<T>(url: string, method: string, payload: unknown): Promi
   });
   if (!res.ok) {
     const text = await res.text();
-    const message = getApiErrorMessage(text);
-    throw new Error(message || `API ${res.status}: 请求失败`);
+    const detail = getStructuredApiError(text);
+    throw new ApiResponseError(
+      res.status, detail.code, detail.message || `API ${res.status}: 请求失败`,
+    );
   }
   return res.json();
 }
@@ -383,6 +439,7 @@ export interface ResearchSignalDataset {
   version: number | null;
   timeframe: string | null;
   recordCount: number;
+  imported?: boolean;
 }
 
 export async function fetchResearchSignalDatasets(): Promise<ResearchSignalDataset[]> {
@@ -469,9 +526,218 @@ export async function fetchBacktestRuns(
   return data.runs;
 }
 
+export interface BacktestRunPageQuery {
+  limit: number;
+  offset: number;
+  query?: string;
+  symbol?: string;
+  configId?: string | null;
+  favoritesOnly?: boolean;
+}
+
+export interface BacktestRunPage {
+  runs: BacktestRunHistory[];
+  total: number;
+  selectableTotal: number;
+  limit: number;
+  offset: number;
+  symbols: string[];
+}
+
+export async function fetchBacktestRunPage(
+  params: BacktestRunPageQuery
+): Promise<BacktestRunPage> {
+  const search = new URLSearchParams({
+    limit: String(params.limit),
+    offset: String(params.offset),
+  });
+  if (params.query?.trim()) search.set('query', params.query.trim());
+  if (params.symbol) search.set('symbol', params.symbol);
+  if (params.configId) search.set('configId', params.configId);
+  if (params.favoritesOnly) search.set('favoritesOnly', 'true');
+  return fetchJson<BacktestRunPage>(`${BASE}/backtest/runs?${search.toString()}`);
+}
+
 export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistory> {
   const data = await fetchJson<{ run: BacktestRunHistory }>(`${BASE}/backtest/runs/${runId}`);
   return data.run;
+}
+
+export interface SharedBacktestPage {
+  items: SharedBacktestListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface SharedBacktestQuery {
+  limit?: number;
+  offset?: number;
+  query?: string;
+  strategyCategory?: string;
+  timeframe?: string;
+  sort?: 'latest' | 'copies';
+  favoritesOnly?: boolean;
+}
+
+export async function publishBacktestRun(
+  runId: string,
+  payload: { title: string; description: string; tags: string[] }
+): Promise<{ publication: SharedBacktestDetail; created: boolean }> {
+  return sendJson(
+    `${BASE}/backtest/runs/${encodeURIComponent(runId)}/publication`,
+    'POST',
+    payload,
+  );
+}
+
+export async function fetchSharedBacktests(
+  params: SharedBacktestQuery = {},
+): Promise<SharedBacktestPage> {
+  const search = new URLSearchParams({
+    limit: String(params.limit ?? 20),
+    offset: String(params.offset ?? 0),
+  });
+  if (params.query?.trim()) search.set('query', params.query.trim());
+  if (params.strategyCategory) search.set('strategyCategory', params.strategyCategory);
+  if (params.timeframe) search.set('timeframe', params.timeframe);
+  if (params.sort) search.set('sort', params.sort);
+  if (params.favoritesOnly) search.set('favoritesOnly', 'true');
+  return fetchNoStoreJson<SharedBacktestPage>(`${BASE}/shared-backtests?${search.toString()}`);
+}
+
+export async function fetchSharedBacktest(publicationId: string): Promise<SharedBacktestDetail> {
+  const data = await fetchNoStoreJson<{ publication: SharedBacktestDetail }>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}`,
+  );
+  return data.publication;
+}
+
+export async function fetchSharedBacktestChart(
+  publicationId: string,
+): Promise<SharedBacktestChart> {
+  return fetchJson<SharedBacktestChart>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/chart`,
+  );
+}
+
+export async function fetchSharedBacktestResultPage(
+  publicationId: string,
+  section: SharedBacktestResultSection,
+  cursor = '0',
+  limit = 50,
+): Promise<SharedBacktestResultPage> {
+  const search = new URLSearchParams({ cursor, limit: String(limit) });
+  return fetchJson<SharedBacktestResultPage>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/${section}?${search.toString()}`,
+  );
+}
+
+export async function fetchMySharedBacktests(
+  limit = 20,
+  offset = 0,
+  status?: SharedBacktestStatus,
+): Promise<{ items: SharedBacktestManagementItem[]; total: number; limit: number; offset: number }> {
+  const search = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (status) search.set('status', status);
+  return fetchJson(`${BASE}/shared-backtests/mine?${search.toString()}`);
+}
+
+export async function updateSharedBacktestMetadata(
+  publicationId: string,
+  payload: { title: string; description: string; tags: string[] },
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}`,
+    'PATCH',
+    payload,
+  );
+  return data.publication;
+}
+
+export async function withdrawSharedBacktest(
+  publicationId: string,
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/withdraw`,
+    'POST',
+    {},
+  );
+  return data.publication;
+}
+
+export async function relistSharedBacktest(
+  publicationId: string,
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/relist`,
+    'POST',
+    {},
+  );
+  return data.publication;
+}
+
+export async function copySharedBacktest(
+  publicationId: string,
+): Promise<SharedBacktestCopyResponse> {
+  return sendJson<SharedBacktestCopyResponse>(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/copy`,
+    'POST',
+    {},
+  );
+}
+
+export async function favoriteSharedBacktest(
+  publicationId: string,
+): Promise<{ favorited: true; created: boolean }> {
+  return sendJson(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/favorite`,
+    'POST',
+    {},
+  );
+}
+
+export async function unfavoriteSharedBacktest(
+  publicationId: string,
+): Promise<{ favorited: false; deleted: boolean }> {
+  return sendJson(
+    `${BASE}/shared-backtests/${encodeURIComponent(publicationId)}/favorite`,
+    'DELETE',
+    {},
+  );
+}
+
+export async function fetchAdminSharedBacktests(
+  limit = 20,
+  offset = 0,
+  status?: SharedBacktestStatus,
+): Promise<{ items: SharedBacktestManagementItem[]; total: number; limit: number; offset: number }> {
+  const search = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (status) search.set('status', status);
+  return fetchNoStoreJson(`${BASE}/admin/shared-backtests?${search.toString()}`);
+}
+
+export async function removeSharedBacktest(
+  publicationId: string,
+  reason: string,
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/admin/shared-backtests/${encodeURIComponent(publicationId)}/remove`,
+    'POST',
+    { reason },
+  );
+  return data.publication;
+}
+
+export async function restoreSharedBacktest(
+  publicationId: string,
+): Promise<SharedBacktestManagementItem> {
+  const data = await sendJson<{ publication: SharedBacktestManagementItem }>(
+    `${BASE}/admin/shared-backtests/${encodeURIComponent(publicationId)}/restore`,
+    'POST',
+    {},
+  );
+  return data.publication;
 }
 
 export async function cancelBacktestRun(runId: string): Promise<{
@@ -502,6 +768,90 @@ export async function deleteBacktestRuns(runIds: string[]): Promise<number> {
   return data.deleted;
 }
 
+export async function summarizeBacktestRunSelection(
+  selection: BacktestRunSelection,
+): Promise<{ selectedRunCount: number; selectionDigest: string }> {
+  return sendJson(`${BASE}/backtest/runs/selection-summary`, 'POST', { selection });
+}
+
+export async function deleteBacktestSelection(
+  selection: BacktestRunSelection,
+  selectedRunCount: number,
+  selectionDigest: string,
+): Promise<number> {
+  const data = await sendJson<{ deleted: number }>(`${BASE}/backtest/runs`, 'DELETE', {
+    selection,
+    expectedSelectedRunCount: selectedRunCount,
+    expectedSelectionDigest: selectionDigest,
+  });
+  return data.deleted;
+}
+
+export interface SignalDetailExportPage {
+  items: SignalDetailExportTask[];
+  nextCursor: string | null;
+  activeCount: number;
+  undownloadedSucceededCount: number;
+}
+
+export async function createSignalDetailExport(
+  selection: BacktestRunSelection,
+  idempotencyKey: string,
+): Promise<SignalDetailExportTask> {
+  const res = await fetch(`${BASE}/backtest/signal-detail-exports`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': idempotencyKey,
+    },
+    body: JSON.stringify({ selection }),
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const detail = getStructuredApiError(await res.text());
+    throw new ApiResponseError(res.status, detail.code, detail.message);
+  }
+  return ((await res.json()) as { export: SignalDetailExportTask }).export;
+}
+
+export async function fetchSignalDetailExports(): Promise<SignalDetailExportPage> {
+  return fetchNoStoreJson(`${BASE}/backtest/signal-detail-exports?limit=100`);
+}
+
+export async function cancelSignalDetailExport(
+  exportId: string,
+): Promise<SignalDetailExportTask> {
+  const data = await sendJson<{ export: SignalDetailExportTask }>(
+    `${BASE}/backtest/signal-detail-exports/${encodeURIComponent(exportId)}/cancel`,
+    'POST',
+    {},
+  );
+  return data.export;
+}
+
+export async function retrySignalDetailExport(
+  exportId: string,
+  idempotencyKey: string,
+): Promise<SignalDetailExportTask> {
+  const res = await fetch(
+    `${BASE}/backtest/signal-detail-exports/${encodeURIComponent(exportId)}/retry`,
+    {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      credentials: 'include',
+    },
+  );
+  if (!res.ok) {
+    const detail = getStructuredApiError(await res.text());
+    throw new ApiResponseError(res.status, detail.code, detail.message);
+  }
+  return ((await res.json()) as { export: SignalDetailExportTask }).export;
+}
+
+export function signalDetailExportDownloadUrl(exportId: string): string {
+  return `${BASE}/backtest/signal-detail-exports/${encodeURIComponent(exportId)}/download`;
+}
+
 export async function fetchBacktestRunChart(
   runId: string,
   date: string,
@@ -523,6 +873,23 @@ export async function updateBacktestRunMeta(
     payload
   );
   return data.run;
+}
+
+export interface BacktestRunFavoriteState {
+  runId: string;
+  isFavorited: boolean;
+  favoritedAt: string | null;
+}
+
+export async function setBacktestRunFavorite(
+  runId: string,
+  favorited: boolean
+): Promise<BacktestRunFavoriteState> {
+  return sendJson<BacktestRunFavoriteState>(
+    `${BASE}/backtest/runs/${runId}/favorite`,
+    'PUT',
+    { favorited }
+  );
 }
 
 export interface StrategyScriptPayload {

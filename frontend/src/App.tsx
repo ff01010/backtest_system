@@ -7,6 +7,7 @@ import LoginPage from './components/LoginPage';
 import SystemErrorLogPage from './components/SystemErrorLogPage';
 import UserManagementPage from './components/UserManagementPage';
 import ApiKeyPage from './components/ApiKeyPage';
+import SharedBacktestPage from './components/SharedBacktestPage';
 import ReleaseNotificationManager from './components/ReleaseNotificationManager';
 import {
   fetchBacktestRunChart,
@@ -39,7 +40,9 @@ async function enterResearchCenter(): Promise<void> {
 }
 
 function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogout: () => void }) {
-  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'apiKeys' | 'users' | 'systemErrors'>('backtest');
+  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'sharedBacktests' | 'apiKeys' | 'users' | 'systemErrors'>('backtest');
+  const [sharedPublicationId, setSharedPublicationId] = useState<string | null>(null);
+  const [strategyConfigToOpen, setStrategyConfigToOpen] = useState<string | null>(null);
   const [urlParams, setUrlParams] = useUrlState();
   const [researchError, setResearchError] = useState<string | null>(null);
   const [researchStarting, setResearchStarting] = useState(false);
@@ -166,6 +169,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
         </div>
         {[
           { key: 'backtest' as const, label: '策略回测' },
+          { key: 'sharedBacktests' as const, label: '策略广场' },
           { key: 'signals' as const, label: '信号可视化' },
           { key: 'apiKeys' as const, label: 'API Key' },
           ...(currentUser.role === 'admin' ? [{ key: 'users' as const, label: '人员管理' }] : []),
@@ -176,7 +180,10 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
             <button
               key={item.key}
               className="app-nav-button"
-              onClick={() => setActivePage(item.key)}
+              onClick={() => {
+                if (item.key === 'sharedBacktests') setSharedPublicationId(null);
+                setActivePage(item.key);
+              }}
               style={{
                 height: 44, padding: '0 12px', borderRadius: 0,
                 border: 'none', borderBottom: `2px solid ${active ? 'var(--accent)' : 'transparent'}`,
@@ -276,8 +283,24 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
             setUrlParams({ runId, symbol, timeframe, date });
             setActivePage('signals');
           }}
+          onViewSharedBacktest={(publicationId) => {
+            setSharedPublicationId(publicationId);
+            setActivePage('sharedBacktests');
+          }}
+          requestedConfigId={strategyConfigToOpen}
         />
       </div>
+
+      {activePage === 'sharedBacktests' && (
+        <SharedBacktestPage
+          initialPublicationId={sharedPublicationId}
+          isAdmin={currentUser.role === 'admin'}
+          onOpenCopiedStrategy={(configId) => {
+            setStrategyConfigToOpen(configId);
+            setActivePage('backtest');
+          }}
+        />
+      )}
 
       {activePage === 'users' && (
         <UserManagementPage />

@@ -146,6 +146,9 @@ def test_health_reports_runner_degradation_without_internal_counts(
     "status": "degraded",
     "runners": {"bar": {"healthy": 0, "queued": 3}},
   })
+  monkeypatch.setattr(
+    api_app.state_store, "signal_export_runner_available", lambda: True,
+  )
 
   assert api_app.health() == {
     "status": "degraded",
@@ -155,4 +158,5 @@ def test_health_reports_runner_degradation_without_internal_counts(
     "strategyRuntimeVersion": api_app.SCRIPT_RUNTIME_VERSION,
     "capabilityDigest": api_app.RUNTIME_CAPABILITY_DIGEST,
     "runtimeCapabilities": api_app._verified_runtime_capabilities,
+    "signalExportRunner": {"healthy": True},
   }

@@ -13,9 +13,11 @@ import hmac
 import json
 import logging
 import re
-from typing import Any
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Literal
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 _viewer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _viewer_dir not in sys.path:
@@ -26,7 +28,7 @@ _STRATEGY_GUIDE_PATH = os.path.join(_viewer_dir, "docs", "玄龄回测系统使�
 from fastapi import FastAPI, Query, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from backend import settings
 from backend.execution import execution_algorithm_snapshot, validate_execution_request
@@ -56,7 +58,13 @@ from backend.services import (
   qmt_instrument_directory,
   data_repository,
   release_notifications,
+  shared_backtest_admin,
   research_signal_snapshot,
+  shared_backtest_artifacts,
+  shared_backtest_lifecycle,
+  shared_backtest_copy,
+  shared_backtest_detail as shared_backtest_detail_service,
+  shared_backtest_discovery,
   state_store,
   strategy_adapters,
 )
@@ -108,7 +116,7 @@ app.add_middleware(
     "http://localhost:5177", "http://127.0.0.1:5177",
   ],
   allow_credentials=True,
-  allow_methods=["GET", "POST", "PUT", "DELETE"],
+  allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
   allow_headers=["*"],
 )
 
@@ -402,6 +410,7 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "execution": execution_algorithm_snapshot(
       str(request["executionAlgorithm"]), dict(request.get("executionParameters") or {}),
     ),
+    "sharedSource": config.get("sharedSource"),
   }
 
 
@@ -454,11 +463,27 @@ def _prepare_research_signal_attachment(request: dict[str, Any]) -> None:
   try:
     bars, warmup_bar_count, _ = backtest_runner._load_user_script_bars(request)
     bar_times = [str(row.time) for row in bars.iloc[warmup_bar_count:].itertuples(index=False)]
-    snapshot = research_signal_snapshot.freeze_signal_snapshot(
-      dataset_id, str(state_store.current_user_id()), request["symbol"], request["startDate"],
-      request["endDate"], request["timeframe"], bar_times,
-    )
-  except research_signal_snapshot.ResearchSignalSnapshotError as error:
+    imported = state_store.get_imported_research_signal_dataset(dataset_id)
+    if imported:
+      artifact_path = shared_backtest_artifacts.verified_artifact_path(
+        str(imported["storage_key"]),
+        str(imported["content_sha256"]),
+        int(imported["byte_size"]),
+      )
+      imported["artifactFile"] = str(artifact_path)
+      snapshot = research_signal_snapshot.freeze_imported_signal_snapshot(
+        imported, request["symbol"], request["startDate"], request["endDate"],
+        request["timeframe"], bar_times,
+      )
+    else:
+      snapshot = research_signal_snapshot.freeze_signal_snapshot(
+        dataset_id, str(state_store.current_user_id()), request["symbol"], request["startDate"],
+        request["endDate"], request["timeframe"], bar_times,
+      )
+  except (
+    research_signal_snapshot.ResearchSignalSnapshotError,
+    shared_backtest_artifacts.SharedArtifactError,
+  ) as error:
     raise HTTPException(422, str(error)) from error
   request["researchSignalSnapshot"] = snapshot
   saved_snapshot = dict(request.get("savedConfigSnapshot") or {})
@@ -627,6 +652,7 @@ def startup():
 @app.get("/api/health")
 def health():
   runner_health = state_store.get_backtest_runner_health()
+  signal_export_healthy = state_store.signal_export_runner_available()
   return {
     "status": runner_health["status"],
     "backtest": "ok" if runner_health["status"] == "ok" else "unavailable",
@@ -635,6 +661,7 @@ def health():
     "clientCompatibilityVersion": settings.CLIENT_COMPATIBILITY_VERSION,
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "runtimeCapabilities": _verified_runtime_capabilities,
+    "signalExportRunner": {"healthy": signal_export_healthy},
   }
 
 
@@ -710,11 +737,16 @@ def _require_backtest_runner(fill_model: str) -> None:
 def research_signal_datasets() -> dict[str, Any]:
   """供回测工作台选择当前用户可用的已发布研究信号。"""
 
+  imported_items = state_store.list_imported_research_signal_datasets()
   try:
-    items = research_signal_snapshot.list_published_signal_datasets(str(state_store.current_user_id()))
+    remote_items = research_signal_snapshot.list_published_signal_datasets(
+      str(state_store.current_user_id()),
+    )
   except research_signal_snapshot.ResearchSignalSnapshotError as error:
-    raise HTTPException(422, str(error)) from error
-  return {"items": items}
+    if not imported_items:
+      raise HTTPException(422, str(error)) from error
+    remote_items = []
+  return {"items": [*imported_items, *remote_items]}
 
 
 def _load_strategy_guide() -> str:
@@ -1264,9 +1296,414 @@ def strategy_config_versions(config_id: str):
 @app.get("/api/backtest/runs")
 def backtest_runs(
   limit: int = Query(30, ge=1, le=100),
+  offset: int = Query(0, ge=0),
+  query: str = Query("", max_length=100),
+  symbol: str | None = Query(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   config_id: str | None = Query(default=None, alias="configId"),
+  favorites_only: bool = Query(False, alias="favoritesOnly"),
 ):
-  return {"runs": state_store.list_backtest_runs(limit, config_id)}
+  return state_store.list_backtest_run_page(
+    limit=limit,
+    offset=offset,
+    query=query,
+    symbol=symbol,
+    config_id=config_id,
+    favorites_only=favorites_only,
+  )
+
+
+def _stable_error(status_code: int, code: str, message: str) -> HTTPException:
+  return HTTPException(status_code, {"code": code, "message": message})
+
+
+def _idempotency_key(request: Request) -> str:
+  value = request.headers.get("idempotency-key", "").strip()
+  try:
+    return str(UUID(value))
+  except (ValueError, AttributeError) as error:
+    raise _stable_error(
+      422, "signal_export.selection_invalid", "Idempotency-Key 必须是 UUID",
+    ) from error
+
+
+def _selection_payload(selection: Any) -> dict[str, Any]:
+  return _model_dump(selection)
+
+
+@app.post("/api/backtest/runs/selection-summary")
+def backtest_run_selection_summary(
+  payload: schemas.BacktestRunSelectionRequest,
+) -> JSONResponse:
+  try:
+    summary = state_store.summarize_backtest_run_selection(
+      _selection_payload(payload.selection),
+    )
+  except KeyError as error:
+    raise _stable_error(404, "backtest.not_found", "部分回测记录不存在") from error
+  except ValueError as error:
+    raise _stable_error(422, "backtest.selection_invalid", str(error)) from error
+  return JSONResponse(summary, headers={"Cache-Control": "private, no-store"})
+
+
+@app.post("/api/backtest/signal-detail-exports")
+def create_signal_detail_export(
+  payload: schemas.SignalDetailExportCreateRequest,
+  request: Request,
+) -> JSONResponse:
+  try:
+    export = state_store.create_signal_detail_export(
+      _selection_payload(payload.selection), _idempotency_key(request),
+    )
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "部分回测记录不存在") from error
+  except state_store.RunnerUnavailableError as error:
+    raise _stable_error(503, "signal_export.runner_unavailable", str(error)) from error
+  except state_store.ConflictError as error:
+    raise _stable_error(409, "signal_export.idempotency_conflict", str(error)) from error
+  except ValueError as error:
+    raise _stable_error(422, "signal_export.selection_invalid", str(error)) from error
+  return JSONResponse(
+    {"export": export}, headers={"Cache-Control": "private, no-store"},
+  )
+
+
+@app.get("/api/backtest/signal-detail-exports")
+def signal_detail_exports(
+  limit: int = Query(20, ge=1, le=100),
+  cursor: str | None = None,
+) -> JSONResponse:
+  try:
+    result = state_store.list_signal_detail_exports(limit, cursor)
+  except ValueError as error:
+    raise _stable_error(422, "signal_export.selection_invalid", str(error)) from error
+  return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+
+
+@app.get("/api/backtest/signal-detail-exports/{export_id}")
+def signal_detail_export_detail(export_id: str) -> JSONResponse:
+  try:
+    export = state_store.get_signal_detail_export(export_id)
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "导出任务不存在") from error
+  return JSONResponse(
+    {"export": export}, headers={"Cache-Control": "private, no-store"},
+  )
+
+
+@app.post("/api/backtest/signal-detail-exports/{export_id}/cancel")
+def cancel_signal_detail_export(export_id: str) -> JSONResponse:
+  try:
+    export = state_store.cancel_signal_detail_export(export_id)
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "导出任务不存在") from error
+  return JSONResponse(
+    {"export": export}, headers={"Cache-Control": "private, no-store"},
+  )
+
+
+@app.post("/api/backtest/signal-detail-exports/{export_id}/retry")
+def retry_signal_detail_export(export_id: str, request: Request) -> JSONResponse:
+  try:
+    export = state_store.retry_signal_detail_export(
+      export_id, _idempotency_key(request),
+    )
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "导出任务不存在") from error
+  except state_store.RunnerUnavailableError as error:
+    raise _stable_error(503, "signal_export.runner_unavailable", str(error)) from error
+  except state_store.ConflictError as error:
+    raise _stable_error(409, "signal_export.idempotency_conflict", str(error)) from error
+  except ValueError as error:
+    raise _stable_error(409, "signal_export.state_conflict", str(error)) from error
+  return JSONResponse(
+    {"export": export}, headers={"Cache-Control": "private, no-store"},
+  )
+
+
+@app.get("/api/backtest/signal-detail-exports/{export_id}/download")
+def download_signal_detail_export(export_id: str) -> FileResponse:
+  try:
+    export = state_store.get_signal_detail_export_download(export_id)
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "导出任务不存在") from error
+  if export["status"] == "expired":
+    raise _stable_error(410, "signal_export.file_unavailable", "信号明细文件已过期")
+  if export["status"] != "succeeded":
+    raise _stable_error(409, "signal_export.state_conflict", "信号明细尚未生成完成")
+  expires_at = export.get("expires_at")
+  if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+    state_store.expire_signal_detail_export(export_id)
+    raise _stable_error(410, "signal_export.file_unavailable", "信号明细文件已过期")
+  artifact_root = Path(settings.OUTPUT_ROOT).resolve()
+  storage_key = str(export.get("storage_key") or "")
+  path = (artifact_root / storage_key).resolve()
+  try:
+    path.relative_to(artifact_root)
+  except ValueError as error:
+    logger.error("信号明细导出路径越界: export_id=%s", export_id)
+    state_store.expire_signal_detail_export(export_id, "artifact_missing")
+    raise _stable_error(410, "signal_export.file_unavailable", "信号明细文件不可用") from error
+  if not path.is_file() or path.stat().st_size != int(export.get("byte_size") or -1):
+    logger.error("信号明细导出文件缺失或大小不一致: export_id=%s", export_id)
+    state_store.expire_signal_detail_export(export_id, "artifact_missing")
+    raise _stable_error(410, "signal_export.file_unavailable", "信号明细文件不可用")
+  state_store.mark_signal_detail_export_downloaded(export_id)
+  return FileResponse(
+    path,
+    media_type="application/zip",
+    filename=str(export.get("download_filename") or "signal-details.zip"),
+    headers={
+      "Cache-Control": "private, no-store",
+      "ETag": f'"{export["content_sha256"]}"',
+      "Accept-Ranges": "bytes",
+    },
+  )
+
+
+@app.post("/api/backtest/runs/{run_id}/publication")
+def publish_backtest_run(
+  run_id: str,
+  payload: schemas.SharedBacktestPublicationCreate,
+) -> dict[str, Any]:
+  try:
+    publication, created = state_store.create_shared_backtest_publication(
+      run_id,
+      payload.title,
+      payload.description,
+      payload.tags,
+    )
+    return {"publication": publication, "created": created}
+  except KeyError as error:
+    raise HTTPException(404, "回测记录不存在或无权共享") from error
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"共享回测创建失败: {error}") from error
+
+
+@app.get("/api/shared-backtests")
+def shared_backtests(
+  response: Response,
+  limit: int = Query(20, ge=1, le=100),
+  offset: int = Query(0, ge=0),
+  query: str = Query("", max_length=100),
+  strategy_category: str | None = Query(default=None, alias="strategyCategory", max_length=32),
+  timeframe: str | None = Query(default=None, max_length=16),
+  sort: Literal["latest", "copies"] = Query("latest"),
+  favorites_only: bool = Query(False, alias="favoritesOnly"),
+) -> dict[str, Any]:
+  response.headers["Cache-Control"] = "private, no-store"
+  return shared_backtest_discovery.list_shared_backtests(
+    limit=limit,
+    offset=offset,
+    query=query,
+    strategy_category=strategy_category,
+    timeframe=timeframe,
+    sort=sort,
+    favorites_only=favorites_only,
+  )
+
+
+@app.post("/api/shared-backtests/{publication_id}/favorite")
+def favorite_shared_backtest(publication_id: str) -> dict[str, bool]:
+  try:
+    created = shared_backtest_discovery.favorite_shared_backtest(publication_id)
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  return {"favorited": True, "created": created}
+
+
+@app.delete("/api/shared-backtests/{publication_id}/favorite")
+def unfavorite_shared_backtest(publication_id: str) -> dict[str, bool]:
+  deleted = shared_backtest_discovery.unfavorite_shared_backtest(publication_id)
+  return {"favorited": False, "deleted": deleted}
+
+
+@app.get("/api/admin/shared-backtests")
+def admin_shared_backtests(
+  request: Request,
+  limit: int = Query(20, ge=1, le=100),
+  offset: int = Query(0, ge=0),
+  status: str | None = Query(default=None, pattern=r"^(active|withdrawn|removed)$"),
+) -> dict[str, Any]:
+  _require_admin(request)
+  return shared_backtest_admin.list_shared_backtests_for_admin(limit, offset, status)
+
+
+@app.post("/api/admin/shared-backtests/{publication_id}/remove")
+def admin_remove_shared_backtest(
+  publication_id: str,
+  payload: schemas.SharedBacktestRemovalRequest,
+  request: Request,
+) -> dict[str, Any]:
+  _require_admin(request)
+  return _admin_publication_transition(
+    lambda: shared_backtest_admin.remove_publication(publication_id, payload.reason),
+  )
+
+
+@app.post("/api/admin/shared-backtests/{publication_id}/restore")
+def admin_restore_shared_backtest(
+  publication_id: str,
+  request: Request,
+) -> dict[str, Any]:
+  _require_admin(request)
+  return _admin_publication_transition(
+    lambda: shared_backtest_admin.restore_publication(publication_id),
+  )
+
+
+def _admin_publication_transition(
+  transition: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+  try:
+    return {"publication": transition()}
+  except KeyError as error:
+    raise HTTPException(404, "共享回测不存在") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"共享回测管理员状态更新失败: {error}") from error
+
+
+@app.get("/api/shared-backtests/mine")
+def my_shared_backtests(
+  limit: int = Query(20, ge=1, le=100),
+  offset: int = Query(0, ge=0),
+  status: str | None = Query(default=None, pattern=r"^(active|withdrawn|removed)$"),
+) -> dict[str, Any]:
+  return shared_backtest_lifecycle.list_my_shared_backtests(limit, offset, status)
+
+
+@app.post("/api/shared-backtests/{publication_id}/copy")
+def copy_shared_backtest(publication_id: str) -> dict[str, Any]:
+  try:
+    return shared_backtest_copy.copy_shared_backtest(publication_id)
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"复制共享回测失败: {error}") from error
+
+
+@app.get("/api/shared-backtests/{publication_id}/chart")
+def shared_backtest_chart(publication_id: str) -> dict[str, Any]:
+  try:
+    return shared_backtest_detail_service.get_shared_backtest_chart(publication_id)
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/shared-backtests/{publication_id}/{section}")
+def shared_backtest_result_page(
+  publication_id: str,
+  section: Literal["holdings", "trades", "signals", "execution-plans", "cycles"],
+  cursor: int = Query(0, ge=0),
+  limit: int = Query(50, ge=1, le=200),
+) -> dict[str, Any]:
+  try:
+    return shared_backtest_detail_service.get_shared_backtest_result_page(
+      publication_id,
+      section,
+      cursor,
+      limit,
+    )
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/shared-backtests/{publication_id}")
+def shared_backtest_detail(
+  publication_id: str,
+  response: Response,
+) -> dict[str, Any]:
+  response.headers["Cache-Control"] = "private, no-store"
+  try:
+    return {"publication": state_store.get_shared_backtest(publication_id)}
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/shared-backtests/{publication_id}/artifacts/{artifact_id}")
+def download_shared_backtest_artifact(
+  publication_id: str,
+  artifact_id: str,
+) -> FileResponse:
+  """鉴权下载仍处于已上架状态的共享附件。"""
+  try:
+    artifact = state_store.get_shared_backtest_artifact(publication_id, artifact_id)
+    path = shared_backtest_artifacts.verified_artifact_path(
+      str(artifact["storage_key"]),
+      str(artifact["content_sha256"]),
+      int(artifact["byte_size"]),
+    )
+  except KeyError as error:
+    raise HTTPException(404, "该共享回测已不可用") from error
+  except shared_backtest_artifacts.SharedArtifactError as error:
+    raise HTTPException(409, str(error)) from error
+  return FileResponse(
+    path,
+    media_type=artifact.get("content_type") or "application/octet-stream",
+    filename=shared_backtest_artifacts.safe_filename(artifact.get("display_name")),
+  )
+
+
+@app.patch("/api/shared-backtests/{publication_id}")
+def update_shared_backtest_metadata(
+  publication_id: str,
+  payload: schemas.SharedBacktestMetaUpdate,
+) -> dict[str, Any]:
+  try:
+    publication = shared_backtest_lifecycle.update_publication_metadata(
+      publication_id,
+      payload.title,
+      payload.description,
+      payload.tags,
+    )
+    return {"publication": publication}
+  except KeyError as error:
+    raise HTTPException(404, "共享回测不存在或无管理权限") from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"共享展示信息更新失败: {error}") from error
+
+
+@app.post("/api/shared-backtests/{publication_id}/withdraw")
+def withdraw_shared_backtest(publication_id: str) -> dict[str, Any]:
+  return _author_publication_transition(
+    publication_id,
+    shared_backtest_lifecycle.withdraw_publication,
+  )
+
+
+@app.post("/api/shared-backtests/{publication_id}/relist")
+def relist_shared_backtest(publication_id: str) -> dict[str, Any]:
+  return _author_publication_transition(
+    publication_id,
+    shared_backtest_lifecycle.relist_publication,
+  )
+
+
+def _author_publication_transition(
+  publication_id: str,
+  transition: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+  try:
+    return {"publication": transition(publication_id)}
+  except KeyError as error:
+    raise HTTPException(404, "共享回测不存在或无管理权限") from error
+  except ValueError as error:
+    raise HTTPException(409, str(error)) from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"共享回测状态更新失败: {error}") from error
 
 
 @app.get("/api/backtest/runs/{run_id}")
@@ -1323,6 +1760,17 @@ def update_backtest_run_meta(run_id: str, payload: schemas.BacktestRunMetaUpdate
     return {"run": run}
   except KeyError:
     raise HTTPException(404, f"回测记录不存在: {run_id}")
+
+
+@app.put("/api/backtest/runs/{run_id}/favorite")
+def set_backtest_run_favorite(
+  run_id: str,
+  payload: schemas.BacktestRunFavoriteUpdate,
+) -> dict[str, Any]:
+  try:
+    return state_store.set_backtest_run_favorite(run_id, payload.favorited)
+  except KeyError as error:
+    raise HTTPException(404, "回测记录不存在") from error
 
 
 @app.get("/api/backtest/timeframes")
@@ -1532,11 +1980,21 @@ def cancel_backtest_run(run_id: str):
 @app.delete("/api/backtest/runs")
 def delete_backtest_runs(payload: schemas.BacktestRunBatchDeleteRequest):
   try:
-    deleted = state_store.delete_backtest_runs(payload.runIds)
+    if payload.selection is not None:
+      deleted = state_store.delete_backtest_run_selection(
+        _selection_payload(payload.selection),
+        int(payload.expectedSelectedRunCount or 0),
+        str(payload.expectedSelectionDigest or ""),
+      )
+    else:
+      deleted = state_store.delete_backtest_runs(payload.runIds or [])
   except KeyError as error:
-    raise HTTPException(404, str(error)) from error
+    raise _stable_error(404, "backtest.not_found", "部分回测记录不存在") from error
+  except state_store.SelectionChangedError as error:
+    raise _stable_error(409, "backtest.selection_changed", str(error)) from error
   except ValueError as error:
-    raise HTTPException(409, str(error)) from error
+    status_code = 422 if payload.selection is not None else 409
+    raise _stable_error(status_code, "backtest.selection_invalid", str(error)) from error
   return {"deleted": deleted}
 
 

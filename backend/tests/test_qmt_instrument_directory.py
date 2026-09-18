@@ -1,6 +1,11 @@
+from pathlib import Path
+
 import pytest
 
 from backend.services import qmt_instrument_directory
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_sync_market_instruments_reads_unified_directory(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -42,6 +47,15 @@ def test_sync_market_instruments_rejects_empty_snapshot(monkeypatch: pytest.Monk
     assert "没有活跃 A 股" in str(error)
   else:
     raise AssertionError("expected empty directory to fail")
+
+
+def test_legacy_secid_migration_preserves_exchange_symbol_identity() -> None:
+  migration = (
+    ROOT / "db" / "migrations" / "038_market_instrument_legacy_secid.sql"
+  ).read_text(encoding="utf-8")
+
+  assert "DROP CONSTRAINT IF EXISTS market_instrument_eastmoney_secid_key" in migration
+  assert "market_instrument_exchange_symbol_key" not in migration
 
 
 @pytest.mark.parametrize(("exchange", "board_type", "expected_exchange", "expected_board"), [

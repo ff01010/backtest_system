@@ -417,6 +417,11 @@ export interface StrategyConfig {
   published: boolean;
   publishedVersionId: string | null;
   revision: number;
+  sharedSource?: {
+    publicationId: string;
+    authorName: string;
+    title: string;
+  } | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -463,12 +468,150 @@ export interface BacktestRunHistory {
   outputDir: string;
   note: string;
   tags: string[];
+  isFavorited: boolean;
+  favoritedAt: string | null;
   queuedAt: string;
   startedAt: string;
   cancelRequested: boolean;
   resultJson: BacktestRunResponse | null;
   createdAt: string;
   finishedAt: string;
+  publicationId?: string | null;
+}
+
+export type BacktestRunSelection = {
+  mode: 'ids';
+  runIds: string[];
+} | {
+  mode: 'filter';
+  query: string;
+  symbol: string | null;
+  configId: string | null;
+  favoritesOnly: boolean;
+  excludedRunIds: string[];
+};
+
+export type SignalDetailExportStatus =
+  | 'queued'
+  | 'preparing'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelling'
+  | 'cancelled'
+  | 'expired';
+
+export interface SignalDetailExportTask {
+  id: string;
+  selectionMode: 'ids' | 'filter';
+  selectionSnapshot: Record<string, unknown>;
+  status: SignalDetailExportStatus;
+  selectedRunCount: number;
+  preparedRunCount: number;
+  totalRunCount: number | null;
+  processedRunCount: number;
+  excludedRunCount: number | null;
+  exclusionSummary: Record<string, number> | null;
+  cancelRequested: boolean;
+  downloadFilename: string | null;
+  byteSize: number | null;
+  contentSha256: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  lastDownloadedAt: string;
+  createdAt: string;
+  startedAt: string;
+  finishedAt: string;
+  expiresAt: string;
+}
+
+export interface SharedBacktestListItem {
+  id: string;
+  title: string;
+  authorName: string;
+  tags: string[];
+  symbol: string;
+  timeframe: string;
+  strategyCategory: string;
+  startDate: string;
+  endDate: string;
+  totalReturn: number | null;
+  maxDrawdownRate: number | null;
+  annualSharpe: number | null;
+  copyCount: number;
+  firstPublishedAt: string;
+  sourcePublicationId?: string | null;
+  sourceAuthorName?: string | null;
+  sourceTitle?: string | null;
+  isFavorited?: boolean;
+  hasCopied?: boolean;
+}
+
+export interface SharedBacktestDetail extends SharedBacktestListItem {
+  description: string;
+  snapshotSchemaVersion: number;
+  snapshotDigest: string;
+  strategy: Record<string, unknown>;
+  configuration: Record<string, unknown>;
+  data: Record<string, unknown>;
+  result: Record<string, unknown>;
+  artifacts: Array<{
+    id: string;
+    type: string;
+    displayName: string;
+    contentType: string | null;
+    byteSize: number;
+    contentSha256: string;
+    snapshotSchemaVersion: number;
+    reproduction: Record<string, unknown>;
+    downloadUrl: string;
+  }>;
+  origin: Record<string, unknown>;
+  riskNotice: string;
+}
+
+export interface SharedBacktestChart {
+  equity: Array<Record<string, unknown>>;
+  benchmarkSymbol: string | null;
+  benchmarkEquity: Array<Record<string, unknown>>;
+}
+
+export type SharedBacktestResultSection =
+  | 'holdings'
+  | 'trades'
+  | 'signals'
+  | 'execution-plans'
+  | 'cycles';
+
+export interface SharedBacktestResultPage {
+  items: Array<Record<string, unknown>>;
+  nextCursor: string | null;
+  total: number;
+}
+
+export type SharedBacktestStatus = 'active' | 'withdrawn' | 'removed';
+
+export interface SharedBacktestManagementItem extends SharedBacktestListItem {
+  description: string;
+  status: SharedBacktestStatus;
+  withdrawnAt: string | null;
+  removedAt: string | null;
+  removalReason: string | null;
+  updatedAt: string;
+  sourceRunAvailable: boolean;
+}
+
+export interface SharedBacktestCopyResponse {
+  configId: string;
+  scriptId: string;
+  name: string;
+  created: boolean;
+  accountCleared: boolean;
+  sharedSource: {
+    publicationId: string;
+    authorName: string;
+    title: string;
+  };
 }
 
 export interface DataGapDate {

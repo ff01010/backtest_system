@@ -4,20 +4,22 @@
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+import base64
 import hashlib
 import json
 import logging
 from pathlib import Path
-import re
 from typing import Any, Iterator
 from uuid import uuid4
 
 import psycopg
+from psycopg import IsolationLevel
 from psycopg.errors import IntegrityError
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend import settings
+from backend.services import shared_backtest_artifacts, shared_backtest_snapshot
 from backend.services.user_context import get_current_user
 from backend.strategies.runtime_contract import (
   RUNTIME_CAPABILITY_DIGEST,
@@ -43,10 +45,15 @@ class RunnerUnavailableError(DatabaseError):
   """指定类型的回测执行器暂时不可用。"""
 
 
+class SelectionChangedError(ConflictError):
+  """批量删除范围与用户最后确认的快照不一致。"""
+
+
 _BACKTEST_SCHEDULER_LOCK_KEY = 314159265
 _STRATEGY_NAME_MAX_LENGTH = 64
 # 保留旧名称，避免外部诊断脚本在迁移期间失效。
 _L2_FAIR_CLAIM_LOCK_KEY = _BACKTEST_SCHEDULER_LOCK_KEY
+_SELECTABLE_BACKTEST_STATUSES = ("succeeded", "failed", "cancelled")
 logger = logging.getLogger(__name__)
 
 
@@ -66,12 +73,45 @@ def current_user_is_admin() -> bool:
   return get_current_user().is_admin
 
 
+def strategy_name_max_length() -> int:
+  """返回完整策略名称的持久化长度上限。"""
+  return _STRATEGY_NAME_MAX_LENGTH
+
+
 @contextmanager
 def _db() -> Iterator[psycopg.Connection[Any]]:
   if not settings.DATABASE_URL:
     raise DatabaseError("未设置 TREND_GRID_DATABASE_URL")
   try:
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
+      with conn.cursor() as cur:
+        cur.execute(
+          "SELECT set_config('app.current_user_id', %s, true)",
+          (current_user_id(),),
+        )
+        cur.execute(
+          "SELECT set_config('app.current_is_admin', %s, true)",
+          ("true" if current_user_is_admin() else "false",),
+        )
+      yield conn
+  except psycopg.Error as error:
+    raise _translate_error(error) from error
+
+
+@contextmanager
+def database_session() -> Iterator[psycopg.Connection[Any]]:
+  """为需要跨仓储原子写入的领域服务提供用户上下文连接。"""
+  with _db() as conn:
+    yield conn
+
+
+@contextmanager
+def _repeatable_read_db() -> Iterator[psycopg.Connection[Any]]:
+  if not settings.DATABASE_URL:
+    raise DatabaseError("未设置 TREND_GRID_DATABASE_URL")
+  try:
+    with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
+      conn.set_isolation_level(IsolationLevel.REPEATABLE_READ)
       with conn.cursor() as cur:
         cur.execute(
           "SELECT set_config('app.current_user_id', %s, true)",
@@ -124,8 +164,18 @@ def ensure_schema() -> None:
       cur.execute("SELECT to_regclass('public.strategy_runtime_error_stat') AS runtime_error_table")
       if cur.fetchone()["runtime_error_table"] is None:
         raise DatabaseError("数据库缺少策略运行时错误统计迁移 025，请先运行 deploy 的 migrate 服务")
-
-
+      cur.execute("""
+        SELECT to_regclass('public.backtest_signal_detail_export') AS export_table,
+          to_regclass('public.backtest_signal_detail_export_item') AS item_table,
+          to_regclass(
+            'public.backtest_signal_detail_export_runner_health'
+          ) AS health_table
+      """)
+      export_tables = cur.fetchone()
+      if any(export_tables[key] is None for key in (
+        "export_table", "item_table", "health_table",
+      )):
+        raise DatabaseError("数据库缺少信号明细批量导出迁移 040，请先运行 migrate 服务")
 def get_release_status_record() -> dict[str, Any] | None:
   """返回当前部署、有效公告和当前用户回执。"""
   with _db() as conn:
@@ -564,6 +614,7 @@ def _normalize_script(row: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
   runtime = _json(row.get("runtime_config"), {})
+  source_publication_id = _uuid(row.get("source_publication_id"))
   return {
     "id": _uuid(row["id"]),
     "name": row["name"],
@@ -585,6 +636,11 @@ def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
     "published": bool(row["published"]),
     "publishedVersionId": _uuid(row.get("published_version_id")),
     "revision": int(row.get("revision") or 1),
+    "sharedSource": {
+      "publicationId": source_publication_id,
+      "authorName": row.get("source_author_name_snapshot"),
+      "title": row.get("source_title_snapshot"),
+    } if source_publication_id else None,
     "createdAt": _format_time(row["created_at"]),
     "updatedAt": _format_time(row["updated_at"]),
   }
@@ -652,12 +708,17 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
     "outputDir": row.get("output_dir", ""),
     "note": row.get("note", ""),
     "tags": _json(row.get("tags"), []),
+    "isFavorited": row.get("favorited_at") is not None,
+    "favoritedAt": (
+      _format_time(row["favorited_at"]) if row.get("favorited_at") is not None else None
+    ),
     "resultJson": result,
     "queuedAt": _format_time(row.get("queued_at")),
     "startedAt": _format_time(row.get("started_at")),
     "cancelRequested": bool(row.get("cancel_requested", False)),
     "createdAt": _format_time(row["created_at"]),
     "finishedAt": _format_time(row.get("finished_at")),
+    "publicationId": _uuid(row.get("publication_id")),
   }
 
 
@@ -1003,6 +1064,7 @@ def _config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
     "strategy": config["strategy"], "mode": config["mode"], "symbol": config["symbol"],
     "timeframe": config.get("timeframe", "5m"), "benchmarkSymbol": config.get("benchmarkSymbol"),
     "accountId": config.get("accountId"), "paramsJson": params_json,
+    "sharedSource": config.get("sharedSource"),
   }
 
 
@@ -1019,12 +1081,15 @@ def _write_config(
     cur.execute("""
       INSERT INTO strategy_config (
         owner_user_id, name, strategy_id, strategy_version_id, strategy_key, mode, instrument_id, timeframe,
-        benchmark_instrument_id, account_id, params, enabled, published
-      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true) RETURNING id
+        benchmark_instrument_id, account_id, params, enabled, published,
+        source_publication_id, source_author_name_snapshot, source_title_snapshot
+      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s) RETURNING id
     """, (current_user_id(), payload["name"], strategy_id, strategy_version_id,
            payload.get("strategy", "user_script"),
            payload.get("mode", "backtest"), instrument_id, payload.get("timeframe", "5m"), benchmark_id,
-           payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True)))
+           payload.get("accountId"), Jsonb(payload.get("paramsJson", {})), payload.get("enabled", True),
+           payload.get("sourcePublicationId"), payload.get("sourceAuthorName"),
+           payload.get("sourceTitle")))
   else:
     cur.execute("""
       UPDATE strategy_config SET name=%s, strategy_version_id=%s, strategy_key=%s, mode=%s,
@@ -1060,6 +1125,39 @@ def _get_strategy_config_with_cursor(
   if not row:
     raise KeyError(config_id)
   return _normalize_config(row)
+
+
+def get_strategy_config_in_transaction(
+  cur: Any,
+  config_id: str,
+) -> dict[str, Any]:
+  """在调用方事务中读取当前用户的完整策略。"""
+  return _get_strategy_config_with_cursor(cur, config_id)
+
+
+def create_published_strategy_in_transaction(
+  cur: Any,
+  script_payload: dict[str, Any],
+  config_payload: dict[str, Any],
+) -> dict[str, Any]:
+  """在调用方事务中创建并发布一套独立完整策略。"""
+  resolved_name = _resolve_unique_strategy_name(
+    cur, str(config_payload["name"]), None,
+  )
+  resolved_script = {**script_payload, "name": resolved_name}
+  resolved_config = {**config_payload, "name": resolved_name}
+  params_json = dict(resolved_config.get("paramsJson") or {})
+  params_json["scriptName"] = resolved_name
+  resolved_config["paramsJson"] = params_json
+  script_id, strategy_version_id, _ = _write_strategy_script(
+    cur, None, resolved_script,
+  )
+  config_id = _write_config(
+    cur, None, resolved_config, script_id, strategy_version_id,
+  )
+  config = _get_strategy_config_with_cursor(cur, config_id)
+  _publish_strategy_config_with_cursor(cur, config)
+  return config
 
 
 
@@ -1329,6 +1427,11 @@ def _save_research_signal_snapshot(cur: Any, run_id: str, owner_user_id: str, sn
   if not path.is_file():
     raise DatabaseError("研究信号冻结文件不存在")
   content_sha256 = hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+  try:
+    storage_key = shared_backtest_artifacts.storage_key_for_path(path)
+  except shared_backtest_artifacts.SharedArtifactError:
+    # 兼容测试和旧调用方传入的显式快照路径；正常运行仍由受控根目录生成。
+    storage_key = f"research_signals/{path.name}"
   cur.execute(
     """INSERT INTO artifact_file
       (id, owner_user_id, run_id, artifact_type, storage_key, original_filename, content_type, byte_size, content_sha256)
@@ -1341,7 +1444,7 @@ def _save_research_signal_snapshot(cur: Any, run_id: str, owner_user_id: str, sn
         AND artifact_file.byte_size=EXCLUDED.byte_size
         AND artifact_file.content_sha256=EXCLUDED.content_sha256
       RETURNING id""",
-    (owner_user_id, run_id, f"research_signals/{path.name}", path.name, path.stat().st_size, content_sha256),
+    (owner_user_id, run_id, storage_key, path.name, path.stat().st_size, content_sha256),
   )
   artifact_row = cur.fetchone()
   if artifact_row is None:
@@ -2090,17 +2193,20 @@ def _scheduler_audit_snapshot(cur: Any) -> dict[str, int]:
 
 def _run_query(where: str = "") -> str:
   return f"""
-    SELECT r.*, s.id AS strategy_id,
+    SELECT r.*, s.id AS strategy_id, c.name AS config_name,
       i.symbol || '.' || i.exchange AS symbol,
       b.symbol || '.' || b.exchange AS benchmark_symbol,
-      COALESCE(bar_job.cancel_requested, l2_job.cancel_requested, false) AS cancel_requested
+      COALESCE(bar_job.cancel_requested, l2_job.cancel_requested, false) AS cancel_requested,
+      publication.id AS publication_id
     FROM backtest_run r
+    LEFT JOIN strategy_config c ON c.id=r.config_id
     LEFT JOIN user_strategy_version sv ON sv.id=r.strategy_version_id
     LEFT JOIN user_strategy s ON s.id=sv.strategy_id
     LEFT JOIN market_instrument i ON i.id=r.instrument_id
     LEFT JOIN market_instrument b ON b.id=r.benchmark_instrument_id
     LEFT JOIN bar_backtest_job bar_job ON bar_job.run_id=r.id
     LEFT JOIN l2_backtest_job l2_job ON l2_job.run_id=r.id
+    LEFT JOIN backtest_publication publication ON publication.source_run_id=r.id
     WHERE r.owner_user_id=%s {where}
   """
 
@@ -2128,6 +2234,231 @@ def list_backtest_runs(
       return [_normalize_run(row) for row in cur.fetchall()]
 
 
+def _backtest_run_filter_clause(
+  query: str,
+  symbol: str | None,
+  config_id: str | None,
+  favorites_only: bool,
+) -> tuple[str, tuple[Any, ...]]:
+  clauses: list[str] = []
+  params: list[Any] = []
+  if favorites_only:
+    clauses.append("r.favorited_at IS NOT NULL")
+  if config_id:
+    clauses.append("r.config_id=%s")
+    params.append(config_id)
+  if symbol:
+    clauses.append(
+      "COALESCE(i.symbol || '.' || i.exchange, r.requested_params->>'symbol')=%s"
+    )
+    params.append(symbol)
+  normalized_query = query.strip()
+  if normalized_query:
+    query_pattern = f"%{normalized_query}%"
+    is_display_number = (
+      normalized_query.startswith("#") and normalized_query[1:].isdigit()
+    )
+    display_predicate = (
+      "r.display_no=%s" if is_display_number else "r.display_no::text ILIKE %s"
+    )
+    display_value: Any = (
+      int(normalized_query[1:]) if is_display_number else query_pattern
+    )
+    clauses.append(f"""
+      (r.id::text ILIKE %s OR {display_predicate}
+        OR COALESCE(i.symbol || '.' || i.exchange, r.requested_params->>'symbol', '') ILIKE %s
+        OR COALESCE(r.requested_params->>'strategy', '') ILIKE %s
+        OR COALESCE(c.name, '') ILIKE %s OR COALESCE(r.tags::text, '') ILIKE %s)
+    """)
+    params.extend([
+      query_pattern,
+      display_value,
+      query_pattern,
+      query_pattern,
+      query_pattern,
+      query_pattern,
+    ])
+  clause = "" if not clauses else " AND " + " AND ".join(clauses)
+  return clause, tuple(params)
+
+
+def _unique_selection_ids(values: list[str]) -> list[str]:
+  return list(dict.fromkeys(str(value) for value in values))
+
+
+def _validate_explicit_backtest_selection(
+  cur: Any,
+  run_ids: list[str],
+  owner_user_id: str,
+) -> list[str]:
+  unique_run_ids = _unique_selection_ids(run_ids)
+  if not unique_run_ids:
+    raise ValueError("请至少选择一条回测记录")
+  rows: list[dict[str, Any]] = []
+  for offset in range(0, len(unique_run_ids), 500):
+    chunk = unique_run_ids[offset:offset + 500]
+    cur.execute(
+      "SELECT id, status FROM backtest_run WHERE id=ANY(%s) AND owner_user_id=%s",
+      (chunk, owner_user_id),
+    )
+    rows.extend(cur.fetchall())
+  if len(rows) != len(unique_run_ids):
+    raise KeyError("部分回测记录不存在或无操作权限")
+  if any(row["status"] not in _SELECTABLE_BACKTEST_STATUSES for row in rows):
+    raise ValueError("选择中包含排队或运行中的回测，请先取消任务")
+  return unique_run_ids
+
+
+def _backtest_selection_query(
+  selection: dict[str, Any],
+  owner_user_id: str,
+  *,
+  columns: str = "r.id",
+  order_by: str = "r.id ASC",
+) -> tuple[str, tuple[Any, ...]]:
+  mode = str(selection.get("mode", ""))
+  if mode == "ids":
+    run_ids = _unique_selection_ids(list(selection.get("runIds") or []))
+    return (
+      f"""
+        SELECT {columns}
+        FROM backtest_run r
+        LEFT JOIN strategy_config c ON c.id=r.config_id
+        LEFT JOIN market_instrument i ON i.id=r.instrument_id
+        WHERE r.owner_user_id=%s AND r.id=ANY(%s)
+          AND r.status=ANY(%s)
+        ORDER BY {order_by}
+      """,
+      (owner_user_id, run_ids, list(_SELECTABLE_BACKTEST_STATUSES)),
+    )
+  if mode != "filter":
+    raise ValueError("无效的回测选择模式")
+  filter_clause, filter_params = _backtest_run_filter_clause(
+    str(selection.get("query") or ""),
+    selection.get("symbol"),
+    selection.get("configId"),
+    bool(selection.get("favoritesOnly", False)),
+  )
+  excluded_ids = _unique_selection_ids(list(selection.get("excludedRunIds") or []))
+  exclusion_clause = " AND NOT (r.id=ANY(%s))" if excluded_ids else ""
+  exclusion_params: tuple[Any, ...] = (excluded_ids,) if excluded_ids else ()
+  return (
+    f"""
+      SELECT {columns}
+      FROM backtest_run r
+      LEFT JOIN strategy_config c ON c.id=r.config_id
+      LEFT JOIN market_instrument i ON i.id=r.instrument_id
+      WHERE r.owner_user_id=%s AND r.status=ANY(%s)
+        {filter_clause}{exclusion_clause}
+      ORDER BY {order_by}
+    """,
+    (
+      owner_user_id,
+      list(_SELECTABLE_BACKTEST_STATUSES),
+      *filter_params,
+      *exclusion_params,
+    ),
+  )
+
+
+def _selection_digest(rows: Iterator[dict[str, Any]]) -> tuple[int, str]:
+  digest = hashlib.sha256()
+  count = 0
+  for row in rows:
+    digest.update(str(row["id"]).encode("ascii"))
+    digest.update(b"\n")
+    count += 1
+  return count, digest.hexdigest()
+
+
+def summarize_backtest_run_selection(selection: dict[str, Any]) -> dict[str, Any]:
+  """按当前用户解析选择，并返回删除确认使用的稳定摘要。"""
+  owner_user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      if selection.get("mode") == "ids":
+        _validate_explicit_backtest_selection(
+          cur, list(selection.get("runIds") or []), owner_user_id,
+        )
+      query, params = _backtest_selection_query(selection, owner_user_id)
+      cur.execute(query, params)
+      selected_count, selection_digest = _selection_digest(iter(cur))
+      if selected_count == 0:
+        raise ValueError("当前选择中没有可处理的终态回测")
+      return {
+        "selectedRunCount": selected_count,
+        "selectionDigest": selection_digest,
+      }
+
+
+def list_backtest_run_page(
+  limit: int,
+  offset: int,
+  query: str = "",
+  symbol: str | None = None,
+  config_id: str | None = None,
+  favorites_only: bool = False,
+) -> dict[str, Any]:
+  """返回当前用户的历史回测分页及分页所需的索引信息。"""
+  if limit < 1 or limit > 100 or offset < 0:
+    raise ValueError("分页参数无效")
+  user_id = current_user_id()
+  filter_clause, filter_params = _backtest_run_filter_clause(
+    query, symbol, config_id, favorites_only,
+  )
+  base_params = (user_id, *filter_params)
+  order_clause = (
+    "r.favorited_at DESC, r.id DESC"
+    if favorites_only
+    else "r.created_at DESC, r.id DESC"
+  )
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(f"""
+        SELECT count(*) AS value
+        FROM backtest_run r
+        LEFT JOIN strategy_config c ON c.id=r.config_id
+        LEFT JOIN market_instrument i ON i.id=r.instrument_id
+        WHERE r.owner_user_id=%s {filter_clause}
+      """, base_params)
+      total = int(cur.fetchone()["value"])
+      cur.execute(f"""
+        SELECT count(*) AS value
+        FROM backtest_run r
+        LEFT JOIN strategy_config c ON c.id=r.config_id
+        LEFT JOIN market_instrument i ON i.id=r.instrument_id
+        WHERE r.owner_user_id=%s AND r.status=ANY(%s) {filter_clause}
+      """, (user_id, list(_SELECTABLE_BACKTEST_STATUSES), *filter_params))
+      selectable_total = int(cur.fetchone()["value"])
+      cur.execute(
+        _run_query(
+          f"{filter_clause} ORDER BY {order_clause} LIMIT %s OFFSET %s"
+        ),
+        (*base_params, limit, offset),
+      )
+      runs = [_normalize_run(row) for row in cur.fetchall()]
+      symbol_config_clause = " AND r.config_id=%s" if config_id else ""
+      symbol_params = (user_id, config_id) if config_id else (user_id,)
+      cur.execute(f"""
+        SELECT DISTINCT COALESCE(
+          i.symbol || '.' || i.exchange, r.requested_params->>'symbol'
+        ) AS symbol
+        FROM backtest_run r
+        LEFT JOIN market_instrument i ON i.id=r.instrument_id
+        WHERE r.owner_user_id=%s {symbol_config_clause}
+        ORDER BY symbol
+      """, symbol_params)
+      symbols = [str(row["symbol"]) for row in cur.fetchall() if row.get("symbol")]
+      return {
+        "runs": runs,
+        "total": total,
+        "selectableTotal": selectable_total,
+        "limit": limit,
+        "offset": offset,
+        "symbols": symbols,
+      }
+
+
 def get_backtest_run(run_id: str) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
@@ -2136,6 +2467,485 @@ def get_backtest_run(run_id: str) -> dict[str, Any]:
       if not row:
         raise KeyError(run_id)
       return _normalize_run(row)
+
+
+_SHARED_RESULT_KEYS = (
+  "strategyCategory", "resultSchemaVersion", "strategyMetrics", "summary",
+  "equity", "dailyHoldings", "cycles", "executionPlans", "benchmarkSymbol",
+  "benchmarkEquity", "benchmarkReturn", "excessReturn", "trades",
+  "skippedSignals", "experimentManifest", "dataSnapshot", "warnings",
+)
+_SHARED_DETAIL_RESULT_KEYS = (
+  "strategyCategory", "resultSchemaVersion", "strategyMetrics", "summary",
+  "benchmarkSymbol", "benchmarkReturn", "excessReturn", "experimentManifest",
+  "warnings",
+)
+_SHARED_CONFIGURATION_KEYS = (
+  "initialCapital", "commissionRate", "slippage", "feeProfile", "allowLong",
+  "allowShort", "holdingPolicy", "overlaySettlementPolicy", "fillModel",
+  "executionAlgorithm", "executionParameters", "baseQuantity", "baseCostPrice",
+  "initialPositionEnabled", "t0Enabled", "warmupTradingDays", "strategyParams",
+)
+_SHARED_DETAIL_STRATEGY_KEYS = (
+  "name", "description", "entryType", "code", "codeHash", "signalRequired",
+  "runtimeVersion", "capabilityDigest",
+)
+_SHARED_DETAIL_CONFIGURATION_KEYS = (
+  "strategyName", "strategy", "strategyCategory", "symbol", "timeframe",
+  "benchmarkSymbol", "startDate", "endDate", "params", "runParams", "execution",
+  *_SHARED_CONFIGURATION_KEYS,
+)
+_SHARED_DETAIL_ORIGIN_KEYS = ("publicationId", "authorName", "title")
+_SHARED_DETAIL_MARKET_DATA_KEYS = (
+  "provider", "symbol", "timeframe", "sourcePeriod", "derivation",
+  "warmupTradingDays", "barCount", "lastImportedAt", "adjustment",
+  "manifestHash", "hash",
+)
+_SHARED_DETAIL_RESULT_DATA_KEYS = (
+  "startDate", "endDate", "actualStartDate", "actualEndDate", "barCount",
+  "sourcePeriod", "aggregationVersion", "mappingVersion", "quality",
+)
+_SHARED_DETAIL_DEPENDENCY_KEYS = (
+  "symbol", "sourceTimeframe", "timeframe", "startDate", "endDate",
+  "rowCount", "snapshotHash", "signalOrder", "alignment",
+)
+_SHARED_DETAIL_MANIFEST_KEYS = (
+  "experimentHash", "engineVersion", "strategyRuntimeVersion",
+  "strategyRuntimeCapabilityDigest", "signalModel", "fillModel",
+  "executionAlgorithm", "executionParameters", "randomSeed", "strategyCodeHash",
+  "configHash", "dataHash", "barCount", "barRange", "costModel",
+  "holdingPolicy", "overlaySettlementPolicy", "strategyCategory",
+  "initialPositionEnabled", "baseQuantity", "baseCostPrice", "t0Enabled",
+  "resultSchemaVersion", "executionEnvironment",
+)
+_SHARED_RISK_NOTICE = "历史回测结果不代表未来表现"
+
+
+def _shared_mapping_projection(value: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+  return shared_backtest_snapshot.project_fields(value, keys)
+
+
+def _shared_data_detail_projection(value: Any) -> dict[str, Any]:
+  projected = shared_backtest_snapshot.project_data(value)
+  market_data = projected["marketData"]
+  raw_value = value if isinstance(value, dict) else {}
+  raw_market_data = raw_value.get("marketData")
+  if isinstance(raw_market_data, dict):
+    dates = raw_market_data.get("formalDates")
+    if isinstance(dates, list) and dates:
+      market_data["formalDateRange"] = {
+        "start": dates[0], "end": dates[-1], "count": len(dates),
+      }
+  return projected
+
+
+def _shared_result_detail_projection(value: Any) -> dict[str, Any]:
+  return shared_backtest_snapshot.project_result(value, detail=True)
+
+
+def _shared_artifact_sources(
+  cur: Any,
+  run_id: str,
+  snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+  """读取原任务附件，并补齐复现研究信号所需的不可变元数据。"""
+  cur.execute("""
+    SELECT artifact.*, signal.dataset_id, signal.dataset_version,
+      signal.snapshot_hash, signal.manifest, signal.source_partitions
+    FROM artifact_file artifact
+    LEFT JOIN research_signal_snapshot signal
+      ON signal.artifact_file_id=artifact.id AND signal.run_id=artifact.run_id
+    WHERE artifact.run_id=%s
+    ORDER BY artifact.created_at, artifact.id
+  """, (run_id,))
+  rows = list(cur.fetchall())
+  dependencies = snapshot.get("data", {}).get("dependencies", [])
+  research_summary = next((
+    item.get("summary", {}) for item in dependencies
+    if isinstance(item, dict) and item.get("type") == "research_signal"
+  ), {})
+  research_rows = [
+    row for row in rows
+    if row.get("artifact_type") == "research_signal" and row.get("dataset_id")
+  ]
+  if research_summary and len(research_rows) != 1:
+    raise ValueError("历史任务的研究信号快照不完整，请重新运行后共享")
+  sources: list[dict[str, Any]] = []
+  for row in rows:
+    metadata: dict[str, Any] = {}
+    if row.get("dataset_id"):
+      metadata = shared_backtest_snapshot.project_reproduction({
+        **research_summary,
+        "datasetId": _uuid(row["dataset_id"]),
+        "datasetVersion": int(row["dataset_version"]),
+        "snapshotHash": row["snapshot_hash"],
+        "manifest": _json(row.get("manifest"), {}),
+        "sourcePartitions": _json(row.get("source_partitions"), []),
+      })
+    sources.append({
+      **row,
+      "source_artifact_file_id": _uuid(row["id"]),
+      "reproduction_metadata": metadata,
+    })
+  return sources
+
+
+def _shared_artifact_metadata(row: dict[str, Any], include_download: bool = False) -> dict[str, Any]:
+  artifact_id = _uuid(row["id"]) or ""
+  result = {
+    "id": artifact_id,
+    "type": row["artifact_type"],
+    "displayName": row.get("display_name") or row.get("original_filename") or "附件",
+    "contentType": row.get("content_type"),
+    "byteSize": int(row.get("byte_size") or 0),
+    "contentSha256": row["content_sha256"],
+    "snapshotSchemaVersion": int(row.get("snapshot_schema_version") or 1),
+    "reproduction": shared_backtest_snapshot.project_reproduction(
+      _json(row.get("reproduction_metadata"), {}),
+    ),
+  }
+  if include_download:
+    result["downloadUrl"] = (
+      f"/api/shared-backtests/{_uuid(row['publication_id'])}/artifacts/{artifact_id}"
+    )
+  return result
+
+
+def _insert_shared_artifacts(cur: Any, artifacts: list[dict[str, Any]], publication_id: str) -> None:
+  for artifact in artifacts:
+    cur.execute("""
+      INSERT INTO backtest_publication_artifact (
+        id, publication_id, artifact_type, display_name, content_type,
+        byte_size, content_sha256, storage_key, source_artifact_file_id,
+        snapshot_schema_version, reproduction_metadata
+      ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s)
+    """, (
+      artifact["id"], publication_id, artifact["artifact_type"],
+      artifact["original_filename"], artifact.get("content_type"),
+      artifact["byte_size"], artifact["content_sha256"], artifact["storage_key"],
+      artifact.get("source_artifact_file_id"),
+      Jsonb(artifact.get("reproduction_metadata") or {}),
+    ))
+
+
+def _publication_artifact_rows(cur: Any, publication_id: str) -> list[dict[str, Any]]:
+  cur.execute("""
+    SELECT * FROM backtest_publication_artifact
+    WHERE publication_id=%s ORDER BY artifact_type, id
+  """, (publication_id,))
+  return list(cur.fetchall())
+
+
+def _shared_strategy_snapshot(run: dict[str, Any]) -> dict[str, Any]:
+  return shared_backtest_snapshot.build_snapshot(run)["strategy"]
+
+
+def _shared_configuration_snapshot(run: dict[str, Any]) -> dict[str, Any]:
+  return shared_backtest_snapshot.build_snapshot(run)["configuration"]
+
+
+def _build_shared_backtest_snapshot(run: dict[str, Any]) -> dict[str, Any]:
+  """从保存证据构造版本 1 业务白名单快照。"""
+  return shared_backtest_snapshot.build_snapshot(run)
+
+
+def _shared_snapshot_digest(snapshot: dict[str, Any]) -> str:
+  canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+  return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _publication_list_item(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "id": _uuid(row["id"]),
+    "title": row["title"],
+    "authorName": row["author_name_snapshot"],
+    "tags": _json(row.get("tags"), []),
+    "symbol": row["symbol"],
+    "timeframe": row["timeframe"],
+    "strategyCategory": row["strategy_category"],
+    "startDate": row["start_date"],
+    "endDate": row["end_date"],
+    "totalReturn": _to_float(row.get("total_return")),
+    "maxDrawdownRate": _to_float(row.get("max_drawdown_rate")),
+    "annualSharpe": _to_float(row.get("annual_sharpe")),
+    "copyCount": int(row.get("copy_count") or 0),
+    "firstPublishedAt": _format_time(row["first_published_at"]),
+    "sourcePublicationId": _uuid(row.get("source_publication_id")),
+    "sourceAuthorName": row.get("source_author_name_snapshot"),
+    "sourceTitle": row.get("source_title_snapshot"),
+  }
+
+
+def _publication_detail(
+  row: dict[str, Any],
+  artifacts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+  version = int(row["snapshot_schema_version"])
+  if version != 1:
+    raise ValueError(f"暂不支持共享快照版本: {version}")
+  snapshot = _json(row["snapshot_json"], {})
+  if not isinstance(snapshot, dict):
+    raise ValueError("共享快照格式无效")
+  result = snapshot.get("result", {})
+  if not isinstance(result, dict):
+    result = {}
+  configuration = _shared_mapping_projection(
+    snapshot.get("configuration"), _SHARED_DETAIL_CONFIGURATION_KEYS,
+  )
+  for key in (
+    "params", "runParams", "execution", "strategyParams",
+    "executionParameters", "feeProfile",
+  ):
+    if key in configuration:
+      configuration[key] = shared_backtest_snapshot.project_author_json(
+        configuration[key],
+      )
+  return {
+    **_publication_list_item(row),
+    "description": row["description"],
+    "snapshotSchemaVersion": version,
+    "snapshotDigest": row["snapshot_digest"],
+    "strategy": _shared_mapping_projection(
+      snapshot.get("strategy"), _SHARED_DETAIL_STRATEGY_KEYS,
+    ),
+    "configuration": configuration,
+    "data": _shared_data_detail_projection(snapshot.get("data")),
+    "result": _shared_result_detail_projection(result),
+    "artifacts": [
+      _shared_artifact_metadata(artifact, include_download=True)
+      for artifact in artifacts or []
+    ],
+    "origin": _shared_mapping_projection(
+      snapshot.get("origin"), _SHARED_DETAIL_ORIGIN_KEYS,
+    ),
+    "riskNotice": _SHARED_RISK_NOTICE,
+  }
+
+
+def _copy_publication_artifacts(
+  cur: Any,
+  run_id: str,
+  publication_id: str,
+  snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+  sources = _shared_artifact_sources(cur, run_id, snapshot)
+  artifacts = shared_backtest_artifacts.copy_artifacts(
+    sources, f"shared_backtests/{publication_id}",
+  )
+  try:
+    for artifact in artifacts:
+      artifact["publication_id"] = publication_id
+      artifact["display_name"] = artifact["original_filename"]
+      artifact["snapshot_schema_version"] = 1
+      if artifact["artifact_type"] != "research_signal":
+        continue
+      expected_hash = artifact.get("reproduction_metadata", {}).get("snapshotHash")
+      actual_hash = shared_backtest_artifacts.research_signal_snapshot_hash(
+        artifact["storage_key"],
+      )
+      if expected_hash != actual_hash:
+        raise ValueError("历史任务的研究信号内容摘要不一致，无法共享")
+    return artifacts
+  except Exception:
+    shared_backtest_artifacts.cleanup_artifacts(artifacts)
+    raise
+
+
+def _insert_publication_record(
+  cur: Any,
+  publication_id: str,
+  user_id: str,
+  run_id: str,
+  title: str,
+  description: str,
+  tags: list[str],
+  snapshot: dict[str, Any],
+) -> dict[str, Any] | None:
+  summary = snapshot["result"].get("summary", {})
+  configuration = snapshot["configuration"]
+  origin = snapshot.get("origin") or {}
+  cur.execute("""
+    INSERT INTO backtest_publication (
+      id, owner_user_id, author_name_snapshot, source_run_id, title, description,
+      tags, status, snapshot_schema_version, snapshot_json, snapshot_digest,
+      symbol, timeframe, strategy_category, start_date, end_date,
+      total_return, max_drawdown_rate, annual_sharpe,
+      source_publication_id, source_author_name_snapshot, source_title_snapshot
+    ) VALUES (
+      %s, %s, %s, %s, %s, %s, %s, 'active', 1, %s, %s,
+      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+    )
+    ON CONFLICT (source_run_id) WHERE source_run_id IS NOT NULL DO NOTHING
+    RETURNING *
+  """, (
+    publication_id, user_id, get_current_user().display_name, run_id, title,
+    description, Jsonb(tags), Jsonb(snapshot), _shared_snapshot_digest(snapshot),
+    configuration["symbol"], configuration["timeframe"],
+    configuration["strategyCategory"], configuration["startDate"],
+    configuration["endDate"], summary.get("totalReturn"),
+    summary.get("maxDrawdownRate"), summary.get("annualSharpe"),
+    origin.get("publicationId"), origin.get("authorName"), origin.get("title"),
+  ))
+  return cur.fetchone()
+
+
+def _publication_for_source(
+  cur: Any,
+  run_id: str,
+  user_id: str | None = None,
+) -> dict[str, Any] | None:
+  owner_filter = " AND owner_user_id=%s" if user_id is not None else ""
+  params = (run_id, user_id) if user_id is not None else (run_id,)
+  cur.execute(
+    f"SELECT * FROM backtest_publication WHERE source_run_id=%s{owner_filter}",
+    params,
+  )
+  return cur.fetchone()
+
+
+def create_shared_backtest_publication(
+  run_id: str,
+  title: str,
+  description: str,
+  tags: list[str],
+) -> tuple[dict[str, Any], bool]:
+  """幂等地将当前用户的一次完整成功回测冻结为共享回测。"""
+  user_id = current_user_id()
+  publication_id = str(uuid4())
+  copied_artifacts: list[dict[str, Any]] = []
+  try:
+    with _db() as conn:
+      with conn.cursor() as cur:
+        existing = _publication_for_source(cur, run_id, user_id)
+        if existing:
+          artifacts = _publication_artifact_rows(cur, str(existing["id"]))
+          return _publication_detail(existing, artifacts), False
+        cur.execute(_run_query("AND r.id=%s FOR UPDATE OF r"), (user_id, run_id))
+        row = cur.fetchone()
+        if not row:
+          raise KeyError(run_id)
+        run = _normalize_run(row)
+        snapshot = _build_shared_backtest_snapshot(run)
+        copied_artifacts = _copy_publication_artifacts(
+          cur, run_id, publication_id, snapshot,
+        )
+        snapshot["data"]["dependencies"] = [
+          _shared_artifact_metadata(artifact) for artifact in copied_artifacts
+        ]
+        publication = _insert_publication_record(
+          cur, publication_id, user_id, run_id, title, description, tags, snapshot,
+        )
+        if publication is None:
+          shared_backtest_artifacts.cleanup_artifacts(copied_artifacts)
+          copied_artifacts = []
+          publication = _publication_for_source(cur, run_id)
+          if publication is None:
+            raise DatabaseError("共享回测创建失败")
+          artifacts = _publication_artifact_rows(cur, str(publication["id"]))
+          return _publication_detail(publication, artifacts), False
+        _insert_shared_artifacts(cur, copied_artifacts, publication_id)
+        return _publication_detail(publication, copied_artifacts), True
+  except Exception:
+    shared_backtest_artifacts.cleanup_artifacts(copied_artifacts)
+    raise
+
+
+def list_shared_backtests(limit: int = 20, offset: int = 0) -> dict[str, Any]:
+  """返回当前正常登录用户可见的已上架共享回测。"""
+  if limit < 1 or limit > 100 or offset < 0:
+    raise ValueError("分页参数无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT count(*) AS value FROM backtest_publication WHERE status='active'")
+      total = int(cur.fetchone()["value"])
+      cur.execute("""
+        SELECT * FROM backtest_publication WHERE status='active'
+        ORDER BY first_published_at DESC, id DESC LIMIT %s OFFSET %s
+      """, (limit, offset))
+      return {
+        "items": [_publication_list_item(row) for row in cur.fetchall()],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+      }
+
+
+def get_shared_backtest(publication_id: str) -> dict[str, Any]:
+  """读取 active 共享回测的安全详情投影。"""
+  viewer_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT p.*, favorite.user_id IS NOT NULL AS is_favorited,
+          copied.recipient_user_id IS NOT NULL AS has_copied
+        FROM backtest_publication p
+        LEFT JOIN backtest_publication_favorite favorite
+          ON favorite.publication_id=p.id AND favorite.user_id=%s
+        LEFT JOIN backtest_publication_copy copied
+          ON copied.publication_id=p.id AND copied.recipient_user_id=%s
+        WHERE p.id=%s AND p.status='active'
+      """, (viewer_id, viewer_id, publication_id))
+      row = cur.fetchone()
+      if not row:
+        raise KeyError(publication_id)
+      return {
+        **_publication_detail(row, _publication_artifact_rows(cur, publication_id)),
+        "isFavorited": bool(row.get("is_favorited")),
+        "hasCopied": bool(row.get("has_copied")),
+      }
+
+
+def get_shared_backtest_artifact(publication_id: str, artifact_id: str) -> dict[str, Any]:
+  """读取当前仍已上架共享附件的内部定位信息。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT artifact.*
+        FROM backtest_publication_artifact artifact
+        JOIN backtest_publication publication ON publication.id=artifact.publication_id
+        WHERE artifact.id=%s AND artifact.publication_id=%s
+          AND publication.status='active'
+      """, (artifact_id, publication_id))
+      row = cur.fetchone()
+      if not row:
+        raise KeyError(artifact_id)
+      return row
+
+
+def list_imported_research_signal_datasets() -> list[dict[str, Any]]:
+  """列出当前用户从共享回测导入的可运行研究信号数据集。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT dataset.*
+        FROM imported_research_signal_dataset dataset
+        WHERE dataset.owner_user_id=%s
+        ORDER BY dataset.created_at DESC, dataset.id DESC
+      """, (current_user_id(),))
+      return [{
+        "id": _uuid(row["id"]),
+        "name": row["display_name"],
+        "datasetKey": row["dataset_key"],
+        "version": int(row["dataset_version"]),
+        "timeframe": row["timeframe"],
+        "recordCount": int(row["row_count"]),
+        "imported": True,
+      } for row in cur.fetchall()]
+
+
+def get_imported_research_signal_dataset(dataset_id: str) -> dict[str, Any] | None:
+  """返回当前用户拥有的导入数据集；不允许沿用原作者数据身份。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT dataset.*, artifact.storage_key, artifact.byte_size,
+          artifact.content_sha256
+        FROM imported_research_signal_dataset dataset
+        JOIN artifact_file artifact ON artifact.id=dataset.artifact_file_id
+        WHERE dataset.id=%s AND dataset.owner_user_id=%s
+      """, (dataset_id, current_user_id()))
+      row = cur.fetchone()
+      return dict(row) if row else None
 
 
 def delete_backtest_run(run_id: str) -> bool:
@@ -2178,6 +2988,46 @@ def delete_backtest_runs(run_ids: list[str]) -> int:
         "DELETE FROM backtest_run WHERE id=ANY(%s) AND owner_user_id=%s",
         (unique_run_ids, current_user_id()),
       )
+      return cur.rowcount
+
+
+def delete_backtest_run_selection(
+  selection: dict[str, Any],
+  expected_count: int,
+  expected_digest: str,
+) -> int:
+  """按用户确认过的完整选择原子删除，范围漂移时不删除任何记录。"""
+  owner_user_id = current_user_id()
+  with _repeatable_read_db() as conn:
+    with conn.cursor() as cur:
+      if selection.get("mode") == "ids":
+        _validate_explicit_backtest_selection(
+          cur, list(selection.get("runIds") or []), owner_user_id,
+        )
+      cur.execute("""
+        CREATE TEMP TABLE selected_backtest_run (
+          id uuid PRIMARY KEY
+        ) ON COMMIT DROP
+      """)
+      query, params = _backtest_selection_query(selection, owner_user_id)
+      cur.execute(f"INSERT INTO selected_backtest_run (id) {query}", params)
+      cur.execute("""
+        SELECT run.id
+        FROM backtest_run run
+        JOIN selected_backtest_run selected ON selected.id=run.id
+        ORDER BY run.id
+        FOR UPDATE OF run
+      """)
+      cur.fetchall()
+      cur.execute("SELECT id FROM selected_backtest_run ORDER BY id")
+      actual_count, actual_digest = _selection_digest(iter(cur))
+      if actual_count != expected_count or actual_digest != expected_digest:
+        raise SelectionChangedError("选择范围已变化，请重新确认")
+      cur.execute("""
+        DELETE FROM backtest_run run
+        USING selected_backtest_run selected
+        WHERE run.id=selected.id AND run.owner_user_id=%s
+      """, (owner_user_id,))
       return cur.rowcount
 
 
@@ -2322,6 +3172,33 @@ def update_backtest_run_meta(run_id: str, note: str, tags: list[str]) -> dict[st
   return get_backtest_run(run_id)
 
 
+def set_backtest_run_favorite(run_id: str, favorited: bool) -> dict[str, Any]:
+  """幂等设置当前用户历史回测的收藏状态。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_run
+        SET favorited_at=CASE
+          WHEN %s THEN COALESCE(favorited_at, now())
+          ELSE NULL
+        END
+        WHERE id=%s AND owner_user_id=%s
+        RETURNING favorited_at
+      """, (favorited, run_id, current_user_id()))
+      row = cur.fetchone()
+      if row is None:
+        raise KeyError(run_id)
+      return {
+        "runId": run_id,
+        "isFavorited": row["favorited_at"] is not None,
+        "favoritedAt": (
+          _format_time(row["favorited_at"])
+          if row.get("favorited_at") is not None
+          else None
+        ),
+      }
+
+
 def finish_backtest_run(
   run_id: str,
   status: str,
@@ -2440,3 +3317,706 @@ def _public_system_error_context(context: dict[str, Any]) -> dict[str, Any]:
     for key, value in context.items()
     if not key.startswith("__internal_")
   }
+
+
+def _canonical_backtest_selection(selection: dict[str, Any]) -> dict[str, Any]:
+  mode = str(selection.get("mode", ""))
+  if mode == "ids":
+    return {
+      "mode": "ids",
+      "runIds": sorted(_unique_selection_ids(list(selection.get("runIds") or []))),
+    }
+  if mode == "filter":
+    return {
+      "mode": "filter",
+      "query": str(selection.get("query") or "").strip(),
+      "symbol": selection.get("symbol") or None,
+      "configId": selection.get("configId") or None,
+      "favoritesOnly": bool(selection.get("favoritesOnly", False)),
+      "excludedRunIds": sorted(_unique_selection_ids(
+        list(selection.get("excludedRunIds") or []),
+      )),
+    }
+  raise ValueError("无效的回测选择模式")
+
+
+def _signal_export_request_hash(selection: dict[str, Any]) -> str:
+  encoded = json.dumps(
+    selection, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+  ).encode("utf-8")
+  return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalize_signal_export(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "id": _uuid(row["id"]),
+    "selectionMode": row["selection_mode"],
+    "selectionSnapshot": _json(row.get("selection_snapshot"), {}),
+    "status": row["status"],
+    "selectedRunCount": int(row["selected_run_count"]),
+    "preparedRunCount": int(row.get("prepared_run_count") or 0),
+    "totalRunCount": (
+      int(row["total_run_count"]) if row.get("total_run_count") is not None else None
+    ),
+    "processedRunCount": int(row.get("processed_run_count") or 0),
+    "excludedRunCount": (
+      int(row["excluded_run_count"])
+      if row.get("excluded_run_count") is not None else None
+    ),
+    "exclusionSummary": _json(row.get("exclusion_summary"), None),
+    "cancelRequested": bool(row.get("cancel_requested", False)),
+    "downloadFilename": row.get("download_filename"),
+    "byteSize": int(row["byte_size"]) if row.get("byte_size") is not None else None,
+    "contentSha256": row.get("content_sha256"),
+    "errorCode": row.get("error_code"),
+    "errorMessage": row.get("error_message"),
+    "lastDownloadedAt": _format_time(row.get("last_downloaded_at")),
+    "createdAt": _format_time(row.get("created_at")),
+    "startedAt": _format_time(row.get("started_at")),
+    "finishedAt": _format_time(row.get("finished_at")),
+    "expiresAt": _format_time(row.get("expires_at")),
+  }
+
+
+def signal_export_runner_available() -> bool:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT EXISTS (
+          SELECT 1 FROM backtest_signal_detail_export_runner_health
+          WHERE status IN ('ready', 'running')
+            AND heartbeat_at > now() - (%s * interval '1 second')
+        ) AS available
+      """, (settings.SIGNAL_EXPORT_RUNNER_TTL_SECONDS,))
+      return bool(cur.fetchone()["available"])
+
+
+def _assert_signal_export_runner_available(cur: Any) -> None:
+  if not settings.SIGNAL_EXPORT_RUNNER_AVAILABILITY_REQUIRED:
+    return
+  cur.execute("""
+    SELECT EXISTS (
+      SELECT 1 FROM backtest_signal_detail_export_runner_health
+      WHERE status IN ('ready', 'running')
+        AND heartbeat_at > now() - (%s * interval '1 second')
+    ) AS available
+  """, (settings.SIGNAL_EXPORT_RUNNER_TTL_SECONDS,))
+  if not cur.fetchone()["available"]:
+    raise RunnerUnavailableError("信号明细导出服务暂不可用")
+
+
+def create_signal_detail_export(
+  selection: dict[str, Any],
+  idempotency_key: str,
+) -> dict[str, Any]:
+  """固化当前用户的候选记录，但不在请求内读取完整回测结果。"""
+  owner_user_id = current_user_id()
+  canonical_selection = _canonical_backtest_selection(selection)
+  request_hash = _signal_export_request_hash(canonical_selection)
+  export_id = str(uuid4())
+  with _repeatable_read_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT * FROM backtest_signal_detail_export
+        WHERE owner_user_id=%s AND idempotency_key=%s
+      """, (owner_user_id, idempotency_key))
+      existing = cur.fetchone()
+      if existing is not None:
+        if existing["request_hash"] != request_hash:
+          raise ConflictError("同一幂等键不能用于不同的导出请求")
+        return _normalize_signal_export(existing)
+      _assert_signal_export_runner_available(cur)
+      if canonical_selection["mode"] == "ids":
+        _validate_explicit_backtest_selection(
+          cur, canonical_selection["runIds"], owner_user_id,
+        )
+      count_query, count_params = _backtest_selection_query(
+        canonical_selection, owner_user_id, columns="count(*) AS value", order_by="r.id",
+      )
+      count_query = count_query.rsplit("ORDER BY", 1)[0]
+      cur.execute(count_query, count_params)
+      selected_count = int(cur.fetchone()["value"])
+      if selected_count == 0:
+        raise ValueError("当前选择中没有可处理的终态回测")
+      cur.execute("""
+        INSERT INTO backtest_signal_detail_export (
+          id, owner_user_id, selection_mode, selection_snapshot,
+          idempotency_key, request_hash, selected_run_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+      """, (
+        export_id, owner_user_id, canonical_selection["mode"],
+        Jsonb(canonical_selection), idempotency_key, request_hash, selected_count,
+      ))
+      item_columns = """
+        row_number() OVER (ORDER BY r.display_no ASC, r.id ASC)::integer AS ordinal,
+        r.id,
+        r.display_no,
+        COALESCE(i.symbol || '.' || i.exchange, r.requested_params->>'symbol', ''),
+        COALESCE(r.requested_params->>'startDate', ''),
+        COALESCE(r.requested_params->>'endDate', '')
+      """
+      item_query, item_params = _backtest_selection_query(
+        canonical_selection,
+        owner_user_id,
+        columns=item_columns,
+        order_by="r.display_no ASC, r.id ASC",
+      )
+      cur.execute(f"""
+        INSERT INTO backtest_signal_detail_export_item (
+          export_id, ordinal, source_run_id, display_no, symbol, start_date, end_date
+        )
+        SELECT %s, selected.* FROM ({item_query}) selected
+      """, (export_id, *item_params))
+      cur.execute(
+        "SELECT * FROM backtest_signal_detail_export WHERE id=%s",
+        (export_id,),
+      )
+      return _normalize_signal_export(cur.fetchone())
+
+
+def _encode_signal_export_cursor(created_at: datetime, export_id: str) -> str:
+  raw = json.dumps([created_at.isoformat(), export_id], separators=(",", ":"))
+  return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_signal_export_cursor(value: str) -> tuple[datetime, str]:
+  try:
+    padded = value + "=" * (-len(value) % 4)
+    raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    created_at, export_id = json.loads(raw)
+    return datetime.fromisoformat(created_at), str(export_id)
+  except (ValueError, TypeError, json.JSONDecodeError) as error:
+    raise ValueError("无效的导出记录游标") from error
+
+
+def list_signal_detail_exports(limit: int, cursor: str | None) -> dict[str, Any]:
+  owner_user_id = current_user_id()
+  cursor_value = _decode_signal_export_cursor(cursor) if cursor else None
+  cursor_clause = " AND (created_at, id) < (%s, %s)" if cursor_value else ""
+  cursor_params: tuple[Any, ...] = cursor_value or ()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(f"""
+        SELECT * FROM backtest_signal_detail_export
+        WHERE owner_user_id=%s {cursor_clause}
+        ORDER BY created_at DESC, id DESC LIMIT %s
+      """, (owner_user_id, *cursor_params, limit + 1))
+      rows = cur.fetchall()
+      page = rows[:limit]
+      next_cursor = None
+      if len(rows) > limit and page:
+        next_cursor = _encode_signal_export_cursor(page[-1]["created_at"], str(page[-1]["id"]))
+      cur.execute("""
+        SELECT
+          count(*) FILTER (
+            WHERE status IN ('queued', 'preparing', 'running', 'cancelling')
+          ) AS active_count,
+          count(*) FILTER (
+            WHERE status='succeeded' AND expires_at > now()
+              AND last_downloaded_at IS NULL
+          ) AS undownloaded_count
+        FROM backtest_signal_detail_export WHERE owner_user_id=%s
+      """, (owner_user_id,))
+      summary = cur.fetchone()
+      return {
+        "items": [_normalize_signal_export(row) for row in page],
+        "nextCursor": next_cursor,
+        "activeCount": int(summary["active_count"] or 0),
+        "undownloadedSucceededCount": int(summary["undownloaded_count"] or 0),
+      }
+
+
+def get_signal_detail_export(export_id: str) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT * FROM backtest_signal_detail_export
+        WHERE id=%s AND owner_user_id=%s
+      """, (export_id, current_user_id()))
+      row = cur.fetchone()
+      if row is None:
+        raise KeyError(export_id)
+      return _normalize_signal_export(row)
+
+
+def cancel_signal_detail_export(export_id: str) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT * FROM backtest_signal_detail_export
+        WHERE id=%s AND owner_user_id=%s FOR UPDATE
+      """, (export_id, current_user_id()))
+      row = cur.fetchone()
+      if row is None:
+        raise KeyError(export_id)
+      if row["status"] == "queued":
+        cur.execute("""
+          UPDATE backtest_signal_detail_export
+          SET status='cancelled', cancel_requested=true, finished_at=now()
+          WHERE id=%s RETURNING *
+        """, (export_id,))
+        return _normalize_signal_export(cur.fetchone())
+      if row["status"] in {"preparing", "running"}:
+        cur.execute("""
+          UPDATE backtest_signal_detail_export
+          SET status='cancelling', cancel_requested=true
+          WHERE id=%s RETURNING *
+        """, (export_id,))
+        return _normalize_signal_export(cur.fetchone())
+      return _normalize_signal_export(row)
+
+
+def retry_signal_detail_export(
+  export_id: str,
+  idempotency_key: str,
+) -> dict[str, Any]:
+  owner_user_id = current_user_id()
+  request_hash = hashlib.sha256(f"retry:{export_id}".encode("ascii")).hexdigest()
+  new_export_id = str(uuid4())
+  with _repeatable_read_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT * FROM backtest_signal_detail_export
+        WHERE owner_user_id=%s AND idempotency_key=%s
+      """, (owner_user_id, idempotency_key))
+      existing = cur.fetchone()
+      if existing is not None:
+        if existing["request_hash"] != request_hash:
+          raise ConflictError("同一幂等键不能用于不同的导出请求")
+        return _normalize_signal_export(existing)
+      cur.execute("""
+        SELECT * FROM backtest_signal_detail_export
+        WHERE id=%s AND owner_user_id=%s FOR UPDATE
+      """, (export_id, owner_user_id))
+      source = cur.fetchone()
+      if source is None:
+        raise KeyError(export_id)
+      retryable = (
+        source["status"] in {"cancelled", "expired"}
+        or source["status"] == "failed"
+        and source.get("error_code") in {
+          "storage_unavailable", "archive_failed", "runner_interrupted",
+        }
+      )
+      if not retryable:
+        raise ValueError("当前导出任务不能重新导出")
+      _assert_signal_export_runner_available(cur)
+      snapshot = _json(source["selection_snapshot"], {})
+      snapshot["retrySourceExportId"] = export_id
+      cur.execute("""
+        INSERT INTO backtest_signal_detail_export (
+          id, owner_user_id, selection_mode, selection_snapshot,
+          idempotency_key, request_hash, selected_run_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+      """, (
+        new_export_id, owner_user_id, source["selection_mode"], Jsonb(snapshot),
+        idempotency_key, request_hash, source["selected_run_count"],
+      ))
+      cur.execute("""
+        INSERT INTO backtest_signal_detail_export_item (
+          export_id, ordinal, source_run_id, display_no, symbol, start_date, end_date
+        )
+        SELECT %s, ordinal, source_run_id, display_no, symbol, start_date, end_date
+        FROM backtest_signal_detail_export_item
+        WHERE export_id=%s ORDER BY ordinal
+      """, (new_export_id, export_id))
+      cur.execute(
+        "SELECT * FROM backtest_signal_detail_export WHERE id=%s",
+        (new_export_id,),
+      )
+      return _normalize_signal_export(cur.fetchone())
+
+
+def record_signal_export_runner_heartbeat(
+  worker_id: str,
+  status: str,
+  current_export_id: str | None = None,
+  error_code: str | None = None,
+) -> None:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        INSERT INTO backtest_signal_detail_export_runner_health (
+          worker_id, status, current_export_id, last_error_code
+        ) VALUES (%s, %s, %s, %s)
+        ON CONFLICT (worker_id) DO UPDATE SET
+          status=EXCLUDED.status,
+          current_export_id=EXCLUDED.current_export_id,
+          last_error_code=EXCLUDED.last_error_code,
+          heartbeat_at=now()
+      """, (worker_id, status, current_export_id, error_code))
+
+
+def claim_signal_detail_export(worker_id: str) -> dict[str, Any] | None:
+  attempt_token = str(uuid4())
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export
+        SET status='cancelled', finished_at=now(), attempt_token=NULL,
+          worker_id=NULL, lease_expires_at=NULL
+        WHERE status='cancelling' AND lease_expires_at < now()
+      """)
+      cur.execute("""
+        UPDATE backtest_signal_detail_export
+        SET status='failed', finished_at=now(), error_code='runner_interrupted',
+          error_message='导出执行器连续中断，请重新导出',
+          attempt_token=NULL, worker_id=NULL, lease_expires_at=NULL
+        WHERE status IN ('preparing', 'running') AND lease_expires_at < now()
+          AND attempt_no >= %s
+      """, (settings.SIGNAL_EXPORT_MAX_ATTEMPTS,))
+      cur.execute("""
+        SELECT id FROM backtest_signal_detail_export export
+        WHERE (
+          export.status IN ('preparing', 'running')
+          AND export.lease_expires_at < now()
+          AND export.attempt_no < %s
+        ) OR (
+          export.status='queued'
+          AND NOT EXISTS (
+            SELECT 1 FROM backtest_signal_detail_export active
+            WHERE active.owner_user_id=export.owner_user_id
+              AND active.status IN ('preparing', 'running', 'cancelling')
+          )
+        )
+        ORDER BY
+          CASE WHEN export.status IN ('preparing', 'running') THEN 0 ELSE 1 END,
+          COALESCE(export.lease_expires_at, export.created_at), export.id
+        FOR UPDATE SKIP LOCKED LIMIT 1
+      """, (settings.SIGNAL_EXPORT_MAX_ATTEMPTS,))
+      candidate = cur.fetchone()
+      if candidate is None:
+        return None
+      export_id = str(candidate["id"])
+      cur.execute("""
+        UPDATE backtest_signal_detail_export SET
+          status='preparing', prepared_run_count=0, processed_run_count=0,
+          total_run_count=NULL, excluded_run_count=NULL, exclusion_summary=NULL,
+          error_code=NULL, error_message=NULL, cancel_requested=false,
+          attempt_no=attempt_no + 1, attempt_token=%s, worker_id=%s,
+          lease_expires_at=now() + (%s * interval '1 second'),
+          started_at=COALESCE(started_at, now()), finished_at=NULL
+        WHERE id=%s RETURNING *
+      """, (
+        attempt_token, worker_id, settings.SIGNAL_EXPORT_LEASE_SECONDS, export_id,
+      ))
+      claimed = cur.fetchone()
+      cur.execute("""
+        UPDATE backtest_signal_detail_export_item
+        SET qualification_status='pending', exclusion_reason=NULL
+        WHERE export_id=%s
+      """, (export_id,))
+      normalized = _normalize_signal_export(claimed)
+      normalized.update({
+        "ownerUserId": _uuid(claimed["owner_user_id"]),
+        "attemptToken": attempt_token,
+      })
+      return normalized
+
+
+def heartbeat_signal_detail_export(export_id: str, attempt_token: str) -> bool:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export
+        SET lease_expires_at=now() + (%s * interval '1 second')
+        WHERE id=%s AND attempt_token=%s
+          AND status IN ('preparing', 'running', 'cancelling')
+      """, (settings.SIGNAL_EXPORT_LEASE_SECONDS, export_id, attempt_token))
+      return cur.rowcount == 1
+
+
+def get_signal_export_items(
+  export_id: str,
+  qualification_status: str,
+  after_ordinal: int = 0,
+  limit: int = 200,
+) -> list[dict[str, Any]]:
+  """按固定批次读取任务项，避免选择规模直接扩大执行器内存。"""
+  if after_ordinal < 0 or limit < 1 or limit > 1000:
+    raise ValueError("信号明细导出任务项分页参数无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT ordinal, source_run_id, display_no, symbol, start_date, end_date,
+          qualification_status, exclusion_reason
+        FROM backtest_signal_detail_export_item
+        WHERE export_id=%s AND qualification_status=%s AND ordinal>%s
+        ORDER BY ordinal LIMIT %s
+      """, (export_id, qualification_status, after_ordinal, limit))
+      return [dict(row) for row in cur.fetchall()]
+
+
+def get_signal_export_source(export_id: str, ordinal: int) -> dict[str, Any] | None:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT item.ordinal, item.source_run_id, item.display_no, item.symbol,
+          item.start_date, item.end_date, export.owner_user_id,
+          run.status, run.fill_model, run.requested_params, run.result_json,
+          run.params_snapshot->>'name' AS strategy_name
+        FROM backtest_signal_detail_export_item item
+        JOIN backtest_signal_detail_export export ON export.id=item.export_id
+        LEFT JOIN backtest_run run
+          ON run.id=item.source_run_id AND run.owner_user_id=export.owner_user_id
+        WHERE item.export_id=%s AND item.ordinal=%s
+      """, (export_id, ordinal))
+      row = cur.fetchone()
+      if row is None or row.get("status") is None:
+        return None
+      result = dict(row)
+      result["requested_params"] = _json(row.get("requested_params"), {})
+      result["result_json"] = _json(row.get("result_json"), None)
+      return result
+
+
+def classify_signal_export_item(
+  export_id: str,
+  attempt_token: str,
+  ordinal: int,
+  exclusion_reason: str | None,
+) -> bool:
+  qualification_status = "excluded" if exclusion_reason else "included"
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export_item item
+        SET qualification_status=%s, exclusion_reason=%s
+        FROM backtest_signal_detail_export export
+        WHERE item.export_id=export.id AND item.export_id=%s AND item.ordinal=%s
+          AND export.attempt_token=%s
+          AND export.status IN ('preparing', 'cancelling')
+      """, (
+        qualification_status, exclusion_reason, export_id, ordinal, attempt_token,
+      ))
+      if cur.rowcount != 1:
+        return False
+      cur.execute("""
+        UPDATE backtest_signal_detail_export
+        SET prepared_run_count=prepared_run_count + 1
+        WHERE id=%s AND attempt_token=%s
+          AND status IN ('preparing', 'cancelling')
+      """, (export_id, attempt_token))
+      return cur.rowcount == 1
+
+
+def finish_signal_export_preparation(export_id: str, attempt_token: str) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT qualification_status, exclusion_reason, count(*) AS value
+        FROM backtest_signal_detail_export_item
+        WHERE export_id=%s
+        GROUP BY qualification_status, exclusion_reason
+      """, (export_id,))
+      rows = cur.fetchall()
+      total = sum(
+        int(row["value"]) for row in rows
+        if row["qualification_status"] == "included"
+      )
+      exclusions = {
+        str(row["exclusion_reason"]): int(row["value"])
+        for row in rows if row["qualification_status"] == "excluded"
+      }
+      excluded = sum(exclusions.values())
+      if total == 0:
+        cur.execute("""
+          UPDATE backtest_signal_detail_export SET
+            status='failed', total_run_count=0, excluded_run_count=%s,
+            exclusion_summary=%s, error_code='no_exportable_runs',
+            error_message='所选回测中没有可导出的信号明细结果',
+            finished_at=now(), attempt_token=NULL, worker_id=NULL,
+            lease_expires_at=NULL
+          WHERE id=%s AND attempt_token=%s AND status='preparing'
+          RETURNING *
+        """, (excluded, Jsonb(exclusions), export_id, attempt_token))
+      else:
+        cur.execute("""
+          UPDATE backtest_signal_detail_export SET
+            status='running', total_run_count=%s, excluded_run_count=%s,
+            exclusion_summary=%s
+          WHERE id=%s AND attempt_token=%s AND status='preparing'
+          RETURNING *
+        """, (total, excluded, Jsonb(exclusions), export_id, attempt_token))
+      row = cur.fetchone()
+      if row is None:
+        raise ConflictError("信号明细导出任务租约已失效")
+      return _normalize_signal_export(row)
+
+
+def mark_signal_export_item_processed(export_id: str, attempt_token: str) -> bool:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export
+        SET processed_run_count=processed_run_count + 1
+        WHERE id=%s AND attempt_token=%s
+          AND status IN ('running', 'cancelling')
+      """, (export_id, attempt_token))
+      return cur.rowcount == 1
+
+
+def signal_export_should_cancel(export_id: str, attempt_token: str) -> bool:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT cancel_requested, status
+        FROM backtest_signal_detail_export
+        WHERE id=%s AND attempt_token=%s
+      """, (export_id, attempt_token))
+      row = cur.fetchone()
+      return row is None or bool(row["cancel_requested"]) or row["status"] == "cancelling"
+
+
+def finish_cancelled_signal_export(export_id: str, attempt_token: str) -> None:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export SET
+          status='cancelled', finished_at=now(), attempt_token=NULL,
+          worker_id=NULL, lease_expires_at=NULL
+        WHERE id=%s AND attempt_token=%s AND status='cancelling'
+      """, (export_id, attempt_token))
+
+
+def complete_signal_detail_export(
+  export_id: str,
+  attempt_token: str,
+  storage_key: str,
+  download_filename: str,
+  byte_size: int,
+  content_sha256: str,
+) -> None:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export SET
+          status='succeeded', storage_key=%s, download_filename=%s,
+          byte_size=%s, content_sha256=%s, finished_at=now(),
+          expires_at=now() + (%s * interval '1 hour'),
+          attempt_token=NULL, worker_id=NULL, lease_expires_at=NULL
+        WHERE id=%s AND attempt_token=%s AND status='running'
+      """, (
+        storage_key, download_filename, byte_size, content_sha256,
+        settings.SIGNAL_EXPORT_RETENTION_HOURS, export_id, attempt_token,
+      ))
+      if cur.rowcount != 1:
+        raise ConflictError("信号明细导出任务租约已失效")
+
+
+def fail_signal_detail_export(
+  export_id: str,
+  attempt_token: str,
+  error_code: str,
+  error_message: str,
+) -> None:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export SET
+          status='failed', error_code=%s, error_message=%s,
+          finished_at=now(), attempt_token=NULL, worker_id=NULL,
+          lease_expires_at=NULL
+        WHERE id=%s AND attempt_token=%s
+          AND status IN ('preparing', 'running')
+      """, (error_code, error_message[:500], export_id, attempt_token))
+
+
+def get_signal_detail_export_download(export_id: str) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT * FROM backtest_signal_detail_export
+        WHERE id=%s AND owner_user_id=%s
+      """, (export_id, current_user_id()))
+      row = cur.fetchone()
+      if row is None:
+        raise KeyError(export_id)
+      return dict(row)
+
+
+def mark_signal_detail_export_downloaded(export_id: str) -> None:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export SET last_downloaded_at=now()
+        WHERE id=%s AND owner_user_id=%s AND status='succeeded'
+      """, (export_id, current_user_id()))
+
+
+def expire_signal_detail_export(export_id: str, error_code: str | None = None) -> None:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export SET status='expired',
+          error_code=%s, error_message=CASE WHEN %s IS NULL THEN error_message
+            ELSE '信号明细文件不可用，请重新导出' END
+        WHERE id=%s AND owner_user_id=%s AND status='succeeded'
+      """, (error_code, error_code, export_id, current_user_id()))
+
+
+def cleanup_signal_detail_export_records() -> list[dict[str, Any]]:
+  """标记到期任务并返回仍需删除的文件，文件失败时下轮继续重试。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export SET status='expired'
+        WHERE status='succeeded' AND expires_at <= now()
+      """)
+      cur.execute("""
+        SELECT id, owner_user_id, storage_key
+        FROM backtest_signal_detail_export
+        WHERE status='expired' AND storage_key IS NOT NULL
+      """)
+      expired = [dict(row) for row in cur.fetchall()]
+      cur.execute("""
+        DELETE FROM backtest_signal_detail_export_runner_health
+        WHERE heartbeat_at < now() - interval '24 hours'
+      """)
+      return expired
+
+
+def mark_signal_export_artifact_cleaned(export_id: str) -> None:
+  """文件删除成功后清空附件元数据，保留过期任务用于页面展示。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_signal_detail_export SET
+          storage_key=NULL, byte_size=NULL, content_sha256=NULL
+        WHERE id=%s AND status='expired'
+      """, (export_id,))
+
+
+def signal_export_cleanup_inventory() -> dict[str, set[str]]:
+  """返回有效租约临时文件和任务表已登记正式文件的相对路径。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT id, owner_user_id, attempt_token
+        FROM backtest_signal_detail_export
+        WHERE status IN ('preparing', 'running', 'cancelling')
+          AND attempt_token IS NOT NULL AND lease_expires_at > now()
+      """)
+      active_parts = {
+        str(Path("signal-detail-exports") / str(row["owner_user_id"])
+          / f"{row['id']}.{row['attempt_token']}.part")
+        for row in cur.fetchall()
+      }
+      cur.execute("""
+        SELECT storage_key FROM backtest_signal_detail_export
+        WHERE storage_key IS NOT NULL
+      """)
+      storage_keys = {str(row["storage_key"]) for row in cur.fetchall()}
+      return {"activeParts": active_parts, "storageKeys": storage_keys}
+
+
+def prune_signal_detail_export_records() -> None:
+  """删除已超过页面保留期且没有待清理附件的终态任务。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        DELETE FROM backtest_signal_detail_export
+        WHERE status IN ('expired', 'failed', 'cancelled')
+          AND storage_key IS NULL
+          AND finished_at < now() - (%s * interval '1 day')
+      """, (settings.SIGNAL_EXPORT_TASK_RETENTION_DAYS,))
