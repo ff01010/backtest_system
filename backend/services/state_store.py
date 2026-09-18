@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Iterator
 from uuid import uuid4
 
