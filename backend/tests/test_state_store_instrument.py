@@ -32,3 +32,12 @@ def test_instrument_id_updates_existing_name_when_name_is_provided() -> None:
   state_store._instrument_id(cursor, "688981.SH", "中芯国际")
 
   assert cursor.params == ("688981", "SH", "中芯国际", "1.688981", "中芯国际")
+
+
+def test_instrument_search_matches_exact_symbol_with_exchange() -> None:
+  cursor = FakeCursor()
+
+  state_store._execute_instrument_search(cursor, "688981.SH", 20)
+
+  assert "symbol=%s AND exchange=%s" in cursor.query
+  assert cursor.params == ("688981", "SH", 20)
