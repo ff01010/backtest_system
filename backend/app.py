@@ -14,9 +14,10 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Literal
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 _viewer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _viewer_dir not in sys.path:
@@ -651,6 +652,7 @@ def startup():
 @app.get("/api/health")
 def health():
   runner_health = state_store.get_backtest_runner_health()
+  signal_export_healthy = state_store.signal_export_runner_available()
   return {
     "status": runner_health["status"],
     "backtest": "ok" if runner_health["status"] == "ok" else "unavailable",
@@ -659,6 +661,7 @@ def health():
     "clientCompatibilityVersion": settings.CLIENT_COMPATIBILITY_VERSION,
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "runtimeCapabilities": _verified_runtime_capabilities,
+    "signalExportRunner": {"healthy": signal_export_healthy},
   }
 
 
@@ -1309,6 +1312,154 @@ def backtest_runs(
   )
 
 
+def _stable_error(status_code: int, code: str, message: str) -> HTTPException:
+  return HTTPException(status_code, {"code": code, "message": message})
+
+
+def _idempotency_key(request: Request) -> str:
+  value = request.headers.get("idempotency-key", "").strip()
+  try:
+    return str(UUID(value))
+  except (ValueError, AttributeError) as error:
+    raise _stable_error(
+      422, "signal_export.selection_invalid", "Idempotency-Key 必须是 UUID",
+    ) from error
+
+
+def _selection_payload(selection: Any) -> dict[str, Any]:
+  return _model_dump(selection)
+
+
+@app.post("/api/backtest/runs/selection-summary")
+def backtest_run_selection_summary(
+  payload: schemas.BacktestRunSelectionRequest,
+) -> JSONResponse:
+  try:
+    summary = state_store.summarize_backtest_run_selection(
+      _selection_payload(payload.selection),
+    )
+  except KeyError as error:
+    raise _stable_error(404, "backtest.not_found", "部分回测记录不存在") from error
+  except ValueError as error:
+    raise _stable_error(422, "backtest.selection_invalid", str(error)) from error
+  return JSONResponse(summary, headers={"Cache-Control": "private, no-store"})
+
+
+@app.post("/api/backtest/signal-detail-exports")
+def create_signal_detail_export(
+  payload: schemas.SignalDetailExportCreateRequest,
+  request: Request,
+) -> JSONResponse:
+  try:
+    export = state_store.create_signal_detail_export(
+      _selection_payload(payload.selection), _idempotency_key(request),
+    )
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "部分回测记录不存在") from error
+  except state_store.RunnerUnavailableError as error:
+    raise _stable_error(503, "signal_export.runner_unavailable", str(error)) from error
+  except state_store.ConflictError as error:
+    raise _stable_error(409, "signal_export.idempotency_conflict", str(error)) from error
+  except ValueError as error:
+    raise _stable_error(422, "signal_export.selection_invalid", str(error)) from error
+  return JSONResponse(
+    {"export": export}, headers={"Cache-Control": "private, no-store"},
+  )
+
+
+@app.get("/api/backtest/signal-detail-exports")
+def signal_detail_exports(
+  limit: int = Query(20, ge=1, le=100),
+  cursor: str | None = None,
+) -> JSONResponse:
+  try:
+    result = state_store.list_signal_detail_exports(limit, cursor)
+  except ValueError as error:
+    raise _stable_error(422, "signal_export.selection_invalid", str(error)) from error
+  return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+
+
+@app.get("/api/backtest/signal-detail-exports/{export_id}")
+def signal_detail_export_detail(export_id: str) -> JSONResponse:
+  try:
+    export = state_store.get_signal_detail_export(export_id)
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "导出任务不存在") from error
+  return JSONResponse(
+    {"export": export}, headers={"Cache-Control": "private, no-store"},
+  )
+
+
+@app.post("/api/backtest/signal-detail-exports/{export_id}/cancel")
+def cancel_signal_detail_export(export_id: str) -> JSONResponse:
+  try:
+    export = state_store.cancel_signal_detail_export(export_id)
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "导出任务不存在") from error
+  return JSONResponse(
+    {"export": export}, headers={"Cache-Control": "private, no-store"},
+  )
+
+
+@app.post("/api/backtest/signal-detail-exports/{export_id}/retry")
+def retry_signal_detail_export(export_id: str, request: Request) -> JSONResponse:
+  try:
+    export = state_store.retry_signal_detail_export(
+      export_id, _idempotency_key(request),
+    )
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "导出任务不存在") from error
+  except state_store.RunnerUnavailableError as error:
+    raise _stable_error(503, "signal_export.runner_unavailable", str(error)) from error
+  except state_store.ConflictError as error:
+    raise _stable_error(409, "signal_export.idempotency_conflict", str(error)) from error
+  except ValueError as error:
+    raise _stable_error(409, "signal_export.state_conflict", str(error)) from error
+  return JSONResponse(
+    {"export": export}, headers={"Cache-Control": "private, no-store"},
+  )
+
+
+@app.get("/api/backtest/signal-detail-exports/{export_id}/download")
+def download_signal_detail_export(export_id: str) -> FileResponse:
+  try:
+    export = state_store.get_signal_detail_export_download(export_id)
+  except KeyError as error:
+    raise _stable_error(404, "signal_export.not_found", "导出任务不存在") from error
+  if export["status"] == "expired":
+    raise _stable_error(410, "signal_export.file_unavailable", "信号明细文件已过期")
+  if export["status"] != "succeeded":
+    raise _stable_error(409, "signal_export.state_conflict", "信号明细尚未生成完成")
+  expires_at = export.get("expires_at")
+  if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+    state_store.expire_signal_detail_export(export_id)
+    raise _stable_error(410, "signal_export.file_unavailable", "信号明细文件已过期")
+  artifact_root = Path(settings.OUTPUT_ROOT).resolve()
+  storage_key = str(export.get("storage_key") or "")
+  path = (artifact_root / storage_key).resolve()
+  try:
+    path.relative_to(artifact_root)
+  except ValueError as error:
+    logger.error("信号明细导出路径越界: export_id=%s", export_id)
+    state_store.expire_signal_detail_export(export_id, "artifact_missing")
+    raise _stable_error(410, "signal_export.file_unavailable", "信号明细文件不可用") from error
+  if not path.is_file() or path.stat().st_size != int(export.get("byte_size") or -1):
+    logger.error("信号明细导出文件缺失或大小不一致: export_id=%s", export_id)
+    state_store.expire_signal_detail_export(export_id, "artifact_missing")
+    raise _stable_error(410, "signal_export.file_unavailable", "信号明细文件不可用")
+  state_store.mark_signal_detail_export_downloaded(export_id)
+  return FileResponse(
+    path,
+    media_type="application/zip",
+    filename=str(export.get("download_filename") or "signal-details.zip"),
+    headers={
+      "Cache-Control": "private, no-store",
+      "ETag": f'"{export["content_sha256"]}"',
+      "Accept-Ranges": "bytes",
+    },
+  )
+
+
 @app.post("/api/backtest/runs/{run_id}/publication")
 def publish_backtest_run(
   run_id: str,
@@ -1829,11 +1980,21 @@ def cancel_backtest_run(run_id: str):
 @app.delete("/api/backtest/runs")
 def delete_backtest_runs(payload: schemas.BacktestRunBatchDeleteRequest):
   try:
-    deleted = state_store.delete_backtest_runs(payload.runIds)
+    if payload.selection is not None:
+      deleted = state_store.delete_backtest_run_selection(
+        _selection_payload(payload.selection),
+        int(payload.expectedSelectedRunCount or 0),
+        str(payload.expectedSelectionDigest or ""),
+      )
+    else:
+      deleted = state_store.delete_backtest_runs(payload.runIds or [])
   except KeyError as error:
-    raise HTTPException(404, str(error)) from error
+    raise _stable_error(404, "backtest.not_found", "部分回测记录不存在") from error
+  except state_store.SelectionChangedError as error:
+    raise _stable_error(409, "backtest.selection_changed", str(error)) from error
   except ValueError as error:
-    raise HTTPException(409, str(error)) from error
+    status_code = 422 if payload.selection is not None else 409
+    raise _stable_error(status_code, "backtest.selection_invalid", str(error)) from error
   return {"deleted": deleted}
 
 

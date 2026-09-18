@@ -113,7 +113,7 @@ check_active_backtests() {
 stop_submission_and_wait_for_backtests() {
   local attempt
   echo "停止 backend，阻断新的页面和开放 API 回测提交"
-  "${compose[@]}" stop frontend backend
+  "${compose[@]}" stop frontend backend signal-export-runner
   for attempt in $(seq 1 360); do
     if check_active_backtests; then
       echo "回测队列已排空，可以开始迁移和同批发布"
@@ -188,7 +188,9 @@ wait_for_application() {
     response="$(curl --fail --silent --show-error "$health_url" 2>/dev/null || true)"
     if runner_containers_ready "bar-runner" "$bar_replicas" \
       && runner_containers_ready "l2-runner" "$l2_replicas" \
+      && runner_containers_ready "signal-export-runner" "1" \
       && [[ "$response" == *'"status":"ok"'* ]] \
+      && [[ "$response" == *'"signalExportRunner":{"healthy":true}'* ]] \
       && [[ "$response" == *"\"applicationBuildId\":\"${APPLICATION_BUILD_ID}\""* ]] \
       && [[ "$response" == *"\"clientCompatibilityVersion\":${CLIENT_COMPATIBILITY_VERSION}"* ]]; then
       echo "发布完成，应用与 Runner 健康检查通过：$health_url"
@@ -317,7 +319,7 @@ verify_trade_calendar || fail "交易日历同步后校验失败"
 "${compose[@]}" up -d --build \
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \
-  strategy-worker backend bar-runner l2-runner
+  strategy-worker backend bar-runner l2-runner signal-export-runner
 "${compose[@]}" --profile release-admin build release-admin
 verify_release_admin_image
 # Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。

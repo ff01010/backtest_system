@@ -259,6 +259,44 @@ services:
       - quant-backtest-net
       - quant-backtest-l2-net
 
+  signal-export-runner:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    container_name: quant-backtest-signal-export-runner
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
+      TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_OUTPUT_ROOT: /runtime/artifacts
+      TREND_GRID_SIGNAL_EXPORT_RETENTION_HOURS: ${TREND_GRID_SIGNAL_EXPORT_RETENTION_HOURS:-24}
+      TREND_GRID_SIGNAL_EXPORT_TASK_RETENTION_DAYS: ${TREND_GRID_SIGNAL_EXPORT_TASK_RETENTION_DAYS:-30}
+      TREND_GRID_SIGNAL_EXPORT_STALE_PART_HOURS: ${TREND_GRID_SIGNAL_EXPORT_STALE_PART_HOURS:-24}
+      TREND_GRID_SIGNAL_EXPORT_CLEANUP_SECONDS: ${TREND_GRID_SIGNAL_EXPORT_CLEANUP_SECONDS:-300}
+      TREND_GRID_SIGNAL_EXPORT_MIN_FREE_BYTES: ${TREND_GRID_SIGNAL_EXPORT_MIN_FREE_BYTES:-536870912}
+    command: ['python', '-m', 'backend.signal_export_runner']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - quant-backtest-artifacts:/runtime/artifacts
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 128
+    healthcheck:
+      test: ['CMD', 'python', '-m', 'backend.signal_export_runner', '--healthcheck']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - quant-backtest-net
+
   frontend:
     build:
       context: ..

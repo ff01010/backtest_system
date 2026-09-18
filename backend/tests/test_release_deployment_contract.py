@@ -40,3 +40,29 @@ def test_deploy_script_rejects_incomplete_market_directory() -> None:
   assert script.index("\nverify_market_instrument_directory\n") < script.index(
     '\ngeneration="$(docker exec quant-backtest-postgres',
   )
+
+
+def test_signal_export_runner_is_deployed_and_health_checked_with_backend() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(
+    encoding="utf-8",
+  )
+
+  assert "signal-export-runner:" in compose
+  assert "python', '-m', 'backend.signal_export_runner" in compose
+  assert "quant-backtest-artifacts:/runtime/artifacts" in compose
+  assert "backend.signal_export_runner', '--healthcheck" in compose
+  assert "strategy-worker backend bar-runner l2-runner signal-export-runner" in script
+  assert 'runner_containers_ready "signal-export-runner" "1"' in script
+  assert '"signalExportRunner":{"healthy":true}' in script
+
+
+def test_signal_export_runner_health_is_readable_but_only_admin_writable() -> None:
+  migration = (
+    ROOT / "db" / "migrations" / "040_backtest_signal_detail_exports.sql"
+  ).read_text(encoding="utf-8")
+
+  assert "signal_detail_export_runner_read" in migration
+  assert "FOR SELECT\n  USING (true)" in migration
+  assert "signal_detail_export_runner_admin_write" in migration
+  assert "FOR ALL\n  USING (app.current_is_admin())" in migration

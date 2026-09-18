@@ -17,6 +17,12 @@ const apiMocks = vi.hoisted(() => ({
   searchMarketInstruments: vi.fn(),
   publishBacktestRun: vi.fn(),
   setBacktestRunFavorite: vi.fn(),
+  createSignalDetailExport: vi.fn(),
+  fetchSignalDetailExports: vi.fn(),
+  cancelSignalDetailExport: vi.fn(),
+  retrySignalDetailExport: vi.fn(),
+  summarizeBacktestRunSelection: vi.fn(),
+  deleteBacktestSelection: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
@@ -26,6 +32,7 @@ vi.mock('../api/client', () => ({
   createAccount: vi.fn(),
   deleteBacktestRun: vi.fn(),
   deleteBacktestRuns: vi.fn(),
+  deleteBacktestSelection: apiMocks.deleteBacktestSelection,
   deleteStrategyConfig: vi.fn(),
   fetchAccounts: vi.fn().mockResolvedValue([]),
   fetchStrategyConfigVersions: vi.fn().mockResolvedValue([]),
@@ -34,6 +41,12 @@ vi.mock('../api/client', () => ({
   runBacktest: vi.fn(),
   saveCompleteStrategy: vi.fn(),
   setBacktestRunFavorite: apiMocks.setBacktestRunFavorite,
+  createSignalDetailExport: apiMocks.createSignalDetailExport,
+  fetchSignalDetailExports: apiMocks.fetchSignalDetailExports,
+  cancelSignalDetailExport: apiMocks.cancelSignalDetailExport,
+  retrySignalDetailExport: apiMocks.retrySignalDetailExport,
+  signalDetailExportDownloadUrl: (exportId: string) => `/api/export/${exportId}`,
+  summarizeBacktestRunSelection: apiMocks.summarizeBacktestRunSelection,
   updateBacktestRunMeta: vi.fn(),
 }));
 
@@ -84,6 +97,7 @@ describe('BacktestPage history pagination', () => {
       return {
         runs: filtered.slice(offset, offset + limit),
         total: filtered.length,
+        selectableTotal: filtered.length,
         limit,
         offset,
         symbols: ['688981.SH'],
@@ -100,6 +114,23 @@ describe('BacktestPage history pagination', () => {
       isFavorited: favorited,
       favoritedAt: favorited ? '2026-09-16T10:30:00+08:00' : null,
     }));
+    apiMocks.fetchSignalDetailExports.mockResolvedValue({
+      items: [], nextCursor: null, activeCount: 0, undownloadedSucceededCount: 0,
+    });
+    apiMocks.createSignalDetailExport.mockResolvedValue({
+      id: 'export-1', selectionMode: 'ids', selectionSnapshot: {}, status: 'queued',
+      selectedRunCount: 2, preparedRunCount: 0, totalRunCount: null,
+      processedRunCount: 0, excludedRunCount: null, exclusionSummary: null,
+      cancelRequested: false, downloadFilename: null, byteSize: null,
+      contentSha256: null, errorCode: null, errorMessage: null,
+      lastDownloadedAt: null, createdAt: '2026-09-18T10:00:00+08:00',
+      startedAt: null, finishedAt: null, expiresAt: null,
+    });
+    apiMocks.summarizeBacktestRunSelection.mockResolvedValue({
+      selectedRunCount: 35,
+      selectionDigest: 'a'.repeat(64),
+    });
+    apiMocks.deleteBacktestSelection.mockResolvedValue(35);
   });
 
   it('can navigate to records after the first thirty', async () => {
@@ -236,11 +267,13 @@ describe('BacktestPage history pagination', () => {
     }));
 
     resolveLatest({
-      runs: [makeRun(2)], total: 1, limit: 10, offset: 0, symbols: ['688981.SH'],
+      runs: [makeRun(2)], total: 1, selectableTotal: 1,
+      limit: 10, offset: 0, symbols: ['688981.SH'],
     });
     expect(await screen.findByRole('button', { name: '#02' })).toBeTruthy();
     resolveOlder({
-      runs: [makeRun(1)], total: 1, limit: 10, offset: 0, symbols: ['688981.SH'],
+      runs: [makeRun(1)], total: 1, selectableTotal: 1,
+      limit: 10, offset: 0, symbols: ['688981.SH'],
     });
 
     await waitFor(() => expect(screen.queryByRole('button', { name: '#01' })).toBeNull());
@@ -322,6 +355,69 @@ describe('BacktestPage history pagination', () => {
       symbol: '',
       favoritesOnly: true,
     }));
+  });
+
+  it('uses one toolbar to export an explicit multi-selection', async () => {
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
+    await screen.findByText('显示 1-10 / 35 条实验');
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择历史回测 #35' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择历史回测 #34' }));
+    expect(screen.getByText('已选择 2 条')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '批量导出信号明细' }));
+
+    await waitFor(() => expect(apiMocks.createSignalDetailExport).toHaveBeenCalledWith(
+      { mode: 'ids', runIds: ['run-34', 'run-35'] },
+      expect.any(String),
+    ));
+    expect(await screen.findByRole('dialog', { name: '信号明细导出记录' })).toBeTruthy();
+  });
+
+  it('extends page selection to all filtered records for bulk deletion', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
+    await screen.findByText('显示 1-10 / 35 条实验');
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: '选择当前页中的全部可删除回测',
+    }));
+    fireEvent.click(screen.getByRole('button', {
+      name: '选择当前筛选结果中的全部 35 条',
+    }));
+    expect(screen.getAllByText('已选择 35 条').length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole('button', { name: '删除所选' }));
+
+    const selection = {
+      mode: 'filter', query: '', symbol: null, configId: null,
+      favoritesOnly: false, excludedRunIds: [],
+    };
+    await waitFor(() => expect(apiMocks.summarizeBacktestRunSelection)
+      .toHaveBeenCalledWith(selection));
+    await waitFor(() => expect(apiMocks.deleteBacktestSelection).toHaveBeenCalledWith(
+      selection, 35, 'a'.repeat(64),
+    ));
+    expect(confirm).toHaveBeenCalledWith('将永久删除 35 条历史回测，删除后无法恢复。');
+    confirm.mockRestore();
   });
 
   it('refreshes the filtered page after unfavoriting a run', async () => {

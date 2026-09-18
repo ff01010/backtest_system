@@ -19,7 +19,7 @@ import {
   createAccount,
   cancelBacktestRun,
   deleteBacktestRun,
-  deleteBacktestRuns,
+  deleteBacktestSelection,
   deleteStrategyConfig,
   fetchAccounts,
   fetchBacktestRunPage,
@@ -38,6 +38,8 @@ import {
   publishBacktestRun,
   setBacktestRunFavorite,
   updateBacktestRunMeta,
+  summarizeBacktestRunSelection,
+  ApiResponseError,
 } from '../api/client';
 import type {
   BacktestRunPayload,
@@ -62,8 +64,28 @@ import type {
 } from '../types';
 import { typography } from '../styles/typography';
 import { backtestErrorPresentation } from '../utils/backtestErrorPresentation';
+import {
+  areAllPageRunsSelected,
+  backtestRunFilterKey,
+  emptyBacktestRunSelection,
+  isBacktestRunSelected,
+  selectAllFilteredBacktestRuns,
+  selectedBacktestRunCount,
+  toBacktestRunSelection,
+  toggleBacktestRun,
+  toggleBacktestRunPage,
+} from '../utils/backtestRunSelection';
+import type { BacktestRunFilters } from '../utils/backtestRunSelection';
+import {
+  downloadSignalDetailCsv,
+  formatSignalTime,
+  getClosedLoopTradePnl,
+} from '../utils/signalDetailCsv';
+export { getClosedLoopTradePnl } from '../utils/signalDetailCsv';
+import { useSignalDetailExports } from '../hooks/useSignalDetailExports';
 import BacktestTabs from './BacktestTabs';
 import InstrumentSearchField from './InstrumentSearchField';
+import SignalDetailExportDrawer from './SignalDetailExportDrawer';
 import StrategyGuideDrawer from './StrategyGuideDrawer';
 
 import BacktestDateRangePicker from './BacktestDateRangePicker';
@@ -110,6 +132,14 @@ const fieldStyle = {
   padding: '0 10px',
   fontSize: typography.base,
 } as const;
+
+const SELECTABLE_HISTORY_RUN_STATUSES = new Set([
+  'ok', 'succeeded', 'error', 'failed', 'cancelled',
+]);
+
+function isSelectableHistoryRun(run: BacktestRunHistory): boolean {
+  return SELECTABLE_HISTORY_RUN_STATUSES.has(run.status);
+}
 
 export function StrategyStudioErrorNotice({ message }: { message: string }) {
   if (!message) return null;
@@ -506,22 +536,6 @@ export function formatTradeNote(direction: string, note: string, fundingLimited 
   return fundingLimited ? baseNote + '；资金不足限制，已成交可负担部分' : baseNote;
 }
 
-const CLOSED_TRADE_ACTION_PATTERN = /(CLOSE|COVER|STOP|FORCE)/;
-const OVERLAY_CLOSE_EFFECTS = new Set(['partial_close', 'close', 'reverse']);
-
-export function getClosedLoopTradePnl(trade: BacktestTrade, isOverlayResult: boolean): number | null {
-  if (trade.status && trade.status !== 'filled') return null;
-  if (isOverlayResult) {
-    if (!OVERLAY_CLOSE_EFFECTS.has(trade.cycleEffect || '')) return null;
-    return typeof trade.realizedOverlayPnl === 'number' && Number.isFinite(trade.realizedOverlayPnl)
-      ? trade.realizedOverlayPnl
-      : null;
-  }
-  const action = String(trade.action || trade.direction).toUpperCase();
-  if (!CLOSED_TRADE_ACTION_PATTERN.test(action) && trade.pnl === 0) return null;
-  return Number.isFinite(trade.pnl) ? trade.pnl : null;
-}
-
 function getOverlayCycleEffectLabel(value: string): string {
   const labels: Record<string, string> = {
     open: '开启周期',
@@ -545,18 +559,6 @@ function getOverlayCycleTradeDisplay(trade: BacktestTrade, cycleId: string) {
       ? realizedPnl
       : null,
   };
-}
-
-function formatSignalTime(value: string): string {
-  if (!value) return '-';
-  const compact = value.replace(/\D/g, '');
-  if (compact.length >= 12) {
-    return `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)} ${compact.slice(8, 10)}:${compact.slice(10, 12)}`;
-  }
-  if (compact.length === 8) {
-    return `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
-  }
-  return value;
 }
 
 function formatElapsedTime(startedAt: string, now: number): string {
@@ -767,23 +769,6 @@ function buildDailyBars(points: EquityPoint[], benchmarkPoints: BenchmarkPoint[]
       excess: point.pnl - (benchmarkReturn - previousBenchmark) * (points[index - 1]?.value || point.value),
     };
   });
-}
-
-function downloadCsv(filename: string, rows: Array<Record<string, string | number>>) {
-  if (rows.length === 0) return;
-  const headers = Object.keys(rows[0]);
-  const escapeCell = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`;
-  const csv = [
-    headers.join(','),
-    ...rows.map((row) => headers.map((header) => escapeCell(row[header])).join(',')),
-  ].join('\n');
-  const blob = new Blob([`\ufeff${csv}`], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(url);
 }
 
 const HISTORY_VALUE_LABELS: Record<string, string> = {
@@ -1261,7 +1246,7 @@ export default function BacktestPage({
   const [configVersions, setConfigVersions] = useState<StrategyConfigVersion[]>([]);
   const [backtestRuns, setBacktestRuns] = useState<BacktestRunHistory[]>([]);
   const [historyRunDetails, setHistoryRunDetails] = useState<Record<string, BacktestRunHistory>>({});
-  const [selectedHistoryRunIds, setSelectedHistoryRunIds] = useState<Set<string>>(new Set());
+  const [historySelection, setHistorySelection] = useState(emptyBacktestRunSelection);
   const [selectedHistoryRunId, setSelectedHistoryRunId] = useState<string | ''>('');
   const [compareHistoryRunId, setCompareHistoryRunId] = useState<string | ''>('');
   const [historyQuery, setHistoryQuery] = useState('');
@@ -1273,6 +1258,7 @@ export default function BacktestPage({
   const [historyPage, setHistoryPage] = useState(1);
   const [historyPageSize, setHistoryPageSize] = useState(10);
   const [historyTotal, setHistoryTotal] = useState(0);
+  const [historySelectableTotal, setHistorySelectableTotal] = useState(0);
   const [historySymbols, setHistorySymbols] = useState<string[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyLoadError, setHistoryLoadError] = useState('');
@@ -1286,6 +1272,9 @@ export default function BacktestPage({
   const [publicationTags, setPublicationTags] = useState('');
   const [publicationError, setPublicationError] = useState('');
   const [publishingRun, setPublishingRun] = useState(false);
+  const [signalExportDrawerOpen, setSignalExportDrawerOpen] = useState(false);
+  const [creatingSignalExport, setCreatingSignalExport] = useState(false);
+  const [deletingHistorySelection, setDeletingHistorySelection] = useState(false);
   const [selectedScriptId, setSelectedScriptId] = useState<string>('');
   const [selectedConfigId, setSelectedConfigId] = useState<string>('');
   const lastRequestedConfigIdRef = useRef<string | null>(null);
@@ -1320,6 +1309,30 @@ export default function BacktestPage({
   }, [versionDirty]);
 
   const [activePanel, setActivePanel] = useState<WorkbenchPanel>('overview');
+  const signalDetailExports = useSignalDetailExports(activePanel === 'history');
+  const historyFilters: BacktestRunFilters = useMemo(() => ({
+    query: historyQuery,
+    symbol: historySymbolFilter,
+    configId: null,
+    favoritesOnly: historyFavoritesOnly,
+  }), [historyFavoritesOnly, historyQuery, historySymbolFilter]);
+  const historyFilterKey = backtestRunFilterKey(historyFilters);
+  const previousHistoryFilterKey = useRef(historyFilterKey);
+
+  useEffect(() => {
+    if (previousHistoryFilterKey.current === historyFilterKey) return;
+    previousHistoryFilterKey.current = historyFilterKey;
+    if (selectedBacktestRunCount(historySelection) > 0) {
+      setHistorySelection(emptyBacktestRunSelection());
+      setStatus('筛选条件已变化，请重新选择');
+    }
+  }, [historyFilterKey, historySelection]);
+
+  useEffect(() => {
+    if (!signalDetailExports.notice) return;
+    setStatus(signalDetailExports.notice);
+    signalDetailExports.clearNotice();
+  }, [signalDetailExports.notice]);
   const [chartRange, setChartRange] = useState<ChartRange>('all');
   const [showStrategyCurve, setShowStrategyCurve] = useState(true);
   const [showBenchmarkCurve, setShowBenchmarkCurve] = useState(true);
@@ -1664,14 +1677,6 @@ export default function BacktestPage({
   }, [backtestRuns]);
 
   useEffect(() => {
-    setSelectedHistoryRunIds((previous) => {
-      const available = new Set(backtestRuns.map((run) => run.id));
-      const next = new Set([...previous].filter((runId) => available.has(runId)));
-      return next.size === previous.size ? previous : next;
-    });
-  }, [backtestRuns]);
-
-  useEffect(() => {
     if (selectedHistoryRunId === '' || compareHistoryRunId === '') return;
     if (selectedHistoryRunId === compareHistoryRunId) {
       const nextCompare = backtestRuns.find((item) => item.id !== selectedHistoryRunId);
@@ -1760,6 +1765,9 @@ export default function BacktestPage({
       if (requestId !== historyRequestIdRef.current) return;
       const lastPage = Math.max(1, Math.ceil(page.total / historyPageSize));
       setHistoryTotal(page.total);
+      setHistorySelectableTotal(
+        page.selectableTotal ?? page.runs.filter(isSelectableHistoryRun).length,
+      );
       setHistorySymbols(page.symbols);
       if (targetPage > lastPage) {
         setHistoryPage(lastPage);
@@ -2885,13 +2893,19 @@ export default function BacktestPage({
   const historyParamDiffs = compareHistoryRuns(selectedHistoryRun, compareHistoryRun);
   const filteredHistoryRuns = backtestRuns;
   const deletableFilteredHistoryRuns = filteredHistoryRuns.filter(
-    (run) => run.status !== 'queued' && run.status !== 'running' && run.status !== 'cancelling',
+    isSelectableHistoryRun,
   );
-  const selectedDeletableHistoryRunIds = deletableFilteredHistoryRuns
-    .filter((run) => selectedHistoryRunIds.has(run.id))
-    .map((run) => run.id);
-  const allDeletableHistoryRunsSelected = deletableFilteredHistoryRuns.length > 0
-    && selectedDeletableHistoryRunIds.length === deletableFilteredHistoryRuns.length;
+  const deletablePageRunIds = deletableFilteredHistoryRuns.map((run) => run.id);
+  const selectedHistoryRunCount = selectedBacktestRunCount(historySelection);
+  const allDeletableHistoryRunsSelected = areAllPageRunsSelected(
+    historySelection, deletablePageRunIds,
+  );
+  const showSelectAllHistoryPrompt = historySelection.mode === 'ids'
+    && allDeletableHistoryRunsSelected
+    && historySelectableTotal > selectedHistoryRunCount;
+  const showAllFilteredHistoryBanner = historySelection.mode === 'filter';
+  const hasHistorySelectionBanner = showSelectAllHistoryPrompt
+    || showAllFilteredHistoryBanner;
   const historyPageCount = Math.max(1, Math.ceil(historyTotal / historyPageSize));
   const safeHistoryPage = Math.min(historyPage, historyPageCount);
   const historyPageStart = (safeHistoryPage - 1) * historyPageSize;
@@ -2907,24 +2921,10 @@ export default function BacktestPage({
   const statusColor = error ? '#b91c1c' : status ? '#0f766e' : '#94a3b8';
   const statusBackground = error ? '#fef2f2' : status ? '#ecfdf5' : '#f8fafc';
   const handleExportTrades = () => {
-    downloadCsv(
+    downloadSignalDetailCsv(
       `trades_${selectedSymbol}_${params.startDate}_${params.endDate}.csv`,
-      filteredTrades.map((trade) => ({
-        signalTime: formatSignalTime(trade.signalTime || trade.time),
-        executionTime: formatSignalTime(trade.executionTime || trade.time),
-        status: trade.status === 'skipped' ? '已跳过' : '已成交',
-        direction: trade.direction,
-        side: trade.side,
-        action: trade.action || trade.direction,
-        price: trade.price,
-        priceSource: trade.priceSource || '成交模型价格',
-        quantity: trade.quantity,
-        pnl: getClosedLoopTradePnl(trade, isOverlayResult) ?? '',
-        researchSignalId: trade.researchSignalId || '',
-        researchSignalAction: trade.researchSignalAction || '',
-        researchSignalEffectiveAt: trade.researchSignalEffectiveAt || '',
-        note: trade.note,
-      }))
+      filteredTrades,
+      isOverlayResult,
     );
   };
 
@@ -3161,7 +3161,7 @@ export default function BacktestPage({
   };
 
   const handleDeleteBacktestRun = async (run: BacktestRunHistory) => {
-    if (run.status === 'queued' || run.status === 'running' || run.status === 'cancelling') {
+    if (!isSelectableHistoryRun(run)) {
       setError('排队或运行中的回测不能删除，请先取消任务。');
       return;
     }
@@ -3173,11 +3173,7 @@ export default function BacktestPage({
     setStatus('');
     try {
       await deleteBacktestRun(run.id);
-      setSelectedHistoryRunIds((previous) => {
-        const next = new Set(previous);
-        next.delete(run.id);
-        return next;
-      });
+      setHistorySelection((previous) => toggleBacktestRun(previous, run.id, false));
       if (selectedHistoryRunId === run.id) setSelectedHistoryRunId('');
       if (compareHistoryRunId === run.id) setCompareHistoryRunId('');
       await refreshBacktestRuns();
@@ -3230,37 +3226,95 @@ export default function BacktestPage({
   };
 
   const toggleHistoryRunSelection = (runId: string, checked: boolean) => {
-    setSelectedHistoryRunIds((previous) => {
-      const next = new Set(previous);
-      if (checked) next.add(runId);
-      else next.delete(runId);
-      return next;
-    });
+    setHistorySelection((previous) => toggleBacktestRun(previous, runId, checked));
   };
 
   const toggleAllHistoryRunSelections = (checked: boolean) => {
-    setSelectedHistoryRunIds(checked ? new Set(deletableFilteredHistoryRuns.map((run) => run.id)) : new Set());
+    setHistorySelection((previous) => toggleBacktestRunPage(
+      previous, deletablePageRunIds, checked,
+    ));
+  };
+
+  const handleSelectAllFilteredHistoryRuns = () => {
+    setHistorySelection(selectAllFilteredBacktestRuns(
+      historyFilters, historySelectableTotal,
+    ));
+  };
+
+  const handleCreateSignalDetailExport = async () => {
+    if (selectedHistoryRunCount === 0) return;
+    setCreatingSignalExport(true);
+    setError('');
+    try {
+      const task = await signalDetailExports.create(
+        toBacktestRunSelection(historySelection),
+      );
+      setHistorySelection(emptyBacktestRunSelection());
+      setSignalExportDrawerOpen(true);
+      setStatus(`已创建 ${task.selectedRunCount} 条回测的信号明细导出任务`);
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : '创建信号明细导出失败');
+    } finally {
+      setCreatingSignalExport(false);
+    }
   };
 
   const handleDeleteSelectedHistoryRuns = async () => {
-    const runIds = selectedDeletableHistoryRunIds;
-    if (runIds.length === 0) return;
-    const confirmed = window.confirm(
-      `确认永久删除选中的 ${runIds.length} 条历史回测吗？\n该操作会删除数据库中的回测记录和关联任务数据，无法恢复。`,
-    );
-    if (!confirmed) return;
+    if (selectedHistoryRunCount === 0) return;
+    const selection = toBacktestRunSelection(historySelection);
+    setDeletingHistorySelection(true);
     setError('');
-    setStatus('');
+    setStatus('正在核对删除范围');
     try {
-      const deleted = await deleteBacktestRuns(runIds);
-      const deletedIds = new Set(runIds);
-      if (selectedHistoryRunId && deletedIds.has(selectedHistoryRunId)) setSelectedHistoryRunId('');
-      if (compareHistoryRunId && deletedIds.has(compareHistoryRunId)) setCompareHistoryRunId('');
-      setSelectedHistoryRunIds(new Set());
+      const summary = await summarizeBacktestRunSelection(selection);
+      const confirmed = window.confirm(
+        `将永久删除 ${summary.selectedRunCount} 条历史回测，删除后无法恢复。`,
+      );
+      if (!confirmed) {
+        setStatus('');
+        return;
+      }
+      const deleted = await deleteBacktestSelection(
+        selection, summary.selectedRunCount, summary.selectionDigest,
+      );
+      setSelectedHistoryRunId('');
+      setCompareHistoryRunId('');
+      setHistorySelection(emptyBacktestRunSelection());
       await refreshBacktestRuns();
       setStatus(`已永久删除 ${deleted} 条历史回测`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '批量删除历史回测失败');
+    } catch (deleteError) {
+      if (
+        deleteError instanceof ApiResponseError
+        && deleteError.code === 'backtest.selection_changed'
+      ) {
+        setError('选择范围已变化，请重新确认');
+      } else {
+        setError(
+          deleteError instanceof Error ? deleteError.message : '批量删除历史回测失败',
+        );
+      }
+    } finally {
+      setDeletingHistorySelection(false);
+    }
+  };
+
+  const handleCancelSignalExport = async (exportId: string) => {
+    setError('');
+    try {
+      await signalDetailExports.cancel(exportId);
+      setStatus('正在取消信号明细导出');
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : '取消信号明细导出失败');
+    }
+  };
+
+  const handleRetrySignalExport = async (exportId: string) => {
+    setError('');
+    try {
+      await signalDetailExports.retry(exportId);
+      setStatus('已重新创建信号明细导出任务');
+    } catch (retryError) {
+      setError(retryError instanceof Error ? retryError.message : '重新导出信号明细失败');
     }
   };
 
@@ -3283,6 +3337,16 @@ export default function BacktestPage({
           {preflightNotice}
         </div>
       )}
+
+      <SignalDetailExportDrawer
+        open={signalExportDrawerOpen}
+        tasks={signalDetailExports.tasks}
+        loading={signalDetailExports.loading}
+        onClose={() => setSignalExportDrawerOpen(false)}
+        onCancel={handleCancelSignalExport}
+        onRetry={handleRetrySignalExport}
+        onRefresh={signalDetailExports.refresh}
+      />
 
       {publicationRun && (
         <div
@@ -4874,21 +4938,29 @@ export default function BacktestPage({
                         每次回测会保存代码、参数与行情数据快照。
                       </div>
                     </div>
-                    <button
-                      onClick={() => void refreshBacktestRuns()}
-                      disabled={historyLoading}
-                      style={{
-                        height: 34,
-                        borderRadius: 4,
-                        border: '1px solid #cbd5e1',
-                        background: '#f8fafc',
-                        color: '#334155',
-                        cursor: historyLoading ? 'wait' : 'pointer',
-                        padding: '0 12px',
-                      }}
-                    >
-                      {historyLoading ? '刷新中...' : '刷新'}
-                    </button>
+                    <span className="history-heading-actions">
+                      <button
+                        type="button"
+                        className="app-button is-quiet"
+                        onClick={() => {
+                          setSignalExportDrawerOpen(true);
+                          void signalDetailExports.refresh();
+                        }}
+                      >
+                        信号明细导出记录
+                        {signalDetailExports.activeCount > 0
+                          ? ` (${signalDetailExports.activeCount})`
+                          : signalDetailExports.undownloadedCount > 0 ? ' · 有新文件' : ''}
+                      </button>
+                      <button
+                        type="button"
+                        className="app-button is-quiet"
+                        onClick={() => void refreshBacktestRuns()}
+                        disabled={historyLoading}
+                      >
+                        {historyLoading ? '刷新中...' : '刷新'}
+                      </button>
+                    </span>
                   </div>
                   <div className="history-index-controls" style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
                     <input
@@ -4929,13 +5001,61 @@ export default function BacktestPage({
                       {historyLoadError}
                     </div>
                   )}
-                  {selectedDeletableHistoryRunIds.length > 0 && (
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 14, padding: '8px 10px', border: '1px solid #fecaca', borderRadius: 4, background: '#fff1f2', color: '#9f1239', fontSize: 12 }}>
-                      <span>已选 {selectedDeletableHistoryRunIds.length} 条</span>
-                      <span style={{ display: 'flex', gap: 8 }}>
-                        <button onClick={() => setSelectedHistoryRunIds(new Set())} style={{ height: 28, borderRadius: 4, border: '1px solid #cbd5e1', background: '#ffffff', color: '#334155', cursor: 'pointer' }}>取消选择</button>
-                        <button onClick={() => void handleDeleteSelectedHistoryRuns()} style={{ height: 28, borderRadius: 4, border: '1px solid #fecaca', background: '#be123c', color: '#ffffff', cursor: 'pointer' }}>删除所选</button>
-                      </span>
+                  {selectedHistoryRunCount > 0 && (
+                    <div style={{ marginBottom: 14 }}>
+                      {showSelectAllHistoryPrompt && (
+                          <div style={{
+                            padding: '8px 10px', border: '1px solid #bae6fd',
+                            borderBottom: 'none', borderRadius: '4px 4px 0 0',
+                            background: '#f0f9ff', color: '#075985', fontSize: 12,
+                          }}>
+                            本页 {deletablePageRunIds.length} 条可操作记录已全部选择。{' '}
+                            <button
+                              type="button"
+                              onClick={handleSelectAllFilteredHistoryRuns}
+                              style={{ border: 'none', background: 'transparent', color: '#0369a1', padding: 0, fontWeight: 700, cursor: 'pointer' }}
+                            >
+                              选择当前筛选结果中的全部 {historySelectableTotal} 条
+                            </button>
+                          </div>
+                      )}
+                      {showAllFilteredHistoryBanner && (
+                        <div style={{
+                          padding: '8px 10px', border: '1px solid #bae6fd',
+                          borderBottom: 'none', borderRadius: '4px 4px 0 0',
+                          background: '#f0f9ff', color: '#075985', fontSize: 12,
+                        }}>
+                          已选择当前筛选结果中的全部 {selectedHistoryRunCount} 条
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '8px 10px', border: '1px solid #99f6e4', borderRadius: hasHistorySelectionBanner ? '0 0 4px 4px' : 4, background: '#f0fdfa', color: '#115e59', fontSize: 12 }}>
+                        <span>已选择 {selectedHistoryRunCount} 条</span>
+                        <span className="history-selection-actions">
+                          <button
+                            type="button"
+                            className="app-button is-quiet is-compact"
+                            onClick={() => setHistorySelection(emptyBacktestRunSelection())}
+                          >
+                            取消选择
+                          </button>
+                          <button
+                            type="button"
+                            className="app-button is-primary is-compact"
+                            onClick={() => void handleCreateSignalDetailExport()}
+                            disabled={creatingSignalExport || deletingHistorySelection}
+                          >
+                            {creatingSignalExport ? '正在创建...' : '批量导出信号明细'}
+                          </button>
+                          <button
+                            type="button"
+                            className="app-button is-danger-solid is-compact"
+                            onClick={() => void handleDeleteSelectedHistoryRuns()}
+                            disabled={creatingSignalExport || deletingHistorySelection}
+                          >
+                            {deletingHistorySelection ? '正在核对...' : '删除所选'}
+                          </button>
+                        </span>
+                      </div>
                     </div>
                   )}
                   <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 16 }}>
@@ -4956,10 +5076,10 @@ export default function BacktestPage({
                       {filteredHistoryRuns.length > 0 ? (
                         pagedHistoryRuns.map((run) => {
                           const isSelected = run.id === selectedHistoryRunId;
-                          const deletable = run.status !== 'queued' && run.status !== 'running' && run.status !== 'cancelling';
+                          const deletable = isSelectableHistoryRun(run);
                           return (
                             <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} onDoubleClick={() => handleViewHistoryResult(run)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
-                              <input type="checkbox" checked={selectedHistoryRunIds.has(run.id)} disabled={!deletable} onClick={(event) => event.stopPropagation()} onChange={(event) => toggleHistoryRunSelection(run.id, event.target.checked)} aria-label={`选择历史回测 ${formatRunReference(run.displayNo)}`} />
+                              <input type="checkbox" checked={deletable && isBacktestRunSelected(historySelection, run.id)} disabled={!deletable} onClick={(event) => event.stopPropagation()} onChange={(event) => toggleHistoryRunSelection(run.id, event.target.checked)} aria-label={`选择历史回测 ${formatRunReference(run.displayNo)}`} />
                               <button
                                 type="button"
                                 className={`history-favorite-button${run.isFavorited ? ' is-active' : ''}`}
@@ -5016,35 +5136,22 @@ export default function BacktestPage({
                                   </div>
                                 )}
                               </span>
-                              <span style={{ display: 'flex', gap: 4 }}>
+                              <span className="history-row-actions">
                                 <button
+                                  type="button"
+                                  className="app-button is-quiet is-compact"
                                   onClick={() => handleApplyBacktestRun(run)}
-                                  style={{
-                                    height: 28,
-                                    borderRadius: 4,
-                                    border: '1px solid #cbd5e1',
-                                    background: '#f8fafc',
-                                    color: '#334155',
-                                    cursor: 'pointer',
-                                  }}
                                 >
                                   复制
                                 </button>
                                 <button
+                                  type="button"
+                                  className="app-button is-danger is-compact"
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     void handleDeleteBacktestRun(run);
                                   }}
-                                  disabled={run.status === 'queued' || run.status === 'running' || run.status === 'cancelling'}
-                                  style={{
-                                    height: 28,
-                                    borderRadius: 4,
-                                    border: '1px solid #fecaca',
-                                    background: '#fff1f2',
-                                    color: '#be123c',
-                                    cursor: run.status === 'queued' || run.status === 'running' || run.status === 'cancelling' ? 'not-allowed' : 'pointer',
-                                    opacity: run.status === 'queued' || run.status === 'running' || run.status === 'cancelling' ? 0.55 : 1,
-                                  }}
+                                  disabled={!deletable}
                                 >
                                   删除
                                 </button>

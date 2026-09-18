@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fetchBacktestRunPage } from '../api/client';
 
 
-describe('backtest history pagination', () => {
+describe('backtest history API pagination', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });

@@ -2,7 +2,8 @@
 """Pydantic 响应模型"""
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
+from uuid import UUID
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.date_codec import TradingDateError, format_api_date
@@ -608,8 +609,51 @@ class BacktestRunFavoriteUpdate(BaseModel):
   favorited: bool
 
 
+class BacktestRunIdSelection(BaseModel):
+  mode: Literal["ids"]
+  runIds: list[UUID] = Field(min_length=1)
+
+
+class BacktestRunFilterSelection(BaseModel):
+  mode: Literal["filter"]
+  query: str = Field(default="", max_length=100)
+  symbol: str | None = Field(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$")
+  configId: str | None = None
+  favoritesOnly: bool = False
+  excludedRunIds: list[UUID] = Field(default_factory=list)
+
+
+BacktestRunSelection = Annotated[
+  BacktestRunIdSelection | BacktestRunFilterSelection,
+  Field(discriminator="mode"),
+]
+
+
 class BacktestRunBatchDeleteRequest(BaseModel):
-  runIds: list[str] = Field(min_length=1, max_length=100)
+  runIds: list[str] | None = Field(default=None, min_length=1, max_length=100)
+  selection: BacktestRunSelection | None = None
+  expectedSelectedRunCount: int | None = Field(default=None, gt=0)
+  expectedSelectionDigest: str | None = Field(
+    default=None, pattern=r"^[0-9a-f]{64}$",
+  )
+
+  @model_validator(mode="after")
+  def validate_delete_shape(self) -> "BacktestRunBatchDeleteRequest":
+    if (self.runIds is None) == (self.selection is None):
+      raise ValueError("runIds 和 selection 必须且只能提供一个")
+    if self.selection is not None and (
+      self.expectedSelectedRunCount is None or self.expectedSelectionDigest is None
+    ):
+      raise ValueError("公共选择删除必须携带已确认的数量和摘要")
+    return self
+
+
+class BacktestRunSelectionRequest(BaseModel):
+  selection: BacktestRunSelection
+
+
+class SignalDetailExportCreateRequest(BaseModel):
+  selection: BacktestRunSelection
 
 
 class BacktestCapacityOverrideRequest(BaseModel):

@@ -102,6 +102,105 @@ button, input, select, textarea {
   font-variant-numeric: tabular-nums;
 }
 
+.app-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+  padding: 0 12px;
+  text-decoration: none;
+  white-space: nowrap;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    color 140ms ease,
+    transform 140ms ease;
+}
+
+.app-button:not(:disabled):active {
+  transform: translateY(1px);
+}
+
+.app-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.app-button.is-quiet {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.app-button.is-quiet:not(:disabled):hover {
+  border-color: var(--accent);
+  background: var(--surface-accent);
+  color: var(--accent-strong);
+}
+
+.app-button.is-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 2px 7px rgba(15, 118, 110, 0.16);
+}
+
+.app-button.is-primary:not(:disabled):hover {
+  border-color: var(--accent-strong);
+  background: var(--accent-strong);
+  box-shadow: 0 4px 10px rgba(15, 118, 110, 0.20);
+}
+
+.app-button.is-danger {
+  border-color: color-mix(in srgb, var(--danger) 36%, var(--border));
+  background: var(--surface);
+  color: var(--danger);
+}
+
+.app-button.is-danger:not(:disabled):hover {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.app-button.is-danger-solid {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #ffffff;
+}
+
+.app-button.is-danger-solid:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--danger) 84%, #000);
+  background: color-mix(in srgb, var(--danger) 84%, #000);
+}
+
+.app-button.is-compact {
+  min-height: 28px;
+  padding: 0 9px;
+}
+
+.history-heading-actions,
+.history-selection-actions,
+.history-row-actions,
+.signal-export-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.history-heading-actions,
+.history-selection-actions,
+.signal-export-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .workspace-shell {
   background: var(--canvas) !important;
 }

@@ -107,6 +107,7 @@ def test_history_page_exposes_records_after_the_first_thirty(monkeypatch: Any) -
 
   assert [run["displayNo"] for run in page["runs"]] == [5, 4, 3, 2, 1]
   assert page["total"] == 65
+  assert page["selectableTotal"] == 65
   assert page["limit"] == 20
   assert page["offset"] == 60
   assert page["symbols"] == ["000001.SZ", "688981.SH"]
@@ -128,13 +129,19 @@ def test_history_page_filters_the_complete_user_history(monkeypatch: Any) -> Non
 
   assert [run["displayNo"] for run in page["runs"]] == [42]
   count_query, count_params = cursor.commands[0]
-  page_query, page_params = cursor.commands[1]
+  selectable_query, selectable_params = cursor.commands[1]
+  page_query, page_params = cursor.commands[2]
   assert "r.owner_user_id=%s" in count_query
   assert "r.config_id=%s" in count_query
   assert "ILIKE %s" in count_query
   assert "COALESCE(i.symbol || '.' || i.exchange" in count_query
   assert count_params == (
     "user-1", "config-1", "688981.SH",
+    "%候选%", "%候选%", "%候选%", "%候选%", "%候选%", "%候选%",
+  )
+  assert "r.status=ANY(%s)" in selectable_query
+  assert selectable_params == (
+    "user-1", ["succeeded", "failed", "cancelled"], "config-1", "688981.SH",
     "%候选%", "%候选%", "%候选%", "%候选%", "%候选%", "%候选%",
   )
   assert "ORDER BY r.created_at DESC, r.id DESC" in page_query
@@ -150,8 +157,10 @@ def test_history_page_filters_and_orders_favorites(monkeypatch: Any) -> None:
   state_store.list_backtest_run_page(limit=10, offset=0, favorites_only=True)
 
   count_query, _ = cursor.commands[0]
-  page_query, _ = cursor.commands[1]
+  selectable_query, _ = cursor.commands[1]
+  page_query, _ = cursor.commands[2]
   assert "r.favorited_at IS NOT NULL" in count_query
+  assert "r.status=ANY(%s)" in selectable_query
   assert "r.favorited_at IS NOT NULL" in page_query
   assert "ORDER BY r.favorited_at DESC, r.id DESC" in page_query
 
@@ -160,6 +169,7 @@ def test_history_endpoint_returns_pagination_metadata(monkeypatch: Any) -> None:
   expected = {
     "runs": [make_run_row(25)],
     "total": 65,
+    "selectableTotal": 60,
     "limit": 20,
     "offset": 40,
     "symbols": ["688981.SH"],

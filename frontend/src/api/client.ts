@@ -24,6 +24,8 @@ import type {
   SharedBacktestStatus,
   SharedBacktestResultPage,
   SharedBacktestResultSection,
+  BacktestRunSelection,
+  SignalDetailExportTask,
 } from '../types';
 
 const BASE = '/api';
@@ -48,6 +50,18 @@ export class ReleaseApiError extends Error {
   }
 }
 
+export class ApiResponseError extends Error {
+  status: number;
+  code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = 'ApiResponseError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { credentials: 'include' });
   if (!res.ok) {
@@ -61,10 +75,32 @@ async function fetchNoStoreJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { credentials: 'include', cache: 'no-store' });
   if (!res.ok) {
     const text = await res.text();
-    const message = getApiErrorMessage(text);
-    throw new Error(message || `API ${res.status}: 请求失败`);
+    const detail = getStructuredApiError(text);
+    throw new ApiResponseError(
+      res.status, detail.code, detail.message || `API ${res.status}: 请求失败`,
+    );
   }
   return res.json();
+}
+
+function getStructuredApiError(text: string): { code: string; message: string } {
+  try {
+    const body = JSON.parse(text) as {
+      detail?: string | { code?: unknown; message?: unknown };
+    };
+    if (typeof body.detail === 'string') return { code: '', message: body.detail };
+    if (body.detail && typeof body.detail === 'object') {
+      return {
+        code: typeof body.detail.code === 'string' ? body.detail.code : '',
+        message: typeof body.detail.message === 'string'
+          ? body.detail.message
+          : getApiErrorMessage(text),
+      };
+    }
+  } catch {
+    // 由通用错误解析器保留原始响应。
+  }
+  return { code: '', message: getApiErrorMessage(text) };
 }
 
 async function sendJson<T>(url: string, method: string, payload: unknown): Promise<T> {
@@ -76,8 +112,10 @@ async function sendJson<T>(url: string, method: string, payload: unknown): Promi
   });
   if (!res.ok) {
     const text = await res.text();
-    const message = getApiErrorMessage(text);
-    throw new Error(message || `API ${res.status}: 请求失败`);
+    const detail = getStructuredApiError(text);
+    throw new ApiResponseError(
+      res.status, detail.code, detail.message || `API ${res.status}: 请求失败`,
+    );
   }
   return res.json();
 }
@@ -500,6 +538,7 @@ export interface BacktestRunPageQuery {
 export interface BacktestRunPage {
   runs: BacktestRunHistory[];
   total: number;
+  selectableTotal: number;
   limit: number;
   offset: number;
   symbols: string[];
@@ -727,6 +766,90 @@ export async function deleteBacktestRun(runId: string): Promise<void> {
 export async function deleteBacktestRuns(runIds: string[]): Promise<number> {
   const data = await sendJson<{ deleted: number }>(`${BASE}/backtest/runs`, 'DELETE', { runIds });
   return data.deleted;
+}
+
+export async function summarizeBacktestRunSelection(
+  selection: BacktestRunSelection,
+): Promise<{ selectedRunCount: number; selectionDigest: string }> {
+  return sendJson(`${BASE}/backtest/runs/selection-summary`, 'POST', { selection });
+}
+
+export async function deleteBacktestSelection(
+  selection: BacktestRunSelection,
+  selectedRunCount: number,
+  selectionDigest: string,
+): Promise<number> {
+  const data = await sendJson<{ deleted: number }>(`${BASE}/backtest/runs`, 'DELETE', {
+    selection,
+    expectedSelectedRunCount: selectedRunCount,
+    expectedSelectionDigest: selectionDigest,
+  });
+  return data.deleted;
+}
+
+export interface SignalDetailExportPage {
+  items: SignalDetailExportTask[];
+  nextCursor: string | null;
+  activeCount: number;
+  undownloadedSucceededCount: number;
+}
+
+export async function createSignalDetailExport(
+  selection: BacktestRunSelection,
+  idempotencyKey: string,
+): Promise<SignalDetailExportTask> {
+  const res = await fetch(`${BASE}/backtest/signal-detail-exports`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': idempotencyKey,
+    },
+    body: JSON.stringify({ selection }),
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const detail = getStructuredApiError(await res.text());
+    throw new ApiResponseError(res.status, detail.code, detail.message);
+  }
+  return ((await res.json()) as { export: SignalDetailExportTask }).export;
+}
+
+export async function fetchSignalDetailExports(): Promise<SignalDetailExportPage> {
+  return fetchNoStoreJson(`${BASE}/backtest/signal-detail-exports?limit=100`);
+}
+
+export async function cancelSignalDetailExport(
+  exportId: string,
+): Promise<SignalDetailExportTask> {
+  const data = await sendJson<{ export: SignalDetailExportTask }>(
+    `${BASE}/backtest/signal-detail-exports/${encodeURIComponent(exportId)}/cancel`,
+    'POST',
+    {},
+  );
+  return data.export;
+}
+
+export async function retrySignalDetailExport(
+  exportId: string,
+  idempotencyKey: string,
+): Promise<SignalDetailExportTask> {
+  const res = await fetch(
+    `${BASE}/backtest/signal-detail-exports/${encodeURIComponent(exportId)}/retry`,
+    {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      credentials: 'include',
+    },
+  );
+  if (!res.ok) {
+    const detail = getStructuredApiError(await res.text());
+    throw new ApiResponseError(res.status, detail.code, detail.message);
+  }
+  return ((await res.json()) as { export: SignalDetailExportTask }).export;
+}
+
+export function signalDetailExportDownloadUrl(exportId: string): string {
+  return `${BASE}/backtest/signal-detail-exports/${encodeURIComponent(exportId)}/download`;
 }
 
 export async function fetchBacktestRunChart(

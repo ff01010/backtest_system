@@ -16,6 +16,7 @@ frontend/coverage/
 *.pid
 storage/
 artifacts/
+.scratch/
 backend/strategies/*
 !backend/strategies/runtime_contract.py
 !backend/strategies/generate_runtime_manifest.py

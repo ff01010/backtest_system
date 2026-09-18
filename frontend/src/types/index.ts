@@ -479,6 +479,52 @@ export interface BacktestRunHistory {
   publicationId?: string | null;
 }
 
+export type BacktestRunSelection = {
+  mode: 'ids';
+  runIds: string[];
+} | {
+  mode: 'filter';
+  query: string;
+  symbol: string | null;
+  configId: string | null;
+  favoritesOnly: boolean;
+  excludedRunIds: string[];
+};
+
+export type SignalDetailExportStatus =
+  | 'queued'
+  | 'preparing'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelling'
+  | 'cancelled'
+  | 'expired';
+
+export interface SignalDetailExportTask {
+  id: string;
+  selectionMode: 'ids' | 'filter';
+  selectionSnapshot: Record<string, unknown>;
+  status: SignalDetailExportStatus;
+  selectedRunCount: number;
+  preparedRunCount: number;
+  totalRunCount: number | null;
+  processedRunCount: number;
+  excludedRunCount: number | null;
+  exclusionSummary: Record<string, number> | null;
+  cancelRequested: boolean;
+  downloadFilename: string | null;
+  byteSize: number | null;
+  contentSha256: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  lastDownloadedAt: string;
+  createdAt: string;
+  startedAt: string;
+  finishedAt: string;
+  expiresAt: string;
+}
+
 export interface SharedBacktestListItem {
   id: string;
   title: string;
