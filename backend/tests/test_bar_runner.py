@@ -105,8 +105,8 @@ def test_research_result_outbox_failure_does_not_escape(monkeypatch: pytest.Monk
   bar_runner._dispatch_research_result_outbox()
 
 
-def test_worker_summary_uses_cash_and_base_cost_as_initial_equity() -> None:
-  summary = bar_runner.backtest_runner._build_worker_summary(
+def test_strategy_summary_uses_cash_and_base_cost_as_initial_equity() -> None:
+  summary = bar_runner.backtest_runner._build_strategy_summary(
     1_000_000,
     100_000,
     20.0,

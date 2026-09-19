@@ -52,9 +52,33 @@ def test_signal_export_runner_is_deployed_and_health_checked_with_backend() -> N
   assert "python', '-m', 'backend.signal_export_runner" in compose
   assert "quant-backtest-artifacts:/runtime/artifacts" in compose
   assert "backend.signal_export_runner', '--healthcheck" in compose
-  assert "strategy-worker backend bar-runner l2-runner signal-export-runner" in script
+  assert "backend bar-runner l2-runner signal-export-runner" in script
+  assert "strategy-worker" not in script
+  assert "strategy-worker:" not in compose
+  assert "Dockerfile.worker" not in compose
   assert 'runner_containers_ready "signal-export-runner" "1"' in script
   assert '"signalExportRunner":{"healthy":true}' in script
+
+
+def test_retired_strategy_worker_is_absent_from_runtime_and_deployment() -> None:
+  paths = (
+    ROOT / "backend" / "worker_app.py",
+    ROOT / "backend" / "services" / "strategy_worker.py",
+    ROOT / "deploy" / "Dockerfile.worker",
+  )
+  deployment_text = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (
+      ROOT / "deploy" / "compose.infrastructure.yml",
+      ROOT / "deploy" / "compose.clickhouse.yml",
+      ROOT / "scripts" / "deploy-server.sh",
+      ROOT / "scripts" / "start-local.ps1",
+    )
+  )
+
+  assert all(not path.exists() for path in paths)
+  assert "strategy-worker" not in deployment_text
+  assert "quant-backtest-worker-net" not in deployment_text
 
 
 def test_signal_export_runner_health_is_readable_but_only_admin_writable() -> None:

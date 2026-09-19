@@ -21,15 +21,6 @@ from backend.services.backtest_errors import RemoteBacktestError, error_detail
 from backend.services.system_error_catalog import classify_system_error
 from backend.services import clickhouse_client
 from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
-from backend.worker_app import (
-  L2WorkerSession,
-  L2StreamDecoder,
-  WorkerL2BarsRequest,
-  WorkerL2ChunkRequest,
-  WorkerL2DayRequest,
-  WorkerL2QuoteRequest,
-  WorkerL2SessionCreateRequest,
-)
 
 
 class BuyStrategy:
@@ -1436,45 +1427,6 @@ def test_quote_page_retries_temporary_timeout(monkeypatch: pytest.MonkeyPatch) -
   assert calls == 2
 
 
-def test_worker_l2_session_keeps_script_state_across_chunks() -> None:
-  session = L2WorkerSession(WorkerL2SessionCreateRequest(
-    scriptId="test", code="""
-def on_bar(bar, state):
-  state['count'] = state.get('count', 0) + 1
-  if state['count'] == 1:
-    return [{'action': 'buy_open', 'quantity': 100, 'reason': '首次触发'}]
-  return []
-""", initialCapital=100_000, commissionRate=0, holdingPolicy="overnight",
-  ))
-  session.begin_day(WorkerL2DayRequest(tradeDate="20260102", expectedChunks=2))
-  session.process_chunk(WorkerL2ChunkRequest(
-    tradeDate="20260102", chunkNo=0, bars=[asdict(_bar())],
-  ))
-  session.process_chunk(WorkerL2ChunkRequest(
-    tradeDate="20260102", chunkNo=1, quotes=[asdict(_quote("2026-01-02 09:31:03"))],
-  ))
-  session.finish_day("20260102")
-
-  result = session.result()
-
-  assert len(result["fills"]) == 1
-  assert result["fills"][0]["quantity"] == 100
-
-
-def test_l2_stream_decoder_preserves_chunk_boundaries() -> None:
-  decoder = L2StreamDecoder()
-  first = json.dumps({"tradeDate": "20260102", "chunkNo": 0, "bars": [asdict(_bar())]}).encode("utf-8")
-  second = json.dumps({"tradeDate": "20260102", "chunkNo": 1, "quotes": [asdict(_quote("2026-01-02 09:31:03"))]}).encode("utf-8")
-
-  assert decoder.feed(first[:20]) == []
-  records = decoder.feed(first[20:] + b"\n" + second + b"\n")
-  decoder.finish()
-
-  assert [item.chunkNo for item in records] == [0, 1]
-  assert len(records[0].bars) == 1
-  assert len(records[1].quotes) == 1
-
-
 def test_continuous_stream_chunks_maintain_chunk_order(monkeypatch: pytest.MonkeyPatch) -> None:
   class Provider:
     def iter_quotes(self, *_: Any):
@@ -1487,58 +1439,6 @@ def test_continuous_stream_chunks_maintain_chunk_order(monkeypatch: pytest.Monke
   assert [chunk["chunkNo"] for chunk in chunks] == [0]
   assert chunks[0]["bars"][0]["end_time"] == "2026-01-02 09:31:00"
   assert [item["time"] for item in chunks[0]["quotes"]] == ["2026-01-02 09:31:03", "2026-01-02 09:31:06"]
-
-
-def test_worker_l2_session_stops_bar_batch_when_order_needs_quote() -> None:
-  session = L2WorkerSession(WorkerL2SessionCreateRequest(
-    scriptId="test",
-    code="def on_bar(bar, state):\n  return [{'action': 'buy_open', 'quantity': 100, 'reason': '测试'}]",
-    initialCapital=100_000,
-    commissionRate=0,
-    holdingPolicy="overnight",
-  ))
-  session.begin_day(WorkerL2DayRequest(tradeDate="20260102"))
-
-  response = session.process_bars(WorkerL2BarsRequest(tradeDate="20260102", bars=[asdict(_bar())]))
-
-  assert response["processedBars"] == 1
-  assert response["quoteDemand"] == "waiting_quote"
-  quote_response = session.process_quote(WorkerL2QuoteRequest(
-    tradeDate="20260102", quote=asdict(_quote("2026-01-02 09:31:03")),
-  ))
-  session.finish_day("20260102")
-
-  assert quote_response["quoteDemand"] == "idle"
-  assert len(session.result()["fills"]) == 1
-
-
-def test_quote_callback_orders_fill_on_next_snapshot_and_receives_fill_event() -> None:
-  session = L2WorkerSession(WorkerL2SessionCreateRequest(
-    scriptId="quote-test", code="""
-def on_bar(bar, state):
-  return []
-
-def on_quote(quote, state):
-  if not state.get('submitted'):
-    state['submitted'] = True
-    return [{'action': 'buy_open', 'quantity': 100, 'clientOrderKey': 'quote-entry'}]
-  return []
-
-def on_order_event(event, state):
-  if event['type'] == 'filled':
-    state['fillSeen'] = event['clientOrderKey']
-""", initialCapital=100_000, commissionRate=0, holdingPolicy="overnight", quoteMode="continuous",
-  ))
-  session.begin_day(WorkerL2DayRequest(tradeDate="20260102"))
-  first = _quote("2026-01-02 09:30:03")
-  second = _quote("2026-01-02 09:30:06")
-
-  session.process_quote(WorkerL2QuoteRequest(tradeDate="20260102", quote=asdict(first)))
-  assert session.result()["fills"] == []
-  session.process_quote(WorkerL2QuoteRequest(tradeDate="20260102", quote=asdict(second)))
-
-  assert len(session.result()["fills"]) == 1
-  assert session.strategy._state["fillSeen"] == "quote-entry"
 
 
 def test_local_strategy_session_keeps_l2_engine_in_runner_process() -> None:

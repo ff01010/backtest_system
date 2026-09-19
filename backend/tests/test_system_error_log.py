@@ -197,7 +197,7 @@ def test_strategy_error_is_not_written_to_system_error_log() -> None:
   assert system_error_log_record(error, "l2_runner", "l2.market_replay") is None
 
 
-def test_remote_worker_diagnostic_is_saved_for_administrator() -> None:
+def test_strategy_process_diagnostic_is_saved_for_administrator() -> None:
   error = RemoteBacktestError.from_dict(
     {
       "category": "system_error",
@@ -223,7 +223,7 @@ def test_remote_worker_diagnostic_is_saved_for_administrator() -> None:
   assert record.retryable is False
   assert record.reason == "平仓数量超过可用持仓"
   assert record.context == {
-    "service": "strategy_worker",
+    "service": "strategy_process",
     "symbol": "688126.SH",
     "eventTime": "2026-04-03 09:31:02",
     "trace": "engine.py:120:process_quote",

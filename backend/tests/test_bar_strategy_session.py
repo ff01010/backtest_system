@@ -5,6 +5,7 @@ import time
 import pytest
 
 from backend.bar_strategy_session import BarStrategySession
+from backend.services.backtest_errors import RemoteBacktestError
 from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
 
 
@@ -82,6 +83,37 @@ def on_bar(bar, state):
 
   assert len(result["trades"]) == 1
   assert result["trades"][0]["quantity"] == 200
+
+
+def test_bar_strategy_session_keeps_raw_script_exception_for_administrator() -> None:
+  payload = _payload("def on_bar(bar, state):\n  return missing_variable\n")
+  payload["scriptId"] = "diagnostic-script"
+
+  with pytest.raises(RemoteBacktestError) as raised:
+    BarStrategySession().run_script(payload)
+
+  diagnostic = raised.value.diagnostic
+  assert diagnostic["exceptionType"] == "NameError"
+  assert "missing_variable" in diagnostic["reason"]
+  assert "missing_variable" in diagnostic["__internal_raw_message"]
+  assert "strategy_script_diagnostic-script.py" in diagnostic["__internal_raw_traceback"]
+
+
+def test_bar_strategy_session_applies_slippage_to_trade_price() -> None:
+  payload = _payload(
+    "def on_bar(bar, state):\n  return [{'action': 'buy_open', 'quantity': 100}]\n",
+  )
+  payload["bars"].append({
+    "time": "20260901094000", "symbol": "688981.SH", "open": 11,
+    "high": 11, "low": 11, "close": 11, "volume": 1000,
+  })
+  payload["slippage"] = 0.001
+  payload["holdingPolicy"] = "overnight"
+
+  result = BarStrategySession().run_script(payload)
+
+  assert round(result["trades"][0]["price"], 2) == 11.01
+  assert result["trades"][0]["priceSource"] == "下一根 Bar 开盘价 + 固定滑点 10.00 bp"
 
 
 def test_bar_strategy_session_terminates_blocked_strategy_on_cancel() -> None:

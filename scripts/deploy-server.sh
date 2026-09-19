@@ -316,10 +316,10 @@ check_active_backtests || fail "回测任务未完全排空；backend 保持停�
 "${compose[@]}" --profile migration run --rm migrate
 "${compose[@]}" --profile calendar-sync run --rm --build calendar-sync
 verify_trade_calendar || fail "交易日历同步后校验失败"
-"${compose[@]}" up -d --build \
+"${compose[@]}" up -d --build --remove-orphans \
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \
-  strategy-worker backend bar-runner l2-runner signal-export-runner
+  backend bar-runner l2-runner signal-export-runner
 "${compose[@]}" --profile release-admin build release-admin
 verify_release_admin_image
 # Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。

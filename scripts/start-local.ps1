@@ -115,12 +115,12 @@ try {
   Invoke-Compose @('--profile', 'migration', 'run', '--rm', 'migrate')
 
   $upArguments = @(
-    'up', '-d', '--scale', "bar-runner=$barRunnerReplicas", '--scale', "l2-runner=$l2RunnerReplicas"
+    'up', '-d', '--remove-orphans', '--scale', "bar-runner=$barRunnerReplicas", '--scale', "l2-runner=$l2RunnerReplicas"
   )
   if (-not $SkipBuild) {
     $upArguments += '--build'
   }
-  $upArguments += 'redis', 'strategy-worker', 'bar-runner', 'l2-runner', 'backend', 'frontend'
+  $upArguments += 'redis', 'bar-runner', 'l2-runner', 'backend', 'frontend'
   Invoke-Compose $upArguments
   Invoke-Compose @('ps')
   Wait-ApplicationHealthy $httpPort $barRunnerReplicas $l2RunnerReplicas

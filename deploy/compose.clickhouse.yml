@@ -2,7 +2,6 @@ services:
   backend:
     networks:
       - quant-backtest-net
-      - quant-backtest-worker-net
       - quant-platform-net
   l2-runner:
     networks:

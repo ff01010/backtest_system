@@ -1,4 +1,4 @@
-"""通过正式 strategy-worker 回归最近的普通用户策略，不输出或落盘源码。"""
+"""通过正式 Bar 策略子进程回归最近的普通用户策略，不输出或落盘源码。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 from backend.bar_strategy_session import BarStrategySession
 from backend.l2.models import NormalizedBar
 from backend.l2.strategy_session import L2StrategySession
-from backend.services import state_store, strategy_worker
+from backend.services import state_store
 from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
 
 
@@ -124,9 +124,9 @@ def main() -> None:
   succeeded = 0
   for index, sample in enumerate(samples, start=1):
     try:
-      result = strategy_worker.run_script(_payload(sample, index))
+      result = BarStrategySession().run_script(_payload(sample, index))
       if not isinstance(result.get("portfolioSnapshots"), list):
-        raise ValueError("Worker 未返回最终账户快照")
+        raise ValueError("Bar 策略子进程未返回最终账户快照")
     except Exception as error:
       print(f"sample-{index}=failed:{type(error).__name__}")
     else:

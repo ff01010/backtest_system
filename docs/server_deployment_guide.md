@@ -107,7 +107,6 @@ quant-backtest-artifacts       回测输出文件
 | 容器名 | Compose 服务 | 作用 |
 | --- | --- | --- |
 | `quant-backtest-postgres` | `postgres` | 保存用户、策略、方案和回测记录 |
-| `quant-backtest-strategy-worker` | `strategy-worker` | 在隔离环境中执行用户策略脚本 |
 | `quant-backtest-backend` | `backend` | 登录、权限、QMT 覆盖检查、回测编排和 API |
 | `quant-backtest-platform-bar-runner-*` | `bar-runner` | 领取并执行标准 Bar 回测任务 |
 | `quant-backtest-platform-l2-runner-*` | `l2-runner` | 领取并执行 L2 盘口回测任务 |
@@ -201,7 +200,7 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml --pro
 ### 第四步：重建并启动应用
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml up -d --build --scale bar-runner=12 --scale l2-runner=12 strategy-worker backend bar-runner l2-runner frontend
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml up -d --build --remove-orphans --scale bar-runner=12 --scale l2-runner=12 backend bar-runner l2-runner frontend
 ```
 
 首次拉取前端 Node 镜像或执行 `npm ci` 时，构建可能需要几分钟。
@@ -280,10 +279,10 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml ps
 docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml logs --tail=100 backend
 ```
 
-### 查看策略 worker 日志
+### 查看 Runner 日志
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml logs --tail=100 strategy-worker
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml logs --tail=100 bar-runner l2-runner
 ```
 
 ### 查看前端日志
@@ -301,7 +300,7 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml up -d
 ### 重建并重启全部应用容器
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml up -d --build --scale bar-runner=12 --scale l2-runner=12 strategy-worker backend bar-runner l2-runner frontend
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml up -d --build --remove-orphans --scale bar-runner=12 --scale l2-runner=12 backend bar-runner l2-runner frontend
 ```
 
 ## 9. 注意事项
