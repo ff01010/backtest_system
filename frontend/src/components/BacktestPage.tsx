@@ -1274,6 +1274,7 @@ export default function BacktestPage({
   const [publishingRun, setPublishingRun] = useState(false);
   const [signalExportDrawerOpen, setSignalExportDrawerOpen] = useState(false);
   const [creatingSignalExport, setCreatingSignalExport] = useState(false);
+  const [signalExportError, setSignalExportError] = useState('');
   const [deletingHistorySelection, setDeletingHistorySelection] = useState(false);
   const [selectedScriptId, setSelectedScriptId] = useState<string>('');
   const [selectedConfigId, setSelectedConfigId] = useState<string>('');
@@ -1318,6 +1319,10 @@ export default function BacktestPage({
   }), [historyFavoritesOnly, historyQuery, historySymbolFilter]);
   const historyFilterKey = backtestRunFilterKey(historyFilters);
   const previousHistoryFilterKey = useRef(historyFilterKey);
+
+  useEffect(() => {
+    setSignalExportError('');
+  }, [historySelection]);
 
   useEffect(() => {
     if (previousHistoryFilterKey.current === historyFilterKey) return;
@@ -3244,7 +3249,7 @@ export default function BacktestPage({
   const handleCreateSignalDetailExport = async () => {
     if (selectedHistoryRunCount === 0) return;
     setCreatingSignalExport(true);
-    setError('');
+    setSignalExportError('');
     try {
       const task = await signalDetailExports.create(
         toBacktestRunSelection(historySelection),
@@ -3253,7 +3258,9 @@ export default function BacktestPage({
       setSignalExportDrawerOpen(true);
       setStatus(`已创建 ${task.selectedRunCount} 条回测的信号明细导出任务`);
     } catch (exportError) {
-      setError(exportError instanceof Error ? exportError.message : '创建信号明细导出失败');
+      setSignalExportError(
+        exportError instanceof Error ? exportError.message : '创建信号明细导出失败',
+      );
     } finally {
       setCreatingSignalExport(false);
     }
@@ -5056,6 +5063,23 @@ export default function BacktestPage({
                           </button>
                         </span>
                       </div>
+                      {signalExportError && (
+                        <div
+                          role="alert"
+                          aria-label="信号明细导出错误"
+                          style={{
+                            marginTop: 8,
+                            padding: '8px 10px',
+                            border: '1px solid #fecaca',
+                            borderRadius: 4,
+                            background: '#fef2f2',
+                            color: '#b91c1c',
+                            fontSize: 12,
+                          }}
+                        >
+                          {signalExportError}
+                        </div>
+                      )}
                     </div>
                   )}
                   <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 16 }}>

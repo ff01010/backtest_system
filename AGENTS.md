@@ -65,3 +65,7 @@
 ### Domain docs
 
 采用 single-context：读取根目录 `CONTEXT.md`（存在时）及相关 `docs/adr/`。详见 `docs/agents/domain.md`。
+
+### 前端浏览器运行环境
+
+修改前端浏览器 API、异步创建操作、幂等键或错误提示时，必须读取 `docs/agents/frontend-browser-runtime.md` 并完成其中的兼容性检查与回归要求。

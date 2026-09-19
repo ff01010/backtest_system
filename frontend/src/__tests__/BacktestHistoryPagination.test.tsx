@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import BacktestPage from '../components/BacktestPage';
 import type { BacktestRunPage } from '../api/client';
 import type { BacktestRunHistory } from '../types';
@@ -86,7 +86,23 @@ function makeRun(displayNo: number): BacktestRunHistory {
   };
 }
 
+function makeSignalExportTask() {
+  return {
+    id: 'export-1', selectionMode: 'ids', selectionSnapshot: {}, status: 'queued',
+    selectedRunCount: 2, preparedRunCount: 0, totalRunCount: null,
+    processedRunCount: 0, excludedRunCount: null, exclusionSummary: null,
+    cancelRequested: false, downloadFilename: null, byteSize: null,
+    contentSha256: null, errorCode: null, errorMessage: null,
+    lastDownloadedAt: null, createdAt: '2026-09-18T10:00:00+08:00',
+    startedAt: null, finishedAt: null, expiresAt: null,
+  };
+}
+
 describe('BacktestPage history pagination', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     const history = Array.from({ length: 35 }, (_, index) => makeRun(35 - index));
@@ -117,15 +133,7 @@ describe('BacktestPage history pagination', () => {
     apiMocks.fetchSignalDetailExports.mockResolvedValue({
       items: [], nextCursor: null, activeCount: 0, undownloadedSucceededCount: 0,
     });
-    apiMocks.createSignalDetailExport.mockResolvedValue({
-      id: 'export-1', selectionMode: 'ids', selectionSnapshot: {}, status: 'queued',
-      selectedRunCount: 2, preparedRunCount: 0, totalRunCount: null,
-      processedRunCount: 0, excludedRunCount: null, exclusionSummary: null,
-      cancelRequested: false, downloadFilename: null, byteSize: null,
-      contentSha256: null, errorCode: null, errorMessage: null,
-      lastDownloadedAt: null, createdAt: '2026-09-18T10:00:00+08:00',
-      startedAt: null, finishedAt: null, expiresAt: null,
-    });
+    apiMocks.createSignalDetailExport.mockResolvedValue(makeSignalExportTask());
     apiMocks.summarizeBacktestRunSelection.mockResolvedValue({
       selectedRunCount: 35,
       selectionDigest: 'a'.repeat(64),
@@ -381,6 +389,86 @@ describe('BacktestPage history pagination', () => {
       expect.any(String),
     ));
     expect(await screen.findByRole('dialog', { name: '信号明细导出记录' })).toBeTruthy();
+  });
+
+  it('falls back to getRandomValues when randomUUID is unavailable', async () => {
+    const nativeCrypto = globalThis.crypto;
+    vi.stubGlobal('crypto', {
+      getRandomValues: nativeCrypto.getRandomValues.bind(nativeCrypto),
+    });
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
+    await screen.findByText('显示 1-10 / 35 条实验');
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择历史回测 #35' }));
+    fireEvent.click(screen.getByRole('button', { name: '批量导出信号明细' }));
+
+    await waitFor(() => expect(apiMocks.createSignalDetailExport).toHaveBeenCalledTimes(1));
+    const idempotencyKey = apiMocks.createSignalDetailExport.mock.calls[0][1];
+    expect(idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(await screen.findByRole('dialog', { name: '信号明细导出记录' })).toBeTruthy();
+  });
+
+  it('submits a signal detail export only once while creation is pending', async () => {
+    let resolveCreate!: (task: ReturnType<typeof makeSignalExportTask>) => void;
+    apiMocks.createSignalDetailExport.mockImplementation(() => new Promise((resolve) => {
+      resolveCreate = resolve;
+    }));
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
+    await screen.findByText('显示 1-10 / 35 条实验');
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择历史回测 #35' }));
+    const exportButton = screen.getByRole('button', { name: '批量导出信号明细' });
+    fireEvent.click(exportButton);
+    fireEvent.click(exportButton);
+
+    expect(apiMocks.createSignalDetailExport).toHaveBeenCalledTimes(1);
+    resolveCreate(makeSignalExportTask());
+    expect(await screen.findByRole('dialog', { name: '信号明细导出记录' })).toBeTruthy();
+  });
+
+  it('shows signal detail export creation errors in history', async () => {
+    apiMocks.createSignalDetailExport.mockRejectedValueOnce(new Error('导出服务暂不可用'));
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
+    await screen.findByText('显示 1-10 / 35 条实验');
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择历史回测 #35' }));
+    fireEvent.click(screen.getByRole('button', { name: '批量导出信号明细' }));
+
+    const alert = await screen.findByRole('alert', { name: '信号明细导出错误' });
+    expect(alert.textContent).toContain('导出服务暂不可用');
+    expect(screen.queryByRole('dialog', { name: '信号明细导出记录' })).toBeNull();
   });
 
   it('extends page selection to all filtered records for bulk deletion', async () => {
