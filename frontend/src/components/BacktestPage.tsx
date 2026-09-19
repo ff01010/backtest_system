@@ -403,14 +403,6 @@ function normalizeOverlaySettlementPolicy(value: unknown): 'intraday_restore' | 
   return value === 'cross_day_carry' ? 'cross_day_carry' : 'intraday_restore';
 }
 
-function calendarMonthRange(month: string): { startDate: string; endDate: string } {
-  const start = new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)) - 1, 1);
-  const end = new Date(start.getFullYear(), start.getMonth() + 1, 0);
-  const format = (value: Date): string => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
-  return { startDate: format(start), endDate: format(end) };
-}
-
-
 export function normalizeApiDate(value: string) {
   return /^\d{8}$/.test(value) ? `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}` : value;
 }
@@ -1231,8 +1223,6 @@ export default function BacktestPage({
   const [loadingBenchmarkDataStatus, setLoadingBenchmarkDataStatus] = useState(false);
   const [params, setParams] = useState<BacktestParams>(DEFAULT_PARAMS);
   const configSectionRefs = useRef<Partial<Record<ConfigSectionKey, HTMLDetailsElement | null>>>({});
-  const [calendarMonth, setCalendarMonth] = useState(DEFAULT_PARAMS.startDate.slice(0, 7));
-  const [calendarPreflight, setCalendarPreflight] = useState<Awaited<ReturnType<typeof fetchBacktestPreflight>> | null>(null);
   const [strategyParameterSchema, setStrategyParameterSchema] = useState<StrategyParameterSchema | null>(null);
   const [strategySchemaError, setStrategySchemaError] = useState('');
   const [loadingStrategySchema, setLoadingStrategySchema] = useState(false);
@@ -1612,15 +1602,6 @@ export default function BacktestPage({
       window.clearTimeout(timer);
     };
   }, [selectedSymbol, selectedTimeframe, params.startDate, params.endDate, params.fillModel]);
-  useEffect(() => {
-    const range = calendarMonthRange(calendarMonth);
-    let cancelled = false;
-    fetchBacktestPreflight(selectedSymbol, selectedTimeframe, range.startDate, range.endDate, normalizeFillModel(params.fillModel))
-      .then((value) => { if (!cancelled) setCalendarPreflight(value); })
-      .catch(() => { if (!cancelled) setCalendarPreflight(null); });
-    return () => { cancelled = true; };
-  }, [calendarMonth, params.fillModel, selectedSymbol, selectedTimeframe]);
-
 
   useEffect(() => {
     if (isCustomScriptStrategy(selectedStrategy)) {
@@ -2490,6 +2471,19 @@ export default function BacktestPage({
   const isL2Quote = params.fillModel === 'l2_quote';
   const preflightTimeframes = preflight?.timeframes || [];
   const selectedPreflight = preflightTimeframes.find((item) => item.timeframe === selectedTimeframe);
+  const dateRangeDataStatus = dataStatus?.symbol === selectedSymbol
+    && dataStatus.timeframe === selectedTimeframe
+    ? dataStatus
+    : null;
+  const backtestDateRangePickerProps = {
+    startDate: params.startDate,
+    endDate: params.endDate,
+    dataStartDate: dateRangeDataStatus?.firstDate,
+    dataEndDate: dateRangeDataStatus?.lastDate,
+    onApplyRange: (startDate: string, endDate: string) => {
+      setParams((current) => ({ ...current, startDate, endDate }));
+    },
+  };
   const timeframeOptions = preflightTimeframes.length > 0
     ? preflightTimeframes
     : (isL2Quote
@@ -3593,10 +3587,7 @@ export default function BacktestPage({
 
               <section style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700 }}>回测区间</div>
-                <BacktestDateRangePicker
-                  startDate={params.startDate} endDate={params.endDate} days={calendarPreflight?.calendarDays || []}
-                  onChange={(key, value) => setParam(key, value)} onMonthChange={setCalendarMonth}
-                />
+                <BacktestDateRangePicker {...backtestDateRangePickerProps} />
               </section>
 
               <section style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -4107,10 +4098,7 @@ export default function BacktestPage({
                     <InstrumentSearchField label="基准标的" value={selectedBenchmarkSymbol} onChange={setSelectedBenchmarkSymbol} />
                     <div>
                       <div style={labelStyle}>回测区间</div>
-                      <BacktestDateRangePicker
-                        startDate={params.startDate} endDate={params.endDate} days={calendarPreflight?.calendarDays || []}
-                        onChange={(key, value) => setParam(key, value)} onMonthChange={setCalendarMonth}
-                      />
+                      <BacktestDateRangePicker {...backtestDateRangePickerProps} />
                     </div>
                     <div className={`strategy-config-check ${dataCoverage.tone === 'ok' ? 'is-ready' : 'is-warning'}`}>
                       {dataCoverage.text}
@@ -5858,10 +5846,7 @@ export default function BacktestPage({
 
           <div>
             <div style={labelStyle}>回测区间</div>
-            <BacktestDateRangePicker
-              startDate={params.startDate} endDate={params.endDate} days={calendarPreflight?.calendarDays || []}
-              onChange={(key, value) => setParam(key, value)} onMonthChange={setCalendarMonth}
-            />
+            <BacktestDateRangePicker {...backtestDateRangePickerProps} />
           </div>
 
           <label>
