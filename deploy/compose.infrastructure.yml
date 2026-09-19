@@ -118,7 +118,6 @@ services:
       TREND_GRID_KLINE_ROOT: /data/kline
       TREND_GRID_SIGNAL_ROOT: /data/signals
       TREND_GRID_OUTPUT_ROOT: /runtime/artifacts
-      TREND_GRID_STRATEGY_WORKER_URL: http://strategy-worker:8001
       TREND_GRID_CLICKHOUSE_HTTP_URL: ${TREND_GRID_CLICKHOUSE_HTTP_URL:-}
       TREND_GRID_CLICKHOUSE_USER: ${TREND_GRID_CLICKHOUSE_USER:-default}
       TREND_GRID_CLICKHOUSE_PASSWORD: ${TREND_GRID_CLICKHOUSE_PASSWORD:-}
@@ -126,8 +125,6 @@ services:
       TREND_GRID_L2_REDIS_PORT: '6379'
     depends_on:
       postgres:
-        condition: service_healthy
-      strategy-worker:
         condition: service_healthy
     volumes:
       - ${TREND_GRID_HOST_KLINE_ROOT}:/data/kline:ro
@@ -141,38 +138,7 @@ services:
       start_period: 20s
     networks:
       - quant-backtest-net
-      - quant-backtest-worker-net
       - quant-backtest-l2-net
-
-  strategy-worker:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.worker
-    container_name: quant-backtest-strategy-worker
-    restart: unless-stopped
-    read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cpus: 2.0
-    mem_limit: 2g
-    pids_limit: 256
-    environment:
-      TREND_GRID_DEFAULT_COMMISSION_RATE: ${TREND_GRID_DEFAULT_COMMISSION_RATE:-0.00008}
-      TREND_GRID_DEFAULT_TRANSFER_FEE_RATE: ${TREND_GRID_DEFAULT_TRANSFER_FEE_RATE:-0.00001}
-      TREND_GRID_DEFAULT_STAMP_DUTY_RATE: ${TREND_GRID_DEFAULT_STAMP_DUTY_RATE:-0.0005}
-      TREND_GRID_DEFAULT_MINIMUM_COMMISSION: ${TREND_GRID_DEFAULT_MINIMUM_COMMISSION:-5}
-    healthcheck:
-      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-    networks:
-      - quant-backtest-worker-net
 
   redis:
     image: redis:7.4-alpine
@@ -350,10 +316,6 @@ networks:
   quant-backtest-net:
     name: quant-backtest-net
     driver: bridge
-  quant-backtest-worker-net:
-    name: quant-backtest-worker-net
-    driver: bridge
-    internal: true
   quant-backtest-l2-net:
     name: quant-backtest-l2-net
     driver: bridge

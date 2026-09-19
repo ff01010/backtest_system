@@ -10,21 +10,22 @@
 - 用户维护自己的策略脚本、回测方案、回测账户和历史回测记录，无法读取其他用户的数据。
 - 回测支持 `1m`、`5m` 周期；`15m`、`30m` 由 `1m` 数据聚合，`60m`、`1d` 可保存为原始行情。
 - 回测前检查标的和基准标的在目标日期内的行情覆盖状态；数据缺失或不完整时拒绝回测。
-- 用户策略在无数据库凭据、无宿主机目录挂载的 `strategy-worker` 容器中执行。
+- Bar 与 L2 Runner 为每个任务创建独立策略子进程，并清空服务凭据后执行用户脚本。
 
 ## 架构
 
 ```text
-浏览器 → Nginx 前端 → FastAPI 后端 → PostgreSQL
-                                  ├─ QMT 覆盖检查与 K 线读取 → ClickHouse
-                                  └─ 策略快照 + K 线数据 → strategy-worker → 回测结果
+浏览器 → Nginx 前端 → FastAPI 后端 → PostgreSQL 任务队列
+                                  ├─ bar-runner × N → 单任务策略子进程
+                                  └─ l2-runner × N → ClickHouse/Redis → 单任务策略子进程
 ```
 
 | 组件 | 职责 |
 | --- | --- |
 | `frontend/` | Vite + React 前端；生产环境由 Nginx 提供服务并转发 `/api` 请求。 |
 | `backend/` | FastAPI 接口、权限校验、回测编排和行情覆盖检查。 |
-| `strategy-worker` | 在隔离容器中执行本次回测的策略脚本。 |
+| `bar-runner` | 领取标准 Bar 任务，并在独立子进程中执行用户策略。 |
+| `l2-runner` | 领取 L2 任务、读取盘口，并在独立子进程中执行策略与撮合。 |
 | PostgreSQL | 保存用户、策略、方案、账户和回测记录。 |
 | ClickHouse | 保存 QMT 原始历史 K 线、覆盖状态和导入批次。 |
 
@@ -108,7 +109,7 @@ cd C:\Users\zhongying\backtest_system
 .\scripts\start-local.ps1
 ```
 
-脚本会启动 PostgreSQL、等待其健康检查、执行数据库迁移，再构建并启动策略执行器、后端和前端，最后请求 `/api/health` 验证应用。
+脚本会启动 PostgreSQL、等待其健康检查、执行数据库迁移，再构建并启动 Bar/L2 Runner、后端和前端，最后请求 `/api/health` 验证应用。
 
 若镜像无需重建，可使用：
 
@@ -145,7 +146,7 @@ ClickHouse 不由 `scripts/start-local.ps1` 创建或导入数据。当前本地
 - QMT 历史行情须先从 Windows QMT 导出、完成校验后导入 ClickHouse；回测不会调用第三方行情接口。
 - 仅覆盖状态为完整的日期会被用于回测；单日 K 线根数不足会标记为 `partial` 并拒绝运行。
 - 部署到公网时必须配置 HTTPS，并设置 `TREND_GRID_AUTH_COOKIE_SECURE=true`。
-- PostgreSQL、后端和策略执行器的内部端口不应直接映射到公网；系统只需公开前端 HTTP(S) 入口。
+- PostgreSQL、后端和 Runner 的内部端口不应直接映射到公网；系统只需公开前端 HTTP(S) 入口。
 
 ## 项目结构
 

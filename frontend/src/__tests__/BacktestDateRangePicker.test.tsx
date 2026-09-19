@@ -1,61 +1,231 @@
 import { fireEvent, render, screen } from '@testing-library/react';
+import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import BacktestDateRangePicker, { type BacktestCalendarDay } from '../components/BacktestDateRangePicker';
+import BacktestDateRangePicker, {
+  buildPresetRange,
+  replaceDatePart,
+} from '../components/BacktestDateRangePicker';
 
-const days: BacktestCalendarDay[] = [
-  { date: '2026-09-01', tradingDay: true, status: 'available' },
-  { date: '2026-09-02', tradingDay: true, status: 'available' },
-  { date: '2026-09-03', tradingDay: true, status: 'available' },
-];
+interface Range {
+  startDate: string;
+  endDate: string;
+}
 
-function renderPicker(onChange = vi.fn()): ReturnType<typeof render> {
-  return render(
-    <details open data-testid="scope-section" style={{ overflow: 'hidden' }}>
-      <summary>回测范围</summary>
-      <BacktestDateRangePicker
-        startDate="2026-09-01"
-        endDate="2026-09-03"
-        days={days}
-        onChange={onChange}
-        onMonthChange={vi.fn()}
-      />
-    </details>
+function PickerHarness({
+  initialRange = { startDate: '2026-09-01', endDate: '2026-09-03' },
+  dataStartDate = '2015-01-05',
+  dataEndDate = '2026-09-18',
+  onApplyRange = vi.fn(),
+}: {
+  initialRange?: Range;
+  dataStartDate?: string | null;
+  dataEndDate?: string | null;
+  onApplyRange?: (startDate: string, endDate: string) => void;
+}) {
+  const [range, setRange] = useState(initialRange);
+  const handleApplyRange = (startDate: string, endDate: string): void => {
+    onApplyRange(startDate, endDate);
+    setRange({ startDate, endDate });
+  };
+  return (
+    <BacktestDateRangePicker
+      {...range}
+      dataStartDate={dataStartDate}
+      dataEndDate={dataEndDate}
+      onApplyRange={handleApplyRange}
+    />
   );
 }
 
 describe('BacktestDateRangePicker', () => {
-  it('renders the calendar outside the clipped config section', () => {
-    renderPicker();
+  it('keeps the compact horizontal controls without a calendar', () => {
+    render(<PickerHarness />);
 
-    fireEvent.click(screen.getByRole('button', { name: '开始：2026-09-01' }));
-
-    const dialog = screen.getByRole('dialog', { name: '回测日期选择' });
-    expect(dialog.parentElement).toBe(document.body);
-    expect(screen.getByTestId('scope-section').hasAttribute('open')).toBe(true);
+    expect(screen.getByText('可回测范围：')).toBeTruthy();
+    expect(screen.getByText('2015-01-05 — 2026-09-18')).toBeTruthy();
+    expect(screen.getByRole('group', { name: '开始日期 2026-09-01' })).toBeTruthy();
+    expect(screen.getByRole('group', { name: '结束日期 2026-09-03' })).toBeTruthy();
+    expect(screen.queryByRole('dialog')).toBeNull();
   });
 
-  it('keeps the section and calendar open while switching to the end date', () => {
-    const onChange = vi.fn();
-    renderPicker(onChange);
+  it('shows the approved shortcuts, earliest action, and draft actions', () => {
+    render(<PickerHarness />);
 
-    fireEvent.click(screen.getByRole('button', { name: '开始：2026-09-01' }));
-    fireEvent.click(screen.getByRole('button', { name: '2' }));
-
-    expect(onChange).toHaveBeenCalledWith('startDate', '2026-09-02');
-    expect(screen.getByRole('dialog', { name: '回测日期选择' })).toBeTruthy();
-    expect(screen.getByTestId('scope-section').hasAttribute('open')).toBe(true);
+    expect(screen.getByRole('button', { name: '近1月' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '近3月' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '今年' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '全部数据' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '从最早日期开始' })).toBeTruthy();
+    expect((screen.getByRole('button', { name: '取消' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '应用' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('closes on an outside pointer or Escape', () => {
-    renderPicker();
-    const startButton = screen.getByRole('button', { name: '开始：2026-09-01' });
+  it('keeps shortcut changes as a draft until Apply is clicked', () => {
+    const onApplyRange = vi.fn();
+    render(<PickerHarness onApplyRange={onApplyRange} />);
 
-    fireEvent.click(startButton);
+    fireEvent.click(screen.getByRole('button', { name: '近3月' }));
+
+    expect(screen.getByRole('group', { name: '开始日期 2026-06-19' })).toBeTruthy();
+    expect(screen.getByRole('group', { name: '结束日期 2026-09-18' })).toBeTruthy();
+    expect(onApplyRange).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '应用' }));
+    expect(onApplyRange).toHaveBeenCalledOnce();
+    expect(onApplyRange).toHaveBeenCalledWith('2026-06-19', '2026-09-18');
+  });
+
+  it('cancels shortcut and wheel draft changes together', () => {
+    const onApplyRange = vi.fn();
+    render(<PickerHarness onApplyRange={onApplyRange} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '全部数据' }));
+    expect(screen.getByRole('group', { name: '开始日期 2015-01-05' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    expect(screen.getByRole('group', { name: '开始日期 2026-09-01' })).toBeTruthy();
+    expect(screen.getByRole('group', { name: '结束日期 2026-09-03' })).toBeTruthy();
+    expect(onApplyRange).not.toHaveBeenCalled();
+  });
+
+  it('uses the earliest available date without linking the draft end date', () => {
+    render(
+      <PickerHarness initialRange={{ startDate: '2014-12-01', endDate: '2014-12-31' }} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '从最早日期开始' }));
+
+    expect(screen.getByRole('group', { name: '开始日期 2015-01-05' })).toBeTruthy();
+    expect(screen.getByRole('group', { name: '结束日期 2014-12-31' })).toBeTruthy();
+  });
+
+  it('opens a visible wheel with context around the selected value', () => {
+    render(<PickerHarness />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始日期年份' }));
+
+    const list = screen.getByRole('listbox', { name: '开始日期年份选项' });
+    expect(list.parentElement?.parentElement).toBe(document.body);
+    expect(screen.getByRole('option', { name: '2025' })).toBeTruthy();
+    expect(screen.getByRole('option', { name: '2026' }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('option', { name: '2027' })).toBeTruthy();
+  });
+
+  it('selects visible year, month, and day options independently', () => {
+    render(<PickerHarness initialRange={{ startDate: '2026-01-31', endDate: '2028-12-31' }} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始日期年份' }));
+    fireEvent.click(screen.getByRole('option', { name: '2027' }));
+    expect(screen.getByRole('group', { name: '开始日期 2027-01-31' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '开始日期月份' }));
+    fireEvent.click(screen.getByRole('option', { name: '02' }));
+    expect(screen.getByRole('group', { name: '开始日期 2027-02-28' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '开始日期日期' }));
+    fireEvent.click(screen.getByRole('option', { name: '27' }));
+    expect(screen.getByRole('group', { name: '开始日期 2027-02-27' })).toBeTruthy();
+  });
+
+  it('updates the centered value when the long list scrolls', () => {
+    render(<PickerHarness />);
+    fireEvent.click(screen.getByRole('button', { name: '开始日期年份' }));
+    const list = screen.getByRole('listbox', { name: '开始日期年份选项' });
+
+    list.scrollTop = (2028 - 1000) * 32;
+    fireEvent.scroll(list);
+
+    expect(screen.getByRole('group', { name: '开始日期 2028-09-01' })).toBeTruthy();
+  });
+
+  it('closes the wheel on an outside pointer or Escape', () => {
+    render(<PickerHarness />);
+    const yearButton = screen.getByRole('button', { name: '开始日期年份' });
+
+    fireEvent.click(yearButton);
     fireEvent.pointerDown(document.body);
-    expect(screen.queryByRole('dialog', { name: '回测日期选择' })).toBeNull();
+    expect(screen.queryByRole('listbox')).toBeNull();
 
-    fireEvent.click(startButton);
+    fireEvent.click(yearButton);
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(screen.queryByRole('dialog', { name: '回测日期选择' })).toBeNull();
+    expect(screen.queryByRole('listbox')).toBeNull();
+  });
+
+  it('does not move the end date when the start date passes it', () => {
+    const onApplyRange = vi.fn();
+    render(
+      <PickerHarness
+        initialRange={{ startDate: '2026-09-03', endDate: '2026-09-03' }}
+        onApplyRange={onApplyRange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '开始日期日期' }));
+    fireEvent.click(screen.getByRole('option', { name: '04' }));
+
+    expect(screen.getByRole('group', { name: '开始日期 2026-09-04' })).toBeTruthy();
+    expect(screen.getByRole('group', { name: '结束日期 2026-09-03' })).toBeTruthy();
+    expect(onApplyRange).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '应用' }));
+    expect(onApplyRange).toHaveBeenCalledWith('2026-09-04', '2026-09-03');
+  });
+
+  it('does not move the start date when the end date passes it', () => {
+    render(<PickerHarness initialRange={{ startDate: '2026-09-03', endDate: '2026-09-03' }} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '结束日期日期' }));
+    fireEvent.click(screen.getByRole('option', { name: '02' }));
+
+    expect(screen.getByRole('group', { name: '开始日期 2026-09-03' })).toBeTruthy();
+    expect(screen.getByRole('group', { name: '结束日期 2026-09-02' })).toBeTruthy();
+  });
+
+  it('does not require market-data boundaries to render wheel options', () => {
+    render(<PickerHarness dataStartDate={null} dataEndDate={null} />);
+    fireEvent.click(screen.getByRole('button', { name: '开始日期年份' }));
+
+    expect(screen.getByText('正在读取')).toBeTruthy();
+    expect((screen.getByRole('button', { name: '近1月' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole('option', { name: '2025' })).toBeTruthy();
+    expect(screen.getByRole('option', { name: '2027' })).toBeTruthy();
+  });
+});
+
+describe('buildPresetRange', () => {
+  it('builds inclusive calendar presets from the latest available date', () => {
+    expect(buildPresetRange('one_month', '2015-01-05', '2026-09-18')).toEqual({
+      startDate: '2026-08-19',
+      endDate: '2026-09-18',
+    });
+    expect(buildPresetRange('three_months', '2015-01-05', '2026-09-18')).toEqual({
+      startDate: '2026-06-19',
+      endDate: '2026-09-18',
+    });
+  });
+
+  it('clamps presets to the available range', () => {
+    expect(buildPresetRange('year_to_date', '2026-03-05', '2026-09-18')).toEqual({
+      startDate: '2026-03-05',
+      endDate: '2026-09-18',
+    });
+    expect(buildPresetRange('all', '2015-01-05', '2026-09-18')).toEqual({
+      startDate: '2015-01-05',
+      endDate: '2026-09-18',
+    });
+  });
+});
+
+describe('replaceDatePart', () => {
+  it('clamps leap days when the year changes', () => {
+    expect(replaceDatePart('2024-02-29', 'year', 2025)).toBe('2025-02-28');
+  });
+
+  it('clamps the day when the month changes', () => {
+    expect(replaceDatePart('2026-01-31', 'month', 2)).toBe('2026-02-28');
+  });
+
+  it('does not use market-data boundaries when changing a valid date', () => {
+    expect(replaceDatePart('2026-09-18', 'year', 2036)).toBe('2036-09-18');
   });
 });

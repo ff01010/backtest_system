@@ -230,7 +230,7 @@ def test_runtime_manifest_base_image_matches_runtime_dockerfiles() -> None:
     ),
   )
 
-  for relative_path in ("deploy/Dockerfile.backend", "deploy/Dockerfile.worker"):
+  for relative_path in ("deploy/Dockerfile.backend",):
     dockerfile = (repository_dir / relative_path).read_text(encoding="utf-8")
     from_line = next(
       line for line in dockerfile.splitlines() if line.strip().startswith("FROM ")

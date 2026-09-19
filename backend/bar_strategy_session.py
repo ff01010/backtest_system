@@ -202,6 +202,10 @@ def _error_diagnostic(error: Exception) -> dict[str, str]:
     "trace": " > ".join(f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in trace),
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+    "__internal_raw_message": str(cause),
+    "__internal_raw_traceback": "".join(
+      traceback.format_exception(type(cause), cause, cause.__traceback__),
+    ),
   }
   name = missing_name(cause)
   line = strategy_source_line(cause)

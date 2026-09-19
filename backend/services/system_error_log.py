@@ -35,9 +35,9 @@ def system_error_log_record(
   task_id: str | None = None,
   worker_id: str | None = None,
 ) -> SystemErrorLogRecord | None:
-  """记录系统错误及 worker 拒绝任务时返回的原始诊断。"""
+  """记录系统错误及策略子进程拒绝任务时返回的原始诊断。"""
   if isinstance(error, RemoteBacktestError) and error.diagnostic:
-    return _remote_worker_record(error, source, stage, task_id, worker_id)
+    return _strategy_process_record(error, source, stage, task_id, worker_id)
   detail = error_detail(error)
   if detail.category != "system_error":
     return None
@@ -64,17 +64,17 @@ def system_error_log_record(
   )
 
 
-def _remote_worker_record(
+def _strategy_process_record(
   error: RemoteBacktestError,
   source: str,
   stage: str,
   task_id: str | None,
   worker_id: str | None,
 ) -> SystemErrorLogRecord:
-  """记录 worker 已返回的受限诊断正文，供管理员定位回放失败。"""
+  """记录策略子进程已返回的受限诊断正文，供管理员定位回放失败。"""
   diagnostic = error.diagnostic
   is_runtime_error = error.detail.code.startswith("runtime.")
-  context = {"service": "strategy_worker", **_worker_context(worker_id)}
+  context = {"service": "strategy_process", **_worker_context(worker_id)}
   if error.detail.symbol:
     context["symbol"] = error.detail.symbol
   if error.detail.event_time:

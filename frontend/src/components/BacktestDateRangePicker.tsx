@@ -1,194 +1,473 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
-export interface BacktestCalendarDay {
-  date: string;
-  tradingDay: boolean;
-  status: 'available' | 'incomplete' | 'future' | 'non_trading' | 'unknown';
-}
+type DateEndpoint = 'startDate' | 'endDate';
+type DatePart = 'year' | 'month' | 'day';
 
 interface Props {
   startDate: string;
   endDate: string;
-  days: BacktestCalendarDay[];
-  onChange: (key: 'startDate' | 'endDate', value: string) => void;
-  onMonthChange: (month: string) => void;
+  dataStartDate?: string | null;
+  dataEndDate?: string | null;
+  onApplyRange: (startDate: string, endDate: string) => void;
 }
 
-interface PopoverPosition {
-  left: number;
-  maxHeight: number;
-  top: number;
+interface DateParts {
+  day: number;
+  month: number;
+  year: number;
 }
 
-const POPOVER_FALLBACK_HEIGHT = 330;
-const POPOVER_FALLBACK_WIDTH = 244;
-const POPOVER_GAP = 6;
+interface ActiveWheel {
+  activationId: number;
+  anchor: HTMLButtonElement;
+  endpoint: DateEndpoint;
+  part: DatePart;
+}
+
+interface DateControlProps {
+  activePart: DatePart | null;
+  endpoint: DateEndpoint;
+  label: string;
+  value: string;
+  wheelId: string;
+  onOpenWheel: (endpoint: DateEndpoint, part: DatePart, anchor: HTMLButtonElement) => void;
+}
+
+interface WheelListProps {
+  label: string;
+  selectedValue: number;
+  values: readonly number[];
+  onSelect: (value: number) => void;
+}
+
+const MIN_YEAR = 1000;
+const MAX_YEAR = 9999;
+const WHEEL_ROW_HEIGHT = 32;
+const WHEEL_VISIBLE_ROWS = 7;
+const WHEEL_BUFFER_ROWS = 3;
+const WHEEL_HEIGHT = WHEEL_ROW_HEIGHT * WHEEL_VISIBLE_ROWS;
+const WHEEL_PADDING = WHEEL_ROW_HEIGHT * Math.floor(WHEEL_VISIBLE_ROWS / 2);
 const VIEWPORT_MARGIN = 8;
+const YEAR_OPTIONS = Array.from({ length: MAX_YEAR - MIN_YEAR + 1 }, (_, index) => MIN_YEAR + index);
+const MONTH_OPTIONS = Array.from({ length: 12 }, (_, index) => index + 1);
+const PRESETS = [
+  { key: 'one_month', label: '近1月' },
+  { key: 'three_months', label: '近3月' },
+] as const;
 
-function monthStart(month: string): Date {
-  return new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)) - 1, 1);
+function parseDate(value: string): DateParts | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (year < MIN_YEAR || year > MAX_YEAR || month < 1 || month > 12) return null;
+  const lastDay = new Date(year, month, 0).getDate();
+  return day >= 1 && day <= lastDay ? { year, month, day } : null;
 }
 
-function shiftMonth(month: string, offset: number): string {
-  const value = monthStart(month);
-  value.setMonth(value.getMonth() + offset);
-  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}`;
+function formatDate({ year, month, day }: DateParts): string {
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
-function formatDate(value: Date): string {
-  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+function lastDayOfMonth(year: number, month: number): number {
+  return new Date(year, month, 0).getDate();
 }
 
-export default function BacktestDateRangePicker({ startDate, endDate, days, onChange, onMonthChange }: Props) {
-  const [open, setOpen] = useState(false);
-  const [target, setTarget] = useState<'startDate' | 'endDate'>('startDate');
-  const [month, setMonth] = useState(startDate.slice(0, 7));
-  const [popoverPosition, setPopoverPosition] = useState<PopoverPosition>({ left: 0, maxHeight: POPOVER_FALLBACK_HEIGHT, top: 0 });
-  const anchorRef = useRef<HTMLDivElement | null>(null);
-  const popoverRef = useRef<HTMLDivElement | null>(null);
-  const popoverId = useId();
-  const dayByDate = useMemo(() => new Map(days.map((item) => [item.date, item])), [days]);
+function shiftDate(value: string, days: number): string {
+  const parsed = parseDate(value);
+  if (!parsed) return value;
+  const date = new Date(parsed.year, parsed.month - 1, parsed.day);
+  date.setDate(date.getDate() + days);
+  return formatDate({ year: date.getFullYear(), month: date.getMonth() + 1, day: date.getDate() });
+}
 
-  const updatePopoverPosition = useCallback((): void => {
-    const anchor = anchorRef.current;
-    if (!anchor) return;
+function shiftDateMonths(value: string, months: number): string {
+  const parsed = parseDate(value);
+  if (!parsed) return value;
+  const target = new Date(parsed.year, parsed.month - 1 + months, 1);
+  return formatDate({
+    year: target.getFullYear(),
+    month: target.getMonth() + 1,
+    day: Math.min(parsed.day, lastDayOfMonth(target.getFullYear(), target.getMonth() + 1)),
+  });
+}
 
-    const anchorRect = anchor.getBoundingClientRect();
-    const popoverWidth = popoverRef.current?.offsetWidth || POPOVER_FALLBACK_WIDTH;
-    const popoverHeight = popoverRef.current?.offsetHeight || POPOVER_FALLBACK_HEIGHT;
-    const spaceBelow = window.innerHeight - anchorRect.bottom - POPOVER_GAP - VIEWPORT_MARGIN;
-    const spaceAbove = anchorRect.top - POPOVER_GAP - VIEWPORT_MARGIN;
-    const showAbove = spaceBelow < popoverHeight && spaceAbove > spaceBelow;
-    const availableHeight = Math.max(96, showAbove ? spaceAbove : spaceBelow);
-    const renderedHeight = Math.min(popoverHeight, availableHeight);
-    const maxLeft = Math.max(VIEWPORT_MARGIN, window.innerWidth - popoverWidth - VIEWPORT_MARGIN);
-    const left = Math.min(Math.max(anchorRect.left, VIEWPORT_MARGIN), maxLeft);
-    const top = showAbove
-      ? Math.max(VIEWPORT_MARGIN, anchorRect.top - POPOVER_GAP - renderedHeight)
-      : Math.min(anchorRect.bottom + POPOVER_GAP, window.innerHeight - VIEWPORT_MARGIN - renderedHeight);
+export function buildPresetRange(
+  key: 'one_month' | 'three_months' | 'year_to_date' | 'all',
+  dataStartDate: string | null | undefined,
+  dataEndDate: string | null | undefined,
+): { startDate: string; endDate: string } | null {
+  const dataStart = dataStartDate ? parseDate(dataStartDate) : null;
+  const dataEnd = dataEndDate ? parseDate(dataEndDate) : null;
+  if (!dataStart || !dataEnd || dataStartDate! > dataEndDate!) return null;
+  if (key === 'all') return { startDate: dataStartDate!, endDate: dataEndDate! };
+  const candidate = key === 'year_to_date'
+    ? `${dataEnd.year}-01-01`
+    : shiftDate(shiftDateMonths(dataEndDate!, key === 'one_month' ? -1 : -3), 1);
+  return {
+    startDate: candidate < dataStartDate! ? dataStartDate! : candidate,
+    endDate: dataEndDate!,
+  };
+}
 
-    setPopoverPosition({ left, maxHeight: availableHeight, top });
+export function replaceDatePart(value: string, part: DatePart, nextPartValue: number): string {
+  const parsed = parseDate(value);
+  if (!parsed) return value;
+
+  if (part === 'year') {
+    if (nextPartValue < MIN_YEAR || nextPartValue > MAX_YEAR) return value;
+    return formatDate({
+      year: nextPartValue,
+      month: parsed.month,
+      day: Math.min(parsed.day, lastDayOfMonth(nextPartValue, parsed.month)),
+    });
+  }
+
+  if (part === 'month') {
+    if (nextPartValue < 1 || nextPartValue > 12) return value;
+    return formatDate({
+      year: parsed.year,
+      month: nextPartValue,
+      day: Math.min(parsed.day, lastDayOfMonth(parsed.year, nextPartValue)),
+    });
+  }
+
+  const maxDay = lastDayOfMonth(parsed.year, parsed.month);
+  if (nextPartValue < 1 || nextPartValue > maxDay) return value;
+  return formatDate({ ...parsed, day: nextPartValue });
+}
+
+function optionLabel(part: DatePart, value: number): string {
+  return part === 'year' ? String(value).padStart(4, '0') : String(value).padStart(2, '0');
+}
+
+function WheelList(props: WheelListProps) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const selectedIndex = Math.max(0, props.values.indexOf(props.selectedValue));
+  const selectedValueRef = useRef(props.selectedValue);
+  const [visibleStart, setVisibleStart] = useState(() => Math.max(0, selectedIndex - WHEEL_VISIBLE_ROWS));
+  const visibleEnd = Math.min(props.values.length, visibleStart + WHEEL_VISIBLE_ROWS + WHEEL_BUFFER_ROWS * 2);
+
+  useLayoutEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    node.scrollTop = selectedIndex * WHEEL_ROW_HEIGHT;
   }, []);
 
   useEffect(() => {
-    if (open) onMonthChange(month);
-  }, [month, onMonthChange, open]);
+    selectedValueRef.current = props.selectedValue;
+  }, [props.selectedValue]);
 
-  useLayoutEffect(() => {
-    if (!open) return;
-    updatePopoverPosition();
-  }, [month, open, updatePopoverPosition]);
-
-  useEffect(() => {
-    if (!open) return undefined;
-
-    const closeOnOutsidePointer = (event: PointerEvent): void => {
-      const targetElement = event.target as Node | null;
-      if (targetElement && (anchorRef.current?.contains(targetElement) || popoverRef.current?.contains(targetElement))) return;
-      setOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setOpen(false);
-    };
-
-    document.addEventListener('pointerdown', closeOnOutsidePointer);
-    document.addEventListener('keydown', closeOnEscape);
-    window.addEventListener('resize', updatePopoverPosition);
-    window.addEventListener('scroll', updatePopoverPosition, true);
-    return () => {
-      document.removeEventListener('pointerdown', closeOnOutsidePointer);
-      document.removeEventListener('keydown', closeOnEscape);
-      window.removeEventListener('resize', updatePopoverPosition);
-      window.removeEventListener('scroll', updatePopoverPosition, true);
-    };
-  }, [open, updatePopoverPosition]);
-
-  const choose = (value: string): void => {
-    const status = dayByDate.get(value)?.status;
-    if (status !== 'available') return;
-    if (target === 'startDate') {
-      onChange('startDate', value);
-      if (value > endDate) onChange('endDate', value);
-      setTarget('endDate');
-      return;
+  const updateFromScroll = (): void => {
+    const node = scrollRef.current;
+    if (!node) return;
+    const centeredIndex = Math.min(
+      props.values.length - 1,
+      Math.max(0, Math.round(node.scrollTop / WHEEL_ROW_HEIGHT)),
+    );
+    const firstVisible = Math.max(
+      0,
+      Math.floor((node.scrollTop - WHEEL_PADDING) / WHEEL_ROW_HEIGHT) - WHEEL_BUFFER_ROWS,
+    );
+    setVisibleStart(firstVisible);
+    const nextValue = props.values[centeredIndex];
+    if (nextValue !== selectedValueRef.current) {
+      selectedValueRef.current = nextValue;
+      props.onSelect(nextValue);
     }
-    onChange('endDate', value);
-    if (value < startDate) onChange('startDate', value);
-    setTarget('startDate');
   };
 
-  const renderMonth = (value: string) => {
-    const first = monthStart(value);
-    const padding = first.getDay() === 0 ? 6 : first.getDay() - 1;
-    const last = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
-    const cells = Array.from({ length: padding + last }, (_, index) => index < padding ? null : index - padding + 1);
-    return (
-      <div style={{ minWidth: 218 }}>
-        <div style={{ color: '#0f172a', fontSize: 12, fontWeight: 700, marginBottom: 8 }}>{value}</div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 3 }}>
-          {['一', '二', '三', '四', '五', '六', '日'].map((label) => <span key={label} style={{ color: '#94a3b8', fontSize: 10, textAlign: 'center' }}>{label}</span>)}
-          {cells.map((day, index) => {
-            if (day === null) return <span key={`empty-${index}`} />;
-            const date = formatDate(new Date(first.getFullYear(), first.getMonth(), day));
-            const status = dayByDate.get(date)?.status || 'unknown';
-            const selected = date === startDate || date === endDate;
-            const unavailable = status !== 'available';
-            return (
-              <button
-                key={date}
-                type="button"
-                disabled={unavailable}
-                onClick={() => choose(date)}
-                title={status === 'future' ? '未来交易日不可用于回测' : status === 'incomplete' ? '该交易日数据不完整' : status === 'unknown' ? '正在检查数据可用性' : undefined}
-                style={{ height: 27, border: 0, borderRadius: 3, background: selected ? '#0f766e' : unavailable ? '#e2e8f0' : '#f8fafc', color: selected ? '#ffffff' : unavailable ? '#94a3b8' : '#334155', cursor: unavailable ? 'not-allowed' : 'pointer', fontSize: 11 }}
-              >
-                {day}
-              </button>
-            );
-          })}
-        </div>
+  const centerOption = (index: number, value: number): void => {
+    selectedValueRef.current = value;
+    props.onSelect(value);
+    const node = scrollRef.current;
+    if (!node) return;
+    if (typeof node.scrollTo === 'function') {
+      node.scrollTo({ top: index * WHEEL_ROW_HEIGHT, behavior: 'smooth' });
+    } else {
+      node.scrollTop = index * WHEEL_ROW_HEIGHT;
+    }
+  };
+
+  return (
+    <div
+      ref={scrollRef}
+      role="listbox"
+      tabIndex={0}
+      className="backtest-date-wheel-scroll"
+      aria-label={props.label}
+      onScroll={updateFromScroll}
+    >
+      <div
+        className="backtest-date-wheel-spacer"
+        style={{ height: props.values.length * WHEEL_ROW_HEIGHT + WHEEL_PADDING * 2 }}
+      >
+        {props.values.slice(visibleStart, visibleEnd).map((value, offset) => {
+          const index = visibleStart + offset;
+          const selected = value === props.selectedValue;
+          return (
+            <button
+              key={value}
+              type="button"
+              role="option"
+              aria-selected={selected}
+              className={`backtest-date-wheel-option${selected ? ' is-selected' : ''}`}
+              style={{ top: WHEEL_PADDING + index * WHEEL_ROW_HEIGHT }}
+              onClick={() => centerOption(index, value)}
+            >
+              {String(value).padStart(value > 31 ? 4 : 2, '0')}
+            </button>
+          );
+        })}
       </div>
+    </div>
+  );
+}
+
+function DateControl(props: DateControlProps) {
+  const parsed = parseDate(props.value);
+  const parts = parsed || { year: 0, month: 0, day: 0 };
+  const endpointLabel = `${props.label}日期`;
+
+  const renderPart = (part: DatePart, value: number) => {
+    const partLabel = part === 'year' ? '年份' : part === 'month' ? '月份' : '日期';
+    const expanded = props.activePart === part;
+    return (
+      <button
+        type="button"
+        className={`backtest-date-segment${expanded ? ' is-active' : ''}`}
+        aria-label={`${endpointLabel}${partLabel}`}
+        aria-haspopup="listbox"
+        aria-expanded={expanded}
+        aria-controls={expanded ? props.wheelId : undefined}
+        title={`点击选择${endpointLabel}${partLabel}`}
+        onClick={(event) => props.onOpenWheel(props.endpoint, part, event.currentTarget)}
+      >
+        {optionLabel(part, value)}
+      </button>
     );
   };
 
   return (
-    <div ref={anchorRef} style={{ position: 'relative' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-        {(['startDate', 'endDate'] as const).map((key) => (
+    <div className="backtest-date-trigger" role="group" aria-label={`${endpointLabel} ${props.value}`}>
+      <span className="backtest-date-trigger-label">{props.label}</span>
+      <strong className="backtest-date-value">
+        {renderPart('year', parts.year)}
+        <span className="backtest-date-separator" aria-hidden="true">-</span>
+        {renderPart('month', parts.month)}
+        <span className="backtest-date-separator" aria-hidden="true">-</span>
+        {renderPart('day', parts.day)}
+      </strong>
+    </div>
+  );
+}
+
+export default function BacktestDateRangePicker(props: Props) {
+  const [draft, setDraft] = useState({ startDate: props.startDate, endDate: props.endDate });
+  const [activeWheel, setActiveWheel] = useState<ActiveWheel | null>(null);
+  const [wheelPosition, setWheelPosition] = useState({ left: 0, top: 0, width: 68 });
+  const wheelRef = useRef<HTMLDivElement | null>(null);
+  const activationSequenceRef = useRef(0);
+  const wheelId = useId();
+  const hasChanges = draft.startDate !== props.startDate || draft.endDate !== props.endDate;
+
+  useEffect(() => {
+    setDraft({ startDate: props.startDate, endDate: props.endDate });
+    setActiveWheel(null);
+  }, [props.endDate, props.startDate]);
+
+  const updateWheelPosition = useCallback((): void => {
+    if (!activeWheel?.anchor.isConnected) return;
+    const anchorRect = activeWheel.anchor.getBoundingClientRect();
+    const width = activeWheel.part === 'year' ? 84 : 68;
+    const left = Math.min(
+      Math.max(anchorRect.left + anchorRect.width / 2 - width / 2, VIEWPORT_MARGIN),
+      window.innerWidth - width - VIEWPORT_MARGIN,
+    );
+    const top = Math.min(
+      Math.max(anchorRect.top + anchorRect.height / 2 - WHEEL_HEIGHT / 2, VIEWPORT_MARGIN),
+      window.innerHeight - WHEEL_HEIGHT - VIEWPORT_MARGIN,
+    );
+    setWheelPosition({ left, top, width });
+  }, [activeWheel]);
+
+  useLayoutEffect(() => {
+    if (activeWheel) updateWheelPosition();
+  }, [activeWheel, updateWheelPosition]);
+
+  useEffect(() => {
+    if (!activeWheel) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      const target = event.target as Node | null;
+      if (target && (activeWheel.anchor.contains(target) || wheelRef.current?.contains(target))) return;
+      setActiveWheel(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setActiveWheel(null);
+    };
+    const repositionOnScroll = (event: Event): void => {
+      const target = event.target as Node | null;
+      if (target && wheelRef.current?.contains(target)) return;
+      updateWheelPosition();
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    document.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('resize', updateWheelPosition);
+    window.addEventListener('scroll', repositionOnScroll, true);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('resize', updateWheelPosition);
+      window.removeEventListener('scroll', repositionOnScroll, true);
+    };
+  }, [activeWheel, updateWheelPosition]);
+
+  const openWheel = (endpoint: DateEndpoint, part: DatePart, anchor: HTMLButtonElement): void => {
+    if (activeWheel?.endpoint === endpoint && activeWheel.part === part) {
+      setActiveWheel(null);
+      return;
+    }
+    activationSequenceRef.current += 1;
+    setActiveWheel({ endpoint, part, anchor, activationId: activationSequenceRef.current });
+  };
+
+  const applyEndpointValue = (endpoint: DateEndpoint, nextValue: string): void => {
+    setDraft((current) => ({ ...current, [endpoint]: nextValue }));
+  };
+
+  const activeDate = activeWheel?.endpoint === 'startDate' ? draft.startDate : draft.endDate;
+  const activeParts = parseDate(activeDate);
+  const values = useMemo(() => {
+    if (!activeWheel || !activeParts) return [];
+    if (activeWheel.part === 'year') return YEAR_OPTIONS;
+    if (activeWheel.part === 'month') return MONTH_OPTIONS;
+    return Array.from(
+      { length: lastDayOfMonth(activeParts.year, activeParts.month) },
+      (_, index) => index + 1,
+    );
+  }, [activeParts?.month, activeParts?.year, activeWheel?.part]);
+  const selectedValue = activeWheel && activeParts ? activeParts[activeWheel.part] : 0;
+
+  const selectWheelValue = (value: number): void => {
+    if (!activeWheel) return;
+    const currentValue = activeWheel.endpoint === 'startDate' ? draft.startDate : draft.endDate;
+    applyEndpointValue(activeWheel.endpoint, replaceDatePart(currentValue, activeWheel.part, value));
+  };
+
+  const applyPreset = (key: 'one_month' | 'three_months' | 'year_to_date' | 'all'): void => {
+    const range = buildPresetRange(key, props.dataStartDate, props.dataEndDate);
+    if (!range) return;
+    setDraft(range);
+    setActiveWheel(null);
+  };
+
+  const useEarliestDate = (): void => {
+    if (!props.dataStartDate || !parseDate(props.dataStartDate)) return;
+    setDraft((current) => ({
+      startDate: props.dataStartDate!,
+      endDate: current.endDate,
+    }));
+    setActiveWheel(null);
+  };
+
+  const cancelChanges = (): void => {
+    setDraft({ startDate: props.startDate, endDate: props.endDate });
+    setActiveWheel(null);
+  };
+
+  const applyChanges = (): void => {
+    props.onApplyRange(draft.startDate, draft.endDate);
+    setActiveWheel(null);
+  };
+
+  const rangeLabel = props.dataStartDate && props.dataEndDate
+    ? `${props.dataStartDate} — ${props.dataEndDate}`
+    : '正在读取';
+
+  return (
+    <div className="backtest-date-range-picker">
+      <div className="backtest-date-coverage">
+        <span>可回测范围：</span>
+        <strong>{rangeLabel}</strong>
+      </div>
+      <div className="backtest-date-presets" aria-label="快捷回测区间">
+        {PRESETS.map((preset) => (
           <button
-            key={key}
+            key={preset.key}
             type="button"
-            aria-controls={popoverId}
-            aria-expanded={target === key && open}
-            onClick={() => {
-              setTarget(key);
-              setMonth((key === 'startDate' ? startDate : endDate).slice(0, 7));
-              setOpen(true);
-            }}
-            style={{ height: 34, border: `1px solid ${target === key && open ? '#0f766e' : '#cbd5e1'}`, borderRadius: 4, background: '#f8fafc', color: '#334155', textAlign: 'left', padding: '0 10px', fontSize: 12 }}
+            disabled={!buildPresetRange(preset.key, props.dataStartDate, props.dataEndDate)}
+            onClick={() => applyPreset(preset.key)}
           >
-            {key === 'startDate' ? '开始：' : '结束：'}{key === 'startDate' ? startDate : endDate}
+            {preset.label}
           </button>
         ))}
-      </div>
-      {open && createPortal(
-        <div
-          id={popoverId}
-          ref={popoverRef}
-          role="dialog"
-          aria-label="回测日期选择"
-          style={{ position: 'fixed', zIndex: 70, top: popoverPosition.top, left: popoverPosition.left, maxHeight: popoverPosition.maxHeight, overflowY: 'auto', padding: 12, background: '#ffffff', border: '1px solid #cbd5e1', borderRadius: 6, boxShadow: '0 12px 28px rgba(15, 23, 42, 0.18)' }}
+        <button
+          type="button"
+          disabled={!buildPresetRange('year_to_date', props.dataStartDate, props.dataEndDate)}
+          onClick={() => applyPreset('year_to_date')}
         >
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-            <button type="button" onClick={() => setMonth(shiftMonth(month, -1))} style={{ border: 0, background: 'transparent', color: '#0f766e', cursor: 'pointer' }}>‹</button>
-            <span style={{ color: '#64748b', fontSize: 11 }}>灰色日期不可选</span>
-            <button type="button" onClick={() => setMonth(shiftMonth(month, 1))} style={{ border: 0, background: 'transparent', color: '#0f766e', cursor: 'pointer' }}>›</button>
-          </div>
-          {renderMonth(month)}
-          <button type="button" onClick={() => setOpen(false)} style={{ width: '100%', marginTop: 10, height: 28, border: '1px solid #cbd5e1', borderRadius: 3, background: '#f8fafc', color: '#475569', fontSize: 11 }}>关闭</button>
+          今年
+        </button>
+        <button
+          type="button"
+          disabled={!buildPresetRange('all', props.dataStartDate, props.dataEndDate)}
+          onClick={() => applyPreset('all')}
+        >
+          全部数据
+        </button>
+      </div>
+      <div className="backtest-date-trigger-grid">
+        <DateControl
+          endpoint="startDate"
+          label="开始"
+          value={draft.startDate}
+          wheelId={wheelId}
+          activePart={activeWheel?.endpoint === 'startDate' ? activeWheel.part : null}
+          onOpenWheel={openWheel}
+        />
+        <DateControl
+          endpoint="endDate"
+          label="结束"
+          value={draft.endDate}
+          wheelId={wheelId}
+          activePart={activeWheel?.endpoint === 'endDate' ? activeWheel.part : null}
+          onOpenWheel={openWheel}
+        />
+      </div>
+      <div className="backtest-date-footer">
+        <button
+          type="button"
+          className="backtest-date-earliest"
+          disabled={!props.dataStartDate || !parseDate(props.dataStartDate)}
+          onClick={useEarliestDate}
+        >
+          从最早日期开始
+        </button>
+        <div className="backtest-date-actions">
+          <button type="button" className="app-button is-quiet" disabled={!hasChanges} onClick={cancelChanges}>取消</button>
+          <button type="button" className="app-button is-primary" disabled={!hasChanges} onClick={applyChanges}>应用</button>
+        </div>
+      </div>
+      {activeWheel && activeParts && createPortal(
+        <div
+          key={activeWheel.activationId}
+          id={wheelId}
+          ref={wheelRef}
+          className="backtest-date-wheel"
+          style={wheelPosition}
+        >
+          <div className="backtest-date-wheel-selection" aria-hidden="true" />
+          <WheelList
+            label={`${activeWheel.endpoint === 'startDate' ? '开始日期' : '结束日期'}${activeWheel.part === 'year' ? '年份' : activeWheel.part === 'month' ? '月份' : '日期'}选项`}
+            selectedValue={selectedValue}
+            values={values}
+            onSelect={selectWheelValue}
+          />
+          <div className="backtest-date-wheel-fade" aria-hidden="true" />
         </div>,
-        document.body
+        document.body,
       )}
     </div>
   );

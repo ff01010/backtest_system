@@ -27,7 +27,7 @@ from backend.strategies.catalog import create_bar_strategy, get_strategy_source_
 from backend.strategies.external_engine import load_external_engine
 from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
 from backend.strategies.script_time_context import normalize_script_bar_time
-from backend.services import bar_data, market_data, state_store, strategy_worker
+from backend.services import bar_data, market_data, state_store
 
 _BACKTEST_SYSTEM_ROOT = os.path.dirname(
   os.path.dirname(os.path.dirname(__file__))
@@ -178,8 +178,12 @@ def run_user_script_backtest(
     payload.get("researchSignalSnapshot"),
     [str(row.time) for row in bars.itertuples(index=False)],
   )
-  execute_script = script_executor or strategy_worker.run_script
-  worker_result = execute_script({
+  if script_executor is None:
+    from backend.bar_strategy_session import BarStrategySession
+
+    script_executor = BarStrategySession().run_script
+  execute_script = script_executor
+  execution_result = execute_script({
     "scriptId": script_id,
     "code": script["code"],
     "params": {
@@ -225,28 +229,28 @@ def run_user_script_backtest(
   base_quantity = int(payload.get("baseQuantity", 0))
   base_cost_price = float(payload.get("baseCostPrice", 0))
   initial_equity = _initial_total_equity(initial_cash, base_quantity, base_cost_price)
-  daily_holdings = _build_worker_daily_holdings(
-    formal_bars, worker_result["portfolioSnapshots"], payload["symbol"], initial_equity,
+  daily_holdings = _build_strategy_daily_holdings(
+    formal_bars, execution_result["portfolioSnapshots"], payload["symbol"], initial_equity,
   )
-  summary = _build_worker_summary(
+  summary = _build_strategy_summary(
     initial_cash, base_quantity, base_cost_price, bool(payload.get("t0Enabled", False)),
-    worker_result["trades"], daily_holdings,
+    execution_result["trades"], daily_holdings,
   )
   cycles: list[dict[str, Any]] = []
   if _strategy_category(payload) == "core_position_overlay":
-    _ensure_fill_ids(worker_result["trades"])
+    _ensure_fill_ids(execution_result["trades"])
     report = build_overlay_report(
-      _overlay_fills(worker_result.get("fills", [])),
+      _overlay_fills(execution_result.get("fills", [])),
       daily_holdings,
       initial_cash,
       base_quantity,
       base_cost_price,
     )
-    _merge_overlay_report(worker_result["trades"], daily_holdings, summary, report)
+    _merge_overlay_report(execution_result["trades"], daily_holdings, summary, report)
     cycles = report["cycles"]
   else:
     summary.update(build_closed_trade_metrics(
-      _directional_fills(worker_result.get("fills", [])),
+      _directional_fills(execution_result.get("fills", [])),
       base_quantity if bool(payload.get("initialPositionEnabled", False)) else 0,
     ))
   benchmark_symbol = payload.get("benchmarkSymbol") or payload["symbol"]
@@ -268,10 +272,10 @@ def run_user_script_backtest(
     "excessReturn": round(summary["totalReturn"] - benchmark_return, 6),
     "dailyHoldings": daily_holdings,
     "cycles": cycles,
-    "trades": worker_result["trades"],
-    "skippedSignals": worker_result["skippedSignals"] + worker_result.get("unexecutedOrders", []),
+    "trades": execution_result["trades"],
+    "skippedSignals": execution_result["skippedSignals"] + execution_result.get("unexecutedOrders", []),
     "experimentManifest": manifest,
-    "warnings": _build_warnings(payload) + benchmark_warnings + worker_result["warnings"],
+    "warnings": _build_warnings(payload) + benchmark_warnings + execution_result["warnings"],
   }
   if isinstance(payload.get("researchSignalSnapshot"), dict):
     response["researchSignalSnapshot"] = payload["researchSignalSnapshot"]
@@ -338,20 +342,20 @@ def run_research_signal_backtest(
   payload: dict[str, Any],
   script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-  """Replay one frozen standard-signal snapshot through the existing Bar worker."""
+  """通过现有 Bar 策略子进程回放冻结的标准研究信号快照。"""
   snapshot = payload.get("researchSignalSnapshot")
   if not isinstance(snapshot, dict) or not isinstance(snapshot.get("artifactFile"), str):
     raise ValueError("研究信号冻结快照不存在")
   signals = _load_frozen_research_signals(snapshot["artifactFile"])
-  worker_payload = dict(payload)
-  worker_payload["scriptId"] = f"research-signal:{snapshot['datasetId']}"
-  worker_payload["versionScriptSnapshot"] = {
+  script_payload = dict(payload)
+  script_payload["scriptId"] = f"research-signal:{snapshot['datasetId']}"
+  script_payload["versionScriptSnapshot"] = {
     "name": "冻结研究信号", "entryType": "on_bar", "code": _RESEARCH_SIGNAL_SCRIPT,
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
-  worker_payload["strategyParams"] = {**dict(payload.get("strategyParams") or {}), "signalsByDate": signals}
-  result = run_user_script_backtest(worker_payload, script_executor)
+  script_payload["strategyParams"] = {**dict(payload.get("strategyParams") or {}), "signalsByDate": signals}
+  result = run_user_script_backtest(script_payload, script_executor)
   result["researchSignalSnapshot"] = snapshot
   return result
 
@@ -488,15 +492,15 @@ def _build_script_experiment_manifest(
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
     "resultSchemaVersion": 3,
-    "executionEnvironment": "strategy-worker",
+    "executionEnvironment": "bar-runner-child-process",
   }
 
 
-def _build_worker_daily_holdings(
+def _build_strategy_daily_holdings(
   bars: pd.DataFrame, snapshots: list[dict[str, Any]], symbol: str, initial_equity: float,
 ) -> list[dict[str, Any]]:
   if len(bars) != len(snapshots):
-    raise ValueError("策略执行容器返回的账本快照数量异常")
+    raise ValueError("策略子进程返回的账本快照数量异常")
   items: list[dict[str, Any]] = []
   previous_total = initial_equity
   for index, row in enumerate(bars.itertuples(index=False)):
@@ -521,7 +525,7 @@ def _build_worker_daily_holdings(
   return items
 
 
-def _build_worker_summary(
+def _build_strategy_summary(
   initial_cash: float,
   base_quantity: int,
   base_cost_price: float,
@@ -549,7 +553,7 @@ def _build_worker_summary(
     "avgLoss": round(sum(losses) / len(losses), 2) if losses else None,
     "profitLossRatio": round(abs(sum(wins) / sum(losses)), 4) if wins and losses else None,
     "finalEquity": round(final_equity, 2),
-    **_build_worker_base_metrics(initial_cash, base_quantity, base_cost_price, t0_enabled, daily_holdings),
+    **_build_strategy_base_metrics(initial_cash, base_quantity, base_cost_price, t0_enabled, daily_holdings),
   }
 
 
@@ -638,7 +642,7 @@ def _merge_overlay_report(
   })
 
 
-def _build_worker_base_metrics(
+def _build_strategy_base_metrics(
   initial_cash: float,
   base_quantity: int,
   base_cost_price: float,
