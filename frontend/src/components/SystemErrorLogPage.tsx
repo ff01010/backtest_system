@@ -48,7 +48,7 @@ export default function SystemErrorLogPage() {
       setSelectedId(null);
       setError('');
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '无法读取系统错误日志');
+      setError(reason instanceof Error ? reason.message : '无法读取回测诊断日志');
     } finally {
       setLoading(false);
     }
@@ -67,8 +67,8 @@ export default function SystemErrorLogPage() {
         <header style={headerStyle}>
           <div>
             <div style={eyebrowStyle}>SYSTEM OBSERVABILITY</div>
-            <h2 style={{ margin: '5px 0 4px', color: 'var(--text)' }}>系统错误日志</h2>
-            <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>仅记录回测系统错误；策略脚本错误仍在策略回测页展示。</p>
+            <h2 style={{ margin: '5px 0 4px', color: 'var(--text)' }}>回测诊断日志</h2>
+            <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>记录系统错误和需维护的数据异常；策略脚本错误仍在策略回测页展示。</p>
           </div>
           <button type="button" disabled={loading} onClick={() => void refresh()} style={buttonStyle}>{loading ? '读取中…' : '刷新日志'}</button>
         </header>
@@ -117,7 +117,7 @@ export default function SystemErrorLogPage() {
               <td style={{ ...cellStyle, maxWidth: 340 }}>{item.reason}</td>
             </tr>)}</tbody>
           </table>
-          {!loading && items.length === 0 ? <div style={emptyStyle}>当前筛选条件下没有系统错误日志。</div> : null}
+          {!loading && items.length === 0 ? <div style={emptyStyle}>当前筛选条件下没有回测诊断日志。</div> : null}
         </div>
 
         {selected ? <section style={detailStyle}>

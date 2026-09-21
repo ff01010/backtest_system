@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import SharedBacktestPage from '../components/SharedBacktestPage';
 
@@ -111,7 +111,9 @@ describe('SharedBacktestPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '查看详情' }));
 
     expect(await screen.findByText('历史回测结果不代表未来表现')).toBeTruthy();
-    expect(screen.getByText('2026-01-01 至 2026-01-31')).toBeTruthy();
+    const rangeField = screen.getByText('回测区间').parentElement;
+    expect(rangeField).toBeTruthy();
+    expect(within(rangeField!).getByText('2026-01-01 至 2026-01-31')).toBeTruthy();
     expect(screen.getByText('bar_next_open')).toBeTruthy();
     expect(screen.getByText('runtime-1')).toBeTruthy();
     expect(screen.getByText('样本期较短')).toBeTruthy();

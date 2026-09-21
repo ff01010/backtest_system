@@ -311,13 +311,14 @@ export interface BacktestRunResponse {
 }
 
 export interface BacktestErrorDetail {
-  category: 'strategy_error' | 'system_error';
+  category: 'strategy_error' | 'data' | 'system_error';
   code: string;
   message: string;
   hint?: string | null;
   callback?: 'on_bar' | 'on_quote' | 'on_order_event' | null;
   eventTime?: string | null;
   symbol?: string | null;
+  tradeDate?: string | null;
   retryable: boolean;
   taskId?: string | null;
   missingName?: string | null;

@@ -226,18 +226,24 @@ def test_saved_initial_position_setting_must_match_run_request() -> None:
     api_app._validate_saved_params(request, config)
 
 
-def test_bar_source_error_is_exposed_as_request_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bar_quality_error_preserves_structured_failure(monkeypatch: pytest.MonkeyPatch) -> None:
   from backend.l2.providers import L2DataError
   from backend.services import bar_data
 
   monkeypatch.setattr(
     bar_data,
     "load_bars_with_snapshot",
-    lambda *_: (_ for _ in ()).throw(L2DataError("临时 L2 Bar 无有效价格: 2025-03-07")),
+    lambda *_: (_ for _ in ()).throw(L2DataError(
+      "临时 L2 Bar 无有效价格: 2025-03-07",
+      code="data.l2_bar_price_invalid",
+      context={"symbol": "688981.SH", "tradeDate": "2025-03-07"},
+    )),
   )
 
-  with pytest.raises(ValueError, match="Bar 数据不可用于回测: 临时 L2 Bar 无有效价格"):
+  with pytest.raises(L2DataError) as raised:
     bar_data.ensure_available("688981.SH", "5m", "20250307", "20250307")
+
+  assert raised.value.code == "data.l2_bar_price_invalid"
 
 
 def test_trend_grid_direction_flags_block_opening_orders(tmp_path: Any) -> None:

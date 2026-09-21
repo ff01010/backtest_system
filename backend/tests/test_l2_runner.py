@@ -6,6 +6,7 @@ import pytest
 
 from backend import l2_runner
 from backend.backtesting.overlay import ResultReconciliationError
+from backend.l2.providers import L2DataError
 
 
 def test_l2_runner_persists_actual_worker_for_result_error(
@@ -52,3 +53,50 @@ def test_l2_runner_persists_actual_worker_for_result_error(
     "container=l2-runner-a; workerId=l2-runner-a:4321; "
     "taskId=run-result; stage=l2.bar_load"
   )
+
+
+def test_l2_runner_persists_operator_visible_data_error(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  job = {
+    "runId": "run-data",
+    "ownerUserId": "owner-1",
+    "attemptToken": "attempt-1",
+    "payload": {
+      "symbol": "688449.SH",
+      "timeframe": "1m",
+      "startDate": "2025-05-29",
+      "endDate": "2025-05-29",
+    },
+  }
+  finished: dict[str, Any] = {}
+  error = L2DataError(
+    "快照缺少稳定 sequence，且同一时间戳存在重复记录",
+    code="data.l2_quote_order_ambiguous",
+    context={"symbol": "688449.SH", "tradeDate": "2025-05-29"},
+  )
+  monkeypatch.setattr(l2_runner.state_store, "claim_l2_backtest_job", lambda *_: job)
+  monkeypatch.setattr(l2_runner._JobLeaseKeeper, "start", lambda _: None)
+  monkeypatch.setattr(l2_runner._JobLeaseKeeper, "stop", lambda _: None)
+  monkeypatch.setattr(
+    l2_runner.bar_data,
+    "load_normalized_bars_with_snapshot",
+    lambda *_: (_ for _ in ()).throw(error),
+  )
+  monkeypatch.setattr(
+    l2_runner.state_store,
+    "finish_l2_backtest_job",
+    lambda *args, **kwargs: finished.update({"args": args, "kwargs": kwargs}) or True,
+  )
+
+  assert l2_runner.L2Runner("l2-runner-a:4321").run_once() is True
+  assert finished["args"][2] == "failed"
+  assert finished["args"][3]["errorDetail"]["category"] == "data"
+  assert finished["args"][3]["errorDetail"]["code"] == "data.l2_quote_order_ambiguous"
+  assert finished["kwargs"]["system_error"]["category"] == "data"
+  context = finished["kwargs"]["system_error"]["context"]
+  assert context["symbol"] == "688449.SH"
+  assert context["tradeDate"] == "2025-05-29"
+  assert context["workerId"] == "l2-runner-a:4321"
+  assert context["__internal_raw_message"] == "快照缺少稳定 sequence，且同一时间戳存在重复记录"
+  assert "L2DataError" in context["__internal_raw_traceback"]

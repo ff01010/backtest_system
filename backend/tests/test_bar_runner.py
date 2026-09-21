@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from backend import bar_runner
+from backend.services.backtest_faults import BacktestFault
 from backend.services.backtest_errors import RemoteBacktestError
 
 
@@ -139,7 +140,9 @@ def test_bar_runner_marks_job_cancelled_when_lease_keeper_detects_cancel(monkeyp
   monkeypatch.setattr(
     bar_runner._BarJobLeaseKeeper,
     "ensure_active",
-    lambda _: (_ for _ in ()).throw(ValueError("Bar 任务租约丢失或已取消")),
+    lambda _: (_ for _ in ()).throw(
+      BacktestFault("task.inactive", "Bar 任务租约丢失或已取消"),
+    ),
   )
   monkeypatch.setattr(bar_runner.research_result_outbox, "dispatch_pending", lambda: 0)
   monkeypatch.setattr(

@@ -34,6 +34,7 @@ class BacktestErrorDetail:
   callback: str | None = None
   event_time: str | None = None
   symbol: str | None = None
+  trade_date: str | None = None
   retryable: bool = False
   task_id: str | None = None
   missing_name: str | None = None
@@ -52,6 +53,7 @@ class BacktestErrorDetail:
       "callback": self.callback,
       "eventTime": self.event_time,
       "symbol": self.symbol,
+      "tradeDate": self.trade_date,
       "retryable": self.retryable,
       "taskId": self.task_id,
       "missingName": self.missing_name,
@@ -122,6 +124,7 @@ class RemoteBacktestError(BacktestExecutionError):
       callback=_optional_text(value.get("callback")),
       event_time=_optional_text(value.get("eventTime")),
       symbol=_optional_text(value.get("symbol")),
+      trade_date=_optional_text(value.get("tradeDate")),
       retryable=bool(value.get("retryable", False)),
       task_id=_optional_text(value.get("taskId")),
       missing_name=_optional_text(value.get("missingName")),
@@ -139,8 +142,14 @@ def error_detail(error: Exception, task_id: str | None = None) -> BacktestErrorD
     return error.detail.with_task_id(task_id or error.detail.task_id)
   classified = classify_system_error(error)
   return BacktestErrorDetail(
-    "data" if classified.category == "data" else "system_error", classified.code, classified.public_message,
-    classified.public_hint, retryable=classified.retryable, task_id=task_id,
+    classified.public_category,
+    classified.code,
+    classified.public_message,
+    classified.public_hint,
+    symbol=classified.context.get("symbol"),
+    trade_date=classified.context.get("tradeDate"),
+    retryable=classified.retryable,
+    task_id=task_id,
   )
 
 
@@ -148,6 +157,20 @@ def error_summary(error: Exception, task_id: str | None = None) -> dict[str, Any
   """生成可持久化且兼容旧任务列表的失败摘要。"""
   detail = error_detail(error, task_id)
   return {"error": detail.message, "errorDetail": detail.to_dict()}
+
+
+def error_http_status(error: Exception) -> int:
+  """返回同步接口应使用的 HTTP 状态，不再从公开错误码反推。"""
+  if isinstance(error, BacktestExecutionError):
+    return 422 if error.detail.category in {"strategy_error", "data"} else 503
+  return classify_system_error(error).http_status
+
+
+def error_terminal_status(error: Exception) -> str:
+  """返回异步任务终态，避免 Runner 匹配异常文本。"""
+  if isinstance(error, BacktestExecutionError):
+    return "failed"
+  return classify_system_error(error).terminal_status
 
 
 def _strategy_code(error: Exception) -> str:
