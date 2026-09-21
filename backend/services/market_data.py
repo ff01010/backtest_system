@@ -16,13 +16,26 @@ from backend.date_codec import TradingDateError, format_api_date, normalize_date
 from backend.services import clickhouse_client, state_store
 
 
-_DATABASE = "raw_historical_data"
-_BJ_DATABASE = "qmt_history_dev"
-_BJ_RAW_TABLE = "qmt_kline_1m_raw"
-_BJ_RUNS_TABLE = "qmt_ingest_runs"
-_BJ_ADJUSTMENT = "none"
-_DIRECT_PERIODS = {"1m", "5m", "60m", "1d"}
-_DERIVED_PERIODS = {"15m": 15, "30m": 30}
+_LEGACY_SOURCE = "legacy"
+_HISTORY_SOURCE = "history_dev"
+_LEGACY_DATABASE = "raw_historical_data"
+_HISTORY_DATABASE = "qmt_history_dev"
+_HISTORY_RUNS_TABLE = "qmt_ingest_runs"
+_HISTORY_ADJUSTMENT = "none"
+_HISTORY_TABLES = {
+  "1m": "qmt_kline_1m_raw",
+  "5m": "qmt_kline_5m_raw",
+  "15m": "qmt_kline_15m_raw",
+  "30m": "qmt_kline_30m_raw",
+  "1h": "qmt_kline_1h_raw",
+  "1d": "qmt_kline_1d_raw",
+}
+_HISTORY_PERIODS = {
+  "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1h", "1d": "1d",
+}
+_LEGACY_DIRECT_PERIODS = {"1m", "5m", "60m", "1d"}
+_LEGACY_DERIVED_PERIODS = {"3m": 3, "15m": 15, "30m": 30, "45m": 45}
+_HISTORY_DERIVED_PERIODS = {"3m": 3, "45m": 45}
 _TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
@@ -40,10 +53,22 @@ class BacktestDataResolution:
   formal_dates: tuple[str, ...]
   warmup_dates: tuple[str, ...]
   available_warmup_days: int
+  source: str = _LEGACY_SOURCE
 
   @property
   def all_dates(self) -> tuple[str, ...]:
     return self.warmup_dates + self.formal_dates
+
+
+@dataclass(frozen=True)
+class _SourceCandidate:
+  source: str
+  source_period: str
+  derivation: str | None = None
+
+  @property
+  def label(self) -> str:
+    return f"{self.source}:{self.source_period}"
 
 
 def resolve_backtest_data(
@@ -58,23 +83,36 @@ def resolve_backtest_data(
   start_date, end_date = _normalized_range(start_date, end_date)
   _validate_request(symbol, timeframe, start_date, end_date)
   _validate_warmup_days(warmup_trading_days)
-  required_dates = _required_formal_dates(symbol, timeframe, start_date, end_date, formal_dates)
+  candidates = _source_candidates(timeframe)
+  cached_coverages: dict[_SourceCandidate, list[dict[str, str]]] = {}
+  if formal_dates is None:
+    cached_coverages = {
+      candidate: _coverage_for_source(symbol, candidate, start_date, end_date)
+      for candidate in candidates
+    }
+    required_dates = sorted({
+      item["date"] for statuses in cached_coverages.values() for item in statuses
+    })
+  else:
+    required_dates = sorted({format_api_date(item) for item in formal_dates})
   if not required_dates:
     raise MarketDataError(f"{symbol} {timeframe} 区间内未导入 QMT 行情")
   failures: list[tuple[str, list[str], int]] = []
-  for source_period in _source_candidates(symbol, timeframe):
-    missing_dates = _missing_dates(symbol, source_period, required_dates)
-    warmup_dates = _complete_dates_before(symbol, source_period, start_date, warmup_trading_days)
+  for candidate in candidates:
+    statuses = cached_coverages.get(candidate)
+    missing_dates = _missing_dates(symbol, candidate, required_dates, statuses)
+    warmup_dates = _complete_dates_before(symbol, candidate, start_date, warmup_trading_days)
     if not missing_dates and len(warmup_dates) == warmup_trading_days:
       return BacktestDataResolution(
         timeframe=timeframe,
-        source_period=source_period,
-        derivation=_derivation(timeframe, source_period),
+        source_period=candidate.source_period,
+        derivation=candidate.derivation,
         formal_dates=tuple(required_dates),
         warmup_dates=tuple(warmup_dates),
         available_warmup_days=len(warmup_dates),
+        source=candidate.source,
       )
-    failures.append((source_period, missing_dates, len(warmup_dates)))
+    failures.append((candidate.label, missing_dates, len(warmup_dates)))
   raise _resolution_error(symbol, timeframe, failures, warmup_trading_days)
 
 
@@ -123,7 +161,7 @@ def load_backtest_bars(
   all_dates = resolution.all_dates
   if not all_dates:
     raise MarketDataError("回测数据范围为空")
-  rows = _query_kline_rows(symbol, resolution.source_period, all_dates[0], all_dates[-1])
+  rows = _query_kline_rows(symbol, resolution, all_dates[0], all_dates[-1])
   frame = _rows_to_frame(rows)
   frame = _transform_source_frame(frame, resolution)
   allowed_dates = set(all_dates)
@@ -141,7 +179,7 @@ def snapshot_for_resolution(
 ) -> dict[str, Any]:
   """将已选择的数据来源固化为分钟回测兼容的任务快照。"""
   all_dates = resolution.all_dates
-  row = _coverage_summary(symbol, resolution.source_period, all_dates[0], all_dates[-1])
+  row = _coverage_summary(symbol, resolution, all_dates[0], all_dates[-1])
   identity = {
     "symbol": symbol,
     "timeframe": resolution.timeframe,
@@ -153,11 +191,13 @@ def snapshot_for_resolution(
     "barCount": int(row.get("bar_count") or 0),
     "lastImportedAt": str(row.get("updated_at") or ""),
   }
-  if _is_bj_symbol(symbol):
+  identity.update({
+    "sourceDatabase": _source_database(resolution.source),
+    "sourceTable": _source_table(resolution.source, resolution.source_period),
+  })
+  if resolution.source == _HISTORY_SOURCE:
     identity.update({
-      "sourceDatabase": _BJ_DATABASE,
-      "sourceTable": _BJ_RAW_TABLE,
-      "adjustment": _BJ_ADJUSTMENT,
+      "adjustment": _HISTORY_ADJUSTMENT,
       "manifestHash": str(row.get("manifest_hash") or ""),
     })
   identity["hash"] = hashlib.sha256(repr(sorted(identity.items())).encode("utf-8")).hexdigest()
@@ -198,69 +238,51 @@ def coverage_status(symbol: str, timeframe: str, start_date: str, end_date: str)
 def list_dates(symbol: str, timeframe: str) -> list[dict[str, Any]]:
   """返回已经导入且覆盖完整的 QMT 交易日。"""
   _validate_symbol(symbol)
-  if _is_bj_symbol(symbol):
-    rows = _coverage_for_period(symbol, "1m", "20000101", "20991231")
-    return [{
-      "date": item["date"], "hasKline": True, "hasSignal": False,
-    } for item in reversed(rows) if item["status"] == "complete"]
-  source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
-  query = f"""
-    SELECT trade_date
-    FROM {_DATABASE}.qmt_kline_coverage FINAL
-    WHERE symbol = '{symbol}' AND period = '{source_period}' AND status = 'complete'
-    ORDER BY trade_date DESC
-  """
-  try:
-    rows = clickhouse_client.query_rows(query)
-  except clickhouse_client.ClickHouseError as error:
-    raise MarketDataError(str(error)) from error
-  return [{"date": format_api_date(str(row["trade_date"])), "hasKline": True, "hasSignal": False} for row in rows]
+  dates = {
+    item["date"]
+    for candidate in _source_candidates(timeframe)
+    for item in _coverage_for_source(symbol, candidate, "20000101", "20991231")
+    if item["status"] == "complete"
+  }
+  return [{"date": item, "hasKline": True, "hasSignal": False} for item in sorted(dates, reverse=True)]
 
 
 def status(symbol: str, timeframe: str, preview_limit: int = 20) -> dict[str, Any]:
   """返回数据管理页所需的 QMT 数据概览。"""
   _validate_request(symbol, timeframe, "20000101", "20991231")
   _validate_symbol(symbol)
-  if _is_bj_symbol(symbol):
-    return _bj_status(symbol, timeframe, preview_limit)
-  source_period = "1m" if timeframe in _DERIVED_PERIODS else timeframe
-  query = f"""
-    SELECT min(trade_date) AS first_date, max(trade_date) AS last_date,
-           sum(valid_row_count) AS bar_count, max(updated_at) AS updated_at
-    FROM {_DATABASE}.qmt_kline_coverage FINAL
-    WHERE symbol = '{symbol}' AND period = '{source_period}' AND status = 'complete'
-  """
-  try:
-    summary = clickhouse_client.query_rows(query)[0]
-    preview = _query_preview(symbol, source_period, preview_limit)
-  except (IndexError, clickhouse_client.ClickHouseError) as error:
-    raise MarketDataError(f"读取 QMT 数据状态失败: {error}") from error
+  candidate, complete_dates = _first_available_candidate(symbol, timeframe)
+  if candidate is None:
+    return _empty_status(symbol, timeframe)
+  preview_days = max(1, min(preview_limit, 200))
+  preview_dates = complete_dates[-preview_days:]
+  preview = _query_preview(
+    symbol, candidate, preview_dates[0], preview_dates[-1], preview_days,
+  )
   return {
-    "symbol": symbol, "timeframe": timeframe, "path": f"clickhouse://{_DATABASE}.qmt_kline",
-    "exists": int(summary.get("bar_count") or 0) > 0, "firstDate": _api_date_or_none(summary.get("first_date")),
-    "lastDate": _api_date_or_none(summary.get("last_date")), "barCount": int(summary.get("bar_count") or 0),
-    "fileSize": 0, "mtime": str(summary.get("updated_at") or "") or None, "duplicateCount": 0,
+    "symbol": symbol, "timeframe": timeframe,
+    "path": f"clickhouse://{_source_database(candidate.source)}.{_source_table(candidate.source, candidate.source_period)}",
+    "exists": True, "firstDate": complete_dates[0], "lastDate": complete_dates[-1],
+    "barCount": None, "fileSize": 0, "mtime": None, "duplicateCount": 0,
     "nonTradingCount": 0, "expectedBarsPerDay": None, "gapDates": [], "preview": preview,
   }
 
 
-def _bj_status(symbol: str, timeframe: str, preview_limit: int) -> dict[str, Any]:
-  statuses = _coverage_for_period(symbol, "1m", "20000101", "20991231")
-  complete_dates = [item["date"] for item in statuses if item["status"] == "complete"]
-  if complete_dates:
-    summary = _coverage_summary(symbol, "1m", complete_dates[0], complete_dates[-1])
-    preview = _query_preview(symbol, "1m", preview_limit)
-  else:
-    summary = {"bar_count": 0, "updated_at": None}
-    preview = []
+def _first_available_candidate(symbol: str, timeframe: str) -> tuple[_SourceCandidate | None, list[str]]:
+  for candidate in _source_candidates(timeframe):
+    statuses = _coverage_for_source(symbol, candidate, "20000101", "20991231")
+    complete_dates = [item["date"] for item in statuses if item["status"] == "complete"]
+    if complete_dates:
+      return candidate, complete_dates
+  return None, []
+
+
+def _empty_status(symbol: str, timeframe: str) -> dict[str, Any]:
   return {
-    "symbol": symbol, "timeframe": timeframe,
-    "path": f"clickhouse://{_BJ_DATABASE}.{_BJ_RAW_TABLE}",
-    "exists": bool(complete_dates), "firstDate": complete_dates[0] if complete_dates else None,
-    "lastDate": complete_dates[-1] if complete_dates else None,
-    "barCount": int(summary.get("bar_count") or 0), "fileSize": 0,
-    "mtime": str(summary.get("updated_at") or "") or None, "duplicateCount": 0,
-    "nonTradingCount": 0, "expectedBarsPerDay": None, "gapDates": [], "preview": preview,
+    "symbol": symbol, "timeframe": timeframe, "path": None, "exists": False,
+    "firstDate": None, "lastDate": None, "barCount": 0, "fileSize": 0, "mtime": None,
+    "duplicateCount": 0, "nonTradingCount": 0, "expectedBarsPerDay": None,
+    "gapDates": [], "preview": [],
   }
 
 
@@ -291,42 +313,48 @@ def _required_formal_dates(
   if formal_dates is not None:
     return sorted({format_api_date(item) for item in formal_dates})
   dates: set[str] = set()
-  for source_period in _source_candidates(symbol, timeframe):
-    dates.update(item["date"] for item in _coverage_for_period(symbol, source_period, start_date, end_date))
+  for candidate in _source_candidates(timeframe):
+    dates.update(item["date"] for item in _coverage_for_source(symbol, candidate, start_date, end_date))
   return sorted(dates)
 
 
-def _source_candidates(symbol: str, timeframe: str) -> tuple[str, ...]:
-  if _is_bj_symbol(symbol):
-    return ("1m",)
+def _source_candidates(timeframe: str) -> tuple[_SourceCandidate, ...]:
+  candidates: list[_SourceCandidate] = []
+  history_period = _HISTORY_PERIODS.get(timeframe)
+  if history_period is not None:
+    candidates.append(_SourceCandidate(_HISTORY_SOURCE, history_period))
+  elif timeframe in _HISTORY_DERIVED_PERIODS:
+    candidates.append(_SourceCandidate(_HISTORY_SOURCE, "1m", f"{timeframe}-from-1m-v1"))
+  if timeframe in _LEGACY_DIRECT_PERIODS:
+    candidates.append(_SourceCandidate(_LEGACY_SOURCE, timeframe))
+  elif timeframe in _LEGACY_DERIVED_PERIODS:
+    candidates.append(_SourceCandidate(_LEGACY_SOURCE, "1m", f"{timeframe}-from-1m-v1"))
   if timeframe == "1d":
-    return ("1d", "1m")
-  return ("1m",) if timeframe in _DERIVED_PERIODS else (timeframe,)
+    candidates.append(_SourceCandidate(_LEGACY_SOURCE, "1m", "daily-from-1m-v1"))
+  return tuple(candidates)
 
 
-def _derivation(timeframe: str, source_period: str) -> str | None:
-  if timeframe == "1d" and source_period == "1m":
-    return "daily-from-1m-v1"
-  if source_period == "1m" and timeframe != "1m":
-    return f"{timeframe}-from-1m-v1"
-  return None
-
-
-def _missing_dates(symbol: str, source_period: str, required_dates: Sequence[str]) -> list[str]:
+def _missing_dates(
+  symbol: str,
+  candidate: _SourceCandidate,
+  required_dates: Sequence[str],
+  statuses: Sequence[dict[str, str]] | None = None,
+) -> list[str]:
   if not required_dates:
     return []
-  statuses = _coverage_for_period(symbol, source_period, required_dates[0], required_dates[-1])
+  if statuses is None:
+    statuses = _coverage_for_source(symbol, candidate, required_dates[0], required_dates[-1])
   complete_dates = {item["date"] for item in statuses if item["status"] == "complete"}
   return sorted(set(required_dates) - complete_dates)
 
 
-def _complete_dates_before(symbol: str, source_period: str, start_date: str, count: int) -> list[str]:
+def _complete_dates_before(symbol: str, candidate: _SourceCandidate, start_date: str, count: int) -> list[str]:
   if count == 0:
     return []
   expected_dates = _expected_warmup_dates(start_date, count)
   if not expected_dates:
     return []
-  statuses = _coverage_for_period(symbol, source_period, expected_dates[0], expected_dates[-1])
+  statuses = _coverage_for_source(symbol, candidate, expected_dates[0], expected_dates[-1])
   complete_dates = {item["date"] for item in statuses if item["status"] == "complete"}
   contiguous_dates: list[str] = []
   for trade_date in reversed(expected_dates):
@@ -370,8 +398,8 @@ def _preview_missing_dates(symbol: str, timeframe: str, required_dates: Sequence
   if not required_dates:
     return []
   candidate_missing = [
-    _missing_dates(symbol, source_period, required_dates)
-    for source_period in _source_candidates(symbol, timeframe)
+    _missing_dates(symbol, candidate, required_dates)
+    for candidate in _source_candidates(timeframe)
   ]
   return sorted(set.intersection(*(set(item) for item in candidate_missing))) if candidate_missing else []
 
@@ -380,7 +408,7 @@ def _preview_warmup_days(symbol: str, timeframe: str, start_date: str, count: in
   if count == 0:
     return 0
   return max(
-    (len(_complete_dates_before(symbol, source_period, start_date, count)) for source_period in _source_candidates(symbol, timeframe)),
+    (len(_complete_dates_before(symbol, candidate, start_date, count)) for candidate in _source_candidates(timeframe)),
     default=0,
   )
 
@@ -390,59 +418,51 @@ def _resolution_reason(resolution: BacktestDataResolution) -> str:
     return "由完整 1m 数据派生日线"
   if resolution.derivation:
     return f"由完整 1m 数据派生 {resolution.timeframe}"
-  return "QMT 原始数据可用"
+  if resolution.source == _HISTORY_SOURCE:
+    return "QMT 优先行情可用"
+  return "QMT 兼容行情可用"
 
 
 def _transform_source_frame(frame: pd.DataFrame, resolution: BacktestDataResolution) -> pd.DataFrame:
   if resolution.derivation == "daily-from-1m-v1":
     return _aggregate_daily_minutes(frame)
-  if resolution.source_period == "1m" and resolution.timeframe != "1m":
+  if resolution.derivation:
     return _aggregate_minutes(frame, int(resolution.timeframe.removesuffix("m")))
   return frame
 
 
 def _cached_timeframe_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:
-  if timeframe == "1d":
-    preview = preview_backtest_data(symbol, timeframe, start_date, end_date)
-    if not preview["available"]:
-      return _unavailable_timeframe(timeframe, str(preview["reason"]))
-    resolution = preview["resolution"]
-    return {
-      "timeframe": timeframe, "available": True, "reason": str(preview["reason"]),
-      "dataStart": resolution.formal_dates[0], "dataEnd": resolution.formal_dates[-1],
-    }
-  try:
-    statuses = _coverage_status(symbol, timeframe, start_date, end_date)
-  except MarketDataError as error:
-    return _unavailable_timeframe(timeframe, str(error))
-  invalid = [item["date"] for item in statuses if item["status"] != "complete"]
-  if invalid:
-    return _unavailable_timeframe(timeframe, f"QMT 数据不完整: {', '.join(invalid)}")
-  if not statuses:
-    return _unavailable_timeframe(timeframe, "未导入该标的的 QMT 行情")
-  derived_from_minutes = timeframe in _DERIVED_PERIODS or (_is_bj_symbol(symbol) and timeframe != "1m")
-  reason = "由 QMT 1 分钟数据聚合" if derived_from_minutes else "QMT 原始数据可用"
-  return {"timeframe": timeframe, "available": True, "reason": reason, "dataStart": statuses[0]["date"], "dataEnd": statuses[-1]["date"]}
+  preview = preview_backtest_data(symbol, timeframe, start_date, end_date)
+  if not preview["available"]:
+    return _unavailable_timeframe(timeframe, str(preview["reason"]))
+  resolution = preview["resolution"]
+  return {
+    "timeframe": timeframe, "available": True, "reason": str(preview["reason"]),
+    "dataStart": resolution.formal_dates[0], "dataEnd": resolution.formal_dates[-1],
+  }
 
 
 def _coverage_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> list[dict[str, str]]:
   start_date, end_date = _normalized_range(start_date, end_date)
   _validate_symbol(symbol)
-  source_period = "1m" if _is_bj_symbol(symbol) or timeframe in _DERIVED_PERIODS else timeframe
-  return _coverage_for_period(symbol, source_period, start_date, end_date)
+  resolution = resolve_backtest_data(symbol, timeframe, start_date, end_date)
+  return [{"date": item, "status": "complete"} for item in resolution.formal_dates]
 
 
-def _coverage_for_period(symbol: str, source_period: str, start_date: str, end_date: str) -> list[dict[str, str]]:
+def _coverage_for_source(
+  symbol: str,
+  candidate: _SourceCandidate,
+  start_date: str,
+  end_date: str,
+) -> list[dict[str, str]]:
   _validate_symbol(symbol)
-  if _is_bj_symbol(symbol):
-    if source_period != "1m":
-      return []
-    query = _bj_coverage_query(symbol, start_date, end_date)
+  if candidate.source == _HISTORY_SOURCE:
+    query = _history_coverage_query(symbol, candidate.source_period, start_date, end_date)
   else:
     query = f"""
       SELECT trade_date, status
-      FROM {_DATABASE}.qmt_kline_coverage FINAL
-      WHERE symbol = '{symbol}' AND period = '{source_period}'
+      FROM {_LEGACY_DATABASE}.qmt_kline_coverage FINAL
+      WHERE symbol = '{symbol}' AND period = '{candidate.source_period}'
         AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
       ORDER BY trade_date
     """
@@ -453,24 +473,26 @@ def _coverage_for_period(symbol: str, source_period: str, start_date: str, end_d
   return [{"date": format_api_date(str(row["trade_date"])), "status": str(row["status"])} for row in rows]
 
 
-def _bj_coverage_query(symbol: str, start_date: str, end_date: str) -> str:
+def _history_coverage_query(symbol: str, period: str, start_date: str, end_date: str) -> str:
+  table = _source_table(_HISTORY_SOURCE, period)
   return f"""
     WITH latest_runs AS (
-      SELECT run_id,
-             argMax(state, tuple(state_version, recorded_at)) AS state,
-             argMax(target_date, tuple(state_version, recorded_at)) AS target_date,
-             argMax(validation_result, tuple(state_version, recorded_at)) AS validation_result,
-             argMax(expected_route_count, tuple(state_version, recorded_at)) AS expected_route_count,
-             argMax(actual_route_count, tuple(state_version, recorded_at)) AS actual_route_count,
-             argMax(missing_symbol_count, tuple(state_version, recorded_at)) AS missing_symbol_count,
-             argMax(duplicate_key_count, tuple(state_version, recorded_at)) AS duplicate_key_count,
-             argMax(actual_routes, tuple(state_version, recorded_at)) AS actual_routes
-      FROM {_BJ_DATABASE}.{_BJ_RUNS_TABLE}
-      GROUP BY run_id
+      SELECT runs.run_id AS run_id,
+             argMax(runs.state, tuple(runs.state_version, runs.recorded_at)) AS state,
+             argMax(runs.target_date, tuple(runs.state_version, runs.recorded_at)) AS target_date,
+             argMax(runs.validation_result, tuple(runs.state_version, runs.recorded_at)) AS validation_result,
+             argMax(runs.expected_route_count, tuple(runs.state_version, runs.recorded_at)) AS expected_route_count,
+             argMax(runs.actual_route_count, tuple(runs.state_version, runs.recorded_at)) AS actual_route_count,
+             argMax(runs.missing_symbol_count, tuple(runs.state_version, runs.recorded_at)) AS missing_symbol_count,
+             argMax(runs.duplicate_key_count, tuple(runs.state_version, runs.recorded_at)) AS duplicate_key_count,
+             argMax(runs.actual_routes, tuple(runs.state_version, runs.recorded_at)) AS actual_routes
+      FROM {_HISTORY_DATABASE}.{_HISTORY_RUNS_TABLE} AS runs
+      WHERE runs.target_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
+      GROUP BY runs.run_id
     ), symbol_dates AS (
       SELECT trade_date, argMax(run_id, tuple(revision, ingested_at)) AS run_id
-      FROM {_BJ_DATABASE}.{_BJ_RAW_TABLE}
-      WHERE symbol = '{symbol}' AND period = '1m' AND adjustment = '{_BJ_ADJUSTMENT}'
+      FROM {_HISTORY_DATABASE}.{table}
+      WHERE symbol = '{symbol}' AND period = '{period}' AND adjustment = '{_HISTORY_ADJUSTMENT}'
         AND quality_status = 'valid' AND is_final = 1
         AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
       GROUP BY trade_date
@@ -480,28 +502,35 @@ def _bj_coverage_query(symbol: str, start_date: str, end_date: str) -> str:
               AND latest_runs.target_date = symbol_dates.trade_date
               AND latest_runs.expected_route_count = latest_runs.actual_route_count
               AND latest_runs.missing_symbol_count = 0 AND latest_runs.duplicate_key_count = 0
-              AND has(latest_runs.actual_routes, '1m/none'), 'complete', 'partial') AS status
+              AND has(latest_runs.actual_routes, '{period}/{_HISTORY_ADJUSTMENT}'), 'complete', 'partial') AS status
     FROM symbol_dates
     LEFT JOIN latest_runs ON latest_runs.run_id = symbol_dates.run_id
     ORDER BY trade_date
   """
 
 
-def _coverage_summary(symbol: str, source_period: str, start_date: str, end_date: str) -> dict[str, Any]:
-  if _is_bj_symbol(symbol):
+def _coverage_summary(
+  symbol: str,
+  resolution: BacktestDataResolution,
+  start_date: str,
+  end_date: str,
+) -> dict[str, Any]:
+  if resolution.source == _HISTORY_SOURCE:
+    table = _source_table(resolution.source, resolution.source_period)
     query = f"""
       SELECT uniqExact(bar_time) AS bar_count, max(ingested_at) AS updated_at,
              max(toString(manifest_sha256)) AS manifest_hash
-      FROM {_BJ_DATABASE}.{_BJ_RAW_TABLE}
-      WHERE symbol = '{symbol}' AND period = '1m' AND adjustment = '{_BJ_ADJUSTMENT}'
+      FROM {_HISTORY_DATABASE}.{table}
+      WHERE symbol = '{symbol}' AND period = '{resolution.source_period}'
+        AND adjustment = '{_HISTORY_ADJUSTMENT}'
         AND quality_status = 'valid' AND is_final = 1
         AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
     """
   else:
     query = f"""
       SELECT sum(valid_row_count) AS bar_count, max(updated_at) AS updated_at
-      FROM {_DATABASE}.qmt_kline_coverage FINAL
-      WHERE symbol = '{symbol}' AND period = '{source_period}'
+      FROM {_LEGACY_DATABASE}.qmt_kline_coverage FINAL
+      WHERE symbol = '{symbol}' AND period = '{resolution.source_period}'
         AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
         AND status = 'complete'
     """
@@ -511,16 +540,22 @@ def _coverage_summary(symbol: str, source_period: str, start_date: str, end_date
     raise MarketDataError(f"读取 QMT 数据快照失败: {error}") from error
 
 
-def _query_kline_rows(symbol: str, period: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
+def _query_kline_rows(
+  symbol: str,
+  resolution: BacktestDataResolution,
+  start_date: str,
+  end_date: str,
+) -> list[dict[str, Any]]:
   _validate_symbol(symbol)
-  if _is_bj_symbol(symbol):
-    query = _bj_kline_query(symbol, start_date, end_date)
+  if resolution.source == _HISTORY_SOURCE:
+    query = _history_kline_query(symbol, resolution.source_period, start_date, end_date)
   else:
     start_time, end_time = _epoch_range(start_date, end_date)
     query = f"""
       SELECT qmt_index, time, open, high, low, close, volume
-      FROM {_DATABASE}.qmt_kline FINAL
-      WHERE symbol = '{symbol}' AND period = '{period}' AND time BETWEEN {start_time} AND {end_time}
+      FROM {_LEGACY_DATABASE}.qmt_kline FINAL
+      WHERE symbol = '{symbol}' AND period = '{resolution.source_period}'
+        AND time BETWEEN {start_time} AND {end_time}
       ORDER BY time
     """
   try:
@@ -529,37 +564,60 @@ def _query_kline_rows(symbol: str, period: str, start_date: str, end_date: str) 
     raise MarketDataError(str(error)) from error
 
 
-def _query_preview(symbol: str, period: str, limit: int) -> list[dict[str, Any]]:
+def _query_preview(
+  symbol: str,
+  candidate: _SourceCandidate,
+  start_date: str,
+  end_date: str,
+  limit: int,
+) -> list[dict[str, Any]]:
   _validate_symbol(symbol)
   row_limit = max(1, min(limit, 200))
-  if _is_bj_symbol(symbol):
-    query = _bj_kline_query(symbol, "20000101", "20991231", descending=True, limit=row_limit)
+  if candidate.source == _HISTORY_SOURCE:
+    query = _history_kline_query(
+      symbol, candidate.source_period, start_date, end_date, descending=True, limit=row_limit,
+    )
   else:
+    start_time, end_time = _epoch_range(start_date, end_date)
     query = f"""
       SELECT qmt_index, time, open, high, low, close, volume
-      FROM {_DATABASE}.qmt_kline FINAL
-      WHERE symbol = '{symbol}' AND period = '{period}' ORDER BY time DESC LIMIT {row_limit}
+      FROM {_LEGACY_DATABASE}.qmt_kline FINAL
+      WHERE symbol = '{symbol}' AND period = '{candidate.source_period}'
+        AND time BETWEEN {start_time} AND {end_time}
+      ORDER BY time DESC LIMIT {row_limit}
     """
   rows = clickhouse_client.query_rows(query)
   return [_row_preview(row) for row in rows]
 
 
-def _bj_kline_query(
+def _history_kline_query(
   symbol: str,
+  period: str,
   start_date: str,
   end_date: str,
   descending: bool = False,
   limit: int | None = None,
 ) -> str:
+  table = _source_table(_HISTORY_SOURCE, period)
   order = "DESC" if descending else "ASC"
   limit_clause = f" LIMIT {limit}" if limit is not None else ""
   return f"""
-    SELECT formatDateTime(bar_time, '%Y%m%d%H%i%S', 'Asia/Shanghai') AS qmt_index,
-           toUInt64(toUnixTimestamp(bar_time)) * 1000 AS time, open, high, low, close, volume
-    FROM {_BJ_DATABASE}.{_BJ_RAW_TABLE}
-    WHERE symbol = '{symbol}' AND period = '1m' AND adjustment = '{_BJ_ADJUSTMENT}'
-      AND quality_status = 'valid' AND is_final = 1
-      AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
+    SELECT qmt_index, time, open, high, low, close, volume
+    FROM (
+      SELECT bar_time,
+             argMax(qmt_index, tuple(revision, ingested_at)) AS qmt_index,
+             argMax(qmt_time_ms, tuple(revision, ingested_at)) AS time,
+             argMax(open, tuple(revision, ingested_at)) AS open,
+             argMax(high, tuple(revision, ingested_at)) AS high,
+             argMax(low, tuple(revision, ingested_at)) AS low,
+             argMax(close, tuple(revision, ingested_at)) AS close,
+             argMax(volume, tuple(revision, ingested_at)) AS volume
+      FROM {_HISTORY_DATABASE}.{table}
+      WHERE symbol = '{symbol}' AND period = '{period}' AND adjustment = '{_HISTORY_ADJUSTMENT}'
+        AND quality_status = 'valid' AND is_final = 1
+        AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
+      GROUP BY bar_time
+    )
     ORDER BY bar_time {order}{limit_clause}
   """
 
@@ -618,8 +676,8 @@ def _row_preview(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_request(symbol: str, timeframe: str, start_date: str, end_date: str) -> None:
-  supported = _DIRECT_PERIODS | set(_DERIVED_PERIODS)
-  if timeframe not in supported and not (_is_bj_symbol(symbol) and timeframe in settings.BAR_RUN_TIMEFRAMES):
+  _validate_symbol(symbol)
+  if timeframe not in settings.BAR_RUN_TIMEFRAMES or not _source_candidates(timeframe):
     raise MarketDataError(f"QMT 数据暂不支持周期: {timeframe}")
   _normalized_range(start_date, end_date)
 
@@ -634,8 +692,23 @@ def _validate_symbol(symbol: str) -> None:
     raise MarketDataError(f"标的格式无效: {symbol}")
 
 
-def _is_bj_symbol(symbol: str) -> bool:
-  return symbol.endswith(".BJ")
+def _source_database(source: str) -> str:
+  if source == _HISTORY_SOURCE:
+    return _HISTORY_DATABASE
+  if source == _LEGACY_SOURCE:
+    return _LEGACY_DATABASE
+  raise MarketDataError(f"未知 QMT 行情来源: {source}")
+
+
+def _source_table(source: str, source_period: str) -> str:
+  if source == _HISTORY_SOURCE:
+    table = _HISTORY_TABLES.get(source_period)
+    if table is None:
+      raise MarketDataError(f"新库不支持物理周期: {source_period}")
+    return table
+  if source == _LEGACY_SOURCE:
+    return "qmt_kline"
+  raise MarketDataError(f"未知 QMT 行情来源: {source}")
 
 
 def _epoch_range(start_date: str, end_date: str) -> tuple[int, int]:
@@ -646,12 +719,6 @@ def _epoch_range(start_date: str, end_date: str) -> tuple[int, int]:
 
 def _date_sql(value: str) -> str:
   return format_api_date(value)
-
-
-def _api_date_or_none(value: Any) -> str | None:
-  if value is None:
-    return None
-  return format_api_date(str(value))
 
 
 def _normalized_range(start_date: str, end_date: str) -> tuple[str, str]:

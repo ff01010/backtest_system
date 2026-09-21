@@ -638,7 +638,7 @@ export interface DataStatus {
   exists: boolean;
   firstDate: string | null;
   lastDate: string | null;
-  barCount: number;
+  barCount: number | null;
   fileSize: number;
   mtime: string | null;
   duplicateCount: number;

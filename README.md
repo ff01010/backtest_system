@@ -8,7 +8,7 @@
 
 - 管理员创建、启用、停用用户并重置密码；系统不开放自助注册。
 - 用户维护自己的策略脚本、回测方案、回测账户和历史回测记录，无法读取其他用户的数据。
-- 回测支持 `1m`、`5m` 周期；`15m`、`30m` 由 `1m` 数据聚合，`60m`、`1d` 可保存为原始行情。
+- 回测支持 `1m`、`3m`、`5m`、`15m`、`30m`、`45m`、`60m`、`1d`；优先读取已发布的原生六周期行情，`3m`、`45m` 由完整 `1m` 数据聚合。
 - 回测前检查标的和基准标的在目标日期内的行情覆盖状态；数据缺失或不完整时拒绝回测。
 - Bar 与 L2 Runner 为每个任务创建独立策略子进程，并清空服务凭据后执行用户脚本。
 
@@ -67,13 +67,15 @@
 
 ### ClickHouse 行情与证券目录表
 
-沪深 QMT 行情表位于数据库 `raw_historical_data`，由 Windows QMT 导出后导入；北交所股票暂时从 `qmt_history_dev.qmt_kline_1m_raw` 读取 `none` 口径的有效最终 1 分钟数据，并使用 `qmt_ingest_runs` 的已发布校验结果做缺失预检。统一证券目录位于 `xl_derived`。回测提交前只检查并读取已导入的 QMT 行情。
+沪、深、北交所统一优先从 `qmt_history_dev` 的六张周期原始表读取 `none` 口径的有效最终数据，并使用 `qmt_ingest_runs` 的已发布校验结果做覆盖预检。新库不能完整覆盖预热期和正式回测期时，整次任务回退到 `raw_historical_data.qmt_kline`，其完整度仍由 `qmt_kline_coverage` 判定；同一任务不跨两库拼接。统一证券目录位于 `xl_derived`。
 
 | 表 | 字段 | 用途 |
 | --- | --- | --- |
 | `qmt_kline` | `symbol`、`period`、`qmt_index`、`time`、`open`、`high`、`low`、`close`、`volume`、`amount`、`settelementPrice`、`openInterest`、`preClose`、`suspendFlag`、`import_batch_id`、`ingested_at`、`ingest_version` | QMT 原始 K 线。按 `symbol`、`period`、时间索引保存，保留 QMT 原字段与导入版本。 |
 | `qmt_kline_coverage` | `symbol`、`period`、`trade_date`、`first_bar_time`、`last_bar_time`、`expected_row_count`、`observed_row_count`、`valid_row_count`、`status`、`quality_note`、`import_batch_id`、`record_version` | 每标的、周期、交易日的完整度。`status` 只能为 `complete`、`partial`、`empty`、`failed`；非完整数据拒绝回测。 |
 | `qmt_import_batch` | `batch_id`、`source_file`、`source_file_sha256`、`symbol`、`period`、`data_start_time`、`data_end_time`、`source_row_count`、`imported_row_count`、`invalid_row_count`、`status`、`failure_reason`、`qmt_client_version`、`created_at`、`updated_at`、`record_version` | 每个原始 CSV 的导入审计与失败原因。 |
+| `qmt_history_dev.qmt_kline_{1m,5m,15m,30m,1h,1d}_raw` | `symbol`、`period`、`adjustment`、`trade_date`、`bar_time`、OHLCV、`is_final`、`quality_status`、`run_id`、`manifest_sha256`、`revision` | 优先行情来源；平台 `60m` 映射到物理 `1h`，仅读取 `none`、有效且定稿的当前修订。 |
+| `qmt_history_dev.qmt_ingest_runs` | `run_id`、`state`、`target_date`、路由数量、缺失与重复计数、`validation_result`、`actual_routes` | 新库独立的发布和完整性依据，不与旧库 `qmt_kline_coverage` 的状态语义混用。 |
 | `xl_derived.stock_directory` | `symbol`、`exchange`、`name`、`type`、`status`、`board_type`、`listed_date`、`de_listed_date`、`source`、`__ver` | 全市场证券主数据。后端启动时筛选 `CS/Active`，规范化交易所和板块后同步到 PostgreSQL `market_instrument`。 |
 
 ### 关系与读取规则
@@ -85,12 +87,13 @@ app_user → user_strategy → user_strategy_version
          → backtest_run → backtest_run_event / artifact_file
 
 ClickHouse xl_derived.stock_directory → PostgreSQL market_instrument
-ClickHouse 沪深 qmt_kline/qmt_kline_coverage + 北交所 qmt_kline_1m_raw/qmt_ingest_runs → 回测行情与覆盖检查
+ClickHouse qmt_history_dev 六周期表/qmt_ingest_runs → 优先回测行情与覆盖检查
+ClickHouse raw_historical_data.qmt_kline/qmt_kline_coverage → 整段兼容回退
 ```
 
 - 策略源码、方案、账户、回测快照和结果始终保存于 PostgreSQL，不写入 ClickHouse。
 - ClickHouse 保存行情、导入审计和统一证券目录；回测不会触发外部行情下载。
-- 沪深 `qmt_kline` 直接保存 `1m`、`5m`、`60m`、`1d` 原始周期，`15m`、`30m` 由已导入 `1m` 数据聚合；北交所当前所有标准 Bar 周期均由 `qmt_kline_1m_raw` 的完整 `1m/none` 数据派生，不写回原始表。
+- 新库直接读取 `1m`、`5m`、`15m`、`30m`、`1h`、`1d` 六个原始周期；平台 `3m`、`45m` 由新库完整 `1m` 数据派生。新库不能覆盖整个任务范围时，旧库保持原有直接周期和分钟派生规则。
 - 本地启动成功后，后端会从远程 ClickHouse 的 `xl_derived.stock_directory` 同步活跃 A 股目录；本机和服务器共享相同的目录映射规则。
 
 
