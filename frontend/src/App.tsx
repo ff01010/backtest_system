@@ -173,7 +173,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
           { key: 'signals' as const, label: '信号可视化' },
           { key: 'apiKeys' as const, label: 'API Key' },
           ...(currentUser.role === 'admin' ? [{ key: 'users' as const, label: '人员管理' }] : []),
-          ...(currentUser.role === 'admin' ? [{ key: 'systemErrors' as const, label: '系统错误日志' }] : []),
+          ...(currentUser.role === 'admin' ? [{ key: 'systemErrors' as const, label: '回测诊断日志' }] : []),
         ].map((item) => {
           const active = activePage === item.key;
           return (

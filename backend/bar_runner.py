@@ -12,7 +12,8 @@ from typing import Any
 from backend import settings
 from backend.bar_strategy_session import BarStrategySession
 from backend.services import backtest_runner, research_result_outbox, state_store
-from backend.services.backtest_errors import error_summary
+from backend.services.backtest_errors import error_summary, error_terminal_status
+from backend.services.backtest_faults import BacktestFault
 from backend.services.system_error_log import system_error_log_record
 from backend.strategies.runtime_contract import (
   RUNTIME_CAPABILITY_DIGEST,
@@ -122,7 +123,7 @@ class BarRunner:
       _dispatch_research_result_outbox()
     except Exception as error:
       logger.exception("标准 Bar 回测任务失败: %s", job["runId"])
-      status = "cancelled" if "租约丢失或已取消" in str(error) else "failed"
+      status = error_terminal_status(error)
       system_error = None
       if status == "failed":
         system_error = system_error_log_record(error, "bar_runner", stage, job["runId"])
@@ -174,7 +175,7 @@ class _BarJobLeaseKeeper:
         return
       if not renewed:
         with self._lock:
-          self._failure = ValueError("Bar 任务租约丢失或已取消")
+          self._failure = BacktestFault("task.inactive", "Bar 任务租约丢失或已取消")
         return
 
 

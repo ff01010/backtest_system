@@ -38,14 +38,17 @@ def system_error_log_record(
   """记录系统错误及策略子进程拒绝任务时返回的原始诊断。"""
   if isinstance(error, RemoteBacktestError) and error.diagnostic:
     return _strategy_process_record(error, source, stage, task_id, worker_id)
-  detail = error_detail(error)
-  if detail.category != "system_error":
-    return None
-  if isinstance(error, BacktestExecutionError) and detail.code.startswith("runtime."):
-    return _runtime_record(error, source, stage, task_id, worker_id)
+  if isinstance(error, BacktestExecutionError):
+    detail = error_detail(error)
+    if detail.code.startswith("runtime."):
+      return _runtime_record(error, source, stage, task_id, worker_id)
+    if detail.category == "strategy_error":
+      return None
 
   cause = root_cause(error)
   classified = classify_system_error(error)
+  if not classified.operator_visible:
+    return None
   context = {
     **classified.context,
     **_worker_context(worker_id),

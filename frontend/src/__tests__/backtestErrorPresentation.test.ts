@@ -62,4 +62,19 @@ describe('backtestErrorPresentation', () => {
     expect(result.title).toBe('策略执行失败');
     expect(result.isUserActionable).toBe(true);
   });
+
+  it('将 L2 顺序异常显示为需维护的数据问题', () => {
+    const result = backtestErrorPresentation({
+      category: 'data',
+      code: 'data.l2_quote_order_ambiguous',
+      message: 'L2 行情数据时间顺序异常，当前任务无法继续。',
+      retryable: false,
+      symbol: '688449.SH',
+      tradeDate: '2025-05-29',
+    });
+
+    expect(result.title).toBe('行情数据异常');
+    expect(result.isUserActionable).toBe(false);
+    expect(result.location).toBe('688449.SH · 2025-05-29');
+  });
 });

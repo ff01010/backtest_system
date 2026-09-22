@@ -26,8 +26,9 @@ def load_bars_with_snapshot(
     try:
       bars = ClickHouseL2Adapter(load_profile("bar")).load_bars(symbol, timeframe, start_date, end_date)
       return _normalized_frame(bars), _snapshot("mapped_l2_bar", symbol, timeframe, start_date, end_date, len(bars))
-    except L2DataError:
-      pass
+    except L2DataError as error:
+      if error.code != "data.l2_bar_missing":
+        raise
   try:
     frame = market_data.load_bars(symbol, timeframe, start_date, end_date)
     return frame, {**market_data.snapshot(symbol, timeframe, start_date, end_date), "provider": "qmt_kline"}
@@ -45,6 +46,8 @@ def ensure_available(symbol: str, timeframe: str, start_date: str, end_date: str
     _, snapshot = load_bars_with_snapshot(symbol, timeframe, start_date, end_date)
     return snapshot
   except L2DataError as error:
+    if error.code != "data.l2_bar_missing":
+      raise
     raise ValueError(f"Bar 数据不可用于回测: {error}") from error
 
 
@@ -60,8 +63,9 @@ def load_normalized_bars_with_snapshot(
       provider = ClickHouseL2Adapter(load_profile("bar"))
       bars = provider.load_bars(symbol, timeframe, start_date, end_date)
       return bars, {"provider": "mapped_l2_bar", **provider.coverage(symbol, start_date, end_date).__dict__}
-    except L2DataError:
-      pass
+    except L2DataError as error:
+      if error.code != "data.l2_bar_missing":
+        raise
   try:
     frame = market_data.load_bars(symbol, timeframe, start_date, end_date)
     snapshot = {**market_data.snapshot(symbol, timeframe, start_date, end_date), "provider": "qmt_kline"}

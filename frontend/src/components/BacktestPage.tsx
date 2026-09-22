@@ -2442,7 +2442,7 @@ export default function BacktestPage({
     if (gaps.length > 0) {
       return { tone: 'warn', text: `${label} ${selectedTimeframe} 覆盖区间，但存在 ${gaps.length} 个缺口日期` };
     }
-    return { tone: 'ok', text: `${label} ${selectedTimeframe} 已覆盖 ${params.startDate}-${params.endDate}，共 ${statusData.barCount} 行` };
+    return { tone: 'ok', text: `${label} ${selectedTimeframe} 已覆盖 ${params.startDate}-${params.endDate}` };
   };
 
   const formatMoney = (value: number | null | undefined) => (

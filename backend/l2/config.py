@@ -13,13 +13,25 @@ def load_profile(kind: str) -> SourceMappingProfile:
   """返回指定源的受控映射；缺少配置时明确拒绝运行。"""
   raw = _raw_mapping(kind)
   if not raw:
-    raise L2DataError(f"未配置 L2 {kind} 数据源映射")
+    raise L2DataError(
+      f"未配置 L2 {kind} 数据源映射",
+      code="l2.config.mapping_missing",
+      context={"kind": kind},
+    )
   try:
     value = json.loads(raw)
   except json.JSONDecodeError as error:
-    raise L2DataError(f"L2 {kind} 数据源映射不是有效 JSON") from error
+    raise L2DataError(
+      f"L2 {kind} 数据源映射不是有效 JSON",
+      code="l2.config.mapping_invalid",
+      context={"kind": kind},
+    ) from error
   if not isinstance(value, dict) or not isinstance(value.get("columns"), dict):
-    raise L2DataError(f"L2 {kind} 数据源映射缺少 columns")
+    raise L2DataError(
+      f"L2 {kind} 数据源映射缺少 columns",
+      code="l2.config.mapping_invalid",
+      context={"kind": kind},
+    )
   return SourceMappingProfile(
     source_name=str(value.get("sourceName", kind)),
     table_name=str(value.get("tableName", "")),
@@ -94,5 +106,9 @@ def _raw_mapping(kind: str) -> str:
     "event": settings.L2_EVENT_MAPPING_JSON,
   }
   if kind not in values:
-    raise L2DataError(f"未知 L2 数据源类型: {kind}")
+    raise L2DataError(
+      f"未知 L2 数据源类型: {kind}",
+      code="l2.config.source_kind_invalid",
+      context={"kind": kind},
+    )
   return values[kind]

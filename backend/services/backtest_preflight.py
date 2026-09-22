@@ -88,6 +88,8 @@ def require_available(
   except ValueError as error:
     raise PreflightError(_failure(symbol, timeframe, start_date, end_date, "data.bar_missing")) from error
   except L2DataError as error:
+    if error.code != "data.l2_bar_missing":
+      raise
     raise PreflightError(_failure(symbol, timeframe, start_date, end_date, "data.bar_missing")) from error
   return {"preflight": result, "barSnapshot": bar_snapshot}
 
@@ -131,17 +133,11 @@ def _preview_timeframe(
 
 
 def _available_bar_dates(symbol: str, timeframe: str, trade_dates: list[str]) -> list[str]:
-  try:
-    return bar_data.derived_bar_available_dates(symbol, timeframe, trade_dates)
-  except L2DataError:
-    return []
+  return bar_data.derived_bar_available_dates(symbol, timeframe, trade_dates)
 
 
 def _available_quote_dates(symbol: str, trade_dates: list[str]) -> set[str]:
-  try:
-    return set(l2_quote_availability.available_quote_dates(symbol, trade_dates))
-  except L2DataError:
-    return set()
+  return set(l2_quote_availability.available_quote_dates(symbol, trade_dates))
 
 
 def _calendar_days(start_date: str, end_date: str) -> tuple[list[str], list[dict[str, Any]], bool]:

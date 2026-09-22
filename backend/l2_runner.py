@@ -20,7 +20,7 @@ from backend.l2.models import NormalizedBar, QuoteSnapshot, TradeEvent, parse_ti
 from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError
 from backend.l2.result_adapter import normalize_l2_result
 from backend.l2.strategy_session import L2StrategySession
-from backend.services.backtest_errors import RemoteBacktestError, error_summary
+from backend.services.backtest_errors import RemoteBacktestError, error_summary, error_terminal_status
 from backend.services import bar_data, state_store
 from backend.services.system_error_log import system_error_log_record
 from backend.strategies.scripted import quote_mode_for_script
@@ -163,7 +163,7 @@ class L2Runner:
           error.diagnostic.get("reason", ""),
           error.diagnostic.get("trace", ""),
         )
-      status = "cancelled" if "租约丢失或已取消" in str(error) else "failed"
+      status = error_terminal_status(error)
       system_error = None
       if status == "failed":
         system_error = system_error_log_record(
@@ -183,7 +183,9 @@ class L2Runner:
   def _session_payload(payload: dict[str, Any]) -> dict[str, Any]:
     script = payload.get("savedScriptSnapshot") or payload.get("versionScriptSnapshot")
     if not isinstance(script, dict) or not isinstance(script.get("code"), str):
-      raise L2DataError("L2 回测缺少已保存的策略脚本快照")
+      raise L2DataError(
+        "L2 回测缺少已保存的策略脚本快照", code="task.snapshot_missing",
+      )
     params = dict(payload.get("strategyParams") or {})
     instrument_rules = dict(params.get("l2InstrumentRules") or {})
     instrument_rules["allow_short"] = bool(payload.get("allowShort", False))
@@ -251,7 +253,9 @@ def _quote_mode(payload: dict[str, Any]) -> str:
   """从不可变脚本快照推导回放方式，防止运行时读取已编辑的脚本。"""
   script = payload.get("savedScriptSnapshot") or payload.get("versionScriptSnapshot")
   if not isinstance(script, dict) or not isinstance(script.get("code"), str):
-    raise L2DataError("L2 回测缺少已保存的策略脚本快照")
+    raise L2DataError(
+      "L2 回测缺少已保存的策略脚本快照", code="task.snapshot_missing",
+    )
   params = dict(payload.get("strategyParams") or {})
   configured = params.get("quoteMode")
   return quote_mode_for_script(script["code"], configured if isinstance(configured, str) else None)
@@ -295,7 +299,10 @@ def _replay_day(
       performance["workerMs"] += _elapsed_ms(started)
       processed = int(response.get("processedBars", 0))
       if processed <= 0 or processed > len(batch):
-        raise L2DataError("L2 策略会话未返回有效的 Bar 处理数量")
+        raise L2DataError(
+          "L2 策略会话未返回有效的 Bar 处理数量",
+          code="worker.protocol.invalid_bar_count",
+        )
       performance["barCount"] += processed
       bar_index += processed
       demand = response
@@ -442,7 +449,10 @@ def _waiting_quote(demand: dict[str, Any]) -> bool:
 def _required_timestamp(demand: dict[str, Any]) -> str:
   value = demand.get("nextQuoteAfter")
   if not isinstance(value, str) or not value:
-    raise L2DataError("L2 worker 未返回待成交订单的时间边界")
+    raise L2DataError(
+      "L2 worker 未返回待成交订单的时间边界",
+      code="worker.protocol.missing_quote_boundary",
+    )
   return value
 
 
@@ -456,7 +466,7 @@ def _heartbeat(job: dict[str, Any], worker_id: str | None = None) -> None:
   if not state_store.heartbeat_l2_backtest_job(
     job["runId"], job["attemptToken"], settings.L2_JOB_LEASE_SECONDS, worker_id,
   ):
-    raise L2DataError("L2 任务租约丢失或已取消")
+    raise L2DataError("L2 任务租约丢失或已取消", code="task.inactive")
 
 
 class _JobLeaseKeeper:

@@ -70,7 +70,13 @@ from backend.services import (
 )
 from backend.services import auth
 from backend.services.user_context import CurrentUser
-from backend.services.backtest_errors import StrategyExecutionError, error_detail, error_summary
+from backend.services.backtest_errors import (
+  StrategyExecutionError,
+  error_detail,
+  error_http_status,
+  error_summary,
+)
+from backend.services.backtest_faults import BacktestFault
 from backend.services.system_error_log import system_error_log_record
 from backend.services.user_context import get_current_user, reset_current_user, set_current_user
 
@@ -85,11 +91,7 @@ def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, A
 
 def _backtest_failure_response(error: Exception, run_id: str | None) -> HTTPException:
   detail = error_detail(error, run_id).to_dict()
-  if detail["code"] == "data.unavailable":
-    status_code = 404
-  else:
-    status_code = 503 if detail["category"] == "system_error" else 422
-  return HTTPException(status_code, {"errorDetail": detail})
+  return HTTPException(error_http_status(error), {"errorDetail": detail})
 
 
 def _sync_system_error_record(error: Exception, run_id: str) -> dict[str, Any] | None:
@@ -507,6 +509,8 @@ def _require_preflight(request: dict[str, Any]) -> None:
     )
   except backtest_preflight.PreflightError as error:
     raise HTTPException(422, {"errorDetail": _preflight_error_detail(error.result)}) from error
+  except BacktestFault as error:
+    raise _backtest_failure_response(error, None) from error
   request["marketDataSnapshot"] = snapshot
 
 
@@ -955,7 +959,7 @@ def admin_system_errors(
   request: Request,
   limit: int = Query(100, ge=1, le=200),
   user_id: str | None = Query(default=None, alias="userId"),
-  run_id: str | None = Query(default=None, alias="runId"),
+  run_id: UUID | None = Query(default=None, alias="runId"),
   error_code: str | None = Query(default=None, alias="errorCode"),
   from_time: str | None = Query(default=None, alias="fromTime"),
   to_time: str | None = Query(default=None, alias="toTime"),
@@ -963,7 +967,7 @@ def admin_system_errors(
   """返回管理员可见的安全系统错误摘要，不含原始堆栈和凭据。"""
   _require_admin(request)
   return {"items": state_store.list_system_error_logs(
-    limit, user_id, run_id, error_code, from_time, to_time,
+    limit, user_id, str(run_id) if run_id else None, error_code, from_time, to_time,
   )}
 
 
@@ -1802,6 +1806,8 @@ def backtest_preflight_check(
     return backtest_preflight.preview(
       symbol, start_date, end_date, fill_model, timeframe,
     )
+  except BacktestFault as error:
+    raise _backtest_failure_response(error, None) from error
   except ValueError as error:
     raise HTTPException(422, str(error)) from error
 

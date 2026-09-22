@@ -12,6 +12,7 @@ from typing import Any, Iterator, Protocol, Sequence
 
 from backend.l2.models import CoverageSnapshot, NormalizedBar, QuoteLevel, QuoteSnapshot, SourceMappingProfile, TradeEvent
 from backend.services import clickhouse_client
+from backend.services.backtest_faults import BacktestFault
 from backend.time_utils import now_shanghai_iso_datetime
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -19,8 +20,17 @@ _TABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
 logger = logging.getLogger(__name__)
 
 
-class L2DataError(RuntimeError):
-  """L2 数据契约、覆盖范围或缓存出现错误。"""
+class L2DataError(BacktestFault):
+  """兼容现有调用方的 L2 失败基类；新抛错点必须提供稳定 code。"""
+
+  def __init__(
+    self,
+    message: str,
+    *,
+    code: str = "l2.unclassified",
+    context: dict[str, str] | None = None,
+  ) -> None:
+    super().__init__(code, message, context)
 
 
 class L2DataCoverageError(L2DataError):
@@ -29,7 +39,11 @@ class L2DataCoverageError(L2DataError):
   def __init__(self, symbol: str, missing_dates: Sequence[str]) -> None:
     self.symbol = symbol
     self.missing_dates = tuple(sorted({str(value) for value in missing_dates}))
-    super().__init__(f"{symbol} 缺少 L2 连续竞价十档快照: {', '.join(self.missing_dates)}")
+    super().__init__(
+      f"{symbol} 缺少 L2 连续竞价十档快照: {', '.join(self.missing_dates)}",
+      code="data.l2_quote_missing",
+      context={"symbol": symbol, "missingDates": ", ".join(self.missing_dates)},
+    )
 
 
 class L2BarProvider(Protocol):
@@ -75,7 +89,7 @@ class RedisJsonCache:
     if response is None:
       return None
     if not isinstance(response, bytes):
-      raise L2DataError("Redis 返回了无效缓存值")
+      raise L2DataError("Redis 返回了无效缓存值", code="cache.redis.payload_invalid")
     return json.loads(response.decode("utf-8"))
 
   def set(self, key: str, value: dict[str, Any], ttl_seconds: int) -> None:
@@ -92,7 +106,9 @@ class RedisJsonCache:
         connection.sendall(packet)
         return self._read_response(connection)
     except OSError as error:
-      raise L2DataError(f"Redis 缓存不可用: {error}") from error
+      raise L2DataError(
+        f"Redis 缓存不可用: {error}", code="cache.redis.unavailable",
+      ) from error
 
   def _read_response(self, connection: socket.socket) -> bytes | str | int | None:
     marker = connection.recv(1)
@@ -102,9 +118,11 @@ class RedisJsonCache:
     if marker == b":":
       return int(line)
     if marker == b"-":
-      raise L2DataError(f"Redis 返回错误: {line.decode('utf-8')}")
+      raise L2DataError(
+        f"Redis 返回错误: {line.decode('utf-8')}", code="cache.redis.command_failed",
+      )
     if marker != b"$":
-      raise L2DataError("Redis 协议响应无效")
+      raise L2DataError("Redis 协议响应无效", code="cache.redis.protocol_invalid")
     length = int(line)
     if length < 0:
       return None
@@ -118,10 +136,12 @@ class RedisJsonCache:
     while True:
       char = connection.recv(1)
       if not char:
-        raise L2DataError("Redis 连接在响应完成前关闭")
+        raise L2DataError(
+          "Redis 连接在响应完成前关闭", code="cache.redis.connection_closed",
+        )
       if char == b"\r":
         if connection.recv(1) != b"\n":
-          raise L2DataError("Redis 行结束符无效")
+          raise L2DataError("Redis 行结束符无效", code="cache.redis.protocol_invalid")
         return b"".join(chunks)
       chunks.append(char)
 
@@ -132,7 +152,9 @@ class RedisJsonCache:
     while remaining:
       chunk = connection.recv(remaining)
       if not chunk:
-        raise L2DataError("Redis 连接在响应完成前关闭")
+        raise L2DataError(
+          "Redis 连接在响应完成前关闭", code="cache.redis.connection_closed",
+        )
       chunks.append(chunk)
       remaining -= len(chunk)
     return b"".join(chunks)
@@ -151,7 +173,11 @@ class ClickHouseL2Adapter:
     rows = clickhouse_client.query_rows(self._select("symbol, trade_date, period, start_time, end_time, open, high, low, close, volume, amount, quality, source_version, snapshot_count, max_gap_ms, valid_price_count, actual_duration_seconds", symbol, start_date, end_date, "period"))
     bars = [self._bar_from_row(row) for row in rows if str(row["period"]) == period]
     if not bars:
-      raise L2DataError("L2 Bar 数据为空或不存在所选周期")
+      raise L2DataError(
+        "L2 Bar 数据为空或不存在所选周期",
+        code="data.l2_bar_missing",
+        context={"symbol": symbol, "timeframe": period},
+      )
     return bars
 
   def iter_quotes(self, symbol: str, trade_date: str, page_size: int) -> Iterator[list[QuoteSnapshot]]:
@@ -214,7 +240,9 @@ class ClickHouseL2Adapter:
     required = {"symbol", "trade_date", "time", "sequence", "trade_id", "price", "volume", "side", "event_type"}
     self._validate_profile(required)
     if not self._profile.trade_value:
-      raise L2DataError("逐笔事件映射必须配置 tradeValue")
+      raise L2DataError(
+        "逐笔事件映射必须配置 tradeValue", code="l2.config.event_mapping_invalid",
+      )
     fields = ", ".join(sorted(required | {"source_version"}))
     for rows in self._pages(fields, symbol, trade_date, page_size, trade_only=True, continuous_session=True):
       yield [self._trade_from_row(row) for row in rows]
@@ -343,30 +371,48 @@ class ClickHouseL2Adapter:
       elif name in {"snapshot_count", "max_gap_ms", "valid_price_count", "actual_duration_seconds"}:
         expressions.append(f"0 AS {name}")
       else:
-        raise L2DataError(f"数据源映射缺少字段: {name}")
+        raise L2DataError(
+          f"数据源映射缺少字段: {name}",
+          code="l2.config.mapping_field_missing",
+          context={"field": name},
+        )
     return ", ".join(expressions)
 
   def _validate_profile(self, required: set[str]) -> None:
     if not _TABLE.fullmatch(self._profile.table_name):
-      raise L2DataError("数据源表名不符合白名单格式")
+      raise L2DataError(
+        "数据源表名不符合白名单格式", code="l2.config.mapping_identifier_invalid",
+      )
     mapped = {self._profile.columns[name] for name in required if name in self._profile.columns}
     if any(not _IDENTIFIER.fullmatch(item) for item in mapped):
-      raise L2DataError("数据源列名不符合白名单格式")
+      raise L2DataError(
+        "数据源列名不符合白名单格式", code="l2.config.mapping_identifier_invalid",
+      )
     missing = required - self._profile.columns.keys() - {"source_version", "snapshot_count", "max_gap_ms", "valid_price_count", "actual_duration_seconds"}
     if missing:
-      raise L2DataError(f"数据源映射缺少字段: {', '.join(sorted(missing))}")
+      fields = ", ".join(sorted(missing))
+      raise L2DataError(
+        f"数据源映射缺少字段: {fields}",
+        code="l2.config.mapping_field_missing",
+        context={"field": fields},
+      )
     if self._validated:
       return
     rows = clickhouse_client.query_rows(f"DESCRIBE TABLE {self._profile.table_name}")
     actual = {str(item.get("name")) for item in rows}
     if not mapped <= actual:
-      raise L2DataError("数据源映射列不存在于 ClickHouse 表")
+      raise L2DataError(
+        "数据源映射列不存在于 ClickHouse 表", code="l2.config.mapping_column_missing",
+      )
     self._validated = True
 
   def _trade_filter(self) -> str:
     column = self._profile.columns.get("event_type")
     if not column or not self._profile.trade_value:
-      raise L2DataError("逐笔事件映射必须配置 event_type 和 tradeValue")
+      raise L2DataError(
+        "逐笔事件映射必须配置 event_type 和 tradeValue",
+        code="l2.config.event_mapping_invalid",
+      )
     return f" AND {column}={self._literal(self._profile.trade_value)}"
 
   def _continuous_session_filter(self) -> str:
@@ -439,7 +485,11 @@ class ClickHouseL2Adapter:
     )
     row = clickhouse_client.query_rows(query)[0]
     if int(row["total"]) != int(row["unique_total"]):
-      raise L2DataError("快照缺少稳定 sequence，且同一时间戳存在重复记录")
+      raise L2DataError(
+        "快照缺少稳定 sequence，且同一时间戳存在重复记录",
+        code="data.l2_quote_order_ambiguous",
+        context={"symbol": symbol, "tradeDate": trade_date},
+      )
 
   def _ensure_unique_quote_times(self, symbol: str, trade_date: str) -> None:
     if "sequence" in self._profile.columns:
@@ -463,7 +513,7 @@ class ClickHouseL2Adapter:
     if value == "":
       return "''"
     if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
-      raise L2DataError("L2 查询参数格式无效")
+      raise L2DataError("L2 查询参数格式无效", code="l2.query.invalid_value")
     return f"'{value}'"
 
   @classmethod
@@ -566,22 +616,39 @@ class TemporaryQuoteBarProvider:
 
   def load_bars(self, symbol: str, period: str, start_date: str, end_date: str) -> list[NormalizedBar]:
     if period not in self._PERIOD_SECONDS:
-      raise L2DataError(f"临时 L2 聚合不支持周期: {period}")
+      raise L2DataError(
+        f"临时 L2 聚合不支持周期: {period}",
+        code="backtest.timeframe_unsupported",
+        context={"timeframe": period},
+      )
     start = self._parse_date(start_date)
     end = self._parse_date(end_date)
     if end < start:
-      raise L2DataError("L2 回测结束日期不能早于开始日期")
+      raise L2DataError(
+        "L2 回测结束日期不能早于开始日期", code="backtest.date_range_invalid",
+      )
     if end >= date.today():
-      raise L2DataError("临时 L2 聚合只支持已结束的历史交易日")
+      raise L2DataError(
+        "临时 L2 聚合只支持已结束的历史交易日", code="data.future_date",
+      )
     self._validate_profile()
     bars: list[NormalizedBar] = []
     for trade_date in self._trading_days(symbol, start.isoformat(), end.isoformat()):
       bars.extend(self._load_day(symbol, trade_date, period))
     if not bars:
-      raise L2DataError("临时 L2 聚合未找到所选范围内的快照数据")
+      raise L2DataError(
+        "临时 L2 聚合未找到所选范围内的快照数据",
+        code="data.l2_bar_missing",
+        context={"symbol": symbol, "timeframe": period},
+      )
     partial = [bar.trade_date for bar in bars if bar.quality != "complete"]
     if partial:
-      raise L2DataError(f"临时 L2 Bar 数据不完整: {', '.join(sorted(set(partial)))}")
+      trade_dates = ", ".join(sorted(set(partial)))
+      raise L2DataError(
+        f"临时 L2 Bar 数据不完整: {trade_dates}",
+        code="data.l2_bar_partial",
+        context={"symbol": symbol, "tradeDates": trade_dates},
+      )
     return bars
 
   def coverage(self, symbol: str, start_date: str, end_date: str) -> CoverageSnapshot:
@@ -611,7 +678,11 @@ class TemporaryQuoteBarProvider:
   def available_bar_dates(self, symbol: str, trade_dates: Sequence[str], period: str) -> list[str]:
     """预检派生 Bar：缓存命中或原始快照可聚合的日期均视为可用。"""
     if period not in self._PERIOD_SECONDS:
-      raise L2DataError(f"临时 L2 聚合不支持周期: {period}")
+      raise L2DataError(
+        f"临时 L2 聚合不支持周期: {period}",
+        code="backtest.timeframe_unsupported",
+        context={"timeframe": period},
+      )
     dates = sorted({str(value) for value in trade_dates})
     if not dates:
       return []
@@ -665,7 +736,11 @@ class TemporaryQuoteBarProvider:
     bars: list[NormalizedBar] = []
     for row in rows:
       if int(row["valid_price_count"]) == 0:
-        raise L2DataError(f"临时 L2 Bar 无有效价格: {trade_date}")
+        raise L2DataError(
+          f"临时 L2 Bar 无有效价格: {trade_date}",
+          code="data.l2_bar_price_invalid",
+          context={"symbol": symbol, "tradeDate": trade_date},
+        )
       bars.append(NormalizedBar(
         symbol=str(row["symbol"]), trade_date=str(row["trade_date"]), period=period,
         start_time=str(row["start_time"]), end_time=str(row["end_time"]),
@@ -792,13 +867,20 @@ ORDER BY trade_date, bucket_start
       return
     required = {"symbol", "trade_date", "time", "last_price", "volume", "amount", "cum_amount"}
     if not _TABLE.fullmatch(self._profile.table_name) or not required <= self._profile.columns.keys():
-      raise L2DataError("临时 L2 快照映射不完整")
+      raise L2DataError(
+        "临时 L2 快照映射不完整", code="l2.config.mapping_invalid",
+      )
     mapped = {self._profile.columns[item] for item in required}
     if any(not _IDENTIFIER.fullmatch(item) for item in mapped):
-      raise L2DataError("临时 L2 快照映射包含非法列名")
+      raise L2DataError(
+        "临时 L2 快照映射包含非法列名", code="l2.config.mapping_identifier_invalid",
+      )
     actual = {str(row.get("name")) for row in clickhouse_client.query_rows(f"DESCRIBE TABLE {self._profile.table_name}")}
     if not mapped <= actual:
-      raise L2DataError("临时 L2 快照映射列不存在于 ClickHouse 表")
+      raise L2DataError(
+        "临时 L2 快照映射列不存在于 ClickHouse 表",
+        code="l2.config.mapping_column_missing",
+      )
     self._validated = True
 
   @staticmethod
@@ -806,7 +888,9 @@ ORDER BY trade_date, bucket_start
     try:
       return date.fromisoformat(value)
     except ValueError as error:
-      raise L2DataError("L2 日期必须为 YYYY-MM-DD 或 YYYYMMDD") from error
+      raise L2DataError(
+        "L2 日期必须为 YYYY-MM-DD 或 YYYYMMDD", code="backtest.date_format_invalid",
+      ) from error
 
 
 def _summarize_quality(bars: Sequence[NormalizedBar]) -> str:

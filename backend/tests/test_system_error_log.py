@@ -4,13 +4,22 @@ from datetime import datetime, timezone
 from http.client import ResponseNotReady
 from pathlib import Path
 from typing import Any, Iterator
+from uuid import UUID
 
 import pytest
 
+from backend import app as api_app
 from backend import settings
 from backend.backtesting.overlay import ResultReconciliationError
+from backend.l2.config import load_temporary_quote_profile
+from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError
 from backend.services import state_store
-from backend.services.backtest_errors import BacktestErrorDetail, RemoteBacktestError, StrategyExecutionError
+from backend.services.backtest_errors import (
+  BacktestErrorDetail,
+  RemoteBacktestError,
+  StrategyExecutionError,
+  error_summary,
+)
 from backend.services.clickhouse_client import ClickHouseError
 from backend.services.state_store import _insert_strategy_runtime_error_stat, _public_system_error_context
 from backend.services.system_error_log import system_error_log_record
@@ -128,6 +137,52 @@ def test_unknown_system_error_is_not_marked_retryable() -> None:
   assert record.context["__internal_raw_message"] == "unexpected"
 
 
+def test_l2_ambiguous_quote_order_is_data_error_and_operator_visible(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  adapter = ClickHouseL2Adapter(load_temporary_quote_profile())
+  monkeypatch.setattr(
+    "backend.l2.providers.clickhouse_client.query_rows",
+    lambda _: [{"total": 2, "unique_total": 1}],
+  )
+
+  with pytest.raises(L2DataError) as raised:
+    adapter._validate_unique_quote_times("688449.SH", "2025-05-29")
+
+  summary = error_summary(raised.value, "117f14fd-203a-4705-8fe3-c4a3a42d4746")
+  record = system_error_log_record(
+    raised.value,
+    "l2_runner",
+    "l2.market_replay",
+    "117f14fd-203a-4705-8fe3-c4a3a42d4746",
+  )
+
+  assert summary["errorDetail"]["category"] == "data"
+  assert summary["errorDetail"]["code"] == "data.l2_quote_order_ambiguous"
+  assert summary["errorDetail"]["message"] == "L2 行情数据时间顺序异常，当前任务无法继续。"
+  assert record is not None
+  assert record.code == "data.l2_quote_order_ambiguous"
+  assert record.category == "data"
+  assert record.context["symbol"] == "688449.SH"
+  assert record.context["tradeDate"] == "2025-05-29"
+
+
+def test_plain_l2_error_is_not_silently_classified_as_data() -> None:
+  record = system_error_log_record(
+    L2DataError("尚未登记的 L2 错误"), "l2_runner", "l2.market_replay", "run-l2",
+  )
+
+  assert record is not None
+  assert record.code == "l2.unclassified"
+  assert record.category == "internal"
+
+
+def test_expected_l2_coverage_gap_does_not_create_operator_log() -> None:
+  error = L2DataCoverageError("688449.SH", ["2025-05-29"])
+
+  assert system_error_log_record(error, "l2_runner", "l2.quote_coverage") is None
+
+
 def test_overlay_reconciliation_error_records_actual_l2_runner() -> None:
   record = system_error_log_record(
     ResultReconciliationError("增强收益与账户收益无法对账", "2026-01-05"),
@@ -177,6 +232,27 @@ def test_administrator_can_find_result_error_by_task_id(
     "tradeDate": "2026-01-05",
   }
   assert records[0]["rawLogRef"] == _RESULT_RAW_LOG_REF
+
+
+def test_admin_endpoint_forwards_exact_task_uuid_without_user_filter(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  run_id = UUID("117f14fd-203a-4705-8fe3-c4a3a42d4746")
+  captured: dict[str, Any] = {}
+  monkeypatch.setattr(api_app, "_require_admin", lambda _: None)
+  monkeypatch.setattr(
+    state_store,
+    "list_system_error_logs",
+    lambda *args: captured.update({"args": args}) or [],
+  )
+
+  result = api_app.admin_system_errors(
+    object(), 100, None, run_id, None, None, None,
+  )
+
+  assert result == {"items": []}
+  assert captured["args"][1] is None
+  assert captured["args"][2] == "117f14fd-203a-4705-8fe3-c4a3a42d4746"
 
 
 def test_internal_error_context_is_not_returned_by_api() -> None:

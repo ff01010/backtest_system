@@ -1,10 +1,20 @@
 """回测对外错误必须可定位且不泄露内部异常。"""
 
+import ast
 from http.client import ResponseNotReady
+from pathlib import Path
 
 from backend.backtesting.overlay import ResultReconciliationError
-from backend.services.backtest_errors import RemoteBacktestError, StrategyExecutionError, error_summary
+from backend.l2.providers import L2DataError
+from backend.services.backtest_errors import (
+  RemoteBacktestError,
+  StrategyExecutionError,
+  error_summary,
+  error_terminal_status,
+)
+from backend.services.backtest_faults import BacktestFault
 from backend.services.clickhouse_client import ClickHouseError
+from backend.services.system_error_catalog import classify_system_error
 
 
 def test_unknown_error_is_sanitized() -> None:
@@ -19,6 +29,7 @@ def test_unknown_error_is_sanitized() -> None:
     "callback": None,
     "eventTime": None,
     "symbol": None,
+    "tradeDate": None,
     "retryable": False,
     "taskId": "run-42",
     "missingName": None,
@@ -85,3 +96,45 @@ def test_remote_error_keeps_worker_diagnostic_outside_public_summary() -> None:
 
   assert error.diagnostic["reason"] == "平仓数量超过可用持仓"
   assert "平仓数量超过可用持仓" not in str(error_summary(error, "run-8"))
+
+
+def test_unclassified_l2_error_fails_closed_as_system_error() -> None:
+  summary = error_summary(L2DataError("尚未归类的 L2 错误"), "run-l2")
+
+  assert summary["errorDetail"]["category"] == "system_error"
+  assert summary["errorDetail"]["code"] == "l2.unclassified"
+
+
+def test_task_inactive_uses_typed_terminal_status() -> None:
+  error = BacktestFault("task.inactive", "任务租约丢失或已取消")
+
+  assert error_terminal_status(error) == "cancelled"
+
+
+def test_every_production_l2_error_declares_a_stable_code() -> None:
+  root = Path(__file__).resolve().parents[2]
+  paths = [
+    root / "backend" / "l2" / "providers.py",
+    root / "backend" / "l2" / "config.py",
+    root / "backend" / "l2_runner.py",
+  ]
+  missing: list[str] = []
+  codes: set[str] = set()
+  for path in paths:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in ast.walk(tree):
+      if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        continue
+      if node.func.id != "L2DataError":
+        continue
+      code_keywords = [keyword for keyword in node.keywords if keyword.arg == "code"]
+      if not code_keywords:
+        missing.append(f"{path.name}:{node.lineno}")
+      elif isinstance(code_keywords[0].value, ast.Constant):
+        codes.add(str(code_keywords[0].value.value))
+
+  assert missing == []
+  assert {
+    classify_system_error(L2DataError("test", code=code)).code
+    for code in codes
+  } == codes
