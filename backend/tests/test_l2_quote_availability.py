@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from backend.l2.config import load_temporary_quote_profile
-from backend.l2.providers import ClickHouseL2Adapter
+from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError
 from backend.services import backtest_preflight, l2_quote_availability, state_store
 
 
@@ -26,8 +26,7 @@ def test_quote_availability_uses_cached_daily_records(monkeypatch: pytest.Monkey
   assert result == ["2026-08-26"]
 
 
-def test_quote_availability_backfills_only_uncached_dates(monkeypatch: pytest.MonkeyPatch) -> None:
-  writes: list[dict[str, Any]] = []
+def test_quote_availability_does_not_backfill_uncached_dates(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setattr(
     state_store,
     "list_l2_quote_daily_availability",
@@ -36,22 +35,17 @@ def test_quote_availability_backfills_only_uncached_dates(monkeypatch: pytest.Mo
   monkeypatch.setattr(
     ClickHouseL2Adapter,
     "quote_daily_availability",
-    lambda _, _symbol, dates: {
-      item: {"snapshotCount": 20, "firstQuoteTime": "09:30:00", "lastQuoteTime": "14:56:57"}
-      for item in dates
-    },
+    lambda *_: pytest.fail("在线范围查询不应回填原始 L2 行情"),
   )
   monkeypatch.setattr(
     state_store,
     "upsert_l2_quote_daily_availability",
-    lambda _source, _symbol, records: writes.extend(records),
+    lambda *_: pytest.fail("在线范围查询不应写入 L2 摘要"),
   )
 
   result = l2_quote_availability.available_quote_dates("688981.SH", ["2026-08-26", "2026-08-27"])
 
-  assert result == ["2026-08-26", "2026-08-27"]
-  assert [item["tradeDate"] for item in writes] == ["2026-08-27"]
-  assert writes[0]["status"] == "complete"
+  assert result == ["2026-08-26"]
 
 
 def test_quote_daily_query_returns_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -79,7 +73,81 @@ def test_quote_daily_query_returns_metrics(monkeypatch: pytest.MonkeyPatch) -> N
   assert "GROUP BY trade_date" in queries[-1]
 
 
-def test_l2_preview_reads_availability_once_for_all_timeframes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_l2_status_reads_summary_without_querying_raw_quotes(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(l2_quote_availability, "has_profile", lambda _: False)
+  monkeypatch.setattr(l2_quote_availability, "_source_key", lambda _: "source-key")
+  monkeypatch.setattr(
+    state_store,
+    "l2_quote_availability_range",
+    lambda source_key, symbol: {
+      "firstDate": "2026-07-01",
+      "lastDate": "2026-07-30",
+      "snapshotCount": 96_000,
+      "checkedAt": "2026-09-22 10:00:00",
+    } if (source_key, symbol) == ("source-key", "688981.SH") else {},
+  )
+  monkeypatch.setattr(
+    ClickHouseL2Adapter,
+    "quote_daily_availability",
+    lambda *_: pytest.fail("范围展示不应查询 L2 原始行情"),
+  )
+
+  result = l2_quote_availability.status("688981.SH", "5m")
+
+  assert result["exists"] is True
+  assert result["firstDate"] == "2026-07-01"
+  assert result["lastDate"] == "2026-07-30"
+  assert result["barCount"] == 96_000
+  assert result["preview"] == []
+
+
+def test_worker_quote_check_reads_only_existing_daily_summary(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(l2_quote_availability, "has_profile", lambda _: False)
+  monkeypatch.setattr(l2_quote_availability, "_source_key", lambda _: "source-key")
+  monkeypatch.setattr(
+    state_store,
+    "list_l2_quote_daily_availability",
+    lambda *_: {
+      "2026-08-26": {"status": "complete"},
+      "2026-08-27": {"status": "complete"},
+    },
+  )
+  monkeypatch.setattr(
+    ClickHouseL2Adapter,
+    "quote_daily_availability",
+    lambda *_: pytest.fail("Worker 摘要校验不应扫描或回填原始 L2 行情"),
+  )
+
+  l2_quote_availability.require_summarized_quote_dates(
+    "688981.SH", ["2026-08-26", "2026-08-27"],
+  )
+
+
+def test_worker_quote_check_rejects_missing_or_incomplete_summary(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(l2_quote_availability, "has_profile", lambda _: False)
+  monkeypatch.setattr(l2_quote_availability, "_source_key", lambda _: "source-key")
+  monkeypatch.setattr(
+    state_store,
+    "list_l2_quote_daily_availability",
+    lambda *_: {"2026-08-26": {"status": "missing"}},
+  )
+
+  with pytest.raises(L2DataCoverageError) as raised:
+    l2_quote_availability.require_summarized_quote_dates(
+      "688981.SH", ["2026-08-26", "2026-08-27"],
+    )
+
+  assert raised.value.code == "data.l2_quote_missing"
+  assert raised.value.missing_dates == ("2026-08-26", "2026-08-27")
+
+
+def test_l2_preview_does_not_read_availability(monkeypatch: pytest.MonkeyPatch) -> None:
   calls: list[list[str]] = []
   monkeypatch.setattr(state_store, "list_open_trade_dates", lambda *_: ["2026-08-26", "2026-08-27"])
   monkeypatch.setattr(state_store, "is_trade_calendar_range_covered", lambda *_: True)
@@ -97,5 +165,7 @@ def test_l2_preview_reads_availability_once_for_all_timeframes(monkeypatch: pyte
 
   result = backtest_preflight.preview("688981.SH", "2026-08-26", "2026-08-27", "l2_quote", "5m")
 
-  assert calls == [["2026-08-26", "2026-08-27"]]
+  assert calls == []
   assert all(item["available"] for item in result["timeframes"])
+  assert result["missingDates"] == []
+  assert result["calendarDays"] == []

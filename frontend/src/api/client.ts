@@ -66,7 +66,10 @@ async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { credentials: 'include' });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`API ${res.status}: ${text}`);
+    const detail = getStructuredApiError(text);
+    throw new ApiResponseError(
+      res.status, detail.code, detail.message || `API ${res.status}: 请求失败`,
+    );
   }
   return res.json();
 }
@@ -86,13 +89,22 @@ async function fetchNoStoreJson<T>(url: string): Promise<T> {
 function getStructuredApiError(text: string): { code: string; message: string } {
   try {
     const body = JSON.parse(text) as {
-      detail?: string | { code?: unknown; message?: unknown };
+      detail?: string | {
+        code?: unknown;
+        message?: unknown;
+        errorDetail?: { code?: unknown; message?: unknown };
+      };
     };
     if (typeof body.detail === 'string') return { code: '', message: body.detail };
     if (body.detail && typeof body.detail === 'object') {
+      const nested = body.detail.errorDetail;
       return {
-        code: typeof body.detail.code === 'string' ? body.detail.code : '',
-        message: typeof body.detail.message === 'string'
+        code: typeof nested?.code === 'string'
+          ? nested.code
+          : typeof body.detail.code === 'string' ? body.detail.code : '',
+        message: typeof nested?.message === 'string'
+          ? nested.message
+          : typeof body.detail.message === 'string'
           ? body.detail.message
           : getApiErrorMessage(text),
       };
@@ -1075,9 +1087,13 @@ export async function deleteStrategyConfig(configId: string): Promise<boolean> {
   return (await data.json()).deleted;
 }
 
-export async function fetchDataStatus(symbol: string, timeframe = '5m'): Promise<DataStatus> {
+export async function fetchDataStatus(
+  symbol: string,
+  timeframe = '5m',
+  fillModel: 'bar_next_open' | 'l2_quote' = 'bar_next_open',
+): Promise<DataStatus> {
   const response = await fetch(
-    `${BASE}/data/status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`,
+    `${BASE}/data/status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&fillModel=${encodeURIComponent(fillModel)}`,
     { credentials: 'include' },
   );
   if (!response.ok) {

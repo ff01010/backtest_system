@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import pytest
 
 from backend import app as backend_app
@@ -187,11 +186,10 @@ def test_imported_dataset_uses_normal_attachment_preparation_after_withdrawal(
     "freeze_signal_snapshot",
     lambda *_: (_ for _ in ()).throw(AssertionError("不应访问原作者研究信号服务")),
   )
-  bars = pd.DataFrame([{"time": "20260102093000"}])
   monkeypatch.setattr(
     backend_app.backtest_runner,
     "_load_user_script_bars",
-    lambda _request: (bars, 0, {}),
+    lambda _request: pytest.fail("提交阶段不应读取 Bar 行情"),
   )
   request = {
     "signalDatasetId": dataset_id,
@@ -206,8 +204,12 @@ def test_imported_dataset_uses_normal_attachment_preparation_after_withdrawal(
 
   snapshot = request["researchSignalSnapshot"]
   assert snapshot["datasetId"] == dataset_id
-  signals = backtest_runner._research_signal_by_bar_time(
+  assert snapshot["alignmentPlan"] == []
+  aligned = backend_app.research_signal_snapshot.align_frozen_signal_snapshot(
     snapshot, ["20260102093000"],
+  )
+  signals = backtest_runner._research_signal_by_bar_time(
+    aligned, ["20260102093000"],
   )
   assert signals["20260102093000"]["action"] == "long"
 

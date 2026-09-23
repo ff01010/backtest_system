@@ -32,19 +32,26 @@ def load_profile(kind: str) -> SourceMappingProfile:
       code="l2.config.mapping_invalid",
       context={"kind": kind},
     )
-  return SourceMappingProfile(
-    source_name=str(value.get("sourceName", kind)),
-    table_name=str(value.get("tableName", "")),
-    columns={str(key): str(item) for key, item in value["columns"].items()},
-    source_version=str(value["sourceVersion"]) if value.get("sourceVersion") else None,
-    price_scale=float(value.get("priceScale", 1)),
-    price_scales={str(key): float(item) for key, item in dict(value.get("priceScales") or {}).items()},
-    volume_scale=float(value.get("volumeScale", 1)),
-    amount_scale=float(value.get("amountScale", 1)),
-    time_semantics=str(value.get("timeSemantics", "event_time")),
-    quality_column=str(value["qualityColumn"]) if value.get("qualityColumn") else None,
-    trade_value=str(value["tradeValue"]) if value.get("tradeValue") else None,
-  )
+  try:
+    return SourceMappingProfile(
+      source_name=str(value.get("sourceName", kind)),
+      table_name=str(value.get("tableName", "")),
+      columns={str(key): str(item) for key, item in value["columns"].items()},
+      source_version=str(value["sourceVersion"]) if value.get("sourceVersion") else None,
+      price_scale=float(value.get("priceScale", 1)),
+      price_scales={str(key): float(item) for key, item in dict(value.get("priceScales") or {}).items()},
+      volume_scale=float(value.get("volumeScale", 1)),
+      amount_scale=float(value.get("amountScale", 1)),
+      time_semantics=str(value.get("timeSemantics", "event_time")),
+      quality_column=str(value["qualityColumn"]) if value.get("qualityColumn") else None,
+      trade_value=str(value["tradeValue"]) if value.get("tradeValue") else None,
+    )
+  except (TypeError, ValueError) as error:
+    raise L2DataError(
+      f"L2 {kind} 数据源映射参数无效",
+      code="l2.config.mapping_invalid",
+      context={"kind": kind},
+    ) from error
 
 
 def has_profile(kind: str) -> bool:

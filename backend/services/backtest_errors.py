@@ -23,6 +23,11 @@ from backend.strategies.runtime_contract import (
 )
 
 
+_DATA_ERROR_MESSAGE = "行情数据异常，请联系管理员"
+_LEGACY_ERROR_MESSAGE = "回测执行异常，请联系管理员"
+_DATA_ERROR_CODE_PREFIXES = ("data.", "clickhouse.", "l2.config.", "cache.redis.")
+
+
 @dataclass(frozen=True)
 class BacktestErrorDetail:
   """可返回前端的回测错误详情，绝不包含原始异常文本。"""
@@ -139,9 +144,11 @@ class RemoteBacktestError(BacktestExecutionError):
 def error_detail(error: Exception, task_id: str | None = None) -> BacktestErrorDetail:
   """把任意异常降级为可公开的结构化错误。"""
   if isinstance(error, BacktestExecutionError):
-    return error.detail.with_task_id(task_id or error.detail.task_id)
+    return _normalize_public_detail(
+      error.detail.with_task_id(task_id or error.detail.task_id),
+    )
   classified = classify_system_error(error)
-  return BacktestErrorDetail(
+  return _normalize_public_detail(BacktestErrorDetail(
     classified.public_category,
     classified.code,
     classified.public_message,
@@ -150,13 +157,38 @@ def error_detail(error: Exception, task_id: str | None = None) -> BacktestErrorD
     trade_date=classified.context.get("tradeDate"),
     retryable=classified.retryable,
     task_id=task_id,
-  )
+  ))
 
 
 def error_summary(error: Exception, task_id: str | None = None) -> dict[str, Any]:
   """生成可持久化且兼容旧任务列表的失败摘要。"""
   detail = error_detail(error, task_id)
   return {"error": detail.message, "errorDetail": detail.to_dict()}
+
+
+def normalize_public_error_summary(summary: dict[str, Any]) -> dict[str, Any]:
+  """读取历史任务时同步应用当前的数据错误脱敏契约。"""
+  normalized = dict(summary)
+  detail = normalized.get("errorDetail")
+  if not isinstance(detail, dict):
+    if isinstance(normalized.get("error"), str) and normalized["error"]:
+      normalized["error"] = _LEGACY_ERROR_MESSAGE
+    return normalized
+  category = str(detail.get("category") or "")
+  code = str(detail.get("code") or "")
+  if category != "data" and not code.startswith(_DATA_ERROR_CODE_PREFIXES):
+    return normalized
+  normalized_detail = {
+    "category": "data",
+    "code": code or "data.legacy_error",
+    "message": _DATA_ERROR_MESSAGE,
+    "hint": None,
+    "retryable": bool(detail.get("retryable", False)),
+    "taskId": _optional_text(detail.get("taskId")),
+  }
+  normalized["error"] = _DATA_ERROR_MESSAGE
+  normalized["errorDetail"] = normalized_detail
+  return normalized
 
 
 def error_http_status(error: Exception) -> int:
@@ -171,6 +203,28 @@ def error_terminal_status(error: Exception) -> str:
   if isinstance(error, BacktestExecutionError):
     return "failed"
   return classify_system_error(error).terminal_status
+
+
+def _normalize_public_detail(detail: BacktestErrorDetail) -> BacktestErrorDetail:
+  """数据源故障只暴露统一业务提示，技术原因保留在服务端诊断。"""
+  if detail.category != "data" and not detail.code.startswith(_DATA_ERROR_CODE_PREFIXES):
+    return detail
+  return replace(
+    detail,
+    category="data",
+    message=_DATA_ERROR_MESSAGE,
+    hint=None,
+    callback=None,
+    event_time=None,
+    symbol=None,
+    trade_date=None,
+    missing_name=None,
+    strategy_line=None,
+    runtime_version=None,
+    requested_module=None,
+    missing_module=None,
+    supported_package=None,
+  )
 
 
 def _strategy_code(error: Exception) -> str:

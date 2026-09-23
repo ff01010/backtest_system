@@ -11,6 +11,7 @@ from backend.services.backtest_errors import (
   StrategyExecutionError,
   error_summary,
   error_terminal_status,
+  normalize_public_error_summary,
 )
 from backend.services.backtest_faults import BacktestFault
 from backend.services.clickhouse_client import ClickHouseError
@@ -39,7 +40,71 @@ def test_unknown_error_is_sanitized() -> None:
     "missingModule": None,
     "supportedPackage": None,
   }
+
+
+def test_historical_data_error_summary_uses_current_public_message() -> None:
+  summary = normalize_public_error_summary({
+    "error": "688981.SH 5m 缺少 2026-07-30",
+    "errorDetail": {
+      "category": "data",
+      "code": "data.bar_missing",
+      "message": "688981.SH 5m 缺少 2026-07-30",
+      "hint": "请补齐 qmt_kline_5m_raw",
+      "taskId": "run-old",
+      "missingDates": ["2026-07-30"],
+      "table": "qmt_kline_5m_raw",
+      "rawError": "query timed out",
+    },
+  })
+
+  assert summary["error"] == "行情数据异常，请联系管理员"
+  assert summary["errorDetail"] == {
+    "category": "data",
+    "code": "data.bar_missing",
+    "message": "行情数据异常，请联系管理员",
+    "hint": None,
+    "retryable": False,
+    "taskId": "run-old",
+  }
+
+
+def test_legacy_error_only_summary_does_not_expose_raw_text() -> None:
+  summary = normalize_public_error_summary({
+    "error": "clickhouse://user:secret@internal/qmt_kline_5m_raw timed out",
+  })
+
+  assert summary == {"error": "回测执行异常，请联系管理员"}
   assert "internal-host" not in str(summary)
+
+
+def test_historical_l2_source_error_uses_one_public_data_message() -> None:
+  summary = normalize_public_error_summary({
+    "error": "L2 数据源配置与实际表结构不一致。",
+    "errorDetail": {
+      "category": "system_error",
+      "code": "l2.config.mapping_column_missing",
+      "message": "L2 数据源配置与实际表结构不一致。",
+      "hint": "请联系管理员检查数据源配置。",
+    },
+  })
+
+  assert summary["error"] == "行情数据异常，请联系管理员"
+  assert summary["errorDetail"]["category"] == "data"
+  assert summary["errorDetail"]["message"] == "行情数据异常，请联系管理员"
+  assert summary["errorDetail"]["hint"] is None
+
+
+def test_historical_data_error_without_code_gets_safe_stable_code() -> None:
+  summary = normalize_public_error_summary({
+    "error": "internal source detail",
+    "errorDetail": {
+      "category": "data",
+      "message": "internal source detail",
+    },
+  })
+
+  assert summary["errorDetail"]["code"] == "data.legacy_error"
+  assert summary["errorDetail"]["message"] == "行情数据异常，请联系管理员"
 
 
 def test_overlay_reconciliation_error_has_safe_actionable_summary() -> None:
@@ -64,9 +129,46 @@ def test_clickhouse_connection_state_error_is_safe_and_not_retryable() -> None:
   summary = error_summary(error, "run-74")
 
   assert summary["errorDetail"]["code"] == "clickhouse.connection_state_invalid"
-  assert summary["errorDetail"]["message"] == "回测服务内部连接状态异常。"
+  assert summary["errorDetail"]["category"] == "data"
+  assert summary["errorDetail"]["message"] == "行情数据异常，请联系管理员"
+  assert summary["errorDetail"]["hint"] is None
   assert summary["errorDetail"]["retryable"] is False
   assert "Request-sent" not in str(summary)
+
+
+def test_bar_load_failure_uses_one_public_data_message() -> None:
+  source = RuntimeError("qmt_history_dev.qmt_kline_5m_raw timed out")
+  error = BacktestFault(
+    "data.bar_load_failed",
+    "标准 Bar 行情读取失败",
+    {"symbol": "688981.SH", "timeframe": "5m"},
+  )
+  error.__cause__ = source
+
+  summary = error_summary(error, "run-data")
+
+  assert summary["error"] == "行情数据异常，请联系管理员"
+  assert summary["errorDetail"]["category"] == "data"
+  assert summary["errorDetail"]["code"] == "data.bar_load_failed"
+  assert summary["errorDetail"]["message"] == "行情数据异常，请联系管理员"
+  assert summary["errorDetail"]["hint"] is None
+  assert summary["errorDetail"]["symbol"] is None
+  assert summary["errorDetail"]["tradeDate"] is None
+  assert "qmt_kline_5m_raw" not in str(summary)
+
+
+def test_remote_data_failure_is_normalized_before_display() -> None:
+  error = RemoteBacktestError.from_dict({
+    "category": "data",
+    "code": "data.l2_bar_missing",
+    "message": "所选范围没有可用的 L2 Bar 数据。",
+    "hint": "请调整日期范围。",
+  })
+
+  detail = error_summary(error, "run-l2-data")["errorDetail"]
+
+  assert detail["message"] == "行情数据异常，请联系管理员"
+  assert detail["hint"] is None
 
 
 def test_strategy_error_is_safe_and_locatable() -> None:

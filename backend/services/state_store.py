@@ -20,6 +20,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend import settings
+from backend.services.backtest_errors import normalize_public_error_summary
 from backend.services import shared_backtest_artifacts, shared_backtest_snapshot
 from backend.services.user_context import get_current_user
 from backend.strategies.runtime_contract import (
@@ -353,7 +354,7 @@ def list_open_trade_dates(start_date: str, end_date: str, exchange: str = "SSE")
 
 
 def is_trade_calendar_range_covered(start_date: str, end_date: str, exchange: str = "SSE") -> bool:
-  """仅当每个自然日都有日历记录时才允许预检使用该区间。"""
+  """仅当每个自然日都有记录时，Worker 才能确定完整目标交易日。"""
   start = date.fromisoformat(start_date)
   end = date.fromisoformat(end_date)
   expected_count = (end - start).days + 1
@@ -397,6 +398,27 @@ def list_l2_quote_daily_availability(
           "lastQuoteTime": str(row["last_quote_time"] or ""),
         }
         for row in cur.fetchall()
+      }
+
+
+def l2_quote_availability_range(source_key: str, symbol: str) -> dict[str, Any]:
+  """只从日级摘要读取标的已有完整 L2 行情的起止日期。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT min(trade_date) AS first_date,
+               max(trade_date) AS last_date,
+               sum(snapshot_count) AS snapshot_count,
+               max(checked_at) AS checked_at
+        FROM l2_quote_daily_availability
+        WHERE source_key=%s AND symbol=%s AND status='complete'
+      """, (source_key, symbol))
+      row = cur.fetchone() or {}
+      return {
+        "firstDate": str(row["first_date"]) if row.get("first_date") else None,
+        "lastDate": str(row["last_date"]) if row.get("last_date") else None,
+        "snapshotCount": int(row.get("snapshot_count") or 0),
+        "checkedAt": _format_time(row.get("checked_at")),
       }
 
 
@@ -675,12 +697,14 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
   fill_model = row.get("fill_model") or "bar_close_signal_fill"
   raw_result = _json(row.get("result_json"), None)
   result = raw_result
-  summary = _json(row.get("result_summary"), {})
+  raw_summary = _json(row.get("result_summary"), {})
+  summary = raw_summary if isinstance(raw_summary, dict) else {}
   if fill_model == "l2_quote" and isinstance(raw_result, dict):
     from backend.l2.result_adapter import normalize_l2_result
 
     result = normalize_l2_result(raw_result, request)
     summary = result["summary"]
+  summary = normalize_public_error_summary(summary if isinstance(summary, dict) else {})
   category = request.get("strategyCategory")
   if category not in {"core_position_overlay", "directional_holding"}:
     category = "core_position_overlay" if int(request.get("baseQuantity") or 0) > 0 or bool(request.get("t0Enabled")) else "directional_holding"
@@ -2017,19 +2041,39 @@ def _finish_backtest_job(
   effective_status = str(row["status"])
   effective_result = result if effective_status == "succeeded" else None
   effective_error = summary.get("error") if effective_status == "failed" else None
+  market_data_snapshot = _market_data_snapshot_from_result(effective_result)
   cur.execute("""
     UPDATE backtest_run
-    SET status=%s, result_summary=%s, result_json=%s, error_message=%s, finished_at=now()
+    SET status=%s, result_summary=%s, result_json=%s, error_message=%s,
+      market_data_snapshot=COALESCE(%s, market_data_snapshot), finished_at=now()
     WHERE id=%s AND status IN ('running', 'cancelling')
   """, (
     effective_status, Jsonb(summary), Jsonb(effective_result) if effective_result else None,
-    effective_error, run_id,
+    effective_error, Jsonb(market_data_snapshot) if market_data_snapshot else None, run_id,
   ))
   cur.execute(
     "DELETE FROM backtest_execution_slot WHERE run_id=%s AND attempt_token=%s",
     (run_id, attempt_token),
   )
   return effective_status
+
+
+def _market_data_snapshot_from_result(
+  result: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+  """从 Worker 成功结果提取实际使用的数据快照，回写运行记录。"""
+  if not isinstance(result, dict):
+    return None
+  manifest = result.get("experimentManifest")
+  if isinstance(manifest, dict) and isinstance(manifest.get("databaseSnapshot"), dict):
+    return {"barSnapshot": dict(manifest["databaseSnapshot"])}
+  data_snapshot = result.get("dataSnapshot")
+  if not isinstance(data_snapshot, dict) or not isinstance(data_snapshot.get("bar"), dict):
+    return None
+  return {
+    "barSnapshot": dict(data_snapshot["bar"]),
+    "l2Snapshot": dict(data_snapshot),
+  }
 
 
 def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary: dict[str, Any]) -> None:

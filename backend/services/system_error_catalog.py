@@ -44,16 +44,31 @@ class _FaultSpec:
 
 
 _FAULT_SPECS: dict[str, _FaultSpec] = {
+  "data.bar_load_failed": _FaultSpec(
+    "data", "data", False, "行情数据异常，请联系管理员", "请联系管理员。",
+    "标准 Bar 行情实际读取失败。", True, 503, ("symbol", "timeframe"),
+  ),
+  "data.l2_bar_invalid": _FaultSpec(
+    "data", "data", False, "行情数据异常，请联系管理员", "请联系管理员。",
+    "Bar 原始行无法转换为标准行情模型。", True, 503, ("symbol", "timeframe"),
+  ),
+  "data.l2_quote_invalid": _FaultSpec(
+    "data", "data", False, "行情数据异常，请联系管理员", "请联系管理员。",
+    "L2 十档原始行无法转换为标准行情模型。", True, 503,
+  ),
+  "data.l2_trade_invalid": _FaultSpec(
+    "data", "data", False, "行情数据异常，请联系管理员", "请联系管理员。",
+    "L2 逐笔原始行无法转换为标准行情模型。", True, 503,
+  ),
   "data.l2_quote_missing": _FaultSpec(
-    "data", "data", False, "当前日期范围缺少 L2 十档快照。",
-    "请调整日期范围，或在数据补齐后重新发起回测。",
-    "实际回放交易日缺少 L2 连续竞价十档快照。", False, 404,
+    "data", "data", False, "行情数据异常，请联系管理员", "请联系管理员。",
+    "实际回放交易日缺少 L2 连续竞价十档快照。", True, 404,
     ("symbol", "missingDates"),
   ),
   "data.l2_bar_missing": _FaultSpec(
-    "data", "data", False, "所选范围没有可用的 L2 Bar 数据。",
-    "请调整标的、日期或周期后重试。", "所选范围没有可用的 L2 Bar 数据。",
-    False, 404, ("symbol", "timeframe"),
+    "data", "data", False, "行情数据异常，请联系管理员", "请联系管理员。",
+    "所选范围没有可用的 L2 Bar 数据。",
+    True, 404, ("symbol", "timeframe"),
   ),
   "data.l2_quote_order_ambiguous": _FaultSpec(
     "data", "data", False, "L2 行情数据时间顺序异常，当前任务无法继续。",
@@ -72,8 +87,8 @@ _FAULT_SPECS: dict[str, _FaultSpec] = {
     True, 422, ("symbol", "tradeDate"),
   ),
   "data.future_date": _FaultSpec(
-    "data", "data", False, "回测区间包含尚未结束的交易日。",
-    "请选择已经结束的历史交易日。", "请求包含尚未结束的交易日。", False, 422,
+    "data", "data", False, "行情数据异常，请联系管理员", "请联系管理员。",
+    "请求包含尚未结束的交易日。", True, 422,
   ),
   "l2.config.mapping_missing": _FaultSpec(
     "l2_config", "system_error", False, "L2 数据源尚未完成配置。",
@@ -215,9 +230,9 @@ def classify_system_error(error: Exception) -> SystemErrorClassification:
     )
   if isinstance(cause, FileNotFoundError):
     return SystemErrorClassification(
-      "data.unavailable", "data", False, "所选区间没有可用行情数据。",
-      "请检查标的、日期和周期后重试。", "回测所需的数据文件不存在或不可读取。", {},
-      public_category="data", operator_visible=False, http_status=404,
+      "data.unavailable", "data", False, "行情数据异常，请联系管理员",
+      "请联系管理员。", "回测所需的数据文件不存在或不可读取。", {},
+      public_category="data", operator_visible=True, http_status=404,
     )
   return SystemErrorClassification(
     "internal.unexpected", "internal", False, "回测服务发生内部错误。",

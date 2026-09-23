@@ -54,7 +54,9 @@ def test_public_request_only_overrides_allowed_runtime_fields(monkeypatch: pytes
     "entryType": "on_bar",
   })
   monkeypatch.setattr(
-    api_app.backtest_preflight, "require_available", lambda *_: {"barSnapshot": {"provider": "test"}},
+    api_app.backtest_preflight,
+    "require_available",
+    lambda *_: pytest.fail("公共回测提交不应执行行情预检"),
   )
   payload = schemas.PublicBacktestCreateRequest(
     config_id=str(config["id"]),

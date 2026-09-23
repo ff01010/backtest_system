@@ -155,6 +155,8 @@ describe('BacktestPage history pagination', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '历史回测' }));
     expect(await screen.findByText('显示 1-10 / 35 条实验')).toBeTruthy();
+    expect(apiMocks.fetchBacktestPreflight).not.toHaveBeenCalled();
+    expect(apiMocks.fetchBacktestTimeframes).not.toHaveBeenCalled();
 
     for (const expectedPage of [2, 3, 4]) {
       fireEvent.click(screen.getByRole('button', { name: '下一页' }));

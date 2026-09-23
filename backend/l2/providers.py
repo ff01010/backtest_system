@@ -10,7 +10,8 @@ from dataclasses import asdict
 from datetime import date, datetime
 from typing import Any, Iterator, Protocol, Sequence
 
-from backend.l2.models import CoverageSnapshot, NormalizedBar, QuoteLevel, QuoteSnapshot, SourceMappingProfile, TradeEvent
+from backend.date_codec import format_api_date
+from backend.l2.models import CoverageSnapshot, NormalizedBar, QuoteLevel, QuoteSnapshot, SourceMappingProfile, TradeEvent, parse_timestamp
 from backend.services import clickhouse_client
 from backend.services.backtest_faults import BacktestFault
 from backend.time_utils import now_shanghai_iso_datetime
@@ -171,12 +172,28 @@ class ClickHouseL2Adapter:
   def load_bars(self, symbol: str, period: str, start_date: str, end_date: str) -> list[NormalizedBar]:
     self._validate_profile({"symbol", "trade_date", "period", "start_time", "end_time", "open", "high", "low", "close", "volume", "amount", "quality", "source_version"})
     rows = clickhouse_client.query_rows(self._select("symbol, trade_date, period, start_time, end_time, open, high, low, close, volume, amount, quality, source_version, snapshot_count, max_gap_ms, valid_price_count, actual_duration_seconds", symbol, start_date, end_date, "period"))
-    bars = [self._bar_from_row(row) for row in rows if str(row["period"]) == period]
+    try:
+      bars = [self._bar_from_row(row) for row in rows if str(row["period"]) == period]
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+      raise L2DataError(
+        "L2 Bar 行数据格式无效",
+        code="data.l2_bar_invalid",
+        context={"symbol": symbol, "timeframe": period},
+      ) from error
     if not bars:
       raise L2DataError(
         "L2 Bar 数据为空或不存在所选周期",
         code="data.l2_bar_missing",
         context={"symbol": symbol, "timeframe": period},
+      )
+    partial_dates = sorted({
+      bar.trade_date for bar in bars if bar.quality not in {"complete", "ok"}
+    })
+    if partial_dates:
+      raise L2DataError(
+        f"L2 Bar 数据不完整: {', '.join(partial_dates)}",
+        code="data.l2_bar_partial",
+        context={"symbol": symbol, "tradeDates": ", ".join(partial_dates)},
       )
     return bars
 
@@ -289,38 +306,16 @@ class ClickHouseL2Adapter:
       }
       for row in rows
     }
-  def missing_quote_dates(self, symbol: str, trade_dates: Sequence[str]) -> list[str]:
-    """一次查询校验实际 Bar 日期是否都存在至少一条有效十档快照。"""
-    dates = sorted({str(value) for value in trade_dates})
-    if not dates:
-      return []
-    price_fields = {f"{side}_price_{index}" for side in ("bid", "ask") for index in range(1, 11)}
-    self._validate_profile({"symbol", "trade_date", "time", *price_fields})
-    valid_quote = " OR ".join(f"{self._profile.columns[name]}>0" for name in sorted(price_fields))
-    query = (
-      f"SELECT {self._profile.columns['trade_date']} AS trade_date "
-      f"FROM {self._profile.table_name} WHERE {self._profile.columns['symbol']}={self._literal(symbol)} "
-      f"AND {self._profile.columns['trade_date']} BETWEEN {self._literal(dates[0])} AND {self._literal(dates[-1])}"
-      f"{self._continuous_session_filter()} AND ({valid_quote}) "
-      f"GROUP BY {self._profile.columns['trade_date']}"
-    )
-    rows = clickhouse_client.query_rows(query)
-    available_dates = {str(row["trade_date"]) for row in rows}
-    return [trade_date for trade_date in dates if trade_date not in available_dates]
-
   def coverage(self, symbol: str, start_date: str, end_date: str) -> CoverageSnapshot:
-    self._validate_profile({"symbol", "trade_date", "source_version"})
-    source_version = self._profile.columns.get("source_version")
-    version_sql = f"any({source_version})" if source_version else self._literal(self._profile.source_version or "")
-    query = (
-      f"SELECT min({self._profile.columns['trade_date']}) AS first_date, "
-      f"max({self._profile.columns['trade_date']}) AS last_date, {version_sql} AS source_version "
-      f"FROM {self._profile.table_name} WHERE {self._profile.columns['symbol']}={self._literal(symbol)} "
-      f"AND {self._profile.columns['trade_date']} BETWEEN {self._literal(start_date)} AND {self._literal(end_date)}"
+    """记录本次已完成读取的来源标识，不为快照再次扫描原始表。"""
+    return CoverageSnapshot(
+      self._profile.source_name,
+      symbol,
+      start_date,
+      end_date,
+      self._profile.source_version,
+      True,
     )
-    row = clickhouse_client.query_rows(query)[0]
-    complete = str(row.get("first_date") or "") <= start_date and str(row.get("last_date") or "") >= end_date
-    return CoverageSnapshot(self._profile.source_name, symbol, start_date, end_date, self._string_or_none(row.get("source_version")), complete)
 
   def _pages(self, fields: str, symbol: str, trade_date: str, page_size: int, trade_only: bool = False, continuous_session: bool = False) -> Iterator[list[dict[str, Any]]]:
     if page_size <= 0:
@@ -428,22 +423,35 @@ class ClickHouseL2Adapter:
     )
 
   def _bar_from_row(self, row: dict[str, Any]) -> NormalizedBar:
-    return NormalizedBar(
-      symbol=str(row["symbol"]), trade_date=str(row["trade_date"]), period=str(row["period"]),
-      start_time=str(row["start_time"]), end_time=str(row["end_time"]), open=self._price(row["open"], "open"),
-      high=self._price(row["high"], "high"), low=self._price(row["low"], "low"), close=self._price(row["close"], "close"),
-      volume=float(row["volume"]) * self._profile.volume_scale, amount=float(row["amount"]) * self._profile.amount_scale,
-      quality=str(row["quality"]), source_version=str(row["source_version"]), snapshot_count=int(row["snapshot_count"]),
-      max_gap_ms=int(row["max_gap_ms"]), valid_price_count=int(row["valid_price_count"]), actual_duration_seconds=int(row["actual_duration_seconds"]),
-    )
+    try:
+      trade_date = format_api_date(row["trade_date"])
+      start_time = str(row["start_time"])
+      end_time = str(row["end_time"])
+      if parse_timestamp(end_time) <= parse_timestamp(start_time):
+        raise ValueError("L2 Bar 结束时间必须晚于开始时间")
+      return NormalizedBar(
+        symbol=str(row["symbol"]), trade_date=trade_date, period=str(row["period"]),
+        start_time=start_time, end_time=end_time, open=self._price(row["open"], "open"),
+        high=self._price(row["high"], "high"), low=self._price(row["low"], "low"), close=self._price(row["close"], "close"),
+        volume=float(row["volume"]) * self._profile.volume_scale, amount=float(row["amount"]) * self._profile.amount_scale,
+        quality=str(row["quality"]), source_version=str(row["source_version"]), snapshot_count=int(row["snapshot_count"]),
+        max_gap_ms=int(row["max_gap_ms"]), valid_price_count=int(row["valid_price_count"]), actual_duration_seconds=int(row["actual_duration_seconds"]),
+      )
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+      raise L2DataError("L2 Bar 行数据格式无效", code="data.l2_bar_invalid") from error
 
   def _quote_from_row(self, row: dict[str, Any], derived_sequence: int) -> QuoteSnapshot:
-    last_price = self._price(row["last_price"], "last_price")
-    quote_price_scale = self._temporary_quote_price_scale(row, last_price)
-    bids = self._quote_levels(row, "bid", quote_price_scale)
-    asks = self._quote_levels(row, "ask", quote_price_scale)
-    sequence = int(row["sequence"]) if "sequence" in self._profile.columns else derived_sequence
-    return QuoteSnapshot(str(row["symbol"]), str(row["trade_date"]), str(row["time"]), sequence, bids, asks, last_price, str(row.get("source_version") or ""))
+    try:
+      event_time = str(row["time"])
+      parse_timestamp(event_time)
+      last_price = self._price(row["last_price"], "last_price")
+      quote_price_scale = self._temporary_quote_price_scale(row, last_price)
+      bids = self._quote_levels(row, "bid", quote_price_scale)
+      asks = self._quote_levels(row, "ask", quote_price_scale)
+      sequence = int(row["sequence"]) if "sequence" in self._profile.columns else derived_sequence
+      return QuoteSnapshot(str(row["symbol"]), str(row["trade_date"]), event_time, sequence, bids, asks, last_price, str(row.get("source_version") or ""))
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+      raise L2DataError("L2 十档行数据格式无效", code="data.l2_quote_invalid") from error
 
   def _quote_levels(
     self, row: dict[str, Any], side: str, price_scale: float | None = None,
@@ -500,7 +508,12 @@ class ClickHouseL2Adapter:
       self._validated_quote_days.add(key)
 
   def _trade_from_row(self, row: dict[str, Any]) -> TradeEvent:
-    return TradeEvent(str(row["symbol"]), str(row["trade_date"]), str(row["time"]), int(row["sequence"]), str(row["trade_id"]), self._price(row["price"], "price"), self._volume(row["volume"]), str(row["side"]), str(row.get("source_version") or ""))
+    try:
+      event_time = str(row["time"])
+      parse_timestamp(event_time)
+      return TradeEvent(str(row["symbol"]), str(row["trade_date"]), event_time, int(row["sequence"]), str(row["trade_id"]), self._price(row["price"], "price"), self._volume(row["volume"]), str(row["side"]), str(row.get("source_version") or ""))
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+      raise L2DataError("L2 逐笔行数据格式无效", code="data.l2_trade_invalid") from error
 
   def _price(self, value: Any, field_name: str) -> float:
     return float(value) * self._profile.price_scales.get(field_name, self._profile.price_scale)
@@ -520,11 +533,6 @@ class ClickHouseL2Adapter:
   def _timestamp_literal(cls, value: str) -> str:
     normalized = value.replace(" ", "T")
     return cls._literal(normalized)
-
-  @staticmethod
-  def _string_or_none(value: Any) -> str | None:
-    return str(value) if value not in {None, ""} else None
-
 
 class VersionedBarCache:
   """以聚合与映射版本隔离的单日派生 Bar 缓存。"""
@@ -734,24 +742,37 @@ class TemporaryQuoteBarProvider:
     seconds = self._PERIOD_SECONDS[period]
     rows = clickhouse_client.query_rows(self._aggregation_query(symbol, trade_date, period, seconds))
     bars: list[NormalizedBar] = []
-    for row in rows:
-      if int(row["valid_price_count"]) == 0:
-        raise L2DataError(
-          f"临时 L2 Bar 无有效价格: {trade_date}",
-          code="data.l2_bar_price_invalid",
-          context={"symbol": symbol, "tradeDate": trade_date},
-        )
-      bars.append(NormalizedBar(
-        symbol=str(row["symbol"]), trade_date=str(row["trade_date"]), period=period,
-        start_time=str(row["start_time"]), end_time=str(row["end_time"]),
-        open=float(row["open"]), high=float(row["high"]), low=float(row["low"]), close=float(row["close"]),
-        volume=float(row["volume"]) * self._profile.volume_scale,
-        amount=float(row["amount"]) * self._profile.amount_scale,
-        quality=str(row["quality"]),
-        source_version=f"{self._aggregation_version}:{self._mapping_version}",
-        snapshot_count=int(row["snapshot_count"]), max_gap_ms=int(row["max_gap_ms"]),
-        valid_price_count=int(row["valid_price_count"]), actual_duration_seconds=int(row["actual_duration_seconds"]),
-      ))
+    try:
+      for row in rows:
+        if int(row["valid_price_count"]) == 0:
+          raise L2DataError(
+            f"临时 L2 Bar 无有效价格: {trade_date}",
+            code="data.l2_bar_price_invalid",
+            context={"symbol": symbol, "tradeDate": trade_date},
+          )
+        start_time = str(row["start_time"])
+        end_time = str(row["end_time"])
+        if parse_timestamp(end_time) <= parse_timestamp(start_time):
+          raise ValueError("临时 L2 Bar 结束时间必须晚于开始时间")
+        bars.append(NormalizedBar(
+          symbol=str(row["symbol"]), trade_date=format_api_date(row["trade_date"]), period=period,
+          start_time=start_time, end_time=end_time,
+          open=float(row["open"]), high=float(row["high"]), low=float(row["low"]), close=float(row["close"]),
+          volume=float(row["volume"]) * self._profile.volume_scale,
+          amount=float(row["amount"]) * self._profile.amount_scale,
+          quality=str(row["quality"]),
+          source_version=f"{self._aggregation_version}:{self._mapping_version}",
+          snapshot_count=int(row["snapshot_count"]), max_gap_ms=int(row["max_gap_ms"]),
+          valid_price_count=int(row["valid_price_count"]), actual_duration_seconds=int(row["actual_duration_seconds"]),
+        ))
+    except L2DataError:
+      raise
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+      raise L2DataError(
+        "临时 L2 Bar 行数据格式无效",
+        code="data.l2_bar_invalid",
+        context={"symbol": symbol, "timeframe": period},
+      ) from error
     return bars
 
   def _aggregation_query(self, symbol: str, trade_date: str, period: str, seconds: int) -> str:

@@ -139,6 +139,27 @@ export function replaceDatePart(value: string, part: DatePart, nextPartValue: nu
   return formatDate({ ...parsed, day: nextPartValue });
 }
 
+function validateAppliedRange(
+  startDate: string,
+  endDate: string,
+  dataStartDate: string | null | undefined,
+  dataEndDate: string | null | undefined,
+): string | null {
+  if (!parseDate(startDate) || !parseDate(endDate)) return '请选择有效的回测日期';
+  if (startDate > endDate) return '开始日期不能晚于结束日期';
+  if (
+    !dataStartDate || !dataEndDate
+    || !parseDate(dataStartDate) || !parseDate(dataEndDate)
+    || dataStartDate > dataEndDate
+  ) {
+    return '可回测范围暂不可用，请稍后重试';
+  }
+  if (startDate < dataStartDate || endDate > dataEndDate) {
+    return `请选择 ${dataStartDate} 至 ${dataEndDate} 范围内的回测区间（含起止日期）`;
+  }
+  return null;
+}
+
 function optionLabel(part: DatePart, value: number): string {
   return part === 'year' ? String(value).padStart(4, '0') : String(value).padStart(2, '0');
 }
@@ -266,6 +287,7 @@ function DateControl(props: DateControlProps) {
 
 export default function BacktestDateRangePicker(props: Props) {
   const [draft, setDraft] = useState({ startDate: props.startDate, endDate: props.endDate });
+  const [applyError, setApplyError] = useState('');
   const [activeWheel, setActiveWheel] = useState<ActiveWheel | null>(null);
   const [wheelPosition, setWheelPosition] = useState({ left: 0, top: 0, width: 68 });
   const wheelRef = useRef<HTMLDivElement | null>(null);
@@ -276,7 +298,12 @@ export default function BacktestDateRangePicker(props: Props) {
   useEffect(() => {
     setDraft({ startDate: props.startDate, endDate: props.endDate });
     setActiveWheel(null);
+    setApplyError('');
   }, [props.endDate, props.startDate]);
+
+  useEffect(() => {
+    setApplyError('');
+  }, [props.dataEndDate, props.dataStartDate]);
 
   const updateWheelPosition = useCallback((): void => {
     if (!activeWheel?.anchor.isConnected) return;
@@ -335,6 +362,7 @@ export default function BacktestDateRangePicker(props: Props) {
 
   const applyEndpointValue = (endpoint: DateEndpoint, nextValue: string): void => {
     setDraft((current) => ({ ...current, [endpoint]: nextValue }));
+    setApplyError('');
   };
 
   const activeDate = activeWheel?.endpoint === 'startDate' ? draft.startDate : draft.endDate;
@@ -361,6 +389,7 @@ export default function BacktestDateRangePicker(props: Props) {
     if (!range) return;
     setDraft(range);
     setActiveWheel(null);
+    setApplyError('');
   };
 
   const useEarliestDate = (): void => {
@@ -370,14 +399,28 @@ export default function BacktestDateRangePicker(props: Props) {
       endDate: current.endDate,
     }));
     setActiveWheel(null);
+    setApplyError('');
   };
 
   const cancelChanges = (): void => {
     setDraft({ startDate: props.startDate, endDate: props.endDate });
     setActiveWheel(null);
+    setApplyError('');
   };
 
   const applyChanges = (): void => {
+    const error = validateAppliedRange(
+      draft.startDate,
+      draft.endDate,
+      props.dataStartDate,
+      props.dataEndDate,
+    );
+    if (error) {
+      setApplyError(error);
+      setActiveWheel(null);
+      return;
+    }
+    setApplyError('');
     props.onApplyRange(draft.startDate, draft.endDate);
     setActiveWheel(null);
   };
@@ -436,6 +479,9 @@ export default function BacktestDateRangePicker(props: Props) {
           onOpenWheel={openWheel}
         />
       </div>
+      {applyError && (
+        <div className="backtest-date-apply-error" role="alert">{applyError}</div>
+      )}
       <div className="backtest-date-footer">
         <button
           type="button"

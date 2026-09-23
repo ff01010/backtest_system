@@ -159,7 +159,7 @@ def test_l2_ambiguous_quote_order_is_data_error_and_operator_visible(
 
   assert summary["errorDetail"]["category"] == "data"
   assert summary["errorDetail"]["code"] == "data.l2_quote_order_ambiguous"
-  assert summary["errorDetail"]["message"] == "L2 行情数据时间顺序异常，当前任务无法继续。"
+  assert summary["errorDetail"]["message"] == "行情数据异常，请联系管理员"
   assert record is not None
   assert record.code == "data.l2_quote_order_ambiguous"
   assert record.category == "data"
@@ -177,10 +177,15 @@ def test_plain_l2_error_is_not_silently_classified_as_data() -> None:
   assert record.category == "internal"
 
 
-def test_expected_l2_coverage_gap_does_not_create_operator_log() -> None:
+def test_l2_coverage_gap_creates_operator_log() -> None:
   error = L2DataCoverageError("688449.SH", ["2025-05-29"])
 
-  assert system_error_log_record(error, "l2_runner", "l2.quote_coverage") is None
+  record = system_error_log_record(error, "l2_runner", "l2.quote_coverage")
+
+  assert record is not None
+  assert record.code == "data.l2_quote_missing"
+  assert record.context["symbol"] == "688449.SH"
+  assert record.context["missingDates"] == "2025-05-29"
 
 
 def test_overlay_reconciliation_error_records_actual_l2_runner() -> None:

@@ -1,4 +1,4 @@
-"""回测保存与提交共用的数据预检。"""
+"""兼容旧客户端的非阻断回测预检接口。"""
 
 from __future__ import annotations
 
@@ -27,29 +27,22 @@ def preview(
   timeframe: str | None = None,
   warmup_trading_days: int = 0,
 ) -> dict[str, Any]:
-  trade_dates, calendar_days, calendar_available = _calendar_days(start_date, end_date)
-  future_dates = [item["date"] for item in calendar_days if item["status"] == "future"]
-  quote_dates = _available_quote_dates(symbol, trade_dates) if fill_model == "l2_quote" else None
-  items = [
-    _preview_timeframe(
-      symbol, item, start_date, end_date, trade_dates, fill_model, calendar_available,
-      future_dates, quote_dates, warmup_trading_days,
-    )
-    for item in settings.BAR_RUN_TIMEFRAMES
-  ]
-  selected = next((item for item in items if item["timeframe"] == timeframe), items[0])
-  missing_dates = set(selected["missingDates"])
-  for item in calendar_days:
-    if item["status"] == "future" or not item["tradingDay"]:
-      continue
-    if item["date"] in missing_dates:
-      item["status"] = "incomplete"
-      item["missingDataTypes"] = selected["missingDataTypes"]
-    elif calendar_available:
-      item["status"] = "available"
+  """兼容旧客户端；不再执行运行前行情完整性查询。"""
+  items = [{
+    "timeframe": item,
+    "available": True,
+    "missingDataTypes": [],
+    "missingDates": [],
+    "barDates": [],
+    "availableWarmupDays": 0,
+    "sourcePeriod": None,
+    "derivation": None,
+    "reason": "回测将在执行时读取行情",
+    "message": "回测将在执行时读取行情",
+  } for item in settings.BAR_RUN_TIMEFRAMES]
   return {
     "symbol": symbol, "startDate": start_date, "endDate": end_date, "fillModel": fill_model,
-    "timeframes": items, "missingDates": selected["missingDates"], "calendarDays": calendar_days,
+    "timeframes": items, "missingDates": [], "calendarDays": [],
   }
 
 
@@ -61,37 +54,14 @@ def require_available(
   fill_model: str,
   warmup_trading_days: int = 0,
 ) -> dict[str, Any]:
-  trade_dates, calendar_days, calendar_available = _calendar_days(start_date, end_date)
-  future_dates = [item["date"] for item in calendar_days if item["status"] == "future"]
-  quote_dates = _available_quote_dates(symbol, trade_dates) if fill_model == "l2_quote" else None
-  result = _preview_timeframe(
-    symbol, timeframe, start_date, end_date, trade_dates, fill_model, calendar_available,
-    future_dates, quote_dates, warmup_trading_days,
+  result = preview(
+    symbol, start_date, end_date, fill_model, timeframe, warmup_trading_days,
   )
-  if not result["available"]:
-    raise PreflightError(result)
-  try:
-    if fill_model == "l2_quote":
-      bars, bar_snapshot = bar_data.load_normalized_bars_with_snapshot(symbol, timeframe, start_date, end_date)
-      bar_dates = sorted({bar.trade_date for bar in bars})
-      if not bar_dates:
-        raise PreflightError(_failure(symbol, timeframe, start_date, end_date, "data.bar_missing"))
-      _require_quotes(trade_dates, quote_dates or set())
-    else:
-      source = market_data.resolve_backtest_data(
-        symbol, timeframe, start_date, end_date,
-        trade_dates if calendar_available else None, warmup_trading_days,
-      )
-      bar_snapshot = {"provider": "qmt_kline", **market_data.snapshot_for_resolution(symbol, source)}
-  except PreflightError:
-    raise
-  except ValueError as error:
-    raise PreflightError(_failure(symbol, timeframe, start_date, end_date, "data.bar_missing")) from error
-  except L2DataError as error:
-    if error.code != "data.l2_bar_missing":
-      raise
-    raise PreflightError(_failure(symbol, timeframe, start_date, end_date, "data.bar_missing")) from error
-  return {"preflight": result, "barSnapshot": bar_snapshot}
+  selected = next(
+    (item for item in result["timeframes"] if item["timeframe"] == timeframe),
+    result["timeframes"][0],
+  )
+  return {"preflight": selected, "barSnapshot": {}}
 
 
 def _preview_timeframe(

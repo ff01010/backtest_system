@@ -159,6 +159,48 @@ def freeze_imported_signal_snapshot(
   }
 
 
+def align_frozen_signal_snapshot(
+  snapshot: dict[str, Any],
+  bar_times: list[str],
+) -> dict[str, Any]:
+  """在 Worker 已读取正式 Bar 后，为冻结信号生成确定性的执行对齐计划。"""
+  artifact_file = snapshot.get("artifactFile")
+  if not isinstance(artifact_file, str):
+    raise ResearchSignalSnapshotError("研究信号冻结附件不可用")
+  try:
+    with open(artifact_file, "r", encoding="utf-8") as handle:
+      rows = [json.loads(line) for line in handle if line.strip()]
+  except (OSError, json.JSONDecodeError) as error:
+    raise ResearchSignalSnapshotError("研究信号冻结附件不可读取") from error
+  if not all(isinstance(row, dict) for row in rows):
+    raise ResearchSignalSnapshotError("研究信号冻结附件格式无效")
+  symbol = snapshot.get("symbol")
+  start_date = snapshot.get("startDate")
+  end_date = snapshot.get("endDate")
+  source_timeframe = snapshot.get("sourceTimeframe")
+  if not all(isinstance(value, str) and value for value in (
+    symbol, start_date, end_date, source_timeframe,
+  )):
+    raise ResearchSignalSnapshotError("研究信号冻结快照元数据无效")
+  canonical_rows = _select_and_validate_rows(
+    rows, symbol, start_date, end_date, source_timeframe,
+  )
+  expected_hash = snapshot.get("snapshotHash")
+  if isinstance(expected_hash, str) and _snapshot_hash(canonical_rows) != expected_hash:
+    raise ResearchSignalSnapshotError("研究信号冻结附件校验失败")
+  alignment_plan = _build_alignment_plan(canonical_rows, bar_times)
+  aligned = dict(snapshot)
+  aligned["alignmentPlan"] = alignment_plan
+  aligned["alignment"] = {
+    "version": "effective-at-first-bar-v1",
+    "sourceTimeframe": snapshot.get("sourceTimeframe"),
+    "backtestTimeframe": snapshot.get("timeframe"),
+    "alignedCount": len(alignment_plan),
+    "unmatchedCount": len(canonical_rows) - len(alignment_plan),
+  }
+  return aligned
+
+
 def _request_json(path: str, user_id: str) -> Any:
   if not _SIGNAL_API_URL or not _SERVICE_TOKEN:
     raise ResearchSignalSnapshotError("研究信号服务尚未配置")

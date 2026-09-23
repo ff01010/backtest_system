@@ -3,6 +3,7 @@
 
 import copy
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from fastapi import HTTPException
 
 from backend import app as api_app
 from backend import schemas
-from backend.services import backtest_preflight, backtest_runner
+from backend.services import backtest_preflight, backtest_runner, research_signal_snapshot
 from backend.services import state_store
 from backend.services import strategy_adapters
 from shared.cost import buy_net, sell_net
@@ -183,7 +184,11 @@ def test_backtest_requires_saved_strategy_params(monkeypatch: pytest.MonkeyPatch
   from backend.services import bar_data
   monkeypatch.setattr(bar_data, "ensure_available", lambda *args: {"hash": args[0], "provider": "qmt_kline"})
   monkeypatch.setattr(api_app.data_repository, "validate_backtest_coverage", lambda *args: None)
-  monkeypatch.setattr(backtest_preflight, "require_available", lambda *_: {"barSnapshot": {"provider": "qmt_kline"}})
+  monkeypatch.setattr(
+    backtest_preflight,
+    "require_available",
+    lambda *_: pytest.fail("提交回测不应执行行情预检"),
+  )
   request = {
     "configId": "00000000-0000-0000-0000-000000000003",
     "configVersionId": None,
@@ -491,6 +496,34 @@ def test_script_experiment_manifest_includes_display_fields(monkeypatch: pytest.
   assert manifest["holdingPolicy"] == "intraday"
 
 
+def test_script_experiment_manifest_identifies_research_signal_snapshot(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    backtest_runner.market_data,
+    "snapshot",
+    lambda *_args: {"hash": "qmt-history-hash", "barCount": 2},
+  )
+  payload = {
+    "strategyParams": {}, "symbol": "688981.SH", "timeframe": "5m",
+    "startDate": "20260601", "endDate": "20260601",
+    "initialCapital": 1_000_000, "commissionRate": 0.0003, "slippage": 0.0001,
+    "researchSignalSnapshot": {"snapshotHash": "a" * 64},
+  }
+  bars = pd.DataFrame({"time": ["202606010930", "202606011500"]})
+
+  first = backtest_runner._build_script_experiment_manifest(
+    payload, bars, "script-1", "测试策略", "script-code-hash",
+  )
+  payload["researchSignalSnapshot"] = {"snapshotHash": "b" * 64}
+  second = backtest_runner._build_script_experiment_manifest(
+    payload, bars, "script-1", "测试策略", "script-code-hash",
+  )
+
+  assert first["configHash"] != second["configHash"]
+  assert first["experimentHash"] != second["experimentHash"]
+
+
 def test_strategy_parameters_endpoint_rejects_unknown_strategy() -> None:
   with pytest.raises(HTTPException) as exc_info:
     api_app.strategy_parameters("missing")
@@ -533,6 +566,67 @@ def test_research_signal_lookup_normalizes_and_forward_fills(tmp_path: Path) -> 
   assert active["20260602094000"]["signalId"] == "sig-long"
   assert active["20260602100000"]["action"] == "flat"
   assert active["20260602100500"]["signalId"] == "sig-flat"
+
+
+def test_user_script_aligns_frozen_signal_after_loading_formal_bars(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  row = research_signal_snapshot._canonical_signal({
+    "signalId": "signal-1", "instrument": "688981.SH", "timeframe": "5m",
+    "signalTime": "2026-06-02T09:30:00+08:00",
+    "availableAt": "2026-06-02T09:30:00+08:00",
+    "effectiveAt": "2026-06-02T09:30:00+08:00", "sequence": 1,
+    "predictedLabelId": "UP", "action": "long", "modelVersionId": "model-1",
+    "sourceHash": "a" * 64, "diagnostic": {},
+  })
+  artifact_file = tmp_path / "signals.ndjson"
+  artifact_file.write_text(
+    json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8",
+  )
+  bars = pd.DataFrame([
+    {"time": "20260602093000", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 1},
+    {"time": "20260602093500", "open": 10, "high": 10, "low": 10, "close": 10, "volume": 1},
+  ])
+  monkeypatch.setattr(
+    backtest_runner,
+    "_load_user_script_bars",
+    lambda _payload: (bars, 1, {"hash": "data-hash", "barCount": 2}),
+  )
+  monkeypatch.setattr(backtest_runner, "_build_benchmark_equity", lambda *_args: ([], []))
+  captured: dict[str, Any] = {}
+
+  def execute(script_payload: dict[str, Any]) -> dict[str, Any]:
+    captured.update(script_payload)
+    return {
+      "trades": [], "fills": [], "skippedSignals": [], "unexecutedOrders": [], "warnings": [],
+      "portfolioSnapshots": [{
+        "longPositions": {}, "shortPositions": {}, "cash": 1_000_000,
+        "equity": 1_000_000, "sellableQuantity": 0,
+      }],
+    }
+
+  payload = {
+    "strategy": "user_script", "scriptId": "script-1",
+    "versionScriptSnapshot": {"name": "信号策略", "entryType": "on_bar", "code": "def on_bar(bar, state):\n  return []"},
+    "symbol": "688981.SH", "timeframe": "5m", "startDate": "2026-06-02", "endDate": "2026-06-02",
+    "initialCapital": 1_000_000, "commissionRate": 0.0003, "feeProfile": {}, "slippage": 0,
+    "strategyParams": {}, "fillModel": "bar_next_open", "executionAlgorithm": "immediate",
+    "holdingPolicy": "intraday", "allowLong": True, "allowShort": False,
+    "researchSignalSnapshot": {
+      "datasetId": "dataset-1", "manifest": {"version": 1}, "symbol": "688981.SH",
+      "sourceTimeframe": "5m", "timeframe": "5m", "startDate": "2026-06-02",
+      "endDate": "2026-06-02", "rowCount": 1,
+      "snapshotHash": research_signal_snapshot._snapshot_hash([row]),
+      "artifactFile": str(artifact_file), "alignmentPlan": [],
+    },
+  }
+
+  result = backtest_runner.run_user_script_backtest(payload, execute)
+
+  signals = captured["params"]["_researchSignalByBarTime"]
+  assert list(signals) == ["20260602093500"]
+  assert result["researchSignalSnapshot"]["alignmentPlan"][0]["executionBarTime"] == "20260602093500"
 
 
 def test_research_signal_lookup_uses_last_transition_from_legacy_same_bar_plan(tmp_path: Path) -> None:

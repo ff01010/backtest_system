@@ -84,6 +84,15 @@ def complete_run() -> dict[str, Any]:
       },
       "dataSnapshot": {"provider": "qmt_kline", "hash": "d" * 64},
       "warnings": [],
+      "researchSignalSnapshot": {
+        "datasetId": "dataset-1",
+        "snapshotHash": "b" * 64,
+        "alignment": {
+          "alignedCount": 7,
+          "unmatchedCount": 1,
+          "version": "effective-at-first-bar-v1",
+        },
+      },
     },
   }
 
@@ -119,6 +128,7 @@ def test_snapshot_uses_business_whitelist_and_removes_system_fields() -> None:
   assert snapshot["configuration"]["initialCapital"] == 1_000_000
   assert snapshot["result"]["summary"]["totalReturn"] == 0.12
   assert snapshot["data"]["dependencies"][0]["summary"]["snapshotHash"] == "b" * 64
+  assert snapshot["data"]["dependencies"][0]["summary"]["alignment"]["alignedCount"] == 7
   for forbidden in (
     "accountId", "outputDir", "sourcePath", "artifactFile", "requestKey", "attemptToken",
   ):

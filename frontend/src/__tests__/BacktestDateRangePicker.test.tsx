@@ -75,6 +75,34 @@ describe('BacktestDateRangePicker', () => {
     expect(onApplyRange).toHaveBeenCalledWith('2026-06-19', '2026-09-18');
   });
 
+  it('validates the closed available range only when Apply is clicked', () => {
+    const onApplyRange = vi.fn();
+    render(<PickerHarness onApplyRange={onApplyRange} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '结束日期年份' }));
+    fireEvent.click(screen.getByRole('option', { name: '2027' }));
+
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '应用' }));
+
+    expect(screen.getByRole('alert').textContent).toContain(
+      '请选择 2015-01-05 至 2026-09-18 范围内的回测区间（含起止日期）',
+    );
+    expect(onApplyRange).not.toHaveBeenCalled();
+  });
+
+  it('accepts both endpoints of the closed available range', () => {
+    const onApplyRange = vi.fn();
+    render(<PickerHarness onApplyRange={onApplyRange} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '全部数据' }));
+    fireEvent.click(screen.getByRole('button', { name: '应用' }));
+
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(onApplyRange).toHaveBeenCalledWith('2015-01-05', '2026-09-18');
+  });
+
   it('cancels shortcut and wheel draft changes together', () => {
     const onApplyRange = vi.fn();
     render(<PickerHarness onApplyRange={onApplyRange} />);
@@ -151,7 +179,7 @@ describe('BacktestDateRangePicker', () => {
     expect(screen.queryByRole('listbox')).toBeNull();
   });
 
-  it('does not move the end date when the start date passes it', () => {
+  it('does not apply when the start date passes the end date', () => {
     const onApplyRange = vi.fn();
     render(
       <PickerHarness
@@ -168,7 +196,8 @@ describe('BacktestDateRangePicker', () => {
     expect(onApplyRange).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('button', { name: '应用' }));
-    expect(onApplyRange).toHaveBeenCalledWith('2026-09-04', '2026-09-03');
+    expect(screen.getByRole('alert').textContent).toContain('开始日期不能晚于结束日期');
+    expect(onApplyRange).not.toHaveBeenCalled();
   });
 
   it('does not move the start date when the end date passes it', () => {
@@ -182,13 +211,27 @@ describe('BacktestDateRangePicker', () => {
   });
 
   it('does not require market-data boundaries to render wheel options', () => {
-    render(<PickerHarness dataStartDate={null} dataEndDate={null} />);
+    const onApplyRange = vi.fn();
+    render(
+      <PickerHarness
+        dataStartDate={null}
+        dataEndDate={null}
+        onApplyRange={onApplyRange}
+      />,
+    );
     fireEvent.click(screen.getByRole('button', { name: '开始日期年份' }));
 
     expect(screen.getByText('正在读取')).toBeTruthy();
     expect((screen.getByRole('button', { name: '近1月' }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByRole('option', { name: '2025' })).toBeTruthy();
     expect(screen.getByRole('option', { name: '2027' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('option', { name: '2025' }));
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '应用' }));
+    expect(screen.getByRole('alert').textContent).toContain('可回测范围暂不可用，请稍后重试');
+    expect(onApplyRange).not.toHaveBeenCalled();
   });
 });
 

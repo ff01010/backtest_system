@@ -299,6 +299,7 @@ def test_finish_bar_backtest_job_preserves_terminal_status_without_research_snap
   assert "UPDATE bar_backtest_job" in cursor.commands[0][0]
   assert cursor.commands[0][1] == (status, None, "run-1", "attempt-1")
   assert "UPDATE backtest_run" in cursor.commands[1][0]
+  assert "market_data_snapshot=COALESCE" in cursor.commands[1][0]
   assert cursor.commands[1][1][0] == status
   assert "DELETE FROM backtest_execution_slot" in cursor.commands[2][0]
   enqueue_query, enqueue_params = cursor.commands[3]
@@ -336,6 +337,27 @@ def test_finish_job_keeps_database_cancellation_over_late_success() -> None:
   assert main_params is not None
   assert main_params[0] == "cancelled"
   assert main_params[2] is None
+
+
+def test_actual_worker_data_snapshot_is_extracted_for_run_history() -> None:
+  bar_snapshot = {"provider": "qmt_kline", "hash": "bar-hash"}
+  bar_result = {
+    "experimentManifest": {"databaseSnapshot": bar_snapshot},
+  }
+  l2_result = {
+    "dataSnapshot": {
+      "bar": {"provider": "mapped_l2_bar", "hash": "l2-bar-hash"},
+      "quote": {"source_name": "quant.tick_quote"},
+    },
+  }
+
+  assert state_store._market_data_snapshot_from_result(bar_result) == {
+    "barSnapshot": bar_snapshot,
+  }
+  assert state_store._market_data_snapshot_from_result(l2_result) == {
+    "barSnapshot": l2_result["dataSnapshot"]["bar"],
+    "l2Snapshot": l2_result["dataSnapshot"],
+  }
 
 def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypatch: Any) -> None:
   cursor = FakeCursor(None)
@@ -409,3 +431,38 @@ def test_save_research_signal_snapshot_rejects_storage_key_content_conflict(
 
   with pytest.raises(state_store.DatabaseError, match="已有存储记录冲突"):
     state_store._save_research_signal_snapshot(cursor, "run-2", "user-1", snapshot)
+
+
+def test_normalize_legacy_l2_run_sanitizes_summary_after_result_adapter(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    "backend.l2.result_adapter.normalize_l2_result",
+    lambda *_: {
+      "summary": {
+        "error": "internal L2 source detail",
+        "errorDetail": {
+          "category": "data",
+          "code": "data.l2_quote_invalid",
+          "message": "internal L2 source detail",
+          "hint": "raw table detail",
+        },
+      },
+    },
+  )
+  row = {
+    "requested_params": {},
+    "fill_model": "l2_quote",
+    "result_json": {"legacy": True},
+    "result_summary": {},
+    "id": "run-1",
+    "display_no": 1,
+    "status": "failed",
+    "created_at": None,
+  }
+
+  normalized = state_store._normalize_run(row)
+
+  assert normalized["summaryJson"]["error"] == "行情数据异常，请联系管理员"
+  assert normalized["summaryJson"]["errorDetail"]["message"] == "行情数据异常，请联系管理员"
+  assert normalized["summaryJson"]["errorDetail"]["hint"] is None
