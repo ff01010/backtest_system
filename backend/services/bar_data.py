@@ -9,7 +9,6 @@ from typing import Any
 import pandas as pd
 
 from backend import settings
-from backend.date_codec import format_api_date
 from backend.l2.config import has_profile, load_profile, load_temporary_quote_profile
 from backend.l2.models import NormalizedBar
 from backend.l2.providers import ClickHouseL2Adapter, L2DataError, RedisJsonCache, TemporaryQuoteBarProvider, VersionedBarCache
@@ -28,7 +27,6 @@ def load_bars_with_snapshot(
   if has_profile("bar"):
     try:
       bars = ClickHouseL2Adapter(load_profile("bar")).load_bars(symbol, timeframe, start_date, end_date)
-      _require_normalized_bar_dates(bars, required_dates, symbol, timeframe)
       return _normalized_frame(bars), _snapshot("mapped_l2_bar", symbol, timeframe, start_date, end_date, len(bars))
     except L2DataError as error:
       if error.code != "data.l2_bar_missing":
@@ -43,7 +41,6 @@ def load_bars_with_snapshot(
   except market_data.MarketDataError:
     provider = _temporary_provider()
     bars = provider.load_bars(symbol, timeframe, start_date, end_date)
-    _require_normalized_bar_dates(bars, required_dates, symbol, timeframe)
     snapshot = _snapshot("temporary_tick_quote_aggregation", symbol, timeframe, start_date, end_date, len(bars))
     snapshot.update(provider.cache_snapshot())
     return _normalized_frame(bars), snapshot
@@ -72,7 +69,6 @@ def load_normalized_bars_with_snapshot(
     try:
       provider = ClickHouseL2Adapter(load_profile("bar"))
       bars = provider.load_bars(symbol, timeframe, start_date, end_date)
-      _require_normalized_bar_dates(bars, required_dates, symbol, timeframe)
       snapshot = _snapshot(
         "mapped_l2_bar", symbol, timeframe, start_date, end_date, len(bars),
       )
@@ -95,7 +91,6 @@ def load_normalized_bars_with_snapshot(
   except market_data.MarketDataError:
     provider = _temporary_provider()
     bars = provider.load_bars(symbol, timeframe, start_date, end_date)
-    _require_normalized_bar_dates(bars, required_dates, symbol, timeframe)
     snapshot = _snapshot("temporary_tick_quote_aggregation", symbol, timeframe, start_date, end_date, len(bars))
     snapshot.update(provider.cache_snapshot())
     return bars, snapshot
@@ -128,22 +123,6 @@ def _required_trade_dates(
       "回测交易日范围不可用",
       {"symbol": symbol, "timeframe": timeframe},
     ) from error
-
-
-def _require_normalized_bar_dates(
-  bars: list[NormalizedBar],
-  required_dates: list[str],
-  symbol: str,
-  timeframe: str,
-) -> None:
-  available_dates = {format_api_date(bar.trade_date) for bar in bars}
-  missing_dates = sorted(set(required_dates) - available_dates)
-  if missing_dates:
-    raise L2DataError(
-      f"Bar 实际行情缺少日期: {', '.join(missing_dates)}",
-      code="data.l2_bar_missing",
-      context={"symbol": symbol, "timeframe": timeframe},
-    )
 
 
 def derived_bar_available_dates(symbol: str, timeframe: str, trade_dates: list[str]) -> list[str]:

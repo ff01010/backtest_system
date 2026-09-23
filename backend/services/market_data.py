@@ -67,10 +67,6 @@ class _SourceCandidate:
   source_period: str
   derivation: str | None = None
 
-  @property
-  def label(self) -> str:
-    return f"{self.source}:{self.source_period}"
-
 
 def resolve_backtest_data(
   symbol: str,
@@ -85,36 +81,38 @@ def resolve_backtest_data(
   _validate_request(symbol, timeframe, start_date, end_date)
   _validate_warmup_days(warmup_trading_days)
   candidates = _source_candidates(timeframe)
-  cached_coverages: dict[_SourceCandidate, list[dict[str, str]]] = {}
-  if formal_dates is None:
-    cached_coverages = {
-      candidate: _coverage_for_source(symbol, candidate, start_date, end_date)
-      for candidate in candidates
-    }
-    required_dates = sorted({
-      item["date"] for statuses in cached_coverages.values() for item in statuses
-    })
-  else:
-    required_dates = sorted({format_api_date(item) for item in formal_dates})
-  if not required_dates:
+  calendar_dates = None if formal_dates is None else {format_api_date(item) for item in formal_dates}
+  if calendar_dates is not None and not calendar_dates:
     raise MarketDataError(f"{symbol} {timeframe} 区间内未导入 QMT 行情")
-  failures: list[tuple[str, list[str], int]] = []
+  available_warmup_days = 0
+  has_formal_bars = False
   for candidate in candidates:
-    statuses = cached_coverages.get(candidate)
-    missing_dates = _missing_dates(symbol, candidate, required_dates, statuses)
+    statuses = _coverage_for_source(symbol, candidate, start_date, end_date)
+    candidate_dates = sorted({
+      item["date"] for item in statuses
+      if item["status"] == "complete" and (calendar_dates is None or item["date"] in calendar_dates)
+    })
+    if not candidate_dates:
+      continue
+    has_formal_bars = True
     warmup_dates = _complete_dates_before(symbol, candidate, start_date, warmup_trading_days)
-    if not missing_dates and len(warmup_dates) == warmup_trading_days:
+    available_warmup_days = max(available_warmup_days, len(warmup_dates))
+    if len(warmup_dates) == warmup_trading_days:
       return BacktestDataResolution(
         timeframe=timeframe,
         source_period=candidate.source_period,
         derivation=candidate.derivation,
-        formal_dates=tuple(required_dates),
+        formal_dates=tuple(candidate_dates),
         warmup_dates=tuple(warmup_dates),
         available_warmup_days=len(warmup_dates),
         source=candidate.source,
       )
-    failures.append((candidate.label, missing_dates, len(warmup_dates)))
-  raise _resolution_error(symbol, timeframe, failures, warmup_trading_days)
+  if not has_formal_bars:
+    raise MarketDataError(f"{symbol} {timeframe} 区间内无完整 QMT 行情")
+  raise MarketDataError(
+    f"{symbol} {timeframe} 预热数据不足: 策略声明需要 {warmup_trading_days} 个交易日，"
+    f"实际可用数据只有 {available_warmup_days} 个"
+  )
 
 
 def preview_backtest_data(
@@ -133,18 +131,14 @@ def preview_backtest_data(
     )
   except MarketDataError as error:
     try:
-      required_dates = _required_formal_dates(symbol, timeframe, start_date, end_date, formal_dates)
-      missing_dates = _preview_missing_dates(symbol, timeframe, required_dates)
       available_warmup = _preview_warmup_days(symbol, timeframe, start_date, warmup_trading_days)
     except MarketDataError:
-      required_dates, missing_dates, available_warmup = [], [], 0
+      available_warmup = 0
     codes = ["data.bar_missing"]
-    if timeframe == "1d" and missing_dates:
-      codes.append("data.minute_incomplete")
-    if not missing_dates and available_warmup < warmup_trading_days:
+    if "预热数据不足" in str(error):
       codes = ["data.warmup_insufficient"]
     return {
-      "available": False, "resolution": None, "missingDates": missing_dates,
+      "available": False, "resolution": None, "missingDates": [],
       "missingDataTypes": codes, "availableWarmupDays": available_warmup, "reason": str(error),
     }
   return {
@@ -166,17 +160,13 @@ def load_backtest_bars(
     rows = _query_kline_rows(symbol, resolution, all_dates[0], all_dates[-1])
     frame = _rows_to_frame(rows)
     frame = _transform_source_frame(frame, resolution)
+    if frame.empty:
+      raise MarketDataError(f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情")
     allowed_dates = set(all_dates)
     frame_dates = frame["time"].str[:8].map(format_api_date)
     frame = frame[frame_dates.isin(allowed_dates)].reset_index(drop=True)
     if frame.empty:
       raise MarketDataError(f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情")
-    loaded_dates = set(frame["time"].str[:8].map(format_api_date))
-    missing_dates = sorted(allowed_dates - loaded_dates)
-    if missing_dates:
-      raise MarketDataError(
-        f"{symbol} {resolution.timeframe} 实际行情缺少日期: {', '.join(missing_dates)}",
-      )
     warmup_dates = set(resolution.warmup_dates)
     warmup_bar_count = int(frame["time"].str[:8].map(format_api_date).isin(warmup_dates).sum())
   except MarketDataError:
@@ -345,21 +335,6 @@ def _require_complete(symbol: str, timeframe: str, start_date: str, end_date: st
     raise MarketDataError(f"{symbol} {timeframe} 区间内未导入 QMT 行情")
 
 
-def _required_formal_dates(
-  symbol: str,
-  timeframe: str,
-  start_date: str,
-  end_date: str,
-  formal_dates: Sequence[str] | None,
-) -> list[str]:
-  if formal_dates is not None:
-    return sorted({format_api_date(item) for item in formal_dates})
-  dates: set[str] = set()
-  for candidate in _source_candidates(timeframe):
-    dates.update(item["date"] for item in _coverage_for_source(symbol, candidate, start_date, end_date))
-  return sorted(dates)
-
-
 def _source_candidates(timeframe: str) -> tuple[_SourceCandidate, ...]:
   candidates: list[_SourceCandidate] = []
   history_period = _HISTORY_PERIODS.get(timeframe)
@@ -376,20 +351,6 @@ def _source_candidates(timeframe: str) -> tuple[_SourceCandidate, ...]:
   return tuple(candidates)
 
 
-def _missing_dates(
-  symbol: str,
-  candidate: _SourceCandidate,
-  required_dates: Sequence[str],
-  statuses: Sequence[dict[str, str]] | None = None,
-) -> list[str]:
-  if not required_dates:
-    return []
-  if statuses is None:
-    statuses = _coverage_for_source(symbol, candidate, required_dates[0], required_dates[-1])
-  complete_dates = {item["date"] for item in statuses if item["status"] == "complete"}
-  return sorted(set(required_dates) - complete_dates)
-
-
 def _complete_dates_before(symbol: str, candidate: _SourceCandidate, start_date: str, count: int) -> list[str]:
   if count == 0:
     return []
@@ -398,52 +359,20 @@ def _complete_dates_before(symbol: str, candidate: _SourceCandidate, start_date:
     return []
   statuses = _coverage_for_source(symbol, candidate, expected_dates[0], expected_dates[-1])
   complete_dates = {item["date"] for item in statuses if item["status"] == "complete"}
-  contiguous_dates: list[str] = []
-  for trade_date in reversed(expected_dates):
-    if trade_date not in complete_dates:
-      break
-    contiguous_dates.append(trade_date)
-  return sorted(contiguous_dates)
+  return [trade_date for trade_date in expected_dates if trade_date in complete_dates][-count:]
 
 
 def _expected_warmup_dates(start_date: str, count: int) -> list[str]:
-  """返回紧邻正式开始日前的预期交易日序列。"""
+  """返回预热查找窗口内的开市日，停牌日不计入标的实际预热天数。"""
   end = date.fromisoformat(start_date) - timedelta(days=1)
   begin = end - timedelta(days=count * 3 + 60)
   try:
     if not state_store.is_trade_calendar_range_covered(begin.isoformat(), end.isoformat()):
-      raise MarketDataError("交易日历暂不可用，无法校验连续预热数据")
+      raise MarketDataError("交易日历暂不可用，无法计算预热日期")
     dates = state_store.list_open_trade_dates(begin.isoformat(), end.isoformat())
   except state_store.DatabaseError as error:
-    raise MarketDataError("交易日历暂不可用，无法校验连续预热数据") from error
-  return dates[-count:]
-
-
-def _resolution_error(
-  symbol: str,
-  timeframe: str,
-  failures: Sequence[tuple[str, list[str], int]],
-  warmup_days: int,
-) -> MarketDataError:
-  missing_dates = sorted({item for _, dates, _ in failures for item in dates})
-  if missing_dates:
-    detail = ", ".join(missing_dates)
-    return MarketDataError(f"{symbol} {timeframe} QMT 行情不完整: {detail}")
-  available_days = max((days for _, _, days in failures), default=0)
-  return MarketDataError(
-    f"{symbol} {timeframe} 预热数据不足: 策略声明需要 {warmup_days} 个交易日，"
-    f"实际连续完整数据只有 {available_days} 个"
-  )
-
-
-def _preview_missing_dates(symbol: str, timeframe: str, required_dates: Sequence[str]) -> list[str]:
-  if not required_dates:
-    return []
-  candidate_missing = [
-    _missing_dates(symbol, candidate, required_dates)
-    for candidate in _source_candidates(timeframe)
-  ]
-  return sorted(set.intersection(*(set(item) for item in candidate_missing))) if candidate_missing else []
+    raise MarketDataError("交易日历暂不可用，无法计算预热日期") from error
+  return dates
 
 
 def _preview_warmup_days(symbol: str, timeframe: str, start_date: str, count: int) -> int:
@@ -716,7 +645,7 @@ def _history_kline_query(
              argMax(volume, tuple(revision, ingested_at)) AS volume
       FROM {_HISTORY_DATABASE}.{table}
       WHERE symbol = '{symbol}' AND period = '{period}' AND adjustment = '{_HISTORY_ADJUSTMENT}'
-        AND quality_status = 'valid' AND is_final = 1
+        AND is_final = 1
         AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
       GROUP BY bar_time
     )

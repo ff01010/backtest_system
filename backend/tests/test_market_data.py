@@ -9,6 +9,7 @@ import pytest
 
 from backend.services import bar_data, clickhouse_client, market_data, state_store
 from backend.services.backtest_faults import BacktestFault
+from backend.l2.models import NormalizedBar
 
 
 _TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -78,7 +79,8 @@ def test_bj_load_uses_published_history_dev_period_table(monkeypatch: pytest.Mon
   assert "qmt_kline_5m_raw" not in coverage_query
   assert "qmt_history_dev.qmt_kline_5m_raw" in raw_query
   assert "adjustment = 'none'" in raw_query
-  assert "quality_status = 'valid' AND is_final = 1" in raw_query
+  assert "quality_status" not in raw_query
+  assert "is_final = 1" in raw_query
 
 
 @pytest.mark.parametrize("symbol", ["688981.SH", "000001.SZ", "920001.BJ"])
@@ -144,48 +146,87 @@ def test_history_dev_uses_matching_period_table(
   assert f"has(latest_runs.actual_routes, '{source_period}/none')" in coverage_query
   assert f"qmt_history_dev.{table}" in raw_query
   assert f"period = '{source_period}'" in raw_query
+  assert "quality_status" not in raw_query
 
 
-def test_incomplete_history_dev_range_falls_back_to_legacy_for_entire_run(
+def test_history_dev_skips_unpublished_exchange_day_without_querying_legacy(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   queries: list[str] = []
-  first_epoch = int(datetime(2026, 9, 10, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
-  second_epoch = int(datetime(2026, 9, 11, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
 
   def query_rows(query: str) -> list[dict[str, object]]:
     queries.append(query)
     if "WITH latest_runs" in query:
       return [{"trade_date": "2026-09-10", "status": "complete"}]
-    if "qmt_kline_coverage" in query:
-      return [
-        {"trade_date": "2026-09-10", "status": "complete"},
-        {"trade_date": "2026-09-11", "status": "complete"},
-      ]
-    return [
-      {
-        "qmt_index": "20260910093000", "time": first_epoch, "open": 10.0, "high": 11.0,
-        "low": 9.0, "close": 10.5, "volume": 100,
-      },
-      {
-        "qmt_index": "20260911093000", "time": second_epoch, "open": 10.5, "high": 11.5,
-        "low": 10.0, "close": 11.0, "volume": 120,
-      },
-    ]
+    pytest.fail("新库存在标的覆盖日期时不应查询旧库")
 
   monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
   resolution = market_data.resolve_backtest_data(
     "688981.SH", "1m", "2026-09-10", "2026-09-11",
     ["2026-09-10", "2026-09-11"],
   )
-  market_data.load_backtest_bars("688981.SH", resolution)
 
-  assert resolution.source == "legacy"
-  assert any("raw_historical_data.qmt_kline FINAL" in query for query in queries)
-  assert all(
-    "qmt_history_dev.qmt_kline_1m_raw" not in query or "WITH latest_runs" in query
-    for query in queries
+  assert resolution.source == "history_dev"
+  assert resolution.formal_dates == ("2026-09-10",)
+  assert len(queries) == 1
+
+
+def test_halted_symbol_replays_published_days_across_calendar_gap(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  first_epoch = int(datetime(2025, 2, 21, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
+  second_epoch = int(datetime(2025, 3, 10, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    if "WITH latest_runs" in query:
+      return [
+        {"trade_date": "2025-02-21", "status": "complete"},
+        {"trade_date": "2025-03-10", "status": "complete"},
+      ]
+    if "qmt_history_dev.qmt_kline_1m_raw" in query:
+      return [
+        {"time": first_epoch, "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "volume": 100},
+        {"time": second_epoch, "open": 11.0, "high": 11.0, "low": 11.0, "close": 11.0, "volume": 100},
+      ]
+    pytest.fail("停牌期间不应回退旧库")
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+  resolution = market_data.resolve_backtest_data(
+    "688126.SH", "1m", "2025-02-21", "2025-03-10",
+    ["2025-02-21", "2025-02-24", "2025-02-25", "2025-03-10"],
   )
+  frame, warmup_bar_count = market_data.load_backtest_bars("688126.SH", resolution)
+
+  assert resolution.formal_dates == ("2025-02-21", "2025-03-10")
+  assert frame["time"].tolist() == ["202502210930", "202503100930"]
+  assert warmup_bar_count == 0
+
+
+def test_published_history_bar_ignores_source_quality_status(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  epoch = int(datetime(2024, 7, 26, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    if "WITH latest_runs" in query:
+      return [{"trade_date": "2024-07-26", "status": "complete"}]
+    if "qmt_history_dev.qmt_kline_1m_raw" in query:
+      if "quality_status = 'valid'" in query:
+        return []
+      return [{
+        "time": epoch, "open": 10.0, "high": 11.0, "low": 9.0,
+        "close": 10.5, "volume": 100,
+      }]
+    pytest.fail("新版来源有已发布 Bar 时不应查询旧库")
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+  resolution = market_data.resolve_backtest_data(
+    "688126.SH", "1m", "2024-07-26", "2024-07-26", ["2024-07-26"],
+  )
+  frame, _ = market_data.load_backtest_bars("688126.SH", resolution)
+
+  assert resolution.source == "history_dev"
+  assert frame["time"].tolist() == ["202407260930"]
 
 
 def test_history_dev_missing_warmup_falls_back_to_legacy_for_entire_run(
@@ -219,7 +260,7 @@ def test_both_sources_incomplete_rejects_backtest(monkeypatch: pytest.MonkeyPatc
 
   monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
 
-  with pytest.raises(market_data.MarketDataError, match="QMT 行情不完整"):
+  with pytest.raises(market_data.MarketDataError, match="区间内无完整 QMT 行情"):
     market_data.ensure_cached("920001.BJ", "1m", "20260911", "20260911")
 
 
@@ -242,7 +283,7 @@ def test_incomplete_qmt_coverage_rejects_backtest(monkeypatch: pytest.MonkeyPatc
     {"trade_date": "2026-07-30", "status": "partial"},
   ])
 
-  with pytest.raises(market_data.MarketDataError, match="QMT 行情不完整"):
+  with pytest.raises(market_data.MarketDataError, match="区间内无完整 QMT 行情"):
     market_data.ensure_cached("688981.SH", "1m", "20260730", "20260730")
 
 
@@ -276,7 +317,7 @@ def test_weekend_start_date_uses_available_qmt_bars(monkeypatch: pytest.MonkeyPa
   assert frame["time"].tolist() == ["202501060930", "202501070930"]
 
 
-def test_load_backtest_bars_rejects_missing_actual_trade_date(
+def test_load_backtest_bars_keeps_available_rows_without_daily_quality_check(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   epoch = int(datetime(2026, 9, 10, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
@@ -294,7 +335,22 @@ def test_load_backtest_bars_rejects_missing_actual_trade_date(
     "low": 9.0, "close": 10.5, "volume": 100,
   }])
 
-  with pytest.raises(market_data.MarketDataError, match="实际行情缺少日期: 2026-09-11"):
+  frame, _ = market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert frame["time"].tolist() == ["202609100930"]
+
+
+def test_load_backtest_bars_rejects_empty_result(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m", source_period="1m", derivation=None,
+    formal_dates=("2026-09-11",), warmup_dates=(), available_warmup_days=0,
+    source="history_dev",
+  )
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", lambda _: [])
+
+  with pytest.raises(market_data.MarketDataError, match="区间内无可用 QMT 行情"):
     market_data.load_backtest_bars("688981.SH", resolution)
 
 
@@ -309,6 +365,35 @@ def test_qmt_normalized_bar_uses_completed_bar_time() -> None:
   assert len(bars) == 1
   assert bars[0].start_time == "2026-07-30 09:29:00"
   assert bars[0].end_time == "2026-07-30 09:30:00"
+
+
+def test_mapped_bar_source_does_not_require_bar_on_every_exchange_day(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  bar = NormalizedBar(
+    symbol="688126.SH", trade_date="2025-03-10", period="1m",
+    start_time="2025-03-10 09:29:00", end_time="2025-03-10 09:30:00",
+    open=10.0, high=10.0, low=10.0, close=10.0, volume=100.0,
+    amount=1000.0, quality="complete", source_version="test",
+  )
+
+  class FakeAdapter:
+    def __init__(self, profile: object) -> None:
+      del profile
+
+    def load_bars(self, symbol: str, period: str, start_date: str, end_date: str) -> list[NormalizedBar]:
+      del symbol, period, start_date, end_date
+      return [bar]
+
+  monkeypatch.setattr(bar_data, "has_profile", lambda *_: True)
+  monkeypatch.setattr(bar_data, "load_profile", lambda *_: object())
+  monkeypatch.setattr(bar_data, "ClickHouseL2Adapter", FakeAdapter)
+  monkeypatch.setattr(bar_data.market_data, "required_trade_dates", lambda *_: ["2025-02-24", "2025-03-10"])
+
+  frame, snapshot = bar_data.load_bars_with_snapshot("688126.SH", "1m", "2025-02-24", "2025-03-10")
+
+  assert frame["time"].tolist() == ["20250310093000"]
+  assert snapshot["provider"] == "mapped_l2_bar"
 
 
 def test_qmt_normalized_bar_accepts_minute_time_without_seconds() -> None:
@@ -387,7 +472,7 @@ def test_daily_resolution_falls_back_to_complete_minutes_for_warmup(monkeypatch:
   assert resolution.source == "legacy"
 
 
-def test_warmup_only_uses_contiguous_complete_trade_dates(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_warmup_skips_halted_exchange_days(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setattr(state_store, "is_trade_calendar_range_covered", lambda *_: True)
   monkeypatch.setattr(
     state_store,
@@ -399,6 +484,8 @@ def test_warmup_only_uses_contiguous_complete_trade_dates(monkeypatch: pytest.Mo
     market_data,
     "_coverage_for_source",
     lambda *_: [
+      {"date": "2025-09-01", "status": "complete"},
+      {"date": "2025-09-02", "status": "complete"},
       {"date": "2025-09-09", "status": "complete"},
       {"date": "2025-09-10", "status": "complete"},
       {"date": "2025-09-11", "status": "complete"},
@@ -408,7 +495,7 @@ def test_warmup_only_uses_contiguous_complete_trade_dates(monkeypatch: pytest.Mo
   candidate = market_data._SourceCandidate("legacy", "1m")
   result = market_data._complete_dates_before("688981.SH", candidate, "2025-09-12", 5)
 
-  assert result == ["2025-09-09", "2025-09-10", "2025-09-11"]
+  assert result == ["2025-09-01", "2025-09-02", "2025-09-09", "2025-09-10", "2025-09-11"]
 
 
 def test_daily_aggregation_uses_last_minute_end_time_without_lunch_split() -> None:
