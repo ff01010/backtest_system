@@ -141,6 +141,51 @@ describe('BacktestPage history pagination', () => {
     apiMocks.deleteBacktestSelection.mockResolvedValue(35);
   });
 
+  it('shows the finished L2 no-data state instead of permanent range loading', async () => {
+    apiMocks.fetchDataStatus.mockImplementation(async (symbol, timeframe, fillModel = 'bar_next_open') => ({
+      symbol,
+      timeframe,
+      fillModel,
+      path: '',
+      exists: fillModel !== 'l2_quote',
+      firstDate: fillModel === 'l2_quote' ? null : '2026-01-01',
+      lastDate: fillModel === 'l2_quote' ? null : '2026-09-18',
+      barCount: 0,
+      fileSize: 0,
+      mtime: null,
+      duplicateCount: 0,
+      nonTradingCount: 0,
+      gapDates: [],
+      preview: [],
+    }));
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '策略代码' }));
+    fireEvent.click(screen.getByText('成交与执行'));
+    const fillModelSelect = screen.getAllByRole('combobox').find((element) =>
+      element.querySelector('option[value="l2_quote"]'),
+    );
+    expect(fillModelSelect).toBeTruthy();
+    fireEvent.change(fillModelSelect!, {
+      target: { value: 'l2_quote' },
+    });
+
+    await waitFor(() => expect(apiMocks.fetchDataStatus)
+      .toHaveBeenCalledWith('688981.SH', '5m', 'l2_quote'));
+    expect(await screen.findByText('暂无可回测数据')).toBeTruthy();
+    expect(screen.getByText('运行标的 L2 暂无可回测数据')).toBeTruthy();
+    expect(screen.queryByText('正在读取')).toBeNull();
+  });
+
   it('can navigate to records after the first thirty', async () => {
     render(
       <BacktestPage

@@ -4,11 +4,16 @@ import { createPortal } from 'react-dom';
 type DateEndpoint = 'startDate' | 'endDate';
 type DatePart = 'year' | 'month' | 'day';
 
+export type RangeAvailability =
+  | { state: 'loading' }
+  | { state: 'empty' }
+  | { state: 'error' }
+  | { state: 'available'; firstDate: string; lastDate: string };
+
 interface Props {
   startDate: string;
   endDate: string;
-  dataStartDate?: string | null;
-  dataEndDate?: string | null;
+  rangeAvailability: RangeAvailability;
   onApplyRange: (startDate: string, endDate: string) => void;
 }
 
@@ -142,14 +147,17 @@ export function replaceDatePart(value: string, part: DatePart, nextPartValue: nu
 function validateAppliedRange(
   startDate: string,
   endDate: string,
-  dataStartDate: string | null | undefined,
-  dataEndDate: string | null | undefined,
+  rangeAvailability: RangeAvailability,
 ): string | null {
   if (!parseDate(startDate) || !parseDate(endDate)) return '请选择有效的回测日期';
   if (startDate > endDate) return '开始日期不能晚于结束日期';
+  if (rangeAvailability.state === 'loading') return '正在读取可回测范围，请稍后重试';
+  if (rangeAvailability.state === 'empty') return '当前标的暂无可回测数据';
+  if (rangeAvailability.state === 'error') return '行情数据异常，请联系管理员';
+  const dataStartDate = rangeAvailability.firstDate;
+  const dataEndDate = rangeAvailability.lastDate;
   if (
-    !dataStartDate || !dataEndDate
-    || !parseDate(dataStartDate) || !parseDate(dataEndDate)
+    !parseDate(dataStartDate) || !parseDate(dataEndDate)
     || dataStartDate > dataEndDate
   ) {
     return '可回测范围暂不可用，请稍后重试';
@@ -286,6 +294,7 @@ function DateControl(props: DateControlProps) {
 }
 
 export default function BacktestDateRangePicker(props: Props) {
+  const availableRange = props.rangeAvailability.state === 'available' ? props.rangeAvailability : null;
   const [draft, setDraft] = useState({ startDate: props.startDate, endDate: props.endDate });
   const [applyError, setApplyError] = useState('');
   const [activeWheel, setActiveWheel] = useState<ActiveWheel | null>(null);
@@ -303,7 +312,7 @@ export default function BacktestDateRangePicker(props: Props) {
 
   useEffect(() => {
     setApplyError('');
-  }, [props.dataEndDate, props.dataStartDate]);
+  }, [props.rangeAvailability.state, availableRange?.firstDate, availableRange?.lastDate]);
 
   const updateWheelPosition = useCallback((): void => {
     if (!activeWheel?.anchor.isConnected) return;
@@ -385,7 +394,7 @@ export default function BacktestDateRangePicker(props: Props) {
   };
 
   const applyPreset = (key: 'one_month' | 'three_months' | 'year_to_date' | 'all'): void => {
-    const range = buildPresetRange(key, props.dataStartDate, props.dataEndDate);
+    const range = buildPresetRange(key, availableRange?.firstDate, availableRange?.lastDate);
     if (!range) return;
     setDraft(range);
     setActiveWheel(null);
@@ -393,9 +402,9 @@ export default function BacktestDateRangePicker(props: Props) {
   };
 
   const useEarliestDate = (): void => {
-    if (!props.dataStartDate || !parseDate(props.dataStartDate)) return;
+    if (!availableRange?.firstDate || !parseDate(availableRange.firstDate)) return;
     setDraft((current) => ({
-      startDate: props.dataStartDate!,
+      startDate: availableRange.firstDate,
       endDate: current.endDate,
     }));
     setActiveWheel(null);
@@ -412,8 +421,7 @@ export default function BacktestDateRangePicker(props: Props) {
     const error = validateAppliedRange(
       draft.startDate,
       draft.endDate,
-      props.dataStartDate,
-      props.dataEndDate,
+      props.rangeAvailability,
     );
     if (error) {
       setApplyError(error);
@@ -425,9 +433,10 @@ export default function BacktestDateRangePicker(props: Props) {
     setActiveWheel(null);
   };
 
-  const rangeLabel = props.dataStartDate && props.dataEndDate
-    ? `${props.dataStartDate} — ${props.dataEndDate}`
-    : '正在读取';
+  const rangeLabel = availableRange
+    ? `${availableRange.firstDate} — ${availableRange.lastDate}`
+    : props.rangeAvailability.state === 'empty' ? '暂无可回测数据'
+      : props.rangeAvailability.state === 'error' ? '可回测范围暂不可用' : '正在读取';
 
   return (
     <div className="backtest-date-range-picker">
@@ -440,7 +449,7 @@ export default function BacktestDateRangePicker(props: Props) {
           <button
             key={preset.key}
             type="button"
-            disabled={!buildPresetRange(preset.key, props.dataStartDate, props.dataEndDate)}
+            disabled={!buildPresetRange(preset.key, availableRange?.firstDate, availableRange?.lastDate)}
             onClick={() => applyPreset(preset.key)}
           >
             {preset.label}
@@ -448,14 +457,14 @@ export default function BacktestDateRangePicker(props: Props) {
         ))}
         <button
           type="button"
-          disabled={!buildPresetRange('year_to_date', props.dataStartDate, props.dataEndDate)}
+          disabled={!buildPresetRange('year_to_date', availableRange?.firstDate, availableRange?.lastDate)}
           onClick={() => applyPreset('year_to_date')}
         >
           今年
         </button>
         <button
           type="button"
-          disabled={!buildPresetRange('all', props.dataStartDate, props.dataEndDate)}
+          disabled={!buildPresetRange('all', availableRange?.firstDate, availableRange?.lastDate)}
           onClick={() => applyPreset('all')}
         >
           全部数据
@@ -486,7 +495,7 @@ export default function BacktestDateRangePicker(props: Props) {
         <button
           type="button"
           className="backtest-date-earliest"
-          disabled={!props.dataStartDate || !parseDate(props.dataStartDate)}
+          disabled={!availableRange?.firstDate || !parseDate(availableRange.firstDate)}
           onClick={useEarliestDate}
         >
           从最早日期开始

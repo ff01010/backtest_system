@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import BacktestDateRangePicker, {
   buildPresetRange,
   replaceDatePart,
+  type RangeAvailability,
 } from '../components/BacktestDateRangePicker';
 
 interface Range {
@@ -13,13 +14,15 @@ interface Range {
 
 function PickerHarness({
   initialRange = { startDate: '2026-09-01', endDate: '2026-09-03' },
-  dataStartDate = '2015-01-05',
-  dataEndDate = '2026-09-18',
+  rangeAvailability = {
+    state: 'available',
+    firstDate: '2015-01-05',
+    lastDate: '2026-09-18',
+  },
   onApplyRange = vi.fn(),
 }: {
   initialRange?: Range;
-  dataStartDate?: string | null;
-  dataEndDate?: string | null;
+  rangeAvailability?: RangeAvailability;
   onApplyRange?: (startDate: string, endDate: string) => void;
 }) {
   const [range, setRange] = useState(initialRange);
@@ -30,8 +33,7 @@ function PickerHarness({
   return (
     <BacktestDateRangePicker
       {...range}
-      dataStartDate={dataStartDate}
-      dataEndDate={dataEndDate}
+      rangeAvailability={rangeAvailability}
       onApplyRange={handleApplyRange}
     />
   );
@@ -214,8 +216,7 @@ describe('BacktestDateRangePicker', () => {
     const onApplyRange = vi.fn();
     render(
       <PickerHarness
-        dataStartDate={null}
-        dataEndDate={null}
+        rangeAvailability={{ state: 'loading' }}
         onApplyRange={onApplyRange}
       />,
     );
@@ -230,7 +231,39 @@ describe('BacktestDateRangePicker', () => {
     expect(screen.queryByRole('alert')).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: '应用' }));
-    expect(screen.getByRole('alert').textContent).toContain('可回测范围暂不可用，请稍后重试');
+    expect(screen.getByRole('alert').textContent).toContain('正在读取可回测范围，请稍后重试');
+    expect(onApplyRange).not.toHaveBeenCalled();
+  });
+
+  it('replaces loading with no-data feedback when the range request completes empty', () => {
+    const onApplyRange = vi.fn();
+    const { rerender } = render(
+      <PickerHarness rangeAvailability={{ state: 'loading' }} onApplyRange={onApplyRange} />,
+    );
+    expect(screen.getByText('正在读取')).toBeTruthy();
+
+    rerender(<PickerHarness rangeAvailability={{ state: 'empty' }} onApplyRange={onApplyRange} />);
+    expect(screen.getByText('暂无可回测数据')).toBeTruthy();
+    expect(screen.queryByText('正在读取')).toBeNull();
+    expect((screen.getByRole('button', { name: '全部数据' }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始日期年份' }));
+    fireEvent.click(screen.getByRole('option', { name: '2025' }));
+    fireEvent.click(screen.getByRole('button', { name: '应用' }));
+    expect(screen.getByRole('alert').textContent).toContain('当前标的暂无可回测数据');
+    expect(onApplyRange).not.toHaveBeenCalled();
+  });
+
+  it('shows a range query error rather than permanent loading', () => {
+    const onApplyRange = vi.fn();
+    render(<PickerHarness rangeAvailability={{ state: 'error' }} onApplyRange={onApplyRange} />);
+    expect(screen.getByText('可回测范围暂不可用')).toBeTruthy();
+    expect(screen.queryByText('正在读取')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '开始日期年份' }));
+    fireEvent.click(screen.getByRole('option', { name: '2025' }));
+    fireEvent.click(screen.getByRole('button', { name: '应用' }));
+    expect(screen.getByRole('alert').textContent).toContain('行情数据异常，请联系管理员');
     expect(onApplyRange).not.toHaveBeenCalled();
   });
 });

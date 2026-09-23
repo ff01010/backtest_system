@@ -4,6 +4,7 @@ import {
   buildDataRangeMetadata,
   buildTimeframeAvailabilityCacheKey,
   normalizeApiDate,
+  resolveRangeAvailability,
 } from '../components/BacktestPage';
 import type { DataStatus } from '../types';
 
@@ -32,7 +33,7 @@ describe('backtest timeframe metadata', () => {
       preview: [],
     };
 
-    expect(buildDataRangeMetadata('运行标的', '5m', status, false, '')).toEqual({
+    expect(buildDataRangeMetadata('运行标的', '5m', resolveRangeAvailability(status, false, ''))).toEqual({
       tone: 'ok',
       text: '运行标的 5m 可回测范围：2020-01-02-2026-09-18',
     });
@@ -40,11 +41,38 @@ describe('backtest timeframe metadata', () => {
 
   it('范围接口失败时只显示统一行情异常', () => {
     expect(buildDataRangeMetadata(
-      '运行标的', '5m', null, false, 'internal table timeout',
+      '运行标的', '5m', resolveRangeAvailability(null, false, 'internal table timeout'),
     )).toEqual({
       tone: 'warn',
       text: '行情数据异常，请联系管理员',
     });
+  });
+
+  it('distinguishes a finished L2 range query with no data from loading', () => {
+    const status: DataStatus = {
+      symbol: '688449.SH',
+      timeframe: '1m',
+      fillModel: 'l2_quote',
+      path: '',
+      exists: false,
+      firstDate: null,
+      lastDate: null,
+      barCount: 0,
+      fileSize: 0,
+      mtime: null,
+      duplicateCount: 0,
+      nonTradingCount: 0,
+      gapDates: [],
+      preview: [],
+    };
+
+    const availability = resolveRangeAvailability(status, false, '');
+    expect(availability).toEqual({ state: 'empty' });
+    expect(buildDataRangeMetadata('运行标的', 'L2', availability)).toEqual({
+      tone: 'warn',
+      text: '运行标的 L2 暂无可回测数据',
+    });
+    expect(resolveRangeAvailability(null, false, '')).toEqual({ state: 'loading' });
   });
 
   it('将同一组标的生成稳定的周期可用性缓存键', () => {

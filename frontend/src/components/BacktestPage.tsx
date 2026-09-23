@@ -85,7 +85,7 @@ import InstrumentSearchField from './InstrumentSearchField';
 import SignalDetailExportDrawer from './SignalDetailExportDrawer';
 import StrategyGuideDrawer from './StrategyGuideDrawer';
 
-import BacktestDateRangePicker from './BacktestDateRangePicker';
+import BacktestDateRangePicker, { type RangeAvailability } from './BacktestDateRangePicker';
 interface Props {
   symbol: string;
   strategy: string;
@@ -418,22 +418,31 @@ export function buildTimeframeAvailabilityCacheKey(
   return `${startDate}:${endDate}:${[...symbols].sort().join(',')}`;
 }
 
-export function buildDataRangeMetadata(
-  label: string,
-  timeframe: string,
+export function resolveRangeAvailability(
   statusData: DataStatus | null,
   loading: boolean,
   statusError: string,
+): RangeAvailability {
+  if (loading || (!statusData && !statusError)) return { state: 'loading' };
+  if (statusError) return { state: 'error' };
+  if (!statusData?.exists) return { state: 'empty' };
+  if (!statusData.firstDate || !statusData.lastDate) return { state: 'error' };
+  return { state: 'available', firstDate: statusData.firstDate, lastDate: statusData.lastDate };
+}
+
+export function buildDataRangeMetadata(
+  label: string,
+  timeframe: string,
+  availability: RangeAvailability,
 ): { tone: 'info' | 'warn' | 'ok'; text: string } {
-  if (loading) return { tone: 'info', text: `正在读取${label} ${timeframe} 可回测范围...` };
-  if (statusError) return { tone: 'warn', text: '行情数据异常，请联系管理员' };
-  if (!statusData?.exists) return { tone: 'warn', text: `${label} ${timeframe} 暂无可回测数据` };
-  if (!statusData.firstDate || !statusData.lastDate) {
-    return { tone: 'warn', text: `${label} ${timeframe} 可回测范围暂不可用` };
+  if (availability.state === 'loading') {
+    return { tone: 'info', text: `正在读取${label} ${timeframe} 可回测范围...` };
   }
+  if (availability.state === 'error') return { tone: 'warn', text: '行情数据异常，请联系管理员' };
+  if (availability.state === 'empty') return { tone: 'warn', text: `${label} ${timeframe} 暂无可回测数据` };
   return {
     tone: 'ok',
-    text: `${label} ${timeframe} 可回测范围：${statusData.firstDate}-${statusData.lastDate}`,
+    text: `${label} ${timeframe} 可回测范围：${availability.firstDate}-${availability.lastDate}`,
   };
 }
 
@@ -2429,24 +2438,27 @@ export default function BacktestPage({
     && benchmarkDataStatus.fillModel === 'bar_next_open'
     ? benchmarkDataStatus
     : null;
+  const rangeAvailability = resolveRangeAvailability(
+    dateRangeDataStatus, loadingDataStatus, dataStatusError,
+  );
   const backtestDateRangePickerProps = {
     startDate: params.startDate,
     endDate: params.endDate,
-    dataStartDate: dateRangeDataStatus?.firstDate,
-    dataEndDate: dateRangeDataStatus?.lastDate,
+    rangeAvailability,
     onApplyRange: (startDate: string, endDate: string) => {
       setParams((current) => ({ ...current, startDate, endDate }));
     },
   };
   const dataRangeMetadata = buildDataRangeMetadata(
-    '运行标的', isL2Quote ? 'L2' : selectedTimeframe,
-    dateRangeDataStatus, loadingDataStatus, dataStatusError,
+    '运行标的', isL2Quote ? 'L2' : selectedTimeframe, rangeAvailability,
   );
   const benchmarkRangeMetadata = isL2Quote
     ? { tone: 'info' as const, text: 'L2 模式暂不计算基准曲线。' }
     : buildDataRangeMetadata(
-      '基准标的', selectedTimeframe, benchmarkRangeDataStatus,
-      loadingBenchmarkDataStatus, benchmarkDataStatusError,
+      '基准标的', selectedTimeframe,
+      resolveRangeAvailability(
+        benchmarkRangeDataStatus, loadingBenchmarkDataStatus, benchmarkDataStatusError,
+      ),
     );
   const dataRangeColor = dataRangeMetadata.tone === 'ok'
     ? '#0f766e'
