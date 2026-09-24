@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import threading
 from dataclasses import asdict, replace
 from typing import Any
@@ -14,13 +15,22 @@ from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteS
 from backend.l2.config import load_profile, load_temporary_quote_profile
 from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError, TemporaryQuoteBarProvider, VersionedBarCache
 from backend.l2.result_adapter import normalize_l2_result
-from backend.l2.strategy_session import L2StrategySession, _redact_diagnostic_text
+from backend.l2.strategy_session import (
+  L2StrategySession,
+  StrategySessionProcessError,
+  _EngineProcessProxy,
+  _redact_diagnostic_text,
+)
 from backend import settings
 from backend.l2_runner import L2Runner, _JobLeaseKeeper, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day
 from backend.services.backtest_errors import RemoteBacktestError, error_detail
 from backend.services.system_error_catalog import classify_system_error
 from backend.services import clickhouse_client
 from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
+
+
+def _exit_strategy_session_process(_connection: Any, _payload: dict[str, Any]) -> None:
+  os._exit(9)
 
 
 class BuyStrategy:
@@ -1603,6 +1613,46 @@ def test_local_strategy_session_returns_strategy_error() -> None:
     assert error.value.diagnostic["__internal_raw_traceback"]
   finally:
     session.close()
+
+
+def test_l2_strategy_session_records_nonzero_process_exit(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    "backend.l2.strategy_session._engine_process_main",
+    _exit_strategy_session_process,
+  )
+  with pytest.raises(StrategySessionProcessError) as raised:
+    L2StrategySession({
+      "scriptId": "local-exit",
+      "code": "def on_bar(bar, state):\n  return []",
+      "params": {},
+      "initialCapital": 100_000,
+      "commissionRate": 0,
+      "feeProfile": {},
+      "latencyMs": 0,
+      "passiveParticipationRate": 0.1,
+      "holdingPolicy": "overnight",
+      "symbol": "688981.SH",
+      "baseQuantity": 0,
+      "baseCostPrice": 0,
+      "t0Enabled": False,
+      "quoteMode": "order_driven",
+      "instrumentRules": {},
+    })
+
+  assert raised.value.exit_code == 9
+  assert raised.value.termination_reason == "strategy_exit_nonzero"
+
+
+def test_l2_strategy_session_maps_negative_exit_code_to_signal() -> None:
+  proxy = object.__new__(_EngineProcessProxy)
+  proxy._process = type("ExitedProcess", (), {"exitcode": -15})()  # type: ignore[assignment]
+
+  error = proxy._process_exit_error("signal")
+
+  assert error.exit_code == -15
+  assert error.termination_reason == "strategy_signal"
 
 
 def test_local_l2_strategy_session_supports_tuple_and_runtime_version() -> None:

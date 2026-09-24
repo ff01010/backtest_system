@@ -1,6 +1,16 @@
 import { useEffect, useState } from 'react';
-import { fetchStrategyRuntimeErrorStats, fetchSystemErrorLogs, fetchUsers } from '../api/client';
-import type { ManagedUser, StrategyRuntimeErrorStat, SystemErrorLogEntry } from '../api/client';
+import {
+  fetchBacktestRunDiagnostics,
+  fetchStrategyRuntimeErrorStats,
+  fetchSystemErrorLogs,
+  fetchUsers,
+} from '../api/client';
+import type {
+  BacktestRunDiagnostics,
+  ManagedUser,
+  StrategyRuntimeErrorStat,
+  SystemErrorLogEntry,
+} from '../api/client';
 
 interface Filters {
   userId: string;
@@ -24,6 +34,8 @@ export default function SystemErrorLogPage() {
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [filters, setFilters] = useState<Filters>(emptyFilters);
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [diagnostics, setDiagnostics] = useState<BacktestRunDiagnostics | null>(null);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -34,18 +46,21 @@ export default function SystemErrorLogPage() {
         fromTime: toIso(filters.fromTime),
         toTime: toIso(filters.toTime),
       };
-      const [nextItems, nextRuntimeStats] = await Promise.all([
+      const runId = filters.runId.trim();
+      const [nextItems, nextRuntimeStats, nextDiagnostics] = await Promise.all([
         fetchSystemErrorLogs({
           userId: filters.userId || undefined,
-          runId: filters.runId.trim() || undefined,
+          runId: runId || undefined,
           errorCode: filters.errorCode.trim() || undefined,
           ...timeFilters,
         }),
         fetchStrategyRuntimeErrorStats(timeFilters),
+        runId ? fetchBacktestRunDiagnostics(runId) : Promise.resolve(null),
       ]);
       setItems(nextItems);
       setRuntimeStats(nextRuntimeStats);
       setSelectedId(null);
+      setDiagnostics(nextDiagnostics);
       setError('');
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '无法读取回测诊断日志');
@@ -60,6 +75,20 @@ export default function SystemErrorLogPage() {
   }, []);
 
   const selected = items.find((item) => item.id === selectedId) || null;
+
+  const selectItem = async (item: SystemErrorLogEntry) => {
+    setSelectedId(item.id);
+    setDiagnosticsLoading(true);
+    try {
+      setDiagnostics(await fetchBacktestRunDiagnostics(item.runId));
+      setError('');
+    } catch (reason) {
+      setDiagnostics(null);
+      setError(reason instanceof Error ? reason.message : '无法读取任务执行尝试');
+    } finally {
+      setDiagnosticsLoading(false);
+    }
+  };
 
   return (
     <section style={pageStyle}>
@@ -107,7 +136,7 @@ export default function SystemErrorLogPage() {
             <thead><tr style={tableHeadStyle}>
               <th style={cellStyle}>发生时间</th><th style={cellStyle}>使用者</th><th style={cellStyle}>任务</th><th style={cellStyle}>标的 / 周期</th><th style={cellStyle}>阶段</th><th style={cellStyle}>分类 / 重试</th><th style={cellStyle}>管理员原因</th>
             </tr></thead>
-            <tbody>{items.map((item) => <tr key={item.id} onClick={() => setSelectedId(item.id)} style={{ ...rowStyle, background: selectedId === item.id ? 'var(--surface-muted)' : 'transparent' }}>
+            <tbody>{items.map((item) => <tr key={item.id} onClick={() => void selectItem(item)} style={{ ...rowStyle, background: selectedId === item.id ? 'var(--surface-muted)' : 'transparent' }}>
               <td style={cellStyle}>{item.occurredAt}</td>
               <td style={cellStyle}><strong>{item.displayName}</strong><span style={subtextStyle}>{item.username}</span></td>
               <td style={cellStyle}><strong>#{item.displayNo}</strong><span style={monoStyle}>{item.runId}</span></td>
@@ -129,11 +158,63 @@ export default function SystemErrorLogPage() {
             <Detail label="原始日志索引" value={selected.rawLogRef} mono />
             {Object.entries(selected.context).map(([key, value]) => <Detail key={key} label={key} value={value} mono />)}
           </div>
-          <p style={{ margin: '14px 0 0', color: 'var(--text-muted)', fontSize: 12 }}>原始堆栈仅保留在服务器容器日志中。使用“原始日志索引”可在受控运维环境查询对应任务与阶段，页面不直接展示敏感日志正文。</p>
+          <p style={{ margin: '14px 0 0', color: 'var(--text-muted)', fontSize: 12 }}>完整运维日志在固定保留期内由集中日志系统保存。页面只展示安全时间线；关联键可在受控服务器维护入口查询，页面不展示原始堆栈或策略源码。</p>
         </section> : null}
+
+        {diagnosticsLoading ? <div style={emptyStyle}>正在读取任务执行尝试…</div> : null}
+        {diagnostics ? <DiagnosticsPanel diagnostics={diagnostics} /> : null}
       </div>
     </section>
   );
+}
+
+function DiagnosticsPanel({ diagnostics }: { diagnostics: BacktestRunDiagnostics }) {
+  const logStatusText = {
+    available: '集中日志可用',
+    unavailable: '集中日志暂不可用，以下数据库事实仍然有效',
+    expired: '集中日志已过保留期，以下数据库事实仍然有效',
+    disabled: '集中日志查询未启用，以下数据库事实仍然有效',
+  }[diagnostics.logStatus];
+  return <section style={diagnosticsStyle}>
+    <div style={diagnosticsHeaderStyle}>
+      <div>
+        <div style={eyebrowStyle}>RUN / ATTEMPT TIMELINE</div>
+        <h3 style={{ margin: '4px 0', color: 'var(--text)' }}>任务 #{diagnostics.run.displayNo} · {diagnostics.run.status}</h3>
+        <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 12 }}>{diagnostics.run.safeReason || '当前没有安全错误摘要。'}</p>
+      </div>
+      <span style={logStatusStyle} data-status={diagnostics.logStatus}>{logStatusText}</span>
+    </div>
+    <div style={attemptListStyle}>
+      {diagnostics.attempts.map((attempt) => <article key={attempt.attemptToken} style={attemptCardStyle}>
+        <div style={attemptTitleStyle}>
+          <strong>Attempt {attempt.attemptNo} · {attempt.status}</strong>
+          <span style={codeBadgeStyle}>{attempt.jobKind}</span>
+        </div>
+        <div style={detailGridStyle}>
+          <Detail label="最后阶段" value={attempt.stage} mono />
+          <Detail label="终止原因" value={attempt.terminationReason || (attempt.status === 'running' ? '执行中' : '未知中断')} mono />
+          <Detail label="退出码" value={attempt.exitCode === null ? '—' : String(attempt.exitCode)} mono />
+          <Detail label="Worker" value={attempt.workerId} mono />
+          <Detail label="容器" value={attempt.containerId} mono />
+          <Detail label="开始 / 结束" value={`${attempt.startedAt} / ${attempt.finishedAt || '执行中'}`} />
+        </div>
+        <div style={correlationStyle}>可选择复制的日志关联键：<code>{attempt.logCorrelationId}</code></div>
+      </article>)}
+      {diagnostics.attempts.length === 0 ? <div style={emptyRuntimeStyle}>该历史任务没有 Attempt 记录。</div> : null}
+    </div>
+    <div style={timelineStyle}>
+      <div style={timelineHeaderStyle}>
+        <strong style={{ color: 'var(--text)' }}>执行时间线</strong>
+        <span>每行是一条生命周期记录，并不代表发生了多次错误。</span>
+      </div>
+      {diagnostics.timeline.map((event, index) => <div key={`${event.timestamp}-${event.event}-${index}`} style={timelineRowStyle}>
+        <time style={timelineTimeStyle}>{event.timestamp || '时间未知'}</time>
+        <div><strong style={{ color: 'var(--text)' }}>{event.event}</strong><span style={subtextStyle}>{event.stage || '—'} · {event.terminationReason || event.errorCode || event.status || '状态事件'}</span></div>
+        <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>{event.message}</span>
+        {event.frameSummary && <code style={timelineFrameStyle}>{event.frameSummary}</code>}
+      </div>)}
+    </div>
+  </section>;
 }
 
 function Detail({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
@@ -161,8 +242,20 @@ const rowStyle = { borderTop: '1px solid var(--border)', cursor: 'pointer' };
 const cellStyle = { padding: '11px 13px', textAlign: 'left' as const, verticalAlign: 'top' as const, fontWeight: 'normal' };
 const subtextStyle = { display: 'block', marginTop: 3, color: 'var(--text-muted)', fontSize: 11 };
 const monoStyle = { ...subtextStyle, fontFamily: 'ui-monospace, Consolas, monospace', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis' as const, whiteSpace: 'nowrap' as const };
+const timelineFrameStyle = { color: 'var(--text-muted)', fontSize: 11, overflowWrap: 'anywhere' as const };
 const codeBadgeStyle = { display: 'inline-block', borderRadius: 4, background: '#edf4f6', color: '#17605a', fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 11, padding: '3px 5px' };
 const categoryBadgeStyle = { display: 'inline-block', borderRadius: 999, background: '#fff3da', color: '#895500', fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 11, padding: '3px 7px' };
 const emptyStyle = { padding: 38, color: 'var(--text-muted)', textAlign: 'center' as const };
 const detailStyle = { marginTop: 14, border: '1px solid var(--border)', borderLeft: '3px solid var(--accent)', borderRadius: 9, background: 'var(--surface)', padding: 16 };
 const detailGridStyle = { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 14, marginTop: 14 };
+const diagnosticsStyle = { marginTop: 14, border: '1px solid var(--border)', borderRadius: 10, background: 'var(--surface)', padding: 16 };
+const diagnosticsHeaderStyle = { display: 'flex', justifyContent: 'space-between', alignItems: 'start', gap: 16 };
+const logStatusStyle = { borderRadius: 999, background: 'var(--surface-muted)', color: 'var(--text-muted)', padding: '5px 9px', fontSize: 11, whiteSpace: 'nowrap' as const };
+const attemptListStyle = { display: 'grid', gap: 10, marginTop: 14 };
+const attemptCardStyle = { border: '1px solid var(--border)', borderRadius: 8, background: 'var(--surface-muted)', padding: 13 };
+const attemptTitleStyle = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 };
+const timelineHeaderStyle = { display: 'flex', justifyContent: 'space-between', gap: 12, padding: '2px 0 10px', color: 'var(--text-muted)', fontSize: 12 };
+const correlationStyle = { marginTop: 12, color: 'var(--text-muted)', fontSize: 11, overflowWrap: 'anywhere' as const };
+const timelineStyle = { display: 'grid', gap: 0, marginTop: 16, borderTop: '1px solid var(--border)' };
+const timelineRowStyle = { display: 'grid', gridTemplateColumns: '180px minmax(190px, 0.8fr) minmax(240px, 1.5fr)', gap: 14, alignItems: 'start', padding: '10px 0', borderBottom: '1px solid var(--border)' };
+const timelineTimeStyle = { color: 'var(--text-muted)', fontSize: 11, fontFamily: 'ui-monospace, Consolas, monospace' };

@@ -1,0 +1,71 @@
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+discovery.docker "local" {
+  host             = "http://docker-socket-proxy:2375"
+  refresh_interval = "5s"
+}
+
+discovery.relabel "task_logs" {
+  targets = discovery.docker.local.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = sys.env("TREND_GRID_COMPOSE_PROJECT")
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = [
+      "__meta_docker_network_name",
+      "__meta_docker_container_label_com_trend_grid_logging_network",
+    ]
+    separator = ";"
+    regex = "(quant-backtest-net;quant-backtest-net|quant-backtest-l2-net;quant-backtest-l2-net|quant-backtest-observability-net;quant-backtest-observability-net)"
+    action = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "compose_project"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "bar-runner"
+    replacement   = "bar"
+    target_label  = "job_kind"
+  }
+
+  rule {
+    source_labels = ["service"]
+    regex         = "l2-runner"
+    replacement   = "l2"
+    target_label  = "job_kind"
+  }
+
+  rule {
+    replacement  = sys.env("TREND_GRID_ENVIRONMENT")
+    target_label = "environment"
+  }
+}
+
+loki.source.docker "containers" {
+  host             = "http://docker-socket-proxy:2375"
+  targets          = discovery.relabel.task_logs.output
+  forward_to       = [loki.write.local.receiver]
+  refresh_interval = "5s"
+}
+
+loki.write "local" {
+  endpoint {
+    url = sys.env("TREND_GRID_LOKI_URL") + "/loki/api/v1/push"
+  }
+}

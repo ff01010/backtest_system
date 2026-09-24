@@ -31,6 +31,17 @@ from backend.strategies.scripted import ScriptedBarStrategy
 class BarStrategyProcessError(RuntimeError):
   """Bar 策略子进程异常退出或 IPC 协议失效。"""
 
+  def __init__(
+    self,
+    message: str,
+    *,
+    exit_code: int | None = None,
+    termination_reason: str = "unknown_interruption",
+  ) -> None:
+    super().__init__(message)
+    self.exit_code = exit_code
+    self.termination_reason = termination_reason
+
 
 class BarStrategySession:
   """每个 Bar 任务启动一个无服务凭据的策略子进程。"""
@@ -56,11 +67,12 @@ class BarStrategySession:
           _terminate(process, self._cancel_grace_seconds)
           raise
         if not process.is_alive():
-          raise BarStrategyProcessError("Bar 策略子进程异常退出")
+          raise _process_exit_error(process, "Bar 策略子进程异常退出")
       message = parent.recv()
       return _parse_response(message)
     except (EOFError, OSError) as error:
-      raise BarStrategyProcessError("Bar 策略子进程通信中断") from error
+      process.join(timeout=0.2)
+      raise _process_exit_error(process, "Bar 策略子进程通信中断") from error
     finally:
       parent.close()
       process.join(timeout=1)
@@ -188,6 +200,24 @@ def _terminate(process: multiprocessing.Process, grace_seconds: int) -> None:
   if process.is_alive() and hasattr(process, "kill"):
     process.kill()
     process.join(timeout=2)
+
+
+def _process_exit_error(
+  process: multiprocessing.Process,
+  message: str,
+) -> BarStrategyProcessError:
+  exit_code = process.exitcode
+  if exit_code is None:
+    reason = "unknown_interruption"
+  elif exit_code < 0:
+    reason = "strategy_signal"
+  elif exit_code > 0:
+    reason = "strategy_exit_nonzero"
+  else:
+    reason = "unknown_interruption"
+  return BarStrategyProcessError(
+    message, exit_code=exit_code, termination_reason=reason,
+  )
 
 
 def _error_diagnostic(error: Exception) -> dict[str, str]:

@@ -7,6 +7,7 @@ from typing import Any, Iterator
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 
 from backend import app as api_app
 from backend import settings
@@ -23,6 +24,7 @@ from backend.services.backtest_errors import (
 from backend.services.clickhouse_client import ClickHouseError
 from backend.services.state_store import _insert_strategy_runtime_error_stat, _public_system_error_context
 from backend.services.system_error_log import system_error_log_record
+from backend.services.task_diagnostics import AttemptContext
 
 
 _RESULT_RAW_LOG_REF = (
@@ -135,6 +137,31 @@ def test_unknown_system_error_is_not_marked_retryable() -> None:
   assert record.category == "internal"
   assert record.retryable is False
   assert record.context["__internal_raw_message"] == "unexpected"
+
+
+def test_unknown_system_error_keeps_attempt_correlation() -> None:
+  context = AttemptContext.from_job({
+    "runId": "117f14fd-203a-4705-8fe3-c4a3a42d4746",
+    "attemptNo": 3,
+    "attemptToken": "6e6a7c64-0594-4ff5-a0a8-0477de5c5c59",
+  }, "bar", "bar-runner-a:4321", service="bar-runner")
+
+  record = system_error_log_record(
+    RuntimeError("unexpected"),
+    "bar_runner",
+    "bar.backtest",
+    context.run_id,
+    attempt_context=context,
+    termination_reason="exception",
+    exit_code=7,
+  )
+
+  assert record is not None
+  assert record.attempt_no == 3
+  assert record.attempt_token == context.attempt_token
+  assert record.container_id == "bar-runner-a"
+  assert record.termination_reason == "exception"
+  assert record.exit_code == 7
 
 
 def test_l2_ambiguous_quote_order_is_data_error_and_operator_visible(
@@ -258,6 +285,59 @@ def test_admin_endpoint_forwards_exact_task_uuid_without_user_filter(
   assert result == {"items": []}
   assert captured["args"][1] is None
   assert captured["args"][2] == "117f14fd-203a-4705-8fe3-c4a3a42d4746"
+
+
+def test_admin_diagnostics_endpoint_accepts_only_uuid_parameters(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  run_id = UUID("117f14fd-203a-4705-8fe3-c4a3a42d4746")
+  attempt_token = UUID("6e6a7c64-0594-4ff5-a0a8-0477de5c5c59")
+  captured: dict[str, Any] = {}
+  expected = {
+    "run": {}, "attempts": [], "errors": [],
+    "logStatus": "disabled", "timeline": [],
+  }
+  monkeypatch.setattr(api_app, "_require_admin", lambda _: None)
+  monkeypatch.setattr(
+    api_app.task_diagnostics,
+    "get_admin_run_diagnostics",
+    lambda *args: captured.update({"args": args}) or expected,
+  )
+
+  result = api_app.admin_backtest_run_diagnostics(
+    run_id, object(), attempt_token,
+  )
+
+  assert result == expected
+  assert captured["args"] == (str(run_id), str(attempt_token))
+
+
+def test_normal_user_cannot_access_run_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(
+    api_app,
+    "_require_admin",
+    lambda _request: (_ for _ in ()).throw(HTTPException(403, "仅管理员可执行此操作")),
+  )
+
+  with pytest.raises(HTTPException) as error:
+    api_app.admin_backtest_run_diagnostics(
+      UUID("117f14fd-203a-4705-8fe3-c4a3a42d4746"), object(), None,
+    )
+
+  assert error.value.status_code == 403
+
+
+def test_attempt_diagnostics_migration_enforces_rls_and_cascade() -> None:
+  migration = (
+    Path(__file__).resolve().parents[2]
+    / "db" / "migrations" / "041_backtest_run_attempt_diagnostics.sql"
+  ).read_text(encoding="utf-8")
+
+  assert "CREATE TABLE IF NOT EXISTS backtest_run_attempt" in migration
+  assert "REFERENCES backtest_run(id) ON DELETE CASCADE" in migration
+  assert "FORCE ROW LEVEL SECURITY" in migration
+  assert "UNIQUE (attempt_token)" in migration
+  assert "ADD COLUMN IF NOT EXISTS log_correlation_id" in migration
 
 
 def test_internal_error_context_is_not_returned_by_api() -> None:

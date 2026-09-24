@@ -52,7 +52,7 @@ def test_l2_runner_persists_actual_worker_for_result_error(
   )
   assert finished["kwargs"]["system_error"]["raw_log_ref"] == (
     "container=l2-runner-a; workerId=l2-runner-a:4321; "
-    "taskId=run-result; stage=l2.bar_load"
+    "taskId=run-result; stage=l2.bar_load; attemptToken=attempt-1"
   )
 
 
@@ -162,5 +162,5 @@ def test_l2_runner_rejects_missing_quote_summary_before_strategy_session(
   assert finished["args"][3]["error"] == "行情数据异常，请联系管理员"
   assert finished["args"][3]["errorDetail"]["code"] == "data.l2_quote_missing"
   assert finished["kwargs"]["system_error"]["raw_log_ref"].endswith(
-    "taskId=run-missing-quote; stage=l2.quote_coverage"
+    "taskId=run-missing-quote; stage=l2.quote_coverage; attemptToken=attempt-1"
   )

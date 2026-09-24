@@ -662,6 +662,92 @@ class BacktestCapacityOverrideRequest(BaseModel):
   reason: str = Field(min_length=1, max_length=500)
 
 
+class BacktestDiagnosticRun(BaseModel):
+  runId: str
+  displayNo: int
+  status: str
+  safeReason: str
+  symbol: str
+  timeframe: str
+  fillModel: str
+  createdAt: str
+  startedAt: str
+  finishedAt: str
+
+
+class BacktestAttemptDiagnostic(BaseModel):
+  attemptNo: int
+  attemptToken: str
+  jobKind: Literal["bar", "l2"]
+  workerId: str
+  containerId: str
+  processId: int | None
+  applicationBuildId: str
+  runtimeVersion: str
+  capabilityDigest: str
+  status: Literal["running", "succeeded", "failed", "cancelled", "interrupted"]
+  stage: str
+  startedAt: str
+  heartbeatAt: str
+  finishedAt: str
+  exitCode: int | None
+  terminationReason: str | None
+  errorCode: str | None
+  logCorrelationId: str
+
+
+class BacktestDiagnosticError(BaseModel):
+  id: int
+  stage: str
+  code: str
+  reason: str
+  exceptionType: str
+  category: str
+  retryable: bool
+  occurredAt: str
+  attemptNo: int | None
+  attemptToken: str | None
+  terminationReason: str | None
+  exitCode: int | None
+  logCorrelationId: str | None
+
+
+class BacktestDiagnosticTimelineEvent(BaseModel):
+  source: str | None = None
+  event: str
+  timestamp: str = ""
+  occurredAt: str | None = None
+  message: str
+  attemptNo: int | None = None
+  attemptToken: str | None = None
+  stage: str | None = None
+  status: str | None = None
+  errorCode: str | None = None
+  exceptionType: str | None = None
+  frameSummary: str | None = None
+  exitCode: int | None = None
+  terminationReason: str | None = None
+  level: str | None = None
+  service: str | None = None
+  jobKind: str | None = None
+  workerId: str | None = None
+  containerId: str | None = None
+  processId: int | None = None
+  durationMs: float | None = None
+  applicationBuildId: str | None = None
+  runtimeVersion: str | None = None
+  capabilityDigest: str | None = None
+  logTimestampNs: str | None = None
+
+
+class BacktestRunDiagnostics(BaseModel):
+  run: BacktestDiagnosticRun
+  attempts: list[BacktestAttemptDiagnostic]
+  errors: list[BacktestDiagnosticError]
+  logStatus: Literal["available", "unavailable", "expired", "disabled"]
+  timeline: list[BacktestDiagnosticTimelineEvent]
+
+
 class StrategyConfigCreate(BaseModel):
   name: str = Field(min_length=1, max_length=64)
   scriptId: str | None = None

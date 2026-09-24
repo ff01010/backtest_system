@@ -58,6 +58,7 @@ from backend.services import (
   market_data,
   qmt_instrument_directory,
   data_repository,
+  loki_client,
   release_notifications,
   shared_backtest_admin,
   research_signal_snapshot,
@@ -68,6 +69,7 @@ from backend.services import (
   shared_backtest_discovery,
   state_store,
   strategy_adapters,
+  task_diagnostics,
 )
 from backend.services import auth
 from backend.services.user_context import CurrentUser
@@ -625,6 +627,7 @@ def startup():
   settings.validate_public_api_configuration()
   settings.validate_research_integration_configuration()
   settings.validate_application_build_configuration()
+  settings.validate_observability_configuration()
   state_store.ensure_schema()
   state_store.prune_strategy_runtime_error_stats()
 
@@ -642,6 +645,7 @@ def health():
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "runtimeCapabilities": _verified_runtime_capabilities,
     "signalExportRunner": {"healthy": signal_export_healthy},
+    "observability": loki_client.health_status(),
   }
 
 
@@ -945,6 +949,25 @@ def admin_system_errors(
   return {"items": state_store.list_system_error_logs(
     limit, user_id, str(run_id) if run_id else None, error_code, from_time, to_time,
   )}
+
+
+@app.get(
+  "/api/admin/backtest-runs/{run_id}/diagnostics",
+  response_model=schemas.BacktestRunDiagnostics,
+)
+def admin_backtest_run_diagnostics(
+  run_id: UUID,
+  request: Request,
+  attempt_token: UUID | None = Query(default=None, alias="attemptToken"),
+):
+  """按任务 UUID 返回安全 Attempt 时间线，不接受任意日志查询表达式。"""
+  _require_admin(request)
+  try:
+    return task_diagnostics.get_admin_run_diagnostics(
+      str(run_id), str(attempt_token) if attempt_token else None,
+    )
+  except KeyError as error:
+    raise HTTPException(404, "回测任务不存在") from error
 
 
 @app.get("/api/admin/strategy-runtime-errors")

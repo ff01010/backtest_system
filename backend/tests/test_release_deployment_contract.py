@@ -90,3 +90,48 @@ def test_signal_export_runner_health_is_readable_but_only_admin_writable() -> No
   assert "FOR SELECT\n  USING (true)" in migration
   assert "signal_detail_export_runner_admin_write" in migration
   assert "FOR ALL\n  USING (app.current_is_admin())" in migration
+
+
+def test_observability_services_are_pinned_isolated_and_started_before_application() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(
+    encoding="utf-8",
+  )
+
+  assert "grafana/loki:3.7.6@sha256:" in compose
+  assert "grafana/alloy:v1.19.2@sha256:" in compose
+  assert "docker-socket-proxy:v0.4.2@sha256:" in compose
+  assert "quant-backtest-observability-net" in compose
+  assert "internal: true" in compose
+  assert "driver: local" in compose
+  assert "max-size: ${TREND_GRID_LOG_LOCAL_MAX_SIZE:-20m}" in compose
+  assert "POST: '0'" in compose
+  assert "docker-socket-proxy/haproxy.cfg.template" in compose
+  assert "com.trend-grid.logging-network" in compose
+  assert "__meta_docker_container_label_com_trend_grid_logging_network" in (
+    ROOT / "deploy" / "alloy" / "config.alloy"
+  ).read_text(encoding="utf-8")
+  assert compose.count("backend.runner_supervisor") == 2
+  assert "- l2\n      - --processes\n      - '1'" in compose
+  assert "- bar\n      - --processes\n      - '1'" in compose
+  assert "wait_for_observability" in script
+  assert script.index("run --rm migrate") < script.index(
+    "up -d --build docker-socket-proxy loki alloy container-event-observer",
+  )
+  assert script.index("wait_for_observability") < script.index(
+    "backend bar-runner l2-runner signal-export-runner",
+  )
+
+
+def test_socket_proxy_uses_exact_read_only_endpoint_allowlist() -> None:
+  proxy = (
+    ROOT / "deploy" / "docker-socket-proxy" / "haproxy.cfg.template"
+  ).read_text(encoding="utf-8")
+
+  assert "http-request deny unless METH_GET" in proxy
+  assert "/containers/json/?$" in proxy
+  assert "/containers/[a-zA-Z0-9_.-]+/logs/?$" in proxy
+  assert "/events/?$" in proxy
+  assert "^(/v[0-9.]+)?/containers }" not in proxy
+  assert "/archive" not in proxy
+  assert "/export" not in proxy

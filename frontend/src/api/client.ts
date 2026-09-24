@@ -248,7 +248,79 @@ export interface SystemErrorLogEntry {
   exceptionType: string;
   context: Record<string, string>;
   rawLogRef: string;
+  attemptNo: number | null;
+  attemptToken: string | null;
+  workerId: string | null;
+  containerId: string | null;
+  terminationReason: string | null;
+  exitCode: number | null;
+  logCorrelationId: string | null;
   occurredAt: string;
+}
+
+export interface BacktestAttemptDiagnostic {
+  attemptNo: number;
+  attemptToken: string;
+  jobKind: 'bar' | 'l2';
+  workerId: string;
+  containerId: string;
+  processId: number | null;
+  applicationBuildId: string;
+  runtimeVersion: string;
+  capabilityDigest: string;
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  stage: string;
+  startedAt: string;
+  heartbeatAt: string;
+  finishedAt: string;
+  exitCode: number | null;
+  terminationReason: string | null;
+  errorCode: string | null;
+  logCorrelationId: string;
+}
+
+export interface BacktestDiagnosticTimelineEvent {
+  source?: string | null;
+  event: string;
+  timestamp: string;
+  message: string;
+  attemptNo?: number | null;
+  attemptToken?: string | null;
+  stage?: string | null;
+  status?: string | null;
+  errorCode?: string | null;
+  exceptionType?: string | null;
+  frameSummary?: string | null;
+  exitCode?: number | null;
+  terminationReason?: string | null;
+}
+
+export interface BacktestRunDiagnostics {
+  run: {
+    runId: string;
+    displayNo: number;
+    status: string;
+    safeReason: string;
+    symbol: string;
+    timeframe: string;
+    fillModel: string;
+    createdAt: string;
+    startedAt: string;
+    finishedAt: string;
+  };
+  attempts: BacktestAttemptDiagnostic[];
+  errors: Array<{
+    id: number;
+    stage: string;
+    code: string;
+    reason: string;
+    exceptionType: string;
+    occurredAt: string;
+    attemptNo: number | null;
+    attemptToken: string | null;
+  }>;
+  logStatus: 'available' | 'unavailable' | 'expired' | 'disabled';
+  timeline: BacktestDiagnosticTimelineEvent[];
 }
 
 export interface StrategyRuntimeErrorStat {
@@ -355,6 +427,19 @@ export async function fetchSystemErrorLogs(filters: {
   });
   const data = await fetchJson<{ items: SystemErrorLogEntry[] }>(`${BASE}/admin/system-errors?${search}`);
   return data.items;
+}
+
+export async function fetchBacktestRunDiagnostics(
+  runId: string,
+  attemptToken?: string,
+): Promise<BacktestRunDiagnostics> {
+  const search = new URLSearchParams();
+  if (attemptToken) search.set('attemptToken', attemptToken);
+  const query = search.toString();
+  const suffix = query ? `?${query}` : '';
+  return fetchJson<BacktestRunDiagnostics>(
+    `${BASE}/admin/backtest-runs/${encodeURIComponent(runId)}/diagnostics${suffix}`,
+  );
 }
 
 export async function fetchStrategyRuntimeErrorStats(filters: {

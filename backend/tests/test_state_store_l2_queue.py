@@ -145,9 +145,14 @@ def test_claim_l2_job_preserves_attempt_token_result_contract(monkeypatch: Any) 
     "attemptNo": 2,
     "attemptToken": "attempt-2",
   }
-  assert "INSERT INTO backtest_execution_slot" in cursor.commands[7][0]
-  assert "UPDATE backtest_run SET status='running'" in cursor.commands[8][0]
-  assert cursor.commands[8][1] == ("run-1",)
+  slot_command = next(
+    item for item in cursor.commands if "INSERT INTO backtest_execution_slot" in item[0]
+  )
+  run_command = next(
+    item for item in cursor.commands if "UPDATE backtest_run SET status='running'" in item[0]
+  )
+  assert slot_command[1] is not None
+  assert run_command[1] == ("run-1",)
 
   claim_update, claim_params = cursor.commands[6]
   assert "runtime_version=%s AND capability_digest=%s" in claim_update
@@ -156,6 +161,29 @@ def test_claim_l2_job_preserves_attempt_token_result_contract(monkeypatch: Any) 
     state_store.SCRIPT_RUNTIME_VERSION,
     state_store.RUNTIME_CAPABILITY_DIGEST,
   )
+
+
+def test_claim_persists_each_attempt_without_overwriting_expired_attempt() -> None:
+  job_row = {
+    "run_id": "run-b", "owner_user_id": "user-b", "payload": {},
+    "attempt_no": 2, "attempt_token": "attempt-b", "lease_expires_at": "later",
+  }
+  cursor = FakeCursor(None, fetch_rows=[
+    {
+      "job_kind": "bar", "run_id": "run-b", "owner_user_id": "user-b",
+      "owner_active_count": 0,
+    },
+    {"active_count": 0, "override_limit": None},
+    job_row,
+  ])
+
+  claimed = state_store._claim_backtest_job(cursor, "bar", "runner-b", 30)
+
+  assert claimed == job_row
+  commands = "\n".join(query for query, _ in cursor.commands)
+  assert "UPDATE backtest_run_attempt" in commands
+  assert "termination_reason='lease_expired'" in commands
+  assert "INSERT INTO backtest_run_attempt" in commands
 
 
 def test_queued_job_freezes_runtime_route_in_columns_and_payload(monkeypatch: Any) -> None:
@@ -213,7 +241,10 @@ def test_global_scheduler_uses_fairness_burst_for_user_without_slot(monkeypatch:
   claimed = state_store._claim_backtest_job(cursor, "bar", "runner-b", 30)
 
   assert claimed == job_row
-  slot_params = cursor.commands[7][1]
+  slot_params = next(
+    params for query, params in cursor.commands
+    if "INSERT INTO backtest_execution_slot" in query
+  )
   assert slot_params is not None
   assert slot_params[5] is True
 
@@ -302,7 +333,9 @@ def test_finish_bar_backtest_job_preserves_terminal_status_without_research_snap
   assert "market_data_snapshot=COALESCE" in cursor.commands[1][0]
   assert cursor.commands[1][1][0] == status
   assert "DELETE FROM backtest_execution_slot" in cursor.commands[2][0]
-  enqueue_query, enqueue_params = cursor.commands[3]
+  enqueue_query, enqueue_params = next(
+    item for item in cursor.commands if "FROM research_signal_snapshot" in item[0]
+  )
   assert "FROM research_signal_snapshot" in enqueue_query
   assert "'backtestInstanceId', %s::text" in enqueue_query
   assert "'status', %s::text" in enqueue_query
@@ -321,7 +354,8 @@ def test_finish_bar_backtest_job_skips_result_outbox_when_reporting_disabled(
     "run-1", "attempt-1", "succeeded", {"totalReturn": 0.1}, {"equity": []},
   ) is True
 
-  assert len(cursor.commands) == 3
+  assert len(cursor.commands) == 4
+  assert "UPDATE backtest_run_attempt" in cursor.commands[3][0]
 
 
 def test_finish_job_keeps_database_cancellation_over_late_success() -> None:

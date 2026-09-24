@@ -191,6 +191,7 @@ wait_for_application() {
       && runner_containers_ready "signal-export-runner" "1" \
       && [[ "$response" == *'"status":"ok"'* ]] \
       && [[ "$response" == *'"signalExportRunner":{"healthy":true}'* ]] \
+      && [[ "$response" == *'"observability":{"status":'* ]] \
       && [[ "$response" == *"\"applicationBuildId\":\"${APPLICATION_BUILD_ID}\""* ]] \
       && [[ "$response" == *"\"clientCompatibilityVersion\":${CLIENT_COMPATIBILITY_VERSION}"* ]]; then
       echo "发布完成，应用与 Runner 健康检查通过：$health_url"
@@ -200,6 +201,21 @@ wait_for_application() {
   done
   "${compose[@]}" ps
   fail "应用或 Runner 未能在 90 秒内通过健康检查：$health_url"
+}
+
+wait_for_observability() {
+  local attempt
+  local check_code="import urllib.request; urls=('http://loki:3100/ready','http://alloy:12345/-/ready','http://docker-socket-proxy:2375/_ping'); [urllib.request.urlopen(url, timeout=3).read(64) for url in urls]"
+  for attempt in $(seq 1 45); do
+    if docker exec quant-backtest-container-event-observer \
+      python -c "$check_code" >/dev/null 2>&1; then
+      echo "Loki、Alloy 与 Docker socket proxy 内部健康检查通过"
+      return
+    fi
+    sleep 2
+  done
+  "${compose[@]}" ps docker-socket-proxy loki alloy container-event-observer
+  fail "日志基础设施未能在 90 秒内通过内部健康检查"
 }
 
 verify_frontend_build() {
@@ -304,7 +320,7 @@ export APPLICATION_BUILD_ID CLIENT_COMPATIBILITY_VERSION RELEASE_ADMIN_IMAGE
 deployment_id="$(cat /proc/sys/kernel/random/uuid)"
 echo "目标构建：${APPLICATION_BUILD_ID}，客户端兼容版本：${CLIENT_COMPATIBILITY_VERSION}"
 
-compose=(docker compose --env-file "$env_file" -f "$compose_file" -f "$clickhouse_compose_file")
+compose=(docker compose --env-file "$env_file" -f "$compose_file" -f "$clickhouse_compose_file" --profile observability)
 bar_runner_replicas="$(read_runner_replicas TREND_GRID_BAR_RUNNER_REPLICAS)"
 l2_runner_replicas="$(read_runner_replicas TREND_GRID_L2_RUNNER_REPLICAS)"
 validate_clickhouse_network
@@ -314,6 +330,8 @@ wait_for_postgres
 stop_submission_and_wait_for_backtests
 check_active_backtests || fail "回测任务未完全排空；backend 保持停止"
 "${compose[@]}" --profile migration run --rm migrate
+"${compose[@]}" up -d --build docker-socket-proxy loki alloy container-event-observer
+wait_for_observability
 "${compose[@]}" --profile calendar-sync run --rm --build calendar-sync
 verify_trade_calendar || fail "交易日历同步后校验失败"
 "${compose[@]}" up -d --build --remove-orphans \

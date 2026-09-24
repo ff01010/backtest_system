@@ -161,4 +161,5 @@ def test_health_reports_runner_degradation_without_internal_counts(
     "capabilityDigest": api_app.RUNTIME_CAPABILITY_DIGEST,
     "runtimeCapabilities": api_app._verified_runtime_capabilities,
     "signalExportRunner": {"healthy": True},
+    "observability": {"status": "disabled"},
   }

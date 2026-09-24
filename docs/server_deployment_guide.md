@@ -98,9 +98,11 @@ TREND_GRID_HOST_SIGNAL_ROOT=/srv/quant-backtest/data/signals
 ```text
 quant-backtest-postgres-data   PostgreSQL 持久化数据
 quant-backtest-artifacts       回测输出文件
+quant-backtest-loki-data       Loki TSDB、chunk、WAL 与 Compactor 工作目录
+quant-backtest-alloy-data      Alloy Docker 日志读取位置
 ```
 
-不要随意删除这两个 Docker 卷。删除 PostgreSQL 数据卷会清空账号、策略、方案、回测记录和已缓存行情。
+不要随意删除这些 Docker 卷。删除 PostgreSQL 数据卷会清空账号、策略、方案和回测记录；删除 Loki 或 Alloy 数据卷会丢失保留期内的集中日志或补采位置，但不会改变回测业务终态。
 
 ## 4. 容器职责
 
@@ -110,6 +112,10 @@ quant-backtest-artifacts       回测输出文件
 | `quant-backtest-backend` | `backend` | 登录、权限、QMT 覆盖检查、回测编排和 API |
 | `quant-backtest-platform-bar-runner-*` | `bar-runner` | 领取并执行标准 Bar 回测任务 |
 | `quant-backtest-platform-l2-runner-*` | `l2-runner` | 领取并执行 L2 盘口回测任务 |
+| `quant-backtest-loki` | `loki` | 保存默认 30 天的任务级结构化运维日志 |
+| `quant-backtest-alloy` | `alloy` | 发现本 Compose 容器并将有限轮转日志采集到 Loki |
+| `quant-backtest-docker-socket-proxy` | `docker-socket-proxy` | 只开放容器发现、日志和事件所需的 Docker API |
+| `quant-backtest-container-event-observer` | `container-event-observer` | 关联明确的 OOM、die、restart 和 destroy 事件 |
 | `quant-backtest-frontend` | `frontend` | Nginx 前端页面和 API 反向代理 |
 
 策略 worker 没有数据库密码、没有宿主机目录挂载，并且不对外暴露端口；容器使用非 root 用户、只读文件系统、受限临时目录和内部网络。Bar/L2 的用户策略子进程也会清空环境并在 Linux 下主动降权，但目前仍与父 Runner 共享容器文件系统和网络命名空间，因此这是兼容与降权加固，不是完整安全沙箱。
@@ -118,7 +124,7 @@ quant-backtest-artifacts       回测输出文件
 
 ### 推荐：使用一键发布脚本
 
-日常升级应优先使用项目内置脚本。脚本会校验当前为 `main` 分支且工作区没有未提交改动，然后依次拉取最新代码、在脚本自身发生更新时于同一发布锁内重新执行、启动并等待 PostgreSQL 健康、执行数据库迁移和交易日历同步、重建并启动策略执行器、后端和前端，最后请求健康检查接口确认发布结果。
+日常升级应优先使用项目内置脚本。脚本会校验当前为 `main` 分支且工作区没有未提交改动，然后依次拉取最新代码、在脚本自身发生更新时于同一发布锁内重新执行、启动并等待 PostgreSQL 健康、排空在途回测、执行数据库迁移、启动并验证 Loki/Alloy/socket proxy/事件观察器、同步交易日历，再同批重建策略执行器、后端和前端，最后请求健康检查接口确认发布结果。
 
 ```bash
 cd /opt/projects/quant_backtest_platform_git
@@ -195,26 +201,37 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml --pro
 
 迁移可以重复执行。已有表、索引或列显示 `already exists, skipping` 是正常提示；命令最终必须正常结束，不能出现 `ERROR` 或事务回滚。
 
-本次运行时兼容改造需要成功执行 `025_strategy_runtime_error_stats.sql`。该迁移只创建无用户、任务和源码关联的脱敏统计表，不改变回测记录及其错误日志的级联删除关系。
+任务级日志改造需要成功执行 `041_backtest_run_attempt_diagnostics.sql`。该迁移新增每次领取不可覆盖的 Attempt 记录并扩展错误日志关联字段；删除回测任务时，Attempt 和数据库错误摘要仍随任务级联删除。
 
-### 第四步：重建并启动应用
+### 第四步：启动并验证日志基础设施
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml up -d --build --remove-orphans --scale bar-runner=12 --scale l2-runner=12 backend bar-runner l2-runner frontend
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml --profile observability up -d --build docker-socket-proxy loki alloy container-event-observer
+docker exec quant-backtest-container-event-observer python -c "import urllib.request; [urllib.request.urlopen(url, timeout=3).read(64) for url in ('http://loki:3100/ready','http://alloy:12345/-/ready','http://docker-socket-proxy:2375/_ping')]"
+```
+
+Loki、Alloy 和 socket proxy 不发布宿主机端口，只加入 `quant-backtest-observability-net` 内部网络。Docker socket 只能挂载到受限 proxy；不得把 socket 直接挂载给 Alloy 或业务服务。proxy 使用 `deploy/docker-socket-proxy/haproxy.cfg.template` 的精确 GET 白名单，只放行健康检查、版本、容器/网络发现、容器日志和事件流；容器文件归档、导出、进程列表及所有写请求均应返回 403。
+
+每个长期服务通过 `com.trend-grid.logging-network` 声明唯一采集网络，Alloy 只保留该网络对应的一个 Docker target，避免多网络容器重复采集和周期性取消告警。新增长期服务时必须同时配置有限本地日志轮转和该标签，标签值应是服务已加入的 `quant-backtest-net`、`quant-backtest-l2-net` 或 `quant-backtest-observability-net` 之一。
+
+### 第五步：重建并启动应用
+
+```bash
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml --profile observability up -d --build --remove-orphans --scale bar-runner=12 --scale l2-runner=12 backend bar-runner l2-runner signal-export-runner frontend
 ```
 
 首次拉取前端 Node 镜像或执行 `npm ci` 时，构建可能需要几分钟。
 
-### 第五步：检查容器状态
+### 第六步：检查容器状态
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml ps
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml --profile observability ps
 ```
 
 期望结果：
 
-- PostgreSQL、策略 worker、后端、Bar Runner、L2 Runner、前端均为 `Up`。
-- PostgreSQL、策略 worker 和后端应显示 `healthy`。
+- PostgreSQL、后端、Bar Runner、L2 Runner、信号导出 Runner、Loki、Alloy、socket proxy、事件观察器和前端均为 `Up`。
+- PostgreSQL、后端、信号导出 Runner、Loki、Alloy、socket proxy 和事件观察器应显示 `healthy`。
 - 前端端口应显示 `0.0.0.0:28601->80/tcp` 或等效输出。
 
 ## 6. 启动失败：端口被占用
@@ -285,6 +302,16 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml logs 
 docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml logs --tail=100 bar-runner l2-runner
 ```
 
+### 按任务 UUID 查询安全诊断
+
+管理员页面的“回测诊断日志”用于日常查看。服务器维护人员需要导出同一份有界诊断时，在 backend 容器内执行固定查询脚本；脚本不接受任意 LogQL：
+
+```bash
+docker exec quant-backtest-backend python -m scripts.query_task_logs <任务UUID>
+```
+
+若只定位一次执行尝试，可追加 `--attempt-token <Attempt UUID>`。输出仅包含 Run、Attempt、数据库安全错误摘要和允许列表中的集中日志字段，不含策略源码、请求载荷、凭据或数据库内部原始 traceback。
+
 ### 查看前端日志
 
 ```bash
@@ -300,7 +327,7 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml up -d
 ### 重建并重启全部应用容器
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml up -d --build --remove-orphans --scale bar-runner=12 --scale l2-runner=12 backend bar-runner l2-runner frontend
+docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f deploy/compose.clickhouse.yml --profile observability up -d --build --remove-orphans --scale bar-runner=12 --scale l2-runner=12 backend bar-runner l2-runner signal-export-runner frontend
 ```
 
 ## 9. 注意事项
@@ -308,6 +335,10 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f de
 - 不要把 `deploy/.env` 提交到 Git，也不要把数据库密码贴到聊天记录或文档中。
 - 不要删除 PostgreSQL 数据卷，除非确认要清空全部系统数据。
 - 每次拉取包含新 `db/migrations/*.sql` 的代码后，都要执行一次迁移命令。
+- `TREND_GRID_OBSERVABILITY_ENABLED` 只控制后端管理员日志查询。首次发布保持 `false`，先确认 Alloy target、Loki 写入和保留删除，再改为 `true` 并重建 backend；关闭它不会停止 Attempt 落库，也不会改变回测结果。
+- `TREND_GRID_LOG_RETENTION_HOURS` 默认 `720`（30 天），必须是有限正数；`TREND_GRID_LOG_LOCAL_MAX_SIZE=20m` 与 `TREND_GRID_LOG_LOCAL_MAX_FILES=5` 将每个长期运行容器的本地缓冲限制在约 100 MiB。所有日志使用非阻塞投递，日志链路故障不得占用回测槽位。
+- Loki 通过 TSDB、ingester WAL 和持久卷保存日志，Compactor 负责执行过期删除。每次发布后应检查 Loki `/ready`、Alloy `/-/ready`、Alloy 活跃 target、发送错误、Loki 卷与 Docker 日志磁盘占用，以及 Compactor 是否持续运行。
+- 日志系统异常时，先将 `TREND_GRID_OBSERVABILITY_ENABLED=false` 并重建 backend，管理员页面会回退到数据库 Attempt 摘要。可停止 Alloy、Loki 和事件观察器，业务仍可运行；不得直接删除未知 Loki 索引目录。恢复后应在本地轮转窗口内验证补采，再重新开启查询。
 - `TREND_GRID_STRATEGY_RUNTIME_ERROR_RETENTION_DAYS` 控制平台运行环境错误聚合保留期，默认 180 天；统计只含错误码、运行时版本、标准内置名称和时间。
 - `8080` 已被其他服务占用，本系统固定使用 `28601`。
 - `28681` 当前未使用，不需要为后端或 worker 单独开放。

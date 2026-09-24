@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir --only-binary=:all: --require-hashes -r /tmp/requ
   && pip check
 
 COPY backend /app/backend
+COPY scripts/query_task_logs.py /app/scripts/query_task_logs.py
 COPY deploy/release-manifest.json /app/deploy/release-manifest.json
 COPY docs/玄龄回测系统使用手册.md /app/docs/玄龄回测系统使用手册.md
 RUN printf '{"buildId":"%s","clientCompatibilityVersion":%s}\n' \

@@ -4,7 +4,11 @@ import time
 
 import pytest
 
-from backend.bar_strategy_session import BarStrategySession
+from backend.bar_strategy_session import (
+  BarStrategyProcessError,
+  BarStrategySession,
+  _process_exit_error,
+)
 from backend.services.backtest_errors import RemoteBacktestError
 from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
 
@@ -134,3 +138,25 @@ def on_bar(bar, state):
 """))
 
   assert time.monotonic() - started < 5
+
+
+def test_bar_strategy_session_records_nonzero_process_exit() -> None:
+  with pytest.raises(BarStrategyProcessError) as raised:
+    BarStrategySession().run_script(_payload("""
+import os
+
+def on_bar(bar, state):
+  os._exit(7)
+"""))
+
+  assert raised.value.exit_code == 7
+  assert raised.value.termination_reason == "strategy_exit_nonzero"
+
+
+def test_bar_strategy_session_maps_negative_exit_code_to_signal() -> None:
+  process = type("ExitedProcess", (), {"exitcode": -9})()
+
+  error = _process_exit_error(process, "signal")  # type: ignore[arg-type]
+
+  assert error.exit_code == -9
+  assert error.termination_reason == "strategy_signal"
