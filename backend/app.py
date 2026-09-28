@@ -54,9 +54,11 @@ from backend.strategies.runtime_contract import (
 from backend.services import (
   backtest_preflight,
   backtest_runner,
+  l2_quote_availability,
   market_data,
   qmt_instrument_directory,
   data_repository,
+  loki_client,
   release_notifications,
   shared_backtest_admin,
   research_signal_snapshot,
@@ -67,6 +69,7 @@ from backend.services import (
   shared_backtest_discovery,
   state_store,
   strategy_adapters,
+  task_diagnostics,
 )
 from backend.services import auth
 from backend.services.user_context import CurrentUser
@@ -453,7 +456,6 @@ def _validate_backtest_request(request: dict) -> None:
     request["fillModel"] = "bar_next_open"
   request["feeProfile"] = settings.default_fee_profile()
   request["commissionRate"] = request["feeProfile"]["commissionRate"]
-  _require_preflight(request)
   if request.get("signalDatasetId"):
     _prepare_research_signal_attachment(request)
 
@@ -463,8 +465,6 @@ def _prepare_research_signal_attachment(request: dict[str, Any]) -> None:
   if not isinstance(dataset_id, str) or not dataset_id:
     raise HTTPException(422, "研究信号数据集无效")
   try:
-    bars, warmup_bar_count, _ = backtest_runner._load_user_script_bars(request)
-    bar_times = [str(row.time) for row in bars.iloc[warmup_bar_count:].itertuples(index=False)]
     imported = state_store.get_imported_research_signal_dataset(dataset_id)
     if imported:
       artifact_path = shared_backtest_artifacts.verified_artifact_path(
@@ -475,12 +475,12 @@ def _prepare_research_signal_attachment(request: dict[str, Any]) -> None:
       imported["artifactFile"] = str(artifact_path)
       snapshot = research_signal_snapshot.freeze_imported_signal_snapshot(
         imported, request["symbol"], request["startDate"], request["endDate"],
-        request["timeframe"], bar_times,
+        request["timeframe"], [],
       )
     else:
       snapshot = research_signal_snapshot.freeze_signal_snapshot(
         dataset_id, str(state_store.current_user_id()), request["symbol"], request["startDate"],
-        request["endDate"], request["timeframe"], bar_times,
+        request["endDate"], request["timeframe"], [],
       )
   except (
     research_signal_snapshot.ResearchSignalSnapshotError,
@@ -499,28 +499,6 @@ def _prepare_research_signal_attachment(request: dict[str, Any]) -> None:
     "alignment": snapshot["alignment"],
   }
   request["savedConfigSnapshot"] = saved_snapshot
-
-def _require_preflight(request: dict[str, Any]) -> None:
-  try:
-    snapshot = backtest_preflight.require_available(
-      str(request["symbol"]), str(request["timeframe"]), str(request["startDate"]),
-      str(request["endDate"]), str(request.get("fillModel", "bar_next_open")),
-      int(request.get("warmupTradingDays", 0)),
-    )
-  except backtest_preflight.PreflightError as error:
-    raise HTTPException(422, {"errorDetail": _preflight_error_detail(error.result)}) from error
-  except BacktestFault as error:
-    raise _backtest_failure_response(error, None) from error
-  request["marketDataSnapshot"] = snapshot
-
-
-def _preflight_error_detail(result: dict[str, Any]) -> dict[str, Any]:
-  codes = list(result.get("missingDataTypes") or [])
-  return {"category": "data", "code": codes[0] if codes else "data.unavailable",
-          "message": result.get("message") or "当前日期范围数据不完整。",
-          "hint": "请调整日期范围或补齐数据后重试。", "retryable": False,
-          "taskId": None, "missingDates": result.get("missingDates") or []}
-
 
 _PUBLIC_OVERRIDE_MAP = {
   "start_date": "startDate",
@@ -649,6 +627,7 @@ def startup():
   settings.validate_public_api_configuration()
   settings.validate_research_integration_configuration()
   settings.validate_application_build_configuration()
+  settings.validate_observability_configuration()
   state_store.ensure_schema()
   state_store.prune_strategy_runtime_error_stats()
 
@@ -666,6 +645,7 @@ def health():
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "runtimeCapabilities": _verified_runtime_capabilities,
     "signalExportRunner": {"healthy": signal_export_healthy},
+    "observability": loki_client.health_status(),
   }
 
 
@@ -971,6 +951,25 @@ def admin_system_errors(
   )}
 
 
+@app.get(
+  "/api/admin/backtest-runs/{run_id}/diagnostics",
+  response_model=schemas.BacktestRunDiagnostics,
+)
+def admin_backtest_run_diagnostics(
+  run_id: UUID,
+  request: Request,
+  attempt_token: UUID | None = Query(default=None, alias="attemptToken"),
+):
+  """按任务 UUID 返回安全 Attempt 时间线，不接受任意日志查询表达式。"""
+  _require_admin(request)
+  try:
+    return task_diagnostics.get_admin_run_diagnostics(
+      str(run_id), str(attempt_token) if attempt_token else None,
+    )
+  except KeyError as error:
+    raise HTTPException(404, "回测任务不存在") from error
+
+
 @app.get("/api/admin/strategy-runtime-errors")
 def admin_strategy_runtime_errors(
   request: Request,
@@ -1262,13 +1261,6 @@ def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
     raise HTTPException(422, f"{engine_name}不支持 {timeframe}")
   if not isinstance(params, dict) or not params.get("startDate") or not params.get("endDate"):
     raise HTTPException(422, "完整策略必须包含回测开始日期和结束日期")
-  try:
-    backtest_preflight.require_available(
-      str(request["symbol"]), timeframe, str(params["startDate"]), str(params["endDate"]), str(fill_model),
-      0,
-    )
-  except backtest_preflight.PreflightError as error:
-    raise HTTPException(422, {"errorDetail": _preflight_error_detail(error.result)}) from error
 
 
 @app.post("/api/strategy-configs/{config_id}/publish")
@@ -1735,12 +1727,13 @@ def backtest_run_chart(
   except TradingDateError as error:
     raise HTTPException(422, str(error)) from error
   selected_timeframe = timeframe or str(run["timeframe"])
-  if not settings.validate_timeframe(selected_timeframe):
+  if not settings.validate_backtest_timeframe(selected_timeframe):
     raise HTTPException(422, f"不支持的周期: {selected_timeframe}")
   try:
     bars = data_repository.load_chart_bars(run["symbol"], date, selected_timeframe)
-  except ValueError as error:
-    raise HTTPException(404, str(error)) from error
+  except BacktestFault as error:
+    logger.exception("读取回测图表行情失败: %s %s", run_id, date)
+    raise _backtest_failure_response(error, run_id) from error
 
   trades, unsupported_count = _backtest_chart_trades(run, date)
   if unsupported_count:
@@ -2037,7 +2030,7 @@ def dates(
   symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   timeframe: str = Query("5m"),
 ):
-  if not settings.validate_timeframe(timeframe):
+  if not settings.validate_backtest_timeframe(timeframe):
     raise HTTPException(422, f"不支持的周期: {timeframe}")
   items = data_repository.list_dates(symbol, timeframe)
   return {"symbol": symbol, "timeframe": timeframe, "dates": items}
@@ -2051,13 +2044,17 @@ def chart(
   strategy: str = Query("trend_grid"),
   signal_file: str = Query(""),
 ):
-  if not settings.validate_timeframe(timeframe):
+  if not settings.validate_backtest_timeframe(timeframe):
     raise HTTPException(422, f"不支持的周期: {timeframe}")
 
-  result = data_repository.load_chart_data(
-    symbol, date, timeframe, strategy,
-    signal_file=signal_file or None,
-  )
+  try:
+    result = data_repository.load_chart_data(
+      symbol, date, timeframe, strategy,
+      signal_file=signal_file or None,
+    )
+  except BacktestFault as error:
+    logger.exception("读取行情图表失败: %s %s %s", symbol, timeframe, date)
+    raise _backtest_failure_response(error, None) from error
   if "error" in result:
     raise HTTPException(404, result["error"])
   return result
@@ -2067,15 +2064,26 @@ def chart(
 def data_status(
   symbol: str = Query(..., pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   timeframe: str = Query("5m"),
+  fill_model: str = Query("bar_next_open", alias="fillModel"),
 ):
-  if not settings.validate_timeframe(timeframe):
+  if not settings.validate_backtest_timeframe(timeframe):
     raise HTTPException(422, f"不支持的周期: {timeframe}")
+  normalized_fill_model = fill_model if isinstance(fill_model, str) else "bar_next_open"
+  if normalized_fill_model not in {"bar_next_open", "l2_quote"}:
+    raise HTTPException(422, f"不支持的撮合方式: {normalized_fill_model}")
   try:
-    return {"status": market_data.status(symbol, timeframe)}
-  except market_data.MarketDataError as error:
+    status = (
+      l2_quote_availability.status(symbol, timeframe)
+      if normalized_fill_model == "l2_quote" else market_data.status(symbol, timeframe)
+    )
+    return {"status": {**status, "fillModel": normalized_fill_model}}
+  except Exception as error:
+    logger.exception(
+      "读取可回测行情范围失败: %s %s %s", symbol, timeframe, normalized_fill_model,
+    )
     raise HTTPException(503, {
       "code": "data.source_unavailable",
-      "message": "行情数据源暂时不可用，请稍后重试。",
+      "message": "行情数据异常，请联系管理员",
       "retryable": True,
     }) from error
 

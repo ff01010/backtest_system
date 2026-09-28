@@ -324,8 +324,15 @@ def build_snapshot(run: dict[str, Any]) -> dict[str, Any]:
     if key in request:
       configuration[key] = project_author_json(request[key])
   dependencies: list[dict[str, Any]] = []
-  if "researchSignal" in saved:
-    research_signal = _required(saved["researchSignal"], ("snapshotHash",), "paramsSnapshot.researchSignal")
+  research_signal_source = (
+    result.get("researchSignalSnapshot")
+    if isinstance(result.get("researchSignalSnapshot"), dict)
+    else saved.get("researchSignal")
+  )
+  if research_signal_source is not None:
+    research_signal = _required(
+      research_signal_source, ("snapshotHash",), "researchSignalSnapshot",
+    )
     dependencies.append({"type": "research_signal", "summary": project_fields(research_signal, DEPENDENCY_FIELDS)})
   return {
     "strategy": project_fields(script, STRATEGY_FIELDS),

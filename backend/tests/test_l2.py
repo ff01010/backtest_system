@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import threading
 from dataclasses import asdict, replace
 from typing import Any
@@ -11,16 +12,25 @@ import pytest
 from backend.backtesting.models import Bar, OrderIntent, OrderSide, PortfolioSnapshot, PositionEffect
 from backend.l2.engine import L2ExecutionEngine
 from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteSnapshot, SourceMappingProfile, TradeEvent, parse_timestamp
-from backend.l2.config import load_temporary_quote_profile
+from backend.l2.config import load_profile, load_temporary_quote_profile
 from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError, TemporaryQuoteBarProvider, VersionedBarCache
 from backend.l2.result_adapter import normalize_l2_result
-from backend.l2.strategy_session import L2StrategySession, _redact_diagnostic_text
+from backend.l2.strategy_session import (
+  L2StrategySession,
+  StrategySessionProcessError,
+  _EngineProcessProxy,
+  _redact_diagnostic_text,
+)
 from backend import settings
-from backend.l2_runner import L2Runner, _JobLeaseKeeper, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day, _validate_quote_coverage
+from backend.l2_runner import L2Runner, _JobLeaseKeeper, _continuous_stream_chunks, _day_chunks, _expected_chunk_count, _new_performance, _quote_mode, _replay_day
 from backend.services.backtest_errors import RemoteBacktestError, error_detail
 from backend.services.system_error_catalog import classify_system_error
 from backend.services import clickhouse_client
 from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
+
+
+def _exit_strategy_session_process(_connection: Any, _payload: dict[str, Any]) -> None:
+  os._exit(9)
 
 
 class BuyStrategy:
@@ -73,6 +83,38 @@ def _bar() -> NormalizedBar:
     start_time="2026-01-02 09:30:00", end_time="2026-01-02 09:31:00",
     open=10, high=10.2, low=9.9, close=10, volume=1000, amount=10_000,
     quality="complete", source_version="v1",
+  )
+
+
+def _mapped_bar_row(**updates: Any) -> dict[str, Any]:
+  row: dict[str, Any] = {
+    "symbol": "688981.SH",
+    "trade_date": "2026-01-02",
+    "period": "1m",
+    "start_time": "2026-01-02 09:30:00",
+    "end_time": "2026-01-02 09:31:00",
+    "open": 10.0,
+    "high": 10.2,
+    "low": 9.9,
+    "close": 10.1,
+    "volume": 1000,
+    "amount": 10_000,
+    "quality": "complete",
+    "source_version": "v1",
+    "snapshot_count": 20,
+    "max_gap_ms": 3000,
+    "valid_price_count": 20,
+    "actual_duration_seconds": 60,
+  }
+  row.update(updates)
+  return row
+
+
+def _mapped_bar_profile() -> SourceMappingProfile:
+  return SourceMappingProfile(
+    source_name="mapped-bar",
+    table_name="market.bar",
+    columns={key: key for key in _mapped_bar_row()},
   )
 
 
@@ -358,36 +400,22 @@ def test_temporary_quote_mapping_uses_actual_depth_volume_columns() -> None:
   assert profile.columns["ask_volume_10"] == "ask_vol_10"
 
 
-def test_quote_coverage_uses_actual_bar_dates(monkeypatch: pytest.MonkeyPatch) -> None:
-  profile = load_temporary_quote_profile()
-  adapter = ClickHouseL2Adapter(profile)
-  queries: list[str] = []
+def test_l2_coverage_snapshot_does_not_rescan_raw_quotes(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  adapter = ClickHouseL2Adapter(load_temporary_quote_profile())
+  monkeypatch.setattr(
+    clickhouse_client,
+    "query_rows",
+    lambda *_: pytest.fail("执行快照不应再次扫描 L2 原始表"),
+  )
 
-  def query_rows(query: str) -> list[dict[str, str]]:
-    queries.append(query)
-    if query.startswith("DESCRIBE TABLE"):
-      return [{"name": column} for column in profile.columns.values()]
-    return [{"trade_date": "2026-01-02"}]
+  snapshot = adapter.coverage("688981.SH", "2026-01-02", "2026-01-30")
 
-  monkeypatch.setattr(clickhouse_client, "query_rows", query_rows)
-
-  missing_dates = adapter.missing_quote_dates("688981.SH", ["2026-01-02", "2026-01-03"])
-
-  assert missing_dates == ["2026-01-03"]
-  assert "GROUP BY trade_date" in queries[-1]
-  assert "09:30:00" in queries[-1]
-  assert "14:57:00" in queries[-1]
-
-
-def test_l2_quote_coverage_fails_before_strategy_session() -> None:
-  class CoverageProbe:
-    def missing_quote_dates(self, symbol: str, dates: list[str]) -> list[str]:
-      assert symbol == "688981.SH"
-      assert dates == ["20260102"]
-      return ["20260102"]
-
-  with pytest.raises(L2DataCoverageError, match="20260102"):
-    _validate_quote_coverage(CoverageProbe(), "688981.SH", [_bar()])  # type: ignore[arg-type]
+  assert snapshot.symbol == "688981.SH"
+  assert snapshot.start_date == "2026-01-02"
+  assert snapshot.end_date == "2026-01-30"
+  assert snapshot.complete is True
 
 
 def test_l2_quote_coverage_error_has_safe_data_message() -> None:
@@ -398,9 +426,89 @@ def test_l2_quote_coverage_error_has_safe_data_message() -> None:
   assert detail.category == "data"
   assert detail.code == "data.l2_quote_missing"
   assert detail.retryable is False
-  assert detail.message == "当前日期范围缺少 L2 十档快照。"
+  assert detail.message == "行情数据异常，请联系管理员"
   assert classification.category == "data"
   assert classification.retryable is False
+
+
+@pytest.mark.parametrize(
+  ("converter", "row", "expected_code"),
+  [
+    ("bar", {"period": "1m"}, "data.l2_bar_invalid"),
+    ("quote", {"last_price": "invalid"}, "data.l2_quote_invalid"),
+    ("trade", {"sequence": "invalid"}, "data.l2_trade_invalid"),
+    ("quote", {"time": "invalid"}, "data.l2_quote_invalid"),
+    ("trade", {"time": "invalid"}, "data.l2_trade_invalid"),
+  ],
+)
+def test_l2_row_conversion_errors_are_safe_data_faults(
+  converter: str,
+  row: dict[str, Any],
+  expected_code: str,
+) -> None:
+  adapter = ClickHouseL2Adapter(load_temporary_quote_profile())
+
+  with pytest.raises(L2DataError) as raised:
+    if converter == "bar":
+      adapter._bar_from_row(row)
+    elif converter == "quote":
+      adapter._quote_from_row(row, 1)
+    else:
+      adapter._trade_from_row(row)
+
+  detail = error_detail(raised.value)
+  assert raised.value.code == expected_code
+  assert raised.value.context == {}
+  assert detail.code == expected_code
+  assert detail.message == "行情数据异常，请联系管理员"
+
+
+def test_l2_bar_converter_rejects_invalid_timestamps_as_data_fault() -> None:
+  adapter = ClickHouseL2Adapter(_mapped_bar_profile())
+
+  with pytest.raises(L2DataError) as raised:
+    adapter._bar_from_row(_mapped_bar_row(end_time="not-a-timestamp"))
+
+  assert raised.value.code == "data.l2_bar_invalid"
+  assert error_detail(raised.value).message == "行情数据异常，请联系管理员"
+
+
+def test_mapped_l2_bar_rejects_non_complete_quality(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  adapter = ClickHouseL2Adapter(_mapped_bar_profile())
+  monkeypatch.setattr(adapter, "_validate_profile", lambda _: None)
+  monkeypatch.setattr(
+    clickhouse_client,
+    "query_rows",
+    lambda _: [_mapped_bar_row(quality="partial")],
+  )
+
+  with pytest.raises(L2DataError) as raised:
+    adapter.load_bars("688981.SH", "1m", "2026-01-02", "2026-01-02")
+
+  assert raised.value.code == "data.l2_bar_partial"
+  assert error_detail(raised.value).message == "行情数据异常，请联系管理员"
+
+
+def test_l2_mapping_rejects_invalid_numeric_scale(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    settings,
+    "L2_BAR_MAPPING_JSON",
+    json.dumps({
+      "tableName": "market.bar",
+      "columns": {"symbol": "symbol"},
+      "priceScale": "not-a-number",
+    }),
+  )
+
+  with pytest.raises(L2DataError) as raised:
+    load_profile("bar")
+
+  assert raised.value.code == "l2.config.mapping_invalid"
+  assert error_detail(raised.value).message == "行情数据异常，请联系管理员"
 
 
 def test_temporary_quote_profile_scales_only_depth_prices() -> None:
@@ -1505,6 +1613,46 @@ def test_local_strategy_session_returns_strategy_error() -> None:
     assert error.value.diagnostic["__internal_raw_traceback"]
   finally:
     session.close()
+
+
+def test_l2_strategy_session_records_nonzero_process_exit(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    "backend.l2.strategy_session._engine_process_main",
+    _exit_strategy_session_process,
+  )
+  with pytest.raises(StrategySessionProcessError) as raised:
+    L2StrategySession({
+      "scriptId": "local-exit",
+      "code": "def on_bar(bar, state):\n  return []",
+      "params": {},
+      "initialCapital": 100_000,
+      "commissionRate": 0,
+      "feeProfile": {},
+      "latencyMs": 0,
+      "passiveParticipationRate": 0.1,
+      "holdingPolicy": "overnight",
+      "symbol": "688981.SH",
+      "baseQuantity": 0,
+      "baseCostPrice": 0,
+      "t0Enabled": False,
+      "quoteMode": "order_driven",
+      "instrumentRules": {},
+    })
+
+  assert raised.value.exit_code == 9
+  assert raised.value.termination_reason == "strategy_exit_nonzero"
+
+
+def test_l2_strategy_session_maps_negative_exit_code_to_signal() -> None:
+  proxy = object.__new__(_EngineProcessProxy)
+  proxy._process = type("ExitedProcess", (), {"exitcode": -15})()  # type: ignore[assignment]
+
+  error = proxy._process_exit_error("signal")
+
+  assert error.exit_code == -15
+  assert error.termination_reason == "strategy_signal"
 
 
 def test_local_l2_strategy_session_supports_tuple_and_runtime_version() -> None:

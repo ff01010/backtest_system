@@ -634,7 +634,8 @@ export interface KlinePreviewRow {
 export interface DataStatus {
   symbol: string;
   timeframe: string;
-  path: string;
+  fillModel: 'bar_next_open' | 'l2_quote';
+  path: string | null;
   exists: boolean;
   firstDate: string | null;
   lastDate: string | null;

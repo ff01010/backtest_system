@@ -1,9 +1,9 @@
-"""回测系统错误的受控分类；原始堆栈只保留在容器日志中。"""
+"""回测系统错误的受控分类与执行尝试关联。"""
 
 from __future__ import annotations
 
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from backend.services.backtest_errors import BacktestExecutionError, RemoteBacktestError, error_detail
@@ -23,6 +23,13 @@ class SystemErrorLogRecord:
   exception_type: str
   context: dict[str, str]
   raw_log_ref: str
+  attempt_no: int | None = None
+  attempt_token: str | None = None
+  worker_id: str | None = None
+  container_id: str | None = None
+  termination_reason: str | None = None
+  exit_code: int | None = None
+  log_correlation_id: str | None = None
 
   def to_dict(self) -> dict[str, Any]:
     return asdict(self)
@@ -34,14 +41,23 @@ def system_error_log_record(
   stage: str,
   task_id: str | None = None,
   worker_id: str | None = None,
+  attempt_context: Any | None = None,
+  termination_reason: str | None = None,
+  exit_code: int | None = None,
 ) -> SystemErrorLogRecord | None:
   """记录系统错误及策略子进程拒绝任务时返回的原始诊断。"""
   if isinstance(error, RemoteBacktestError) and error.diagnostic:
-    return _strategy_process_record(error, source, stage, task_id, worker_id)
+    return _attach_attempt(
+      _strategy_process_record(error, source, stage, task_id, worker_id),
+      attempt_context, termination_reason, exit_code,
+    )
   if isinstance(error, BacktestExecutionError):
     detail = error_detail(error)
     if detail.code.startswith("runtime."):
-      return _runtime_record(error, source, stage, task_id, worker_id)
+      return _attach_attempt(
+        _runtime_record(error, source, stage, task_id, worker_id),
+        attempt_context, termination_reason, exit_code,
+      )
     if detail.category == "strategy_error":
       return None
 
@@ -54,7 +70,7 @@ def system_error_log_record(
     **_worker_context(worker_id),
     **_internal_error_context(error),
   }
-  return SystemErrorLogRecord(
+  return _attach_attempt(SystemErrorLogRecord(
     source=source,
     stage=stage,
     code=classified.code,
@@ -64,7 +80,7 @@ def system_error_log_record(
     exception_type=type(cause).__name__,
     context=context,
     raw_log_ref=_raw_log_ref(source, stage, task_id, worker_id),
-  )
+  ), attempt_context, termination_reason, exit_code)
 
 
 def _strategy_process_record(
@@ -138,6 +154,37 @@ def _runtime_record(
     exception_type=type(root_cause(error)).__name__,
     context=context,
     raw_log_ref=_raw_log_ref(source, stage, task_id, worker_id),
+  )
+
+
+def _attach_attempt(
+  record: SystemErrorLogRecord,
+  context: Any | None,
+  termination_reason: str | None,
+  exit_code: int | None,
+) -> SystemErrorLogRecord:
+  if context is None:
+    return replace(
+      record, termination_reason=termination_reason, exit_code=exit_code,
+    )
+  attempt_no = getattr(context, "attempt_no", None)
+  attempt_token = getattr(context, "attempt_token", None)
+  worker_id = getattr(context, "worker_id", None)
+  container_id = getattr(context, "container_id", None)
+  correlation_id = str(attempt_token) if attempt_token else None
+  raw_log_ref = record.raw_log_ref
+  if correlation_id:
+    raw_log_ref = f"{raw_log_ref}; attemptToken={correlation_id}"
+  return replace(
+    record,
+    raw_log_ref=raw_log_ref,
+    attempt_no=int(attempt_no) if attempt_no is not None else None,
+    attempt_token=correlation_id,
+    worker_id=str(worker_id) if worker_id else record.worker_id,
+    container_id=str(container_id) if container_id else None,
+    termination_reason=termination_reason,
+    exit_code=exit_code,
+    log_correlation_id=correlation_id,
   )
 
 

@@ -33,6 +33,15 @@ def test_freeze_snapshot_canonicalizes_and_writes_exact_rows(monkeypatch: pytest
   lines = Path(snapshot["artifactFile"]).read_text(encoding="utf-8").splitlines()
   assert '"signalId":"b"' in lines[0]
   assert len(snapshot["snapshotHash"]) == 64
+  assert snapshot["alignmentPlan"] == []
+
+  aligned = research_signal_snapshot.align_frozen_signal_snapshot(
+    snapshot, ["20260105093000", "20260106093000"],
+  )
+
+  assert [item["signalId"] for item in aligned["alignmentPlan"]] == ["b", "a"]
+  assert aligned["alignment"]["alignedCount"] == 2
+  assert aligned["alignment"]["unmatchedCount"] == 0
 
 
 def test_freeze_snapshot_rejects_duplicate_event_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

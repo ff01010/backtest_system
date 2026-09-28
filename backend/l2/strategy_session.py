@@ -30,6 +30,17 @@ from backend.strategies.scripted import ScriptedBarStrategy
 class StrategySessionProcessError(RuntimeError):
   """策略会话子进程异常退出或 IPC 协议失效。"""
 
+  def __init__(
+    self,
+    message: str,
+    *,
+    exit_code: int | None = None,
+    termination_reason: str = "unknown_interruption",
+  ) -> None:
+    super().__init__(message)
+    self.exit_code = exit_code
+    self.termination_reason = termination_reason
+
 
 class L2StrategySession:
   """将一个任务的策略与撮合放在独立子进程中批量执行。"""
@@ -133,7 +144,8 @@ class _EngineProcessProxy:
       self._connection.send({"operation": operation, "payload": payload})
       return self._receive(operation)
     except (BrokenPipeError, EOFError, OSError) as error:
-      raise StrategySessionProcessError("策略会话进程通信中断") from error
+      self._process.join(timeout=0.2)
+      raise self._process_exit_error("策略会话进程通信中断") from error
     finally:
       self._elapsed_ms += (time.perf_counter() - started) * 1000
       self._calls += 1
@@ -162,8 +174,14 @@ class _EngineProcessProxy:
     while not self._connection.poll(self._POLL_SECONDS):
       self._check_abort()
       if not self._process.is_alive():
-        raise StrategySessionProcessError(f"策略会话在 {operation} 阶段异常退出")
-    message = self._connection.recv()
+        raise self._process_exit_error(f"策略会话在 {operation} 阶段异常退出")
+    try:
+      message = self._connection.recv()
+    except (BrokenPipeError, EOFError, OSError) as error:
+      self._process.join(timeout=0.2)
+      raise self._process_exit_error(
+        f"策略会话在 {operation} 阶段通信中断",
+      ) from error
     if not isinstance(message, dict):
       raise StrategySessionProcessError("策略会话返回了无效消息")
     if message.get("status") == "error":
@@ -198,6 +216,20 @@ class _EngineProcessProxy:
     if self._process.is_alive():
       self._process.terminate()
       self._process.join(timeout=2)
+
+  def _process_exit_error(self, message: str) -> StrategySessionProcessError:
+    exit_code = self._process.exitcode
+    if exit_code is None:
+      reason = "unknown_interruption"
+    elif exit_code < 0:
+      reason = "strategy_signal"
+    elif exit_code > 0:
+      reason = "strategy_exit_nonzero"
+    else:
+      reason = "unknown_interruption"
+    return StrategySessionProcessError(
+      message, exit_code=exit_code, termination_reason=reason,
+    )
 
 
 def _engine_process_main(connection: Connection, payload: dict[str, Any]) -> None:

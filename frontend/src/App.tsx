@@ -68,6 +68,8 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
   const [loading, setLoading] = useState(false);
 
   const chartRequestRef = useRef(0);
+  const selectedChartDateRef = useRef(urlParams.date);
+  selectedChartDateRef.current = urlParams.date;
   const signalModules: DisplayModule[] = ['A', 'B'];
   const signalSides: DisplaySide[] = ['BUY', 'SELL'];
 
@@ -79,18 +81,19 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
 
   // load dates when symbol changes
   useEffect(() => {
+    if (activePage !== 'signals') return undefined;
     let cancelled = false;
     fetchDates(urlParams.symbol, urlParams.timeframe).then((d) => {
       if (cancelled) return;
       setDates(d);
       // If current date not in list, pick first available
-      if (d.length > 0 && !d.find((x) => x.date === urlParams.date)) {
+      if (d.length > 0 && !d.find((x) => x.date === selectedChartDateRef.current)) {
         const best = d.find((x) => x.hasKline && x.hasSignal) || d.find((x) => x.hasKline) || d[0];
         setUrlParams({ date: best.date });
       }
     }).catch(() => {});
     return () => { cancelled = true; };
-  }, [urlParams.symbol, urlParams.date, urlParams.timeframe, setUrlParams]);
+  }, [activePage, urlParams.symbol, urlParams.timeframe, setUrlParams]);
 
   const toBacktestChartData = useCallback((response: BacktestChartResponse): ChartResponse => ({
     symbol: response.symbol,
@@ -136,8 +139,13 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
   }, [toBacktestChartData, urlParams.date, urlParams.runId, urlParams.symbol, urlParams.timeframe]);
 
   useEffect(() => {
-    loadChart();
-  }, [loadChart]);
+    if (activePage !== 'signals') {
+      chartRequestRef.current += 1;
+      setLoading(false);
+      return;
+    }
+    void loadChart();
+  }, [activePage, loadChart]);
 
   // date navigation — dates 按日期倒序（最新在前），offset +1 = 更旧
   const navByOffset = useCallback((offset: number) => {

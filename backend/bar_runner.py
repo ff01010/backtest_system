@@ -12,9 +12,10 @@ from typing import Any
 from backend import settings
 from backend.bar_strategy_session import BarStrategySession
 from backend.services import backtest_runner, research_result_outbox, state_store
-from backend.services.backtest_errors import error_summary, error_terminal_status
+from backend.services.backtest_errors import error_detail, error_summary, error_terminal_status
 from backend.services.backtest_faults import BacktestFault
 from backend.services.system_error_log import system_error_log_record
+from backend.services.task_diagnostics import AttemptDiagnostics, termination_from_error
 from backend.strategies.runtime_contract import (
   RUNTIME_CAPABILITY_DIGEST,
   SCRIPT_RUNTIME_VERSION,
@@ -105,33 +106,65 @@ class BarRunner:
 
   def _run_job(self, job: dict[str, Any]) -> None:
     lease = _BarJobLeaseKeeper(job, self._worker_id)
-    stage = "bar.initialize"
+    attempt = AttemptDiagnostics.start(
+      job, "bar", self._worker_id, service="bar-runner",
+    )
+    attempt.stage("bar.initialize")
     try:
       lease.start()
       payload = dict(job["payload"])
-      stage = "bar.backtest"
+      attempt.stage("bar.backtest")
       if payload.get("strategy") in {"user_script", "research_signal"}:
+        attempt.emit(
+          "strategy_process.started", "策略子进程已启动", stage="bar.backtest",
+        )
         session = BarStrategySession(lease.ensure_active, settings.BACKTEST_CANCEL_GRACE_SECONDS)
         result = backtest_runner.run_backtest(payload, session.run_script)
+        attempt.emit(
+          "strategy_process.exited", "策略子进程已正常退出",
+          stage="bar.backtest", exitCode=0,
+        )
       else:
         result = backtest_runner.run_backtest(payload)
       lease.ensure_active()
       summary = dict(result["summary"])
       summary["warningCount"] = len(result.get("warnings") or [])
       summary["fillModel"] = str(payload.get("fillModel", "bar_next_open"))
-      state_store.finish_bar_backtest_job(job["runId"], job["attemptToken"], "succeeded", summary, result)
+      completed = state_store.finish_bar_backtest_job(
+        job["runId"], job["attemptToken"], "succeeded", summary, result,
+        termination_reason="completed", stage=attempt.stage_name,
+      )
+      if completed:
+        attempt.finish("succeeded", "completed")
       _dispatch_research_result_outbox()
     except Exception as error:
-      logger.exception("标准 Bar 回测任务失败: %s", job["runId"])
+      logger.error(
+        "标准 Bar 回测任务失败: task=%s exception=%s",
+        job["runId"], type(error).__name__,
+      )
       status = error_terminal_status(error)
+      termination_reason, exit_code = termination_from_error(error)
+      if status == "cancelled":
+        termination_reason = "cancelled_by_user"
+      error_code = error_detail(error, job["runId"]).code
+      if status == "failed":
+        attempt.record_exception(error)
       system_error = None
       if status == "failed":
-        system_error = system_error_log_record(error, "bar_runner", stage, job["runId"])
-      state_store.finish_bar_backtest_job(
+        system_error = system_error_log_record(
+          error, "bar_runner", attempt.stage_name, job["runId"],
+          worker_id=self._worker_id, attempt_context=attempt.context,
+          termination_reason=termination_reason, exit_code=exit_code,
+        )
+      completed = state_store.finish_bar_backtest_job(
         job["runId"], job["attemptToken"], status, error_summary(error, job["runId"]),
         system_error=system_error.to_dict() if system_error else None,
         owner_user_id=job["ownerUserId"],
+        termination_reason=termination_reason, exit_code=exit_code,
+        error_code=error_code, stage=attempt.stage_name,
       )
+      if completed and status == "cancelled":
+        attempt.finish("cancelled", "cancelled_by_user", error_code=error_code)
       _dispatch_research_result_outbox()
     finally:
       lease.stop()

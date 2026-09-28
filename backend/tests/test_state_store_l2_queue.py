@@ -145,9 +145,14 @@ def test_claim_l2_job_preserves_attempt_token_result_contract(monkeypatch: Any) 
     "attemptNo": 2,
     "attemptToken": "attempt-2",
   }
-  assert "INSERT INTO backtest_execution_slot" in cursor.commands[7][0]
-  assert "UPDATE backtest_run SET status='running'" in cursor.commands[8][0]
-  assert cursor.commands[8][1] == ("run-1",)
+  slot_command = next(
+    item for item in cursor.commands if "INSERT INTO backtest_execution_slot" in item[0]
+  )
+  run_command = next(
+    item for item in cursor.commands if "UPDATE backtest_run SET status='running'" in item[0]
+  )
+  assert slot_command[1] is not None
+  assert run_command[1] == ("run-1",)
 
   claim_update, claim_params = cursor.commands[6]
   assert "runtime_version=%s AND capability_digest=%s" in claim_update
@@ -156,6 +161,29 @@ def test_claim_l2_job_preserves_attempt_token_result_contract(monkeypatch: Any) 
     state_store.SCRIPT_RUNTIME_VERSION,
     state_store.RUNTIME_CAPABILITY_DIGEST,
   )
+
+
+def test_claim_persists_each_attempt_without_overwriting_expired_attempt() -> None:
+  job_row = {
+    "run_id": "run-b", "owner_user_id": "user-b", "payload": {},
+    "attempt_no": 2, "attempt_token": "attempt-b", "lease_expires_at": "later",
+  }
+  cursor = FakeCursor(None, fetch_rows=[
+    {
+      "job_kind": "bar", "run_id": "run-b", "owner_user_id": "user-b",
+      "owner_active_count": 0,
+    },
+    {"active_count": 0, "override_limit": None},
+    job_row,
+  ])
+
+  claimed = state_store._claim_backtest_job(cursor, "bar", "runner-b", 30)
+
+  assert claimed == job_row
+  commands = "\n".join(query for query, _ in cursor.commands)
+  assert "UPDATE backtest_run_attempt" in commands
+  assert "termination_reason='lease_expired'" in commands
+  assert "INSERT INTO backtest_run_attempt" in commands
 
 
 def test_queued_job_freezes_runtime_route_in_columns_and_payload(monkeypatch: Any) -> None:
@@ -213,7 +241,10 @@ def test_global_scheduler_uses_fairness_burst_for_user_without_slot(monkeypatch:
   claimed = state_store._claim_backtest_job(cursor, "bar", "runner-b", 30)
 
   assert claimed == job_row
-  slot_params = cursor.commands[7][1]
+  slot_params = next(
+    params for query, params in cursor.commands
+    if "INSERT INTO backtest_execution_slot" in query
+  )
   assert slot_params is not None
   assert slot_params[5] is True
 
@@ -299,9 +330,12 @@ def test_finish_bar_backtest_job_preserves_terminal_status_without_research_snap
   assert "UPDATE bar_backtest_job" in cursor.commands[0][0]
   assert cursor.commands[0][1] == (status, None, "run-1", "attempt-1")
   assert "UPDATE backtest_run" in cursor.commands[1][0]
+  assert "market_data_snapshot=COALESCE" in cursor.commands[1][0]
   assert cursor.commands[1][1][0] == status
   assert "DELETE FROM backtest_execution_slot" in cursor.commands[2][0]
-  enqueue_query, enqueue_params = cursor.commands[3]
+  enqueue_query, enqueue_params = next(
+    item for item in cursor.commands if "FROM research_signal_snapshot" in item[0]
+  )
   assert "FROM research_signal_snapshot" in enqueue_query
   assert "'backtestInstanceId', %s::text" in enqueue_query
   assert "'status', %s::text" in enqueue_query
@@ -320,7 +354,8 @@ def test_finish_bar_backtest_job_skips_result_outbox_when_reporting_disabled(
     "run-1", "attempt-1", "succeeded", {"totalReturn": 0.1}, {"equity": []},
   ) is True
 
-  assert len(cursor.commands) == 3
+  assert len(cursor.commands) == 4
+  assert "UPDATE backtest_run_attempt" in cursor.commands[3][0]
 
 
 def test_finish_job_keeps_database_cancellation_over_late_success() -> None:
@@ -336,6 +371,27 @@ def test_finish_job_keeps_database_cancellation_over_late_success() -> None:
   assert main_params is not None
   assert main_params[0] == "cancelled"
   assert main_params[2] is None
+
+
+def test_actual_worker_data_snapshot_is_extracted_for_run_history() -> None:
+  bar_snapshot = {"provider": "qmt_kline", "hash": "bar-hash"}
+  bar_result = {
+    "experimentManifest": {"databaseSnapshot": bar_snapshot},
+  }
+  l2_result = {
+    "dataSnapshot": {
+      "bar": {"provider": "mapped_l2_bar", "hash": "l2-bar-hash"},
+      "quote": {"source_name": "quant.tick_quote"},
+    },
+  }
+
+  assert state_store._market_data_snapshot_from_result(bar_result) == {
+    "barSnapshot": bar_snapshot,
+  }
+  assert state_store._market_data_snapshot_from_result(l2_result) == {
+    "barSnapshot": l2_result["dataSnapshot"]["bar"],
+    "l2Snapshot": l2_result["dataSnapshot"],
+  }
 
 def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypatch: Any) -> None:
   cursor = FakeCursor(None)
@@ -409,3 +465,38 @@ def test_save_research_signal_snapshot_rejects_storage_key_content_conflict(
 
   with pytest.raises(state_store.DatabaseError, match="已有存储记录冲突"):
     state_store._save_research_signal_snapshot(cursor, "run-2", "user-1", snapshot)
+
+
+def test_normalize_legacy_l2_run_sanitizes_summary_after_result_adapter(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    "backend.l2.result_adapter.normalize_l2_result",
+    lambda *_: {
+      "summary": {
+        "error": "internal L2 source detail",
+        "errorDetail": {
+          "category": "data",
+          "code": "data.l2_quote_invalid",
+          "message": "internal L2 source detail",
+          "hint": "raw table detail",
+        },
+      },
+    },
+  )
+  row = {
+    "requested_params": {},
+    "fill_model": "l2_quote",
+    "result_json": {"legacy": True},
+    "result_summary": {},
+    "id": "run-1",
+    "display_no": 1,
+    "status": "failed",
+    "created_at": None,
+  }
+
+  normalized = state_store._normalize_run(row)
+
+  assert normalized["summaryJson"]["error"] == "行情数据异常，请联系管理员"
+  assert normalized["summaryJson"]["errorDetail"]["message"] == "行情数据异常，请联系管理员"
+  assert normalized["summaryJson"]["errorDetail"]["hint"] is None

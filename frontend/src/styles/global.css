@@ -3534,6 +3534,13 @@ button, input, select, textarea {
   gap: 8px;
 }
 
+.backtest-date-apply-error {
+  margin-top: 7px;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .backtest-date-trigger {
   display: flex;
   align-items: center;

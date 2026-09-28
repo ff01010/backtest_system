@@ -17,12 +17,17 @@ from backend import settings
 from backend.date_codec import format_api_date
 from backend.l2.config import has_profile, load_profile, load_temporary_quote_profile
 from backend.l2.models import NormalizedBar, QuoteSnapshot, TradeEvent, parse_timestamp
-from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError, L2DataError
+from backend.l2.providers import ClickHouseL2Adapter, L2DataError
 from backend.l2.result_adapter import normalize_l2_result
 from backend.l2.strategy_session import L2StrategySession
-from backend.services.backtest_errors import RemoteBacktestError, error_summary, error_terminal_status
-from backend.services import bar_data, state_store
+from backend.services.backtest_errors import (
+  error_detail,
+  error_summary,
+  error_terminal_status,
+)
+from backend.services import bar_data, l2_quote_availability, state_store
 from backend.services.system_error_log import system_error_log_record
+from backend.services.task_diagnostics import AttemptDiagnostics, termination_from_error
 from backend.strategies.scripted import quote_mode_for_script
 from backend.strategies.runtime_contract import (
   RUNTIME_CAPABILITY_DIGEST,
@@ -110,25 +115,33 @@ class L2Runner:
     session: L2StrategySession | None = None
     lease = _JobLeaseKeeper(job, self._worker_id)
     completed = False
-    stage = "l2.initialize"
+    attempt = AttemptDiagnostics.start(
+      job, "l2", self._worker_id, service="l2-runner",
+    )
+    attempt.stage("l2.initialize")
     try:
       lease.start()
       started_at = time.perf_counter()
       payload = dict(job["payload"])
       quote_provider = ClickHouseL2Adapter(load_profile("quote") if has_profile("quote") else load_temporary_quote_profile())
       bar_read_started = time.perf_counter()
-      stage = "l2.bar_load"
+      attempt.stage("l2.bar_load")
       bars, bar_snapshot = bar_data.load_normalized_bars_with_snapshot(
         payload["symbol"], payload["timeframe"], payload["startDate"], payload["endDate"],
       )
-      stage = "l2.quote_coverage"
-      _validate_quote_coverage(quote_provider, payload["symbol"], bars)
-      stage = "l2.strategy_session"
+      attempt.stage("l2.quote_coverage")
+      l2_quote_availability.require_summarized_quote_dates(
+        payload["symbol"], sorted(_bars_by_day(bars)),
+      )
+      attempt.stage("l2.strategy_session")
+      attempt.emit(
+        "strategy_process.started", "策略子进程已启动", stage="l2.strategy_session",
+      )
       session = L2StrategySession(self._session_payload(payload), lease.ensure_active)
       quote_mode = _quote_mode(payload)
       performance = _new_performance(quote_mode)
       performance["barReadMs"] = _elapsed_ms(bar_read_started)
-      stage = "l2.market_replay"
+      attempt.stage("l2.market_replay")
       for trade_date, day_bars in _bars_by_day(bars).items():
         if quote_mode == "continuous":
           _replay_day_continuous(
@@ -140,40 +153,56 @@ class L2Runner:
             session, day_bars, quote_provider, payload["symbol"], trade_date,
             job, performance,
           )
-      stage = "l2.result_finalize"
+      attempt.stage("l2.result_finalize")
       raw_result = session.result()
       session.close()
       session = None
+      attempt.emit(
+        "strategy_process.exited", "策略子进程已正常退出",
+        stage="l2.result_finalize", exitCode=0,
+      )
       raw_result["dataSnapshot"] = _data_snapshot(bar_snapshot, quote_provider, payload, quote_mode)
       performance["totalElapsedMs"] = _elapsed_ms(started_at)
       raw_result["performance"] = performance
       result = normalize_l2_result(raw_result, payload)
       summary = _summary(result)
       lease.ensure_active()
-      completed = state_store.finish_l2_backtest_job(job["runId"], job["attemptToken"], "succeeded", summary, result)
+      completed = state_store.finish_l2_backtest_job(
+        job["runId"], job["attemptToken"], "succeeded", summary, result,
+        termination_reason="completed", stage=attempt.stage_name,
+      )
       if not completed:
         logger.warning("L2 任务 %s 已由新的执行尝试接管", job["runId"])
+      else:
+        attempt.finish("succeeded", "completed")
     except Exception as error:
-      logger.exception("L2 回测任务失败: %s", job["runId"])
-      if isinstance(error, RemoteBacktestError) and error.diagnostic:
-        logger.error(
-          "L2 策略子会话诊断: task=%s type=%s reason=%s trace=%s",
-          job["runId"],
-          error.diagnostic.get("exceptionType", "Unknown"),
-          error.diagnostic.get("reason", ""),
-          error.diagnostic.get("trace", ""),
-        )
+      logger.error(
+        "L2 回测任务失败: task=%s exception=%s",
+        job["runId"], type(error).__name__,
+      )
       status = error_terminal_status(error)
+      termination_reason, exit_code = termination_from_error(error)
+      if status == "cancelled":
+        termination_reason = "cancelled_by_user"
+      error_code = error_detail(error, job["runId"]).code
+      if status == "failed":
+        attempt.record_exception(error)
       system_error = None
       if status == "failed":
         system_error = system_error_log_record(
-          error, "l2_runner", stage, job["runId"], worker_id=self._worker_id,
+          error, "l2_runner", attempt.stage_name, job["runId"],
+          worker_id=self._worker_id, attempt_context=attempt.context,
+          termination_reason=termination_reason, exit_code=exit_code,
         )
-      state_store.finish_l2_backtest_job(
+      completed = state_store.finish_l2_backtest_job(
         job["runId"], job["attemptToken"], status, error_summary(error, job["runId"]),
         system_error=system_error.to_dict() if system_error else None,
         owner_user_id=job["ownerUserId"],
+        termination_reason=termination_reason, exit_code=exit_code,
+        error_code=error_code, stage=attempt.stage_name,
       )
+      if completed and status == "cancelled":
+        attempt.finish("cancelled", "cancelled_by_user", error_code=error_code)
     finally:
       if session is not None:
         session.close()
@@ -237,16 +266,6 @@ def _overlay_settlement_policy(payload: dict[str, Any]) -> str:
   if policy in {"intraday_restore", "cross_day_carry"}:
     return policy
   return "intraday_restore"
-
-
-def _validate_quote_coverage(
-  quote_provider: ClickHouseL2Adapter,
-  symbol: str,
-  bars: list[NormalizedBar],
-) -> None:
-  missing_dates = quote_provider.missing_quote_dates(symbol, [bar.trade_date for bar in bars])
-  if missing_dates:
-    raise L2DataCoverageError(symbol, missing_dates)
 
 
 def _quote_mode(payload: dict[str, Any]) -> str:

@@ -67,6 +67,29 @@ def test_research_reporting_requires_target_configuration(monkeypatch: pytest.Mo
     settings.validate_research_integration_configuration()
 
 
+def test_observability_rejects_public_loki_url(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(settings, "OBSERVABILITY_ENABLED", True)
+  monkeypatch.setattr(settings, "LOKI_URL", "https://logs.example.com")
+
+  with pytest.raises(ValueError, match="内部 HTTP|内部服务名"):
+    settings.validate_observability_configuration()
+
+
+def test_observability_accepts_internal_loki_service(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(settings, "OBSERVABILITY_ENABLED", True)
+  monkeypatch.setattr(settings, "LOKI_URL", "http://loki:3100")
+  monkeypatch.setattr(settings, "LOG_LOCAL_MAX_SIZE", "20m")
+
+  settings.validate_observability_configuration()
+
+
+def test_observability_rejects_unsafe_compose_project(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(settings, "COMPOSE_PROJECT_NAME", "platform\"} | line_format \"secret\"")
+
+  with pytest.raises(ValueError, match="安全的 Compose 项目名"):
+    settings.validate_observability_configuration()
+
+
 def test_l2_strategy_config_accepts_derived_l2_timeframe() -> None:
   assert settings.validate_l2_backtest_timeframe("3m")
   assert settings.validate_backtest_timeframe("3m")

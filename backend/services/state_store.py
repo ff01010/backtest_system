@@ -20,6 +20,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend import settings
+from backend.services.backtest_errors import normalize_public_error_summary
 from backend.services import shared_backtest_artifacts, shared_backtest_snapshot
 from backend.services.user_context import get_current_user
 from backend.strategies.runtime_contract import (
@@ -353,7 +354,7 @@ def list_open_trade_dates(start_date: str, end_date: str, exchange: str = "SSE")
 
 
 def is_trade_calendar_range_covered(start_date: str, end_date: str, exchange: str = "SSE") -> bool:
-  """仅当每个自然日都有日历记录时才允许预检使用该区间。"""
+  """仅当每个自然日都有记录时，Worker 才能确定完整目标交易日。"""
   start = date.fromisoformat(start_date)
   end = date.fromisoformat(end_date)
   expected_count = (end - start).days + 1
@@ -397,6 +398,27 @@ def list_l2_quote_daily_availability(
           "lastQuoteTime": str(row["last_quote_time"] or ""),
         }
         for row in cur.fetchall()
+      }
+
+
+def l2_quote_availability_range(source_key: str, symbol: str) -> dict[str, Any]:
+  """只从日级摘要读取标的已有完整 L2 行情的起止日期。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT min(trade_date) AS first_date,
+               max(trade_date) AS last_date,
+               sum(snapshot_count) AS snapshot_count,
+               max(checked_at) AS checked_at
+        FROM l2_quote_daily_availability
+        WHERE source_key=%s AND symbol=%s AND status='complete'
+      """, (source_key, symbol))
+      row = cur.fetchone() or {}
+      return {
+        "firstDate": str(row["first_date"]) if row.get("first_date") else None,
+        "lastDate": str(row["last_date"]) if row.get("last_date") else None,
+        "snapshotCount": int(row.get("snapshot_count") or 0),
+        "checkedAt": _format_time(row.get("checked_at")),
       }
 
 
@@ -675,12 +697,14 @@ def _normalize_run(row: dict[str, Any]) -> dict[str, Any]:
   fill_model = row.get("fill_model") or "bar_close_signal_fill"
   raw_result = _json(row.get("result_json"), None)
   result = raw_result
-  summary = _json(row.get("result_summary"), {})
+  raw_summary = _json(row.get("result_summary"), {})
+  summary = raw_summary if isinstance(raw_summary, dict) else {}
   if fill_model == "l2_quote" and isinstance(raw_result, dict):
     from backend.l2.result_adapter import normalize_l2_result
 
     result = normalize_l2_result(raw_result, request)
     summary = result["summary"]
+  summary = normalize_public_error_summary(summary if isinstance(summary, dict) else {})
   category = request.get("strategyCategory")
   if category not in {"core_position_overlay", "directional_holding"}:
     category = "core_position_overlay" if int(request.get("baseQuantity") or 0) > 0 or bool(request.get("t0Enabled")) else "directional_holding"
@@ -1569,7 +1593,16 @@ def _finalize_expired_backtest_jobs(cur: Any) -> None:
         UPDATE {table}
         SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
         WHERE status='cancelling' AND lease_expires_at < now()
-        RETURNING run_id
+        RETURNING run_id, attempt_token
+      ), finalized_attempts AS (
+        UPDATE backtest_run_attempt AS attempt
+        SET status='cancelled', termination_reason='cancelled_by_user',
+          finished_at=now(), heartbeat_at=now()
+        FROM expired_jobs
+        WHERE attempt.run_id=expired_jobs.run_id
+          AND attempt.attempt_token=expired_jobs.attempt_token
+          AND attempt.status='running'
+        RETURNING attempt.run_id
       )
       UPDATE backtest_run AS run
       SET status='cancelled', error_message=NULL, finished_at=now()
@@ -1820,6 +1853,11 @@ def _claim_backtest_job(
   if not row:
     return None
   cur.execute("""
+    UPDATE backtest_run_attempt
+    SET status='interrupted', termination_reason='lease_expired', finished_at=now()
+    WHERE run_id=%s AND status='running' AND attempt_token IS DISTINCT FROM %s
+  """, (row["run_id"], row["attempt_token"]))
+  cur.execute("""
     INSERT INTO backtest_execution_slot (
       run_id, owner_user_id, job_kind, attempt_token, worker_id, is_burst, lease_expires_at
     ) VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -1830,7 +1868,28 @@ def _claim_backtest_job(
     row["run_id"], row["owner_user_id"], job_kind, row["attempt_token"], worker_id,
     active_count >= settings.BACKTEST_BASE_CONCURRENCY, row["lease_expires_at"],
   ))
+  container_id, process_id = _worker_identity(worker_id)
+  cur.execute("""
+    INSERT INTO backtest_run_attempt (
+      run_id, owner_user_id, job_kind, attempt_no, attempt_token, worker_id,
+      container_id, process_id, application_build_id, runtime_version,
+      capability_digest, status, stage, log_correlation_id
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+      'running', 'attempt.claimed', %s)
+  """, (
+    row["run_id"], row["owner_user_id"], job_kind, row["attempt_no"],
+    row["attempt_token"], worker_id, container_id, process_id,
+    settings.APPLICATION_BUILD_ID, runtime_version, capability_digest,
+    str(row["attempt_token"]),
+  ))
   return row
+
+
+def _worker_identity(worker_id: str) -> tuple[str, int | None]:
+  """从固定 workerId 解析容器名和 PID，不依赖可变环境。"""
+  container_id, separator, process_text = worker_id.partition(":")
+  process_id = int(process_text) if separator and process_text.isdigit() else None
+  return container_id[:64] or "unknown", process_id
 
 
 def claim_l2_backtest_job(
@@ -1926,6 +1985,14 @@ def _heartbeat_backtest_job(
       SET lease_expires_at=now() + make_interval(secs => %s), updated_at=now()
       WHERE run_id=%s AND attempt_token=%s AND status='running' AND NOT cancel_requested
       RETURNING run_id, attempt_token, lease_expires_at
+    ), renewed_attempt AS (
+      UPDATE backtest_run_attempt AS attempt
+      SET heartbeat_at=now()
+      FROM renewed_job
+      WHERE attempt.run_id=renewed_job.run_id
+        AND attempt.attempt_token=renewed_job.attempt_token
+        AND attempt.status='running'
+      RETURNING attempt.run_id
     )
     UPDATE backtest_execution_slot AS slot
     SET lease_expires_at=renewed_job.lease_expires_at
@@ -1941,6 +2008,87 @@ def _heartbeat_backtest_job(
   return renewed
 
 
+def update_backtest_attempt_stage(
+  run_id: str,
+  attempt_token: str,
+  stage: str,
+) -> bool:
+  """保存低频阶段切换；迟到 Runner 不能修改已结束的 Attempt。"""
+  if not re.fullmatch(r"[a-z][a-z0-9_.]{1,127}", stage):
+    raise ValueError("Attempt 阶段名无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_run_attempt
+        SET stage=%s, heartbeat_at=now()
+        WHERE run_id=%s AND attempt_token=%s AND status='running'
+        RETURNING run_id
+      """, (stage, run_id, attempt_token))
+      return cur.fetchone() is not None
+
+
+def interrupt_worker_attempts(
+  worker_id: str,
+  termination_reason: str,
+  exit_code: int | None = None,
+) -> list[dict[str, Any]]:
+  """Supervisor 尽力收敛退出 Runner 的 Attempt，不改写 Run 终态。"""
+  if termination_reason not in {"runner_exit_nonzero", "unknown_interruption"}:
+    raise ValueError("Runner 中断原因无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_run_attempt
+        SET status='interrupted', termination_reason=%s, exit_code=%s, finished_at=now()
+        WHERE worker_id=%s AND status='running'
+        RETURNING run_id, attempt_no, attempt_token, job_kind, worker_id,
+          container_id, process_id, application_build_id, runtime_version,
+          capability_digest, stage
+      """, (termination_reason, exit_code, worker_id))
+      return [_normalize_active_attempt(row) for row in cur.fetchall()]
+
+
+def interrupt_container_attempts(
+  container_id: str,
+  termination_reason: str,
+  exit_code: int | None = None,
+) -> list[dict[str, Any]]:
+  """容器观察器只结束 Attempt 诊断事实，Run 仍由租约调度收敛。"""
+  if termination_reason not in {"container_oom", "container_died"}:
+    raise ValueError("容器中断原因无效")
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_run_attempt
+        SET status='interrupted', termination_reason=%s, exit_code=%s, finished_at=now()
+        WHERE status='running' AND (
+          container_id=%s OR container_id LIKE %s OR %s LIKE container_id || '%%'
+        )
+        RETURNING run_id, attempt_no, attempt_token, job_kind, worker_id,
+          container_id, process_id, application_build_id, runtime_version,
+          capability_digest, stage
+      """, (
+        termination_reason, exit_code, container_id, f"{container_id}%", container_id,
+      ))
+      return [_normalize_active_attempt(row) for row in cur.fetchall()]
+
+
+def _normalize_active_attempt(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "runId": _uuid(row["run_id"]),
+    "attemptNo": int(row["attempt_no"]),
+    "attemptToken": _uuid(row["attempt_token"]),
+    "jobKind": str(row["job_kind"]),
+    "workerId": str(row["worker_id"]),
+    "containerId": str(row["container_id"]),
+    "processId": row.get("process_id"),
+    "applicationBuildId": str(row["application_build_id"]),
+    "runtimeVersion": str(row["runtime_version"]),
+    "capabilityDigest": str(row["capability_digest"]),
+    "stage": str(row["stage"]),
+  }
+
+
 def finish_l2_backtest_job(
   run_id: str,
   attempt_token: str,
@@ -1949,6 +2097,10 @@ def finish_l2_backtest_job(
   result: dict[str, Any] | None = None,
   system_error: dict[str, Any] | None = None,
   owner_user_id: str | None = None,
+  termination_reason: str | None = None,
+  exit_code: int | None = None,
+  error_code: str | None = None,
+  stage: str | None = None,
 ) -> bool:
   """按尝试令牌提交终态，旧 runner 无法覆盖新的运行结果。"""
   if status not in {"succeeded", "failed", "cancelled"}:
@@ -1957,6 +2109,7 @@ def finish_l2_backtest_job(
     with conn.cursor() as cur:
       effective_status = _finish_backtest_job(
         cur, "l2_backtest_job", run_id, attempt_token, status, summary, result,
+        termination_reason, exit_code, error_code, stage,
       )
       if effective_status is None:
         return False
@@ -1973,6 +2126,10 @@ def finish_bar_backtest_job(
   result: dict[str, Any] | None = None,
   system_error: dict[str, Any] | None = None,
   owner_user_id: str | None = None,
+  termination_reason: str | None = None,
+  exit_code: int | None = None,
+  error_code: str | None = None,
+  stage: str | None = None,
 ) -> bool:
   """提交标准 Bar 回测终态，避免过期 worker 覆盖新执行尝试。"""
   if status not in {"succeeded", "failed", "cancelled"}:
@@ -1981,6 +2138,7 @@ def finish_bar_backtest_job(
     with conn.cursor() as cur:
       effective_status = _finish_backtest_job(
         cur, "bar_backtest_job", run_id, attempt_token, status, summary, result,
+        termination_reason, exit_code, error_code, stage,
       )
       if effective_status is None:
         return False
@@ -1998,6 +2156,10 @@ def _finish_backtest_job(
   requested_status: str,
   summary: dict[str, Any],
   result: dict[str, Any] | None,
+  termination_reason: str | None = None,
+  exit_code: int | None = None,
+  error_code: str | None = None,
+  stage: str | None = None,
 ) -> str | None:
   """以数据库中的取消状态优先，防止迟到成功结果覆盖取消。"""
   cur.execute(f"""
@@ -2017,19 +2179,58 @@ def _finish_backtest_job(
   effective_status = str(row["status"])
   effective_result = result if effective_status == "succeeded" else None
   effective_error = summary.get("error") if effective_status == "failed" else None
+  market_data_snapshot = _market_data_snapshot_from_result(effective_result)
   cur.execute("""
     UPDATE backtest_run
-    SET status=%s, result_summary=%s, result_json=%s, error_message=%s, finished_at=now()
+    SET status=%s, result_summary=%s, result_json=%s, error_message=%s,
+      market_data_snapshot=COALESCE(%s, market_data_snapshot), finished_at=now()
     WHERE id=%s AND status IN ('running', 'cancelling')
   """, (
     effective_status, Jsonb(summary), Jsonb(effective_result) if effective_result else None,
-    effective_error, run_id,
+    effective_error, Jsonb(market_data_snapshot) if market_data_snapshot else None, run_id,
   ))
   cur.execute(
     "DELETE FROM backtest_execution_slot WHERE run_id=%s AND attempt_token=%s",
     (run_id, attempt_token),
   )
+  attempt_status = effective_status
+  default_reason = {
+    "succeeded": "completed",
+    "failed": "exception",
+    "cancelled": "cancelled_by_user",
+  }[effective_status]
+  effective_reason = (
+    "cancelled_by_user" if effective_status == "cancelled"
+    else termination_reason or default_reason
+  )
+  cur.execute("""
+    UPDATE backtest_run_attempt
+    SET status=%s, stage=COALESCE(%s, stage), heartbeat_at=now(), finished_at=now(),
+      exit_code=%s, termination_reason=%s, error_code=%s
+    WHERE run_id=%s AND attempt_token=%s AND status='running'
+  """, (
+    attempt_status, stage, exit_code, effective_reason, error_code,
+    run_id, attempt_token,
+  ))
   return effective_status
+
+
+def _market_data_snapshot_from_result(
+  result: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+  """从 Worker 成功结果提取实际使用的数据快照，回写运行记录。"""
+  if not isinstance(result, dict):
+    return None
+  manifest = result.get("experimentManifest")
+  if isinstance(manifest, dict) and isinstance(manifest.get("databaseSnapshot"), dict):
+    return {"barSnapshot": dict(manifest["databaseSnapshot"])}
+  data_snapshot = result.get("dataSnapshot")
+  if not isinstance(data_snapshot, dict) or not isinstance(data_snapshot.get("bar"), dict):
+    return None
+  return {
+    "barSnapshot": dict(data_snapshot["bar"]),
+    "l2Snapshot": dict(data_snapshot),
+  }
 
 
 def _enqueue_research_signal_result(cur: Any, run_id: str, status: str, summary: dict[str, Any]) -> None:
@@ -3112,6 +3313,102 @@ def list_system_error_logs(
       return [_normalize_system_error(row) for row in cur.fetchall()]
 
 
+def get_backtest_run_diagnostics(run_id: str) -> dict[str, Any]:
+  """返回管理员诊断所需的数据库事实，不包含内部异常正文。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT run.id, run.display_no, run.status, run.result_summary,
+          run.error_message, run.created_at, run.started_at, run.finished_at,
+          instrument.symbol || '.' || instrument.exchange AS symbol,
+          run.timeframe, run.fill_model
+        FROM backtest_run AS run
+        LEFT JOIN market_instrument AS instrument ON instrument.id=run.instrument_id
+        WHERE run.id=%s
+      """, (run_id,))
+      run = cur.fetchone()
+      if run is None:
+        raise KeyError(run_id)
+      cur.execute("""
+        SELECT run_id, attempt_no, attempt_token, job_kind, worker_id,
+          container_id, process_id, application_build_id, runtime_version,
+          capability_digest, status, stage, started_at, heartbeat_at,
+          finished_at, exit_code, termination_reason, error_code,
+          log_correlation_id
+        FROM backtest_run_attempt
+        WHERE run_id=%s
+        ORDER BY attempt_no, started_at
+      """, (run_id,))
+      attempts = [_normalize_backtest_attempt(row) for row in cur.fetchall()]
+      cur.execute("""
+        SELECT id, stage, error_code, reason, exception_type, category,
+          retryable, occurred_at, attempt_no, attempt_token,
+          termination_reason, exit_code, log_correlation_id
+        FROM system_error_log
+        WHERE run_id=%s
+        ORDER BY occurred_at, id
+      """, (run_id,))
+      errors = [_normalize_diagnostic_error(row) for row in cur.fetchall()]
+  summary = normalize_public_error_summary(_json(run.get("result_summary"), {}))
+  return {
+    "run": {
+      "runId": _uuid(run["id"]),
+      "displayNo": int(run["display_no"]),
+      "status": str(run["status"]),
+      "safeReason": str(summary.get("error") or run.get("error_message") or ""),
+      "symbol": str(run.get("symbol") or ""),
+      "timeframe": str(run.get("timeframe") or ""),
+      "fillModel": str(run.get("fill_model") or ""),
+      "createdAt": _format_time(run.get("created_at")),
+      "startedAt": _format_time(run.get("started_at")),
+      "finishedAt": _format_time(run.get("finished_at")),
+    },
+    "attempts": attempts,
+    "errors": errors,
+  }
+
+
+def _normalize_backtest_attempt(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "attemptNo": int(row["attempt_no"]),
+    "attemptToken": _uuid(row["attempt_token"]),
+    "jobKind": str(row["job_kind"]),
+    "workerId": str(row["worker_id"]),
+    "containerId": str(row["container_id"]),
+    "processId": row.get("process_id"),
+    "applicationBuildId": str(row["application_build_id"]),
+    "runtimeVersion": str(row["runtime_version"]),
+    "capabilityDigest": str(row["capability_digest"]),
+    "status": str(row["status"]),
+    "stage": str(row["stage"]),
+    "startedAt": _format_time(row.get("started_at")),
+    "heartbeatAt": _format_time(row.get("heartbeat_at")),
+    "finishedAt": _format_time(row.get("finished_at")),
+    "exitCode": row.get("exit_code"),
+    "terminationReason": row.get("termination_reason"),
+    "errorCode": row.get("error_code"),
+    "logCorrelationId": str(row["log_correlation_id"]),
+  }
+
+
+def _normalize_diagnostic_error(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "id": int(row["id"]),
+    "stage": str(row["stage"]),
+    "code": str(row["error_code"]),
+    "reason": str(row["reason"]),
+    "exceptionType": str(row["exception_type"]),
+    "category": str(row.get("category") or "internal"),
+    "retryable": bool(row.get("retryable")),
+    "occurredAt": _format_time(row.get("occurred_at")),
+    "attemptNo": row.get("attempt_no"),
+    "attemptToken": _uuid(row["attempt_token"]) if row.get("attempt_token") else None,
+    "terminationReason": row.get("termination_reason"),
+    "exitCode": row.get("exit_code"),
+    "logCorrelationId": row.get("log_correlation_id"),
+  }
+
+
 def list_strategy_runtime_error_stats(
   from_time: str | None = None,
   to_time: str | None = None,
@@ -3232,12 +3529,18 @@ def _insert_system_error(
   cur.execute("""
     INSERT INTO system_error_log (
       run_id, owner_user_id, source, stage, error_code, reason,
-      exception_type, context_json, category, retryable, raw_log_ref
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+      exception_type, context_json, category, retryable, raw_log_ref,
+      attempt_no, attempt_token, worker_id, container_id,
+      termination_reason, exit_code, log_correlation_id
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+      %s, %s, %s, %s, %s, %s, %s)
   """, (
     run_id, owner_user_id, record["source"], record["stage"], record["code"],
     record["reason"], record["exception_type"], Jsonb(record["context"]),
     record["category"], record["retryable"], record["raw_log_ref"],
+    record.get("attempt_no"), record.get("attempt_token"), record.get("worker_id"),
+    record.get("container_id"), record.get("termination_reason"),
+    record.get("exit_code"), record.get("log_correlation_id"),
   ))
   _insert_strategy_runtime_error_stat(cur, record)
 
@@ -3308,6 +3611,13 @@ def _normalize_system_error(row: dict[str, Any]) -> dict[str, Any]:
     "exceptionType": row["exception_type"],
     "context": _public_system_error_context(_json(row.get("context_json"), {})),
     "rawLogRef": row.get("raw_log_ref") or "",
+    "attemptNo": row.get("attempt_no"),
+    "attemptToken": _uuid(row["attempt_token"]) if row.get("attempt_token") else None,
+    "workerId": row.get("worker_id"),
+    "containerId": row.get("container_id"),
+    "terminationReason": row.get("termination_reason"),
+    "exitCode": row.get("exit_code"),
+    "logCorrelationId": row.get("log_correlation_id"),
     "occurredAt": _format_time(row["occurred_at"]),
   }
 

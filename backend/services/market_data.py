@@ -21,6 +21,7 @@ _HISTORY_SOURCE = "history_dev"
 _LEGACY_DATABASE = "raw_historical_data"
 _HISTORY_DATABASE = "qmt_history_dev"
 _HISTORY_RUNS_TABLE = "qmt_ingest_runs"
+_HISTORY_UNIVERSE_TABLE = "qmt_universe_snapshot"
 _HISTORY_ADJUSTMENT = "none"
 _HISTORY_TABLES = {
   "1m": "qmt_kline_1m_raw",
@@ -66,10 +67,6 @@ class _SourceCandidate:
   source_period: str
   derivation: str | None = None
 
-  @property
-  def label(self) -> str:
-    return f"{self.source}:{self.source_period}"
-
 
 def resolve_backtest_data(
   symbol: str,
@@ -84,36 +81,38 @@ def resolve_backtest_data(
   _validate_request(symbol, timeframe, start_date, end_date)
   _validate_warmup_days(warmup_trading_days)
   candidates = _source_candidates(timeframe)
-  cached_coverages: dict[_SourceCandidate, list[dict[str, str]]] = {}
-  if formal_dates is None:
-    cached_coverages = {
-      candidate: _coverage_for_source(symbol, candidate, start_date, end_date)
-      for candidate in candidates
-    }
-    required_dates = sorted({
-      item["date"] for statuses in cached_coverages.values() for item in statuses
-    })
-  else:
-    required_dates = sorted({format_api_date(item) for item in formal_dates})
-  if not required_dates:
+  calendar_dates = None if formal_dates is None else {format_api_date(item) for item in formal_dates}
+  if calendar_dates is not None and not calendar_dates:
     raise MarketDataError(f"{symbol} {timeframe} 区间内未导入 QMT 行情")
-  failures: list[tuple[str, list[str], int]] = []
+  available_warmup_days = 0
+  has_formal_bars = False
   for candidate in candidates:
-    statuses = cached_coverages.get(candidate)
-    missing_dates = _missing_dates(symbol, candidate, required_dates, statuses)
+    statuses = _coverage_for_source(symbol, candidate, start_date, end_date)
+    candidate_dates = sorted({
+      item["date"] for item in statuses
+      if item["status"] == "complete" and (calendar_dates is None or item["date"] in calendar_dates)
+    })
+    if not candidate_dates:
+      continue
+    has_formal_bars = True
     warmup_dates = _complete_dates_before(symbol, candidate, start_date, warmup_trading_days)
-    if not missing_dates and len(warmup_dates) == warmup_trading_days:
+    available_warmup_days = max(available_warmup_days, len(warmup_dates))
+    if len(warmup_dates) == warmup_trading_days:
       return BacktestDataResolution(
         timeframe=timeframe,
         source_period=candidate.source_period,
         derivation=candidate.derivation,
-        formal_dates=tuple(required_dates),
+        formal_dates=tuple(candidate_dates),
         warmup_dates=tuple(warmup_dates),
         available_warmup_days=len(warmup_dates),
         source=candidate.source,
       )
-    failures.append((candidate.label, missing_dates, len(warmup_dates)))
-  raise _resolution_error(symbol, timeframe, failures, warmup_trading_days)
+  if not has_formal_bars:
+    raise MarketDataError(f"{symbol} {timeframe} 区间内无完整 QMT 行情")
+  raise MarketDataError(
+    f"{symbol} {timeframe} 预热数据不足: 策略声明需要 {warmup_trading_days} 个交易日，"
+    f"实际可用数据只有 {available_warmup_days} 个"
+  )
 
 
 def preview_backtest_data(
@@ -132,18 +131,14 @@ def preview_backtest_data(
     )
   except MarketDataError as error:
     try:
-      required_dates = _required_formal_dates(symbol, timeframe, start_date, end_date, formal_dates)
-      missing_dates = _preview_missing_dates(symbol, timeframe, required_dates)
       available_warmup = _preview_warmup_days(symbol, timeframe, start_date, warmup_trading_days)
     except MarketDataError:
-      required_dates, missing_dates, available_warmup = [], [], 0
+      available_warmup = 0
     codes = ["data.bar_missing"]
-    if timeframe == "1d" and missing_dates:
-      codes.append("data.minute_incomplete")
-    if not missing_dates and available_warmup < warmup_trading_days:
+    if "预热数据不足" in str(error):
       codes = ["data.warmup_insufficient"]
     return {
-      "available": False, "resolution": None, "missingDates": missing_dates,
+      "available": False, "resolution": None, "missingDates": [],
       "missingDataTypes": codes, "availableWarmupDays": available_warmup, "reason": str(error),
     }
   return {
@@ -161,25 +156,39 @@ def load_backtest_bars(
   all_dates = resolution.all_dates
   if not all_dates:
     raise MarketDataError("回测数据范围为空")
-  rows = _query_kline_rows(symbol, resolution, all_dates[0], all_dates[-1])
-  frame = _rows_to_frame(rows)
-  frame = _transform_source_frame(frame, resolution)
-  allowed_dates = set(all_dates)
-  frame = frame[frame["time"].str[:8].map(format_api_date).isin(allowed_dates)].reset_index(drop=True)
-  if frame.empty:
-    raise MarketDataError(f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情")
-  warmup_dates = set(resolution.warmup_dates)
-  warmup_bar_count = int(frame["time"].str[:8].map(format_api_date).isin(warmup_dates).sum())
+  try:
+    rows = _query_kline_rows(symbol, resolution, all_dates[0], all_dates[-1])
+    frame = _rows_to_frame(rows)
+    frame = _transform_source_frame(frame, resolution)
+    if frame.empty:
+      raise MarketDataError(f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情")
+    allowed_dates = set(all_dates)
+    frame_dates = frame["time"].str[:8].map(format_api_date)
+    frame = frame[frame_dates.isin(allowed_dates)].reset_index(drop=True)
+    if frame.empty:
+      raise MarketDataError(f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情")
+    warmup_dates = set(resolution.warmup_dates)
+    warmup_bar_count = int(frame["time"].str[:8].map(format_api_date).isin(warmup_dates).sum())
+  except MarketDataError:
+    raise
+  except Exception as error:
+    raise MarketDataError(
+      f"{symbol} {resolution.timeframe} QMT Bar 行数据格式无效",
+    ) from error
   return frame[["time", "open", "high", "low", "close", "volume"]], warmup_bar_count
 
 
 def snapshot_for_resolution(
   symbol: str,
   resolution: BacktestDataResolution,
+  bar_count: int | None = None,
 ) -> dict[str, Any]:
   """将已选择的数据来源固化为分钟回测兼容的任务快照。"""
   all_dates = resolution.all_dates
-  row = _coverage_summary(symbol, resolution, all_dates[0], all_dates[-1])
+  row = (
+    _coverage_summary(symbol, resolution, all_dates[0], all_dates[-1])
+    if resolution.source == _LEGACY_SOURCE else {}
+  )
   identity = {
     "symbol": symbol,
     "timeframe": resolution.timeframe,
@@ -188,7 +197,7 @@ def snapshot_for_resolution(
     "formalDates": list(resolution.formal_dates),
     "warmupDates": list(resolution.warmup_dates),
     "warmupTradingDays": len(resolution.warmup_dates),
-    "barCount": int(row.get("bar_count") or 0),
+    "barCount": int(bar_count if bar_count is not None else row.get("bar_count") or 0),
     "lastImportedAt": str(row.get("updated_at") or ""),
   }
   identity.update({
@@ -218,16 +227,31 @@ def load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd
 
 
 def timeframe_status(symbol: str, start_date: str | None, end_date: str | None) -> list[dict[str, Any]]:
-  """返回回测可用周期与 QMT 覆盖情况，不触发任何上游请求。"""
+  """返回引擎支持的周期；日期范围只由数据状态接口展示。"""
+  _validate_symbol(symbol)
   if start_date and end_date:
-    start_date, end_date = _normalized_range(start_date, end_date)
-  items: list[dict[str, Any]] = []
-  for timeframe in settings.BACKTEST_TIMEFRAMES:
-    if not start_date or not end_date:
-      items.append(_unavailable_timeframe(timeframe, "请选择回测日期"))
-      continue
-    items.append(_cached_timeframe_status(symbol, timeframe, start_date, end_date))
-  return items
+    _normalized_range(start_date, end_date)
+  return [{
+    "timeframe": timeframe,
+    "available": True,
+    "reason": "平台支持",
+    "dataStart": None,
+    "dataEnd": None,
+  } for timeframe in settings.BACKTEST_TIMEFRAMES]
+
+
+def required_trade_dates(start_date: str, end_date: str) -> list[str]:
+  """在 Worker 执行阶段读取请求区间应包含的交易日。"""
+  start_date, end_date = _normalized_range(start_date, end_date)
+  try:
+    if not state_store.is_trade_calendar_range_covered(start_date, end_date):
+      raise MarketDataError("交易日历未覆盖本次回测区间")
+    dates = state_store.list_open_trade_dates(start_date, end_date)
+  except state_store.DatabaseError as error:
+    raise MarketDataError("交易日历暂不可用") from error
+  if not dates:
+    raise MarketDataError("回测区间内没有交易日")
+  return dates
 
 
 def coverage_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> list[dict[str, str]]:
@@ -251,30 +275,38 @@ def status(symbol: str, timeframe: str, preview_limit: int = 20) -> dict[str, An
   """返回数据管理页所需的 QMT 数据概览。"""
   _validate_request(symbol, timeframe, "20000101", "20991231")
   _validate_symbol(symbol)
-  candidate, complete_dates = _first_available_candidate(symbol, timeframe)
+  candidate, coverage_range = _preferred_available_range(symbol, timeframe)
   if candidate is None:
     return _empty_status(symbol, timeframe)
-  preview_days = max(1, min(preview_limit, 200))
-  preview_dates = complete_dates[-preview_days:]
-  preview = _query_preview(
-    symbol, candidate, preview_dates[0], preview_dates[-1], preview_days,
-  )
   return {
     "symbol": symbol, "timeframe": timeframe,
-    "path": f"clickhouse://{_source_database(candidate.source)}.{_source_table(candidate.source, candidate.source_period)}",
-    "exists": True, "firstDate": complete_dates[0], "lastDate": complete_dates[-1],
-    "barCount": None, "fileSize": 0, "mtime": None, "duplicateCount": 0,
-    "nonTradingCount": 0, "expectedBarsPerDay": None, "gapDates": [], "preview": preview,
+    "path": coverage_range["path"],
+    "exists": True,
+    "firstDate": coverage_range["firstDate"],
+    "lastDate": coverage_range["lastDate"],
+    "barCount": coverage_range["barCount"],
+    "fileSize": 0,
+    "mtime": coverage_range["updatedAt"],
+    "duplicateCount": 0,
+    "nonTradingCount": 0, "expectedBarsPerDay": None, "gapDates": [], "preview": [],
   }
 
 
-def _first_available_candidate(symbol: str, timeframe: str) -> tuple[_SourceCandidate | None, list[str]]:
+def _preferred_available_range(
+  symbol: str,
+  timeframe: str,
+) -> tuple[_SourceCandidate | None, dict[str, Any]]:
   for candidate in _source_candidates(timeframe):
-    statuses = _coverage_for_source(symbol, candidate, "20000101", "20991231")
-    complete_dates = [item["date"] for item in statuses if item["status"] == "complete"]
-    if complete_dates:
-      return candidate, complete_dates
-  return None, []
+    coverage_range = _coverage_range_for_source(symbol, candidate)
+    if coverage_range["firstDate"] and coverage_range["lastDate"]:
+      path = (
+        f"{_HISTORY_DATABASE}.{_HISTORY_RUNS_TABLE}+"
+        f"{_HISTORY_DATABASE}.{_HISTORY_UNIVERSE_TABLE}"
+        if candidate.source == _HISTORY_SOURCE
+        else f"{_LEGACY_DATABASE}.qmt_kline_coverage"
+      )
+      return candidate, {**coverage_range, "path": f"clickhouse://{path}"}
+  return None, {}
 
 
 def _empty_status(symbol: str, timeframe: str) -> dict[str, Any]:
@@ -303,21 +335,6 @@ def _require_complete(symbol: str, timeframe: str, start_date: str, end_date: st
     raise MarketDataError(f"{symbol} {timeframe} 区间内未导入 QMT 行情")
 
 
-def _required_formal_dates(
-  symbol: str,
-  timeframe: str,
-  start_date: str,
-  end_date: str,
-  formal_dates: Sequence[str] | None,
-) -> list[str]:
-  if formal_dates is not None:
-    return sorted({format_api_date(item) for item in formal_dates})
-  dates: set[str] = set()
-  for candidate in _source_candidates(timeframe):
-    dates.update(item["date"] for item in _coverage_for_source(symbol, candidate, start_date, end_date))
-  return sorted(dates)
-
-
 def _source_candidates(timeframe: str) -> tuple[_SourceCandidate, ...]:
   candidates: list[_SourceCandidate] = []
   history_period = _HISTORY_PERIODS.get(timeframe)
@@ -334,20 +351,6 @@ def _source_candidates(timeframe: str) -> tuple[_SourceCandidate, ...]:
   return tuple(candidates)
 
 
-def _missing_dates(
-  symbol: str,
-  candidate: _SourceCandidate,
-  required_dates: Sequence[str],
-  statuses: Sequence[dict[str, str]] | None = None,
-) -> list[str]:
-  if not required_dates:
-    return []
-  if statuses is None:
-    statuses = _coverage_for_source(symbol, candidate, required_dates[0], required_dates[-1])
-  complete_dates = {item["date"] for item in statuses if item["status"] == "complete"}
-  return sorted(set(required_dates) - complete_dates)
-
-
 def _complete_dates_before(symbol: str, candidate: _SourceCandidate, start_date: str, count: int) -> list[str]:
   if count == 0:
     return []
@@ -356,52 +359,20 @@ def _complete_dates_before(symbol: str, candidate: _SourceCandidate, start_date:
     return []
   statuses = _coverage_for_source(symbol, candidate, expected_dates[0], expected_dates[-1])
   complete_dates = {item["date"] for item in statuses if item["status"] == "complete"}
-  contiguous_dates: list[str] = []
-  for trade_date in reversed(expected_dates):
-    if trade_date not in complete_dates:
-      break
-    contiguous_dates.append(trade_date)
-  return sorted(contiguous_dates)
+  return [trade_date for trade_date in expected_dates if trade_date in complete_dates][-count:]
 
 
 def _expected_warmup_dates(start_date: str, count: int) -> list[str]:
-  """返回紧邻正式开始日前的预期交易日序列。"""
+  """返回预热查找窗口内的开市日，停牌日不计入标的实际预热天数。"""
   end = date.fromisoformat(start_date) - timedelta(days=1)
   begin = end - timedelta(days=count * 3 + 60)
   try:
     if not state_store.is_trade_calendar_range_covered(begin.isoformat(), end.isoformat()):
-      raise MarketDataError("交易日历暂不可用，无法校验连续预热数据")
+      raise MarketDataError("交易日历暂不可用，无法计算预热日期")
     dates = state_store.list_open_trade_dates(begin.isoformat(), end.isoformat())
   except state_store.DatabaseError as error:
-    raise MarketDataError("交易日历暂不可用，无法校验连续预热数据") from error
-  return dates[-count:]
-
-
-def _resolution_error(
-  symbol: str,
-  timeframe: str,
-  failures: Sequence[tuple[str, list[str], int]],
-  warmup_days: int,
-) -> MarketDataError:
-  missing_dates = sorted({item for _, dates, _ in failures for item in dates})
-  if missing_dates:
-    detail = ", ".join(missing_dates)
-    return MarketDataError(f"{symbol} {timeframe} QMT 行情不完整: {detail}")
-  available_days = max((days for _, _, days in failures), default=0)
-  return MarketDataError(
-    f"{symbol} {timeframe} 预热数据不足: 策略声明需要 {warmup_days} 个交易日，"
-    f"实际连续完整数据只有 {available_days} 个"
-  )
-
-
-def _preview_missing_dates(symbol: str, timeframe: str, required_dates: Sequence[str]) -> list[str]:
-  if not required_dates:
-    return []
-  candidate_missing = [
-    _missing_dates(symbol, candidate, required_dates)
-    for candidate in _source_candidates(timeframe)
-  ]
-  return sorted(set.intersection(*(set(item) for item in candidate_missing))) if candidate_missing else []
+    raise MarketDataError("交易日历暂不可用，无法计算预热日期") from error
+  return dates
 
 
 def _preview_warmup_days(symbol: str, timeframe: str, start_date: str, count: int) -> int:
@@ -473,8 +444,40 @@ def _coverage_for_source(
   return [{"date": format_api_date(str(row["trade_date"])), "status": str(row["status"])} for row in rows]
 
 
+def _coverage_range_for_source(
+  symbol: str,
+  candidate: _SourceCandidate,
+) -> dict[str, Any]:
+  """只读取覆盖元数据聚合范围，避免把多年逐日记录拉回应用层。"""
+  _validate_symbol(symbol)
+  if candidate.source == _HISTORY_SOURCE:
+    query = _history_coverage_range_query(symbol, candidate.source_period)
+  else:
+    query = f"""
+      SELECT min(trade_date) AS first_date,
+             max(trade_date) AS last_date,
+             sum(valid_row_count) AS bar_count,
+             max(updated_at) AS updated_at
+      FROM {_LEGACY_DATABASE}.qmt_kline_coverage FINAL
+      WHERE symbol = '{symbol}' AND period = '{candidate.source_period}'
+        AND status = 'complete'
+    """
+  try:
+    rows = clickhouse_client.query_rows_with_retry(query)
+  except clickhouse_client.ClickHouseError as error:
+    raise MarketDataError(str(error)) from error
+  row = rows[0] if rows else {}
+  first_date = row.get("first_date")
+  last_date = row.get("last_date")
+  return {
+    "firstDate": format_api_date(str(first_date)) if first_date else None,
+    "lastDate": format_api_date(str(last_date)) if last_date else None,
+    "barCount": int(row["bar_count"]) if row.get("bar_count") is not None else None,
+    "updatedAt": str(row["updated_at"]) if row.get("updated_at") else None,
+  }
+
+
 def _history_coverage_query(symbol: str, period: str, start_date: str, end_date: str) -> str:
-  table = _source_table(_HISTORY_SOURCE, period)
   return f"""
     WITH latest_runs AS (
       SELECT runs.run_id AS run_id,
@@ -483,29 +486,69 @@ def _history_coverage_query(symbol: str, period: str, start_date: str, end_date:
              argMax(runs.validation_result, tuple(runs.state_version, runs.recorded_at)) AS validation_result,
              argMax(runs.expected_route_count, tuple(runs.state_version, runs.recorded_at)) AS expected_route_count,
              argMax(runs.actual_route_count, tuple(runs.state_version, runs.recorded_at)) AS actual_route_count,
+             argMax(runs.universe_snapshot_id, tuple(runs.state_version, runs.recorded_at)) AS universe_snapshot_id,
              argMax(runs.missing_symbol_count, tuple(runs.state_version, runs.recorded_at)) AS missing_symbol_count,
              argMax(runs.duplicate_key_count, tuple(runs.state_version, runs.recorded_at)) AS duplicate_key_count,
              argMax(runs.actual_routes, tuple(runs.state_version, runs.recorded_at)) AS actual_routes
       FROM {_HISTORY_DATABASE}.{_HISTORY_RUNS_TABLE} AS runs
       WHERE runs.target_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
       GROUP BY runs.run_id
-    ), symbol_dates AS (
-      SELECT trade_date, argMax(run_id, tuple(revision, ingested_at)) AS run_id
-      FROM {_HISTORY_DATABASE}.{table}
-      WHERE symbol = '{symbol}' AND period = '{period}' AND adjustment = '{_HISTORY_ADJUSTMENT}'
-        AND quality_status = 'valid' AND is_final = 1
-        AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
-      GROUP BY trade_date
+    ), eligible_runs AS (
+      SELECT latest_runs.target_date AS target_date,
+             latest_runs.universe_snapshot_id AS universe_snapshot_id
+      FROM latest_runs
+      WHERE latest_runs.state = 'PUBLISHED'
+        AND latest_runs.validation_result = 'PASS'
+        AND latest_runs.expected_route_count = latest_runs.actual_route_count
+        AND latest_runs.missing_symbol_count = 0
+        AND latest_runs.duplicate_key_count = 0
+        AND has(latest_runs.actual_routes, '{period}/{_HISTORY_ADJUSTMENT}')
     )
-    SELECT symbol_dates.trade_date AS trade_date,
-           if(latest_runs.state = 'PUBLISHED' AND latest_runs.validation_result = 'PASS'
-              AND latest_runs.target_date = symbol_dates.trade_date
-              AND latest_runs.expected_route_count = latest_runs.actual_route_count
-              AND latest_runs.missing_symbol_count = 0 AND latest_runs.duplicate_key_count = 0
-              AND has(latest_runs.actual_routes, '{period}/{_HISTORY_ADJUSTMENT}'), 'complete', 'partial') AS status
-    FROM symbol_dates
-    LEFT JOIN latest_runs ON latest_runs.run_id = symbol_dates.run_id
-    ORDER BY trade_date
+    SELECT eligible_runs.target_date AS trade_date, 'complete' AS status
+    FROM eligible_runs
+    INNER JOIN {_HISTORY_DATABASE}.{_HISTORY_UNIVERSE_TABLE} AS snapshots
+      ON snapshots.universe_snapshot_id = eligible_runs.universe_snapshot_id
+    WHERE snapshots.symbol = '{symbol}'
+      AND snapshots.is_active = 1
+    GROUP BY eligible_runs.target_date
+    ORDER BY eligible_runs.target_date
+  """
+
+
+def _history_coverage_range_query(symbol: str, period: str) -> str:
+  """组合发布批次与标的快照，直接聚合该标的声明的可用范围。"""
+  return f"""
+    WITH latest_runs AS (
+      SELECT runs.run_id AS run_id,
+             argMax(runs.state, tuple(runs.state_version, runs.recorded_at)) AS state,
+             argMax(runs.target_date, tuple(runs.state_version, runs.recorded_at)) AS target_date,
+             argMax(runs.validation_result, tuple(runs.state_version, runs.recorded_at)) AS validation_result,
+             argMax(runs.expected_route_count, tuple(runs.state_version, runs.recorded_at)) AS expected_route_count,
+             argMax(runs.actual_route_count, tuple(runs.state_version, runs.recorded_at)) AS actual_route_count,
+             argMax(runs.universe_snapshot_id, tuple(runs.state_version, runs.recorded_at)) AS universe_snapshot_id,
+             argMax(runs.missing_symbol_count, tuple(runs.state_version, runs.recorded_at)) AS missing_symbol_count,
+             argMax(runs.duplicate_key_count, tuple(runs.state_version, runs.recorded_at)) AS duplicate_key_count,
+             argMax(runs.actual_routes, tuple(runs.state_version, runs.recorded_at)) AS actual_routes
+      FROM {_HISTORY_DATABASE}.{_HISTORY_RUNS_TABLE} AS runs
+      GROUP BY runs.run_id
+    ), eligible_runs AS (
+      SELECT latest_runs.target_date AS target_date,
+             latest_runs.universe_snapshot_id AS universe_snapshot_id
+      FROM latest_runs
+      WHERE latest_runs.state = 'PUBLISHED'
+        AND latest_runs.validation_result = 'PASS'
+        AND latest_runs.expected_route_count = latest_runs.actual_route_count
+        AND latest_runs.missing_symbol_count = 0
+        AND latest_runs.duplicate_key_count = 0
+        AND has(latest_runs.actual_routes, '{period}/{_HISTORY_ADJUSTMENT}')
+    )
+    SELECT min(eligible_runs.target_date) AS first_date,
+           max(eligible_runs.target_date) AS last_date
+    FROM eligible_runs
+    INNER JOIN {_HISTORY_DATABASE}.{_HISTORY_UNIVERSE_TABLE} AS snapshots
+      ON snapshots.universe_snapshot_id = eligible_runs.universe_snapshot_id
+    WHERE snapshots.symbol = '{symbol}'
+      AND snapshots.is_active = 1
   """
 
 
@@ -515,25 +558,13 @@ def _coverage_summary(
   start_date: str,
   end_date: str,
 ) -> dict[str, Any]:
-  if resolution.source == _HISTORY_SOURCE:
-    table = _source_table(resolution.source, resolution.source_period)
-    query = f"""
-      SELECT uniqExact(bar_time) AS bar_count, max(ingested_at) AS updated_at,
-             max(toString(manifest_sha256)) AS manifest_hash
-      FROM {_HISTORY_DATABASE}.{table}
-      WHERE symbol = '{symbol}' AND period = '{resolution.source_period}'
-        AND adjustment = '{_HISTORY_ADJUSTMENT}'
-        AND quality_status = 'valid' AND is_final = 1
-        AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
-    """
-  else:
-    query = f"""
-      SELECT sum(valid_row_count) AS bar_count, max(updated_at) AS updated_at
-      FROM {_LEGACY_DATABASE}.qmt_kline_coverage FINAL
-      WHERE symbol = '{symbol}' AND period = '{resolution.source_period}'
-        AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
-        AND status = 'complete'
-    """
+  query = f"""
+    SELECT sum(valid_row_count) AS bar_count, max(updated_at) AS updated_at
+    FROM {_LEGACY_DATABASE}.qmt_kline_coverage FINAL
+    WHERE symbol = '{symbol}' AND period = '{resolution.source_period}'
+      AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
+      AND status = 'complete'
+  """
   try:
     return clickhouse_client.query_rows(query)[0]
   except (IndexError, clickhouse_client.ClickHouseError) as error:
@@ -614,7 +645,7 @@ def _history_kline_query(
              argMax(volume, tuple(revision, ingested_at)) AS volume
       FROM {_HISTORY_DATABASE}.{table}
       WHERE symbol = '{symbol}' AND period = '{period}' AND adjustment = '{_HISTORY_ADJUSTMENT}'
-        AND quality_status = 'valid' AND is_final = 1
+        AND is_final = 1
         AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
       GROUP BY bar_time
     )

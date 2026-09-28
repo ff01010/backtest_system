@@ -2,9 +2,11 @@
 """数据路径和 PostgreSQL 连接配置。"""
 
 import json
+import ipaddress
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -125,9 +127,59 @@ BACKTEST_RUNNER_ERROR_BACKOFF_MAX_SECONDS = _read_bounded_int(
 BACKTEST_RUNNER_AVAILABILITY_REQUIRED = _read_bool(
   "TREND_GRID_BACKTEST_RUNNER_AVAILABILITY_REQUIRED", True,
 )
+
+# 任务日志集中存储为可降级运维能力，不参与回测终态判定。
+OBSERVABILITY_ENABLED = _read_bool("TREND_GRID_OBSERVABILITY_ENABLED", False)
+LOKI_URL = os.getenv("TREND_GRID_LOKI_URL", "http://loki:3100").rstrip("/")
+LOG_RETENTION_HOURS = _read_bounded_int(
+  "TREND_GRID_LOG_RETENTION_HOURS", 720, 1, 24 * 90,
+)
+LOG_QUERY_TIMEOUT_SECONDS = _read_bounded_int(
+  "TREND_GRID_LOG_QUERY_TIMEOUT_SECONDS", 3, 1, 30,
+)
+LOG_QUERY_MAX_LINES = _read_bounded_int(
+  "TREND_GRID_LOG_QUERY_MAX_LINES", 500, 1, 2000,
+)
+LOG_QUERY_MAX_HOURS = _read_bounded_int(
+  "TREND_GRID_LOG_QUERY_MAX_HOURS", 744, 1, 24 * 31,
+)
+LOG_LOCAL_MAX_SIZE = os.getenv("TREND_GRID_LOG_LOCAL_MAX_SIZE", "20m").strip().lower()
+LOG_LOCAL_MAX_FILES = _read_bounded_int(
+  "TREND_GRID_LOG_LOCAL_MAX_FILES", 5, 1, 20,
+)
+DOCKER_EVENTS_URL = os.getenv(
+  "TREND_GRID_DOCKER_EVENTS_URL", "http://docker-socket-proxy:2375",
+).rstrip("/")
+COMPOSE_PROJECT_NAME = os.getenv(
+  "TREND_GRID_COMPOSE_PROJECT", "quant-backtest-platform",
+).strip()
 STRATEGY_RUNTIME_ERROR_RETENTION_DAYS = _read_bounded_int(
   "TREND_GRID_STRATEGY_RUNTIME_ERROR_RETENTION_DAYS", 180, 30, 3650,
 )
+
+
+def validate_observability_configuration() -> None:
+  """启用日志查询时只允许明确的内部 HTTP Loki 地址。"""
+  if not re.fullmatch(r"[1-9][0-9]*[kmg]", LOG_LOCAL_MAX_SIZE):
+    raise ValueError("TREND_GRID_LOG_LOCAL_MAX_SIZE 必须是正整数加 k/m/g 单位")
+  if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", COMPOSE_PROJECT_NAME):
+    raise ValueError("TREND_GRID_COMPOSE_PROJECT 必须是安全的 Compose 项目名")
+  if not OBSERVABILITY_ENABLED:
+    return
+  parsed = urlsplit(LOKI_URL)
+  if parsed.scheme != "http" or not parsed.hostname or parsed.username or parsed.password:
+    raise ValueError("TREND_GRID_LOKI_URL 必须是不含凭据的内部 HTTP 地址")
+  hostname = parsed.hostname.lower()
+  if hostname in {"localhost", "loki"} or hostname.endswith(".internal"):
+    return
+  try:
+    address = ipaddress.ip_address(hostname)
+  except ValueError as error:
+    if re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", hostname) and "." not in hostname:
+      return
+    raise ValueError("TREND_GRID_LOKI_URL 只允许内部服务名或私有地址") from error
+  if not (address.is_private or address.is_loopback):
+    raise ValueError("TREND_GRID_LOKI_URL 只允许私有地址")
 
 # 全局默认 A 股费用。仅由部署环境配置，当前不向普通用户开放编辑。
 DEFAULT_COMMISSION_RATE = float(os.getenv("TREND_GRID_DEFAULT_COMMISSION_RATE", "0.00008"))

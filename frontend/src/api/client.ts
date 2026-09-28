@@ -66,7 +66,10 @@ async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { credentials: 'include' });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`API ${res.status}: ${text}`);
+    const detail = getStructuredApiError(text);
+    throw new ApiResponseError(
+      res.status, detail.code, detail.message || `API ${res.status}: 请求失败`,
+    );
   }
   return res.json();
 }
@@ -86,13 +89,22 @@ async function fetchNoStoreJson<T>(url: string): Promise<T> {
 function getStructuredApiError(text: string): { code: string; message: string } {
   try {
     const body = JSON.parse(text) as {
-      detail?: string | { code?: unknown; message?: unknown };
+      detail?: string | {
+        code?: unknown;
+        message?: unknown;
+        errorDetail?: { code?: unknown; message?: unknown };
+      };
     };
     if (typeof body.detail === 'string') return { code: '', message: body.detail };
     if (body.detail && typeof body.detail === 'object') {
+      const nested = body.detail.errorDetail;
       return {
-        code: typeof body.detail.code === 'string' ? body.detail.code : '',
-        message: typeof body.detail.message === 'string'
+        code: typeof nested?.code === 'string'
+          ? nested.code
+          : typeof body.detail.code === 'string' ? body.detail.code : '',
+        message: typeof nested?.message === 'string'
+          ? nested.message
+          : typeof body.detail.message === 'string'
           ? body.detail.message
           : getApiErrorMessage(text),
       };
@@ -236,7 +248,79 @@ export interface SystemErrorLogEntry {
   exceptionType: string;
   context: Record<string, string>;
   rawLogRef: string;
+  attemptNo: number | null;
+  attemptToken: string | null;
+  workerId: string | null;
+  containerId: string | null;
+  terminationReason: string | null;
+  exitCode: number | null;
+  logCorrelationId: string | null;
   occurredAt: string;
+}
+
+export interface BacktestAttemptDiagnostic {
+  attemptNo: number;
+  attemptToken: string;
+  jobKind: 'bar' | 'l2';
+  workerId: string;
+  containerId: string;
+  processId: number | null;
+  applicationBuildId: string;
+  runtimeVersion: string;
+  capabilityDigest: string;
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  stage: string;
+  startedAt: string;
+  heartbeatAt: string;
+  finishedAt: string;
+  exitCode: number | null;
+  terminationReason: string | null;
+  errorCode: string | null;
+  logCorrelationId: string;
+}
+
+export interface BacktestDiagnosticTimelineEvent {
+  source?: string | null;
+  event: string;
+  timestamp: string;
+  message: string;
+  attemptNo?: number | null;
+  attemptToken?: string | null;
+  stage?: string | null;
+  status?: string | null;
+  errorCode?: string | null;
+  exceptionType?: string | null;
+  frameSummary?: string | null;
+  exitCode?: number | null;
+  terminationReason?: string | null;
+}
+
+export interface BacktestRunDiagnostics {
+  run: {
+    runId: string;
+    displayNo: number;
+    status: string;
+    safeReason: string;
+    symbol: string;
+    timeframe: string;
+    fillModel: string;
+    createdAt: string;
+    startedAt: string;
+    finishedAt: string;
+  };
+  attempts: BacktestAttemptDiagnostic[];
+  errors: Array<{
+    id: number;
+    stage: string;
+    code: string;
+    reason: string;
+    exceptionType: string;
+    occurredAt: string;
+    attemptNo: number | null;
+    attemptToken: string | null;
+  }>;
+  logStatus: 'available' | 'unavailable' | 'expired' | 'disabled';
+  timeline: BacktestDiagnosticTimelineEvent[];
 }
 
 export interface StrategyRuntimeErrorStat {
@@ -343,6 +427,19 @@ export async function fetchSystemErrorLogs(filters: {
   });
   const data = await fetchJson<{ items: SystemErrorLogEntry[] }>(`${BASE}/admin/system-errors?${search}`);
   return data.items;
+}
+
+export async function fetchBacktestRunDiagnostics(
+  runId: string,
+  attemptToken?: string,
+): Promise<BacktestRunDiagnostics> {
+  const search = new URLSearchParams();
+  if (attemptToken) search.set('attemptToken', attemptToken);
+  const query = search.toString();
+  const suffix = query ? `?${query}` : '';
+  return fetchJson<BacktestRunDiagnostics>(
+    `${BASE}/admin/backtest-runs/${encodeURIComponent(runId)}/diagnostics${suffix}`,
+  );
 }
 
 export async function fetchStrategyRuntimeErrorStats(filters: {
@@ -1075,9 +1172,13 @@ export async function deleteStrategyConfig(configId: string): Promise<boolean> {
   return (await data.json()).deleted;
 }
 
-export async function fetchDataStatus(symbol: string, timeframe = '5m'): Promise<DataStatus> {
+export async function fetchDataStatus(
+  symbol: string,
+  timeframe = '5m',
+  fillModel: 'bar_next_open' | 'l2_quote' = 'bar_next_open',
+): Promise<DataStatus> {
   const response = await fetch(
-    `${BASE}/data/status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`,
+    `${BASE}/data/status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&fillModel=${encodeURIComponent(fillModel)}`,
     { credentials: 'include' },
   );
   if (!response.ok) {

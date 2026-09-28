@@ -75,6 +75,34 @@ describe('backtestErrorPresentation', () => {
 
     expect(result.title).toBe('行情数据异常');
     expect(result.isUserActionable).toBe(false);
-    expect(result.location).toBe('688449.SH · 2025-05-29');
+    expect(result.location).toBe('');
+    expect(result.message).toBe('行情数据异常，请联系管理员');
+    expect(result.hint).toBeNull();
+  });
+
+  it('将所有 data 分类错误统一显示为行情数据异常', () => {
+    const result = backtestErrorPresentation({
+      category: 'data',
+      code: 'data.bar_missing',
+      message: '当前日期范围缺少 Bar 数据。',
+      retryable: false,
+    });
+
+    expect(result.title).toBe('行情数据异常');
+    expect(result.isUserActionable).toBe(false);
+    expect(result.message).toBe('行情数据异常，请联系管理员');
+  });
+
+  it('将 ClickHouse 错误统一显示为不可由用户修复的行情数据异常', () => {
+    const result = backtestErrorPresentation({
+      category: 'strategy_error',
+      code: 'clickhouse.query_failed',
+      message: 'ClickHouse query failed',
+      retryable: true,
+    });
+
+    expect(result.title).toBe('行情数据异常');
+    expect(result.isUserActionable).toBe(false);
+    expect(result.message).toBe('行情数据异常，请联系管理员');
   });
 });

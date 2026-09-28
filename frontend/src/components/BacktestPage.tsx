@@ -24,8 +24,6 @@ import {
   fetchAccounts,
   fetchBacktestRunPage,
   fetchBacktestRun,
-  fetchBacktestTimeframes,
-  fetchBacktestPreflight,
   fetchDataStatus,
   fetchResearchSignalDatasets,
   fetchStrategyParameterSchema,
@@ -43,7 +41,6 @@ import {
 } from '../api/client';
 import type {
   BacktestRunPayload,
-  BacktestTimeframeAvailability,
   ResearchSignalDataset,
 } from '../api/client';
 import type {
@@ -88,7 +85,7 @@ import InstrumentSearchField from './InstrumentSearchField';
 import SignalDetailExportDrawer from './SignalDetailExportDrawer';
 import StrategyGuideDrawer from './StrategyGuideDrawer';
 
-import BacktestDateRangePicker from './BacktestDateRangePicker';
+import BacktestDateRangePicker, { type RangeAvailability } from './BacktestDateRangePicker';
 interface Props {
   symbol: string;
   strategy: string;
@@ -188,7 +185,9 @@ const DEFAULT_PARAMS = {
   indexTrendFilter: true,
 };
 
-const L2_TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '45m', '60m', '1d'];
+export const BACKTEST_TIMEFRAMES: readonly string[] = [
+  '1m', '3m', '5m', '15m', '30m', '45m', '60m', '1d',
+];
 
 const EXPERIMENT_PARAM_KEYS = new Set([
   'startDate',
@@ -411,16 +410,40 @@ function getStrategyCategoryLabel(value: unknown): string {
   return value === 'core_position_overlay' ? '底仓增强策略' : '方向性持仓策略';
 }
 
-export function shouldFetchBacktestTimeframes(startDate: string, endDate: string): boolean {
-  return isValidDate(startDate) && isValidDate(endDate);
-}
-
 export function buildTimeframeAvailabilityCacheKey(
   symbols: string[],
   startDate: string,
   endDate: string
 ): string {
   return `${startDate}:${endDate}:${[...symbols].sort().join(',')}`;
+}
+
+export function resolveRangeAvailability(
+  statusData: DataStatus | null,
+  loading: boolean,
+  statusError: string,
+): RangeAvailability {
+  if (loading || (!statusData && !statusError)) return { state: 'loading' };
+  if (statusError) return { state: 'error' };
+  if (!statusData?.exists) return { state: 'empty' };
+  if (!statusData.firstDate || !statusData.lastDate) return { state: 'error' };
+  return { state: 'available', firstDate: statusData.firstDate, lastDate: statusData.lastDate };
+}
+
+export function buildDataRangeMetadata(
+  label: string,
+  timeframe: string,
+  availability: RangeAvailability,
+): { tone: 'info' | 'warn' | 'ok'; text: string } {
+  if (availability.state === 'loading') {
+    return { tone: 'info', text: `正在读取${label} ${timeframe} 可回测范围...` };
+  }
+  if (availability.state === 'error') return { tone: 'warn', text: '行情数据异常，请联系管理员' };
+  if (availability.state === 'empty') return { tone: 'warn', text: `${label} ${timeframe} 暂无可回测数据` };
+  return {
+    tone: 'ok',
+    text: `${label} ${timeframe} 可回测范围：${availability.firstDate}-${availability.lastDate}`,
+  };
 }
 
 export function isCustomScriptStrategy(strategyId: string): boolean {
@@ -1072,8 +1095,8 @@ function BacktestErrorCard({ detail }: { detail: BacktestErrorDetail }): ReactNo
         {presentation.title}
       </div>
       {presentation.location && <div style={{ color: '#9a3412', marginTop: 3 }}>{presentation.location}</div>}
-      <div style={{ marginTop: 5 }}>原因：{detail.message}</div>
-      {detail.hint && <div style={{ marginTop: 3 }}>建议：{detail.hint}</div>}
+      <div style={{ marginTop: 5 }}>原因：{presentation.message}</div>
+      {presentation.hint && <div style={{ marginTop: 3 }}>建议：{presentation.hint}</div>}
       {detail.taskId && <div style={{ marginTop: 6, color: '#64748b', fontSize: 12 }}>任务编号：<code>{detail.taskId}</code></div>}
     </div>
   );
@@ -1201,10 +1224,7 @@ export default function BacktestPage({
   const [accounts, setAccounts] = useState<BacktestAccount[]>([]);
   const [selectedSymbol, setSelectedSymbol] = useState(symbol);
   const [selectedTimeframe, setSelectedTimeframe] = useState('5m');
-  const [backtestTimeframes, setBacktestTimeframes] = useState<BacktestTimeframeAvailability[]>([]);
   const [selectedBenchmarkSymbol, setSelectedBenchmarkSymbol] = useState(symbol);
-  const [preflight, setPreflight] = useState<Awaited<ReturnType<typeof fetchBacktestPreflight>> | null>(null);
-  const [preflightNotice, setPreflightNotice] = useState('');
   const [selectedStrategy, setSelectedStrategy] = useState('user_script');
   const [selectedAccountId, setSelectedAccountId] = useState<number | ''>('');
   const [newAccountName, setNewAccountName] = useState('');
@@ -1254,6 +1274,8 @@ export default function BacktestPage({
   const [historyLoadError, setHistoryLoadError] = useState('');
   const historyRequestIdRef = useRef(0);
   const historyCompareRequestIdRef = useRef(0);
+  const dataStatusRequestIdRef = useRef(0);
+  const benchmarkDataStatusRequestIdRef = useRef(0);
   const [historyNoteDraft, setHistoryNoteDraft] = useState('');
   const [historyTagsDraft, setHistoryTagsDraft] = useState('');
   const [publicationRun, setPublicationRun] = useState<BacktestRunHistory | null>(null);
@@ -1543,11 +1565,23 @@ export default function BacktestPage({
   }, [draftFingerprint, publishedFingerprint, selectedConfigId]);
 
   useEffect(() => {
-    refreshDataStatus(selectedSymbol, selectedTimeframe);
-  }, [selectedSymbol, selectedTimeframe]);
+    refreshDataStatus(
+      selectedSymbol,
+      selectedTimeframe,
+      normalizeFillModel(params.fillModel),
+    );
+  }, [selectedSymbol, selectedTimeframe, params.fillModel]);
 
   useEffect(() => {
+    if (normalizeFillModel(params.fillModel) === 'l2_quote') {
+      benchmarkDataStatusRequestIdRef.current += 1;
+      setBenchmarkDataStatus(null);
+      setBenchmarkDataStatusError('');
+      setLoadingBenchmarkDataStatus(false);
+      return;
+    }
     if (selectedBenchmarkSymbol !== selectedSymbol) return;
+    benchmarkDataStatusRequestIdRef.current += 1;
     setBenchmarkDataStatus(dataStatus);
     setBenchmarkDataStatusError(dataStatusError);
     setLoadingBenchmarkDataStatus(loadingDataStatus);
@@ -1557,51 +1591,14 @@ export default function BacktestPage({
     dataStatus,
     dataStatusError,
     loadingDataStatus,
+    params.fillModel,
   ]);
 
   useEffect(() => {
+    if (normalizeFillModel(params.fillModel) === 'l2_quote') return;
     if (selectedBenchmarkSymbol === selectedSymbol) return;
     refreshBenchmarkDataStatus(selectedBenchmarkSymbol, selectedTimeframe);
-  }, [selectedBenchmarkSymbol, selectedSymbol, selectedTimeframe]);
-
-  useEffect(() => {
-    if (!shouldFetchBacktestTimeframes(params.startDate, params.endDate)) {
-      setBacktestTimeframes([]);
-      return;
-    }
-    let cancelled = false;
-    fetchBacktestTimeframes(selectedSymbol, params.startDate, params.endDate).then((items) => {
-      if (!cancelled) {
-        setBacktestTimeframes(items);
-      }
-    }).catch((requestError) => {
-      if (!cancelled) setDataStatusError(
-        requestError instanceof Error ? requestError.message : '读取可用周期失败'
-      );
-    });
-    return () => { cancelled = true; };
-  }, [params.startDate, params.endDate, selectedSymbol]);
-
-  useEffect(() => {
-    if (!shouldFetchBacktestTimeframes(params.startDate, params.endDate)) {
-      setPreflight(null);
-      return;
-    }
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      fetchBacktestPreflight(selectedSymbol, selectedTimeframe, params.startDate, params.endDate, normalizeFillModel(params.fillModel))
-        .then((value) => {
-          if (!cancelled) setPreflight(value);
-        })
-        .catch(() => {
-          if (!cancelled) setPreflight(null);
-        });
-    }, 280);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [selectedSymbol, selectedTimeframe, params.startDate, params.endDate, params.fillModel]);
+  }, [selectedBenchmarkSymbol, selectedSymbol, selectedTimeframe, params.fillModel]);
 
   useEffect(() => {
     if (isCustomScriptStrategy(selectedStrategy)) {
@@ -1769,18 +1766,25 @@ export default function BacktestPage({
     }
   };
 
-  const refreshDataStatus = async (targetSymbol: string, timeframe: string) => {
+  const refreshDataStatus = async (
+    targetSymbol: string,
+    timeframe: string,
+    fillModel: 'bar_next_open' | 'l2_quote',
+  ) => {
     if (!targetSymbol) return;
+    const requestId = ++dataStatusRequestIdRef.current;
     setLoadingDataStatus(true);
     setDataStatusError('');
     try {
-      const statusData = await fetchDataStatus(targetSymbol, timeframe);
+      const statusData = await fetchDataStatus(targetSymbol, timeframe, fillModel);
+      if (requestId !== dataStatusRequestIdRef.current) return;
       setDataStatus(statusData);
     } catch (e) {
+      if (requestId !== dataStatusRequestIdRef.current) return;
       setDataStatus(null);
       setDataStatusError(e instanceof Error ? e.message : '读取数据状态失败');
     } finally {
-      setLoadingDataStatus(false);
+      if (requestId === dataStatusRequestIdRef.current) setLoadingDataStatus(false);
     }
   };
 
@@ -1937,7 +1941,7 @@ export default function BacktestPage({
         initialPositionEnabled: false,
         t0Enabled: false,
       });
-    if (strategyCategory === 'core_position_overlay' && !L2_TIMEFRAMES.includes(selectedTimeframe)) {
+    if (strategyCategory === 'core_position_overlay' && !BACKTEST_TIMEFRAMES.includes(selectedTimeframe)) {
       setSelectedTimeframe('1m');
     }
   };
@@ -1968,7 +1972,7 @@ export default function BacktestPage({
     if (fillModel !== 'l2_quote') {
       setParam('executionAlgorithm', 'immediate');
     }
-    if (fillModel === 'l2_quote' && !L2_TIMEFRAMES.includes(selectedTimeframe)) {
+    if (fillModel === 'l2_quote' && !BACKTEST_TIMEFRAMES.includes(selectedTimeframe)) {
       setSelectedTimeframe('1m');
     }
   };
@@ -1982,16 +1986,21 @@ export default function BacktestPage({
 
   const refreshBenchmarkDataStatus = async (targetSymbol: string, timeframe: string) => {
     if (!targetSymbol) return;
+    const requestId = ++benchmarkDataStatusRequestIdRef.current;
     setLoadingBenchmarkDataStatus(true);
     setBenchmarkDataStatusError('');
     try {
       const statusData = await fetchDataStatus(targetSymbol, timeframe);
+      if (requestId !== benchmarkDataStatusRequestIdRef.current) return;
       setBenchmarkDataStatus(statusData);
     } catch (e) {
+      if (requestId !== benchmarkDataStatusRequestIdRef.current) return;
       setBenchmarkDataStatus(null);
       setBenchmarkDataStatusError(e instanceof Error ? e.message : '读取基准数据状态失败');
     } finally {
-      setLoadingBenchmarkDataStatus(false);
+      if (requestId === benchmarkDataStatusRequestIdRef.current) {
+        setLoadingBenchmarkDataStatus(false);
+      }
     }
   };
 
@@ -2158,11 +2167,6 @@ export default function BacktestPage({
     setError('');
   };
 
-  const showPreflightNotice = (message: string): void => {
-    setPreflightNotice(message);
-    window.setTimeout(() => setPreflightNotice(''), 4000);
-  };
-
   const handleSaveConfig = async (): Promise<string | null> => {
 
     setError('');
@@ -2179,11 +2183,6 @@ export default function BacktestPage({
     }
     if (selectedStrategy === 'user_script' && scriptForm.entryType !== 'on_bar') {
       setError('自定义脚本策略必须选择或新建一个 on_bar 策略代码');
-      return null;
-    }
-    const selectedPreflight = preflight?.timeframes.find((item) => item.timeframe === selectedTimeframe);
-    if (!selectedPreflight?.available) {
-      showPreflightNotice(selectedPreflight?.reason || '正在检查当前策略的数据可用性');
       return null;
     }
     setStrategySavePending(true);
@@ -2317,12 +2316,6 @@ export default function BacktestPage({
       revealConfigSection('inputs');
       return;
     }
-    const selectedPreflight = preflight?.timeframes.find((item) => item.timeframe === selectedTimeframe);
-    if (!selectedPreflight?.available) {
-      showPreflightNotice(selectedPreflight?.reason || '正在检查当前策略的数据可用性');
-      revealConfigSection('scope');
-      return;
-    }
     const validationErrors = validateParams(params);
     if (validationErrors.length > 0) {
       setError(validationErrors.join('；'));
@@ -2411,40 +2404,6 @@ export default function BacktestPage({
     setError('');
   };
 
-  const buildDataCoverage = (
-    label: string,
-    statusData: DataStatus | null,
-    loading: boolean,
-    statusError: string,
-  ) => {
-    if (loading) return { tone: 'info', text: `正在检查${label} ${selectedTimeframe} K 线覆盖...` };
-    if (statusError) return { tone: 'warn', text: `${label}数据状态读取失败：${statusError}` };
-    if (!statusData || !statusData.exists) {
-      return { tone: 'warn', text: `${label} ${selectedTimeframe} 尚未导入 QMT 历史数据` };
-    }
-    if (!isValidDate(params.startDate) || !isValidDate(params.endDate)) {
-      return { tone: 'warn', text: '日期格式正确后再检查数据覆盖' };
-    }
-    const firstDate = statusData.firstDate || '-';
-    const lastDate = statusData.lastDate || '-';
-    const gaps = statusData.gapDates.filter((item) => (
-      item.date >= params.startDate && item.date <= params.endDate
-    ));
-    if (!statusData.firstDate || !statusData.lastDate) {
-      return { tone: 'warn', text: `${label} ${selectedTimeframe} K 线缺少可识别日期` };
-    }
-    if (params.startDate < statusData.firstDate || params.endDate > statusData.lastDate) {
-      return {
-        tone: 'warn',
-        text: `${label} ${selectedTimeframe} 覆盖 ${firstDate}-${lastDate}，未完全覆盖当前区间`,
-      };
-    }
-    if (gaps.length > 0) {
-      return { tone: 'warn', text: `${label} ${selectedTimeframe} 覆盖区间，但存在 ${gaps.length} 个缺口日期` };
-    }
-    return { tone: 'ok', text: `${label} ${selectedTimeframe} 已覆盖 ${params.startDate}-${params.endDate}` };
-  };
-
   const formatMoney = (value: number | null | undefined) => (
     typeof value === 'number' && Number.isFinite(value)
       ? value.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
@@ -2469,45 +2428,44 @@ export default function BacktestPage({
   );
   const isCorePositionOverlay = params.strategyCategory === 'core_position_overlay';
   const isL2Quote = params.fillModel === 'l2_quote';
-  const preflightTimeframes = preflight?.timeframes || [];
-  const selectedPreflight = preflightTimeframes.find((item) => item.timeframe === selectedTimeframe);
   const dateRangeDataStatus = dataStatus?.symbol === selectedSymbol
     && dataStatus.timeframe === selectedTimeframe
+    && dataStatus.fillModel === normalizeFillModel(params.fillModel)
     ? dataStatus
     : null;
+  const benchmarkRangeDataStatus = benchmarkDataStatus?.symbol === selectedBenchmarkSymbol
+    && benchmarkDataStatus.timeframe === selectedTimeframe
+    && benchmarkDataStatus.fillModel === 'bar_next_open'
+    ? benchmarkDataStatus
+    : null;
+  const rangeAvailability = resolveRangeAvailability(
+    dateRangeDataStatus, loadingDataStatus, dataStatusError,
+  );
   const backtestDateRangePickerProps = {
     startDate: params.startDate,
     endDate: params.endDate,
-    dataStartDate: dateRangeDataStatus?.firstDate,
-    dataEndDate: dateRangeDataStatus?.lastDate,
+    rangeAvailability,
     onApplyRange: (startDate: string, endDate: string) => {
       setParams((current) => ({ ...current, startDate, endDate }));
     },
   };
-  const timeframeOptions = preflightTimeframes.length > 0
-    ? preflightTimeframes
-    : (isL2Quote
-      ? L2_TIMEFRAMES.map((timeframe) => ({ timeframe, available: false, reason: '正在检查数据可用性' }))
-      : backtestTimeframes.map((item) => ({
-        ...item,
-        reason: item.available ? '数据完整' : 'Bar 数据不完整',
-      })));
-  const dataCoverage = selectedPreflight
-    ? {
-      tone: selectedPreflight.available ? 'ok' : 'warning',
-      text: selectedPreflight.reason,
-    }
-    : { tone: 'warning', text: '正在检查当前日期范围的数据可用性。' };
-  const benchmarkCoverage = isL2Quote
-    ? { tone: 'info', text: 'L2 模式不使用 QMT 基准覆盖；结果会保存 L2 数据来源版本。' }
-    : buildDataCoverage(
-      '基准标的',
-      benchmarkDataStatus,
-      loadingBenchmarkDataStatus,
-      benchmarkDataStatusError,
+  const dataRangeMetadata = buildDataRangeMetadata(
+    '运行标的', isL2Quote ? 'L2' : selectedTimeframe, rangeAvailability,
+  );
+  const benchmarkRangeMetadata = isL2Quote
+    ? { tone: 'info' as const, text: 'L2 模式暂不计算基准曲线。' }
+    : buildDataRangeMetadata(
+      '基准标的', selectedTimeframe,
+      resolveRangeAvailability(
+        benchmarkRangeDataStatus, loadingBenchmarkDataStatus, benchmarkDataStatusError,
+      ),
     );
-  const runPreflightReady = selectedPreflight?.available === true && (isL2Quote || benchmarkCoverage.tone === 'ok');
-  const dataCoverageColor = dataCoverage.tone === 'ok' ? '#0f766e' : dataCoverage.tone === 'info' ? '#1d4ed8' : '#b45309';
+  const dataRangeColor = dataRangeMetadata.tone === 'ok'
+    ? '#0f766e'
+    : dataRangeMetadata.tone === 'info' ? '#1d4ed8' : '#b45309';
+  const benchmarkRangeColor = benchmarkRangeMetadata.tone === 'ok'
+    ? '#0f766e'
+    : benchmarkRangeMetadata.tone === 'info' ? '#1d4ed8' : '#b45309';
   const resultHistoryRun = result?.runId ? backtestRuns.find((item) => item.id === result.runId) || null : null;
   const resultStrategyCategory = result?.strategyCategory || result?.experimentManifest?.strategyCategory || resultHistoryRun?.strategyCategory || params.strategyCategory;
   const isOverlayResult = resultStrategyCategory === 'core_position_overlay';
@@ -3329,16 +3287,6 @@ export default function BacktestPage({
       gridTemplateRows: activePanel === 'overview' ? '52px minmax(0, 1fr)' : 'minmax(0, 1fr)',
       overflow: 'hidden',
     }}>
-      {preflightNotice && (
-        <div role="status" style={{
-          position: 'fixed', right: 24, bottom: 24, zIndex: 40, maxWidth: 360,
-          padding: '10px 12px', borderRadius: 6, border: '1px solid #f59e0b', background: '#fffbeb',
-          color: '#92400e', boxShadow: '0 8px 24px rgba(15, 23, 42, 0.16)', fontSize: 13, lineHeight: 1.5,
-        }}>
-          {preflightNotice}
-        </div>
-      )}
-
       <SignalDetailExportDrawer
         open={signalExportDrawerOpen}
         tasks={signalDetailExports.tasks}
@@ -3482,15 +3430,13 @@ export default function BacktestPage({
               ? '请先选择策略方案'
               : versionDirty
                 ? '请先保存策略'
-                : !runPreflightReady
-                  ? '当前日期范围数据不完整'
-                  : undefined}
+                : undefined}
             style={{
               height: 36,
               borderRadius: 4,
-              border: `1px solid ${runDisabled ? '#cbd5e1' : !runPreflightReady ? '#f59e0b' : '#0f766e'}`,
-              background: runDisabled ? '#f1f5f9' : !runPreflightReady ? '#fffbeb' : '#ccfbf1',
-              color: runDisabled ? '#94a3b8' : !runPreflightReady ? '#92400e' : '#0f766e',
+              border: `1px solid ${runDisabled ? '#cbd5e1' : '#0f766e'}`,
+              background: runDisabled ? '#f1f5f9' : '#ccfbf1',
+              color: runDisabled ? '#94a3b8' : '#0f766e',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -3667,14 +3613,14 @@ export default function BacktestPage({
 
               <section style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 8 }}>
-                  运行前检查
+                  可回测范围
                 </div>
-                <div style={{ color: dataCoverageColor, fontSize: 12, lineHeight: 1.65 }}>
-                  {dataCoverage.text}
+                <div style={{ color: dataRangeColor, fontSize: 12, lineHeight: 1.65 }}>
+                  {dataRangeMetadata.text}
                 </div>
 
-                <div style={{ color: benchmarkCoverage.tone === 'ok' ? '#0f766e' : '#b45309', fontSize: 12, lineHeight: 1.65, marginTop: 6 }}>
-                  {benchmarkCoverage.text}
+                <div style={{ color: benchmarkRangeColor, fontSize: 12, lineHeight: 1.65, marginTop: 6 }}>
+                  {benchmarkRangeMetadata.text}
                 </div>
                 <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.65, marginTop: 8 }}>
                   {activeConfig
@@ -4068,7 +4014,7 @@ export default function BacktestPage({
                   <div className="strategy-config-scroll">
                   <ConfigSectionCard
                     title="回测范围"
-                    summary={`${selectedSymbol} · ${selectedTimeframe} · ${dataCoverage.tone === 'ok' ? '数据就绪' : '需检查'}`}
+                    summary={`${selectedSymbol} · ${selectedTimeframe}`}
                     defaultOpen
                     sectionRef={(element) => { configSectionRefs.current.scope = element; }}
                   >
@@ -4080,31 +4026,23 @@ export default function BacktestPage({
                         onChange={(e) => setVersionTimeframe(e.target.value)}
                         style={fieldStyle}
                       >
-                        {timeframeOptions.map((item) => (
-                          <option key={item.timeframe} value={item.timeframe}>
-                            {item.timeframe}（{item.available ? '数据完整' : item.reason || '数据不完整'}）
+                        {BACKTEST_TIMEFRAMES.map((timeframe) => (
+                          <option key={timeframe} value={timeframe}>
+                            {timeframe}
                           </option>
                         ))}
                       </select>
-                      {!isL2Quote && backtestTimeframes.length === 0 && (
-                        <div className="strategy-config-warning">正在读取回测引擎支持的周期。</div>
-                      )}
-                      {!isL2Quote && selectedTimeframe === '1d' && selectedPreflight?.available && (
-                        <div className="strategy-config-help">
-                          {selectedPreflight.derivation ? '日线由完整 1m 数据派生' : '使用 QMT 原始日线'}
-                        </div>
-                      )}
                     </label>
                     <InstrumentSearchField label="基准标的" value={selectedBenchmarkSymbol} onChange={setSelectedBenchmarkSymbol} />
                     <div>
                       <div style={labelStyle}>回测区间</div>
                       <BacktestDateRangePicker {...backtestDateRangePickerProps} />
                     </div>
-                    <div className={`strategy-config-check ${dataCoverage.tone === 'ok' ? 'is-ready' : 'is-warning'}`}>
-                      {dataCoverage.text}
+                    <div className={`strategy-config-check ${dataRangeMetadata.tone === 'ok' ? 'is-ready' : 'is-warning'}`}>
+                      {dataRangeMetadata.text}
                     </div>
-                    <div className={`strategy-config-check ${benchmarkCoverage.tone === 'ok' ? 'is-ready' : 'is-warning'}`}>
-                      {benchmarkCoverage.text}
+                    <div className={`strategy-config-check ${benchmarkRangeMetadata.tone === 'ok' ? 'is-ready' : 'is-warning'}`}>
+                      {benchmarkRangeMetadata.text}
                     </div>
                   </ConfigSectionCard>
                   <ConfigSectionCard
@@ -4348,7 +4286,7 @@ export default function BacktestPage({
                       gap: 6,
                       cursor: runDisabled ? 'not-allowed' : 'pointer',
                       opacity: runDisabled ? 0.7 : 1,
-                    }} onClick={handleRunBacktest} disabled={runDisabled} title={versionDirty ? '请先保存策略' : !hasSelectedConfig ? '请先保存策略' : !runPreflightReady ? '当前日期范围数据不完整' : undefined}>
+                    }} onClick={handleRunBacktest} disabled={runDisabled} title={versionDirty || !hasSelectedConfig ? '请先保存策略' : undefined}>
                       <Play size={14} />
                       {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : '运行回测'}
                     </button>
@@ -4377,7 +4315,7 @@ export default function BacktestPage({
                     ? versionDirty
                       ? '保存后可运行回测'
                       : '完成策略配置后可运行回测'
-                    : `${selectedSymbol} · ${selectedTimeframe} · 已通过运行前检查`}
+                    : `${selectedSymbol} · ${selectedTimeframe} · 可运行回测`}
                 </span>
               </div>
             </section>
@@ -5923,15 +5861,15 @@ export default function BacktestPage({
 
 
           <div style={{
-            color: dataCoverageColor,
-            background: dataCoverage.tone === 'ok' ? '#ecfdf5' : '#fffbeb',
-            border: `1px solid ${dataCoverage.tone === 'ok' ? '#99f6e4' : '#f59e0b'}`,
+            color: dataRangeColor,
+            background: dataRangeMetadata.tone === 'ok' ? '#ecfdf5' : '#fffbeb',
+            border: `1px solid ${dataRangeMetadata.tone === 'ok' ? '#99f6e4' : '#f59e0b'}`,
             borderRadius: 4,
             padding: '8px 10px',
             fontSize: 12,
             lineHeight: 1.5,
           }}>
-            {dataCoverage.text}
+            {dataRangeMetadata.text}
           </div>
 
           {(status || error) && (

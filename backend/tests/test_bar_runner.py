@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from backend import bar_runner
+from backend.services import market_data
 from backend.services.backtest_faults import BacktestFault
 from backend.services.backtest_errors import RemoteBacktestError
 
@@ -104,6 +105,143 @@ def test_research_result_outbox_failure_does_not_escape(monkeypatch: pytest.Monk
   monkeypatch.setattr(bar_runner.research_result_outbox, "dispatch_pending", raise_dispatch_error)
 
   bar_runner._dispatch_research_result_outbox()
+
+
+def test_user_script_bar_load_wraps_data_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(
+    bar_runner.backtest_runner.market_data,
+    "required_trade_dates",
+    lambda *_: ["2026-07-01", "2026-07-02"],
+  )
+  monkeypatch.setattr(
+    bar_runner.backtest_runner.market_data,
+    "resolve_backtest_data",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("query timed out")),
+  )
+
+  with pytest.raises(BacktestFault) as captured:
+    bar_runner.backtest_runner._load_user_script_bars({
+      "symbol": "688981.SH",
+      "timeframe": "5m",
+      "startDate": "2026-07-01",
+      "endDate": "2026-07-30",
+    })
+
+  assert captured.value.code == "data.bar_load_failed"
+  assert isinstance(captured.value.__cause__, TimeoutError)
+
+
+def test_user_script_bar_load_validates_the_requested_trade_dates(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  captured_dates: list[str] = []
+  monkeypatch.setattr(
+    bar_runner.backtest_runner.market_data,
+    "required_trade_dates",
+    lambda *_: ["2026-07-01", "2026-07-02"],
+  )
+
+  def resolve(
+    symbol: str,
+    timeframe: str,
+    start_date: str,
+    end_date: str,
+    formal_dates: list[str],
+    *_: object,
+    **__: object,
+  ) -> object:
+    del symbol, timeframe, start_date, end_date
+    captured_dates.extend(formal_dates)
+    raise market_data.MarketDataError("2026-07-02 缺少覆盖元数据")
+
+  monkeypatch.setattr(bar_runner.backtest_runner.market_data, "resolve_backtest_data", resolve)
+
+  with pytest.raises(BacktestFault) as raised:
+    bar_runner.backtest_runner._load_user_script_bars({
+      "symbol": "688981.SH",
+      "timeframe": "5m",
+      "startDate": "2026-07-01",
+      "endDate": "2026-07-02",
+    })
+
+  assert captured_dates == ["2026-07-01", "2026-07-02"]
+  assert raised.value.code == "data.bar_load_failed"
+
+
+def test_user_script_bar_load_preserves_queued_snapshot_dates(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  captured_dates: list[str] = []
+  monkeypatch.setattr(
+    bar_runner.backtest_runner.market_data,
+    "required_trade_dates",
+    lambda *_: pytest.fail("旧任务已有冻结日期时不应重算交易日"),
+  )
+
+  def resolve(
+    symbol: str,
+    timeframe: str,
+    start_date: str,
+    end_date: str,
+    formal_dates: list[str],
+    *_: object,
+    **__: object,
+  ) -> object:
+    del symbol, timeframe, start_date, end_date
+    captured_dates.extend(formal_dates)
+    raise market_data.MarketDataError("停止测试")
+
+  monkeypatch.setattr(bar_runner.backtest_runner.market_data, "resolve_backtest_data", resolve)
+
+  with pytest.raises(BacktestFault):
+    bar_runner.backtest_runner._load_user_script_bars({
+      "symbol": "688981.SH",
+      "timeframe": "5m",
+      "startDate": "2026-07-01",
+      "endDate": "2026-07-02",
+      "marketDataSnapshot": {
+        "barSnapshot": {"formalDates": ["2026-07-01", "2026-07-02"]},
+      },
+    })
+
+  assert captured_dates == ["2026-07-01", "2026-07-02"]
+
+
+def test_shared_bar_load_wraps_data_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(
+    bar_runner.backtest_runner.bar_data,
+    "load_bars_with_snapshot",
+    lambda *_args: (_ for _ in ()).throw(RuntimeError("invalid bar schema")),
+  )
+
+  with pytest.raises(BacktestFault) as captured:
+    bar_runner.backtest_runner._load_bars(
+      "688981.SH", "5m", "2026-07-01", "2026-07-30",
+    )
+
+  assert captured.value.code == "data.bar_load_failed"
+  assert captured.value.context == {"symbol": "688981.SH", "timeframe": "5m"}
+  assert isinstance(captured.value.__cause__, RuntimeError)
+
+
+def test_benchmark_bar_load_hides_internal_error(
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  monkeypatch.setattr(
+    bar_runner.backtest_runner,
+    "_load_bars",
+    lambda *_args: (_ for _ in ()).throw(ValueError("clickhouse query timed out")),
+  )
+
+  with caplog.at_level("ERROR"):
+    points, warnings = bar_runner.backtest_runner._build_benchmark_equity(
+      "000300.SH", "5m", "2026-07-01", "2026-07-30", 1_000_000,
+    )
+
+  assert points == []
+  assert warnings == ["对比标的 000300.SH 5m 行情数据异常，请联系管理员"]
+  assert "clickhouse query timed out" in caplog.text
 
 
 def test_strategy_summary_uses_cash_and_base_cost_as_initial_equity() -> None:

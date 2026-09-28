@@ -1,10 +1,30 @@
 name: quant-backtest-platform
 
+x-bounded-logging: &bounded-logging
+  driver: local
+  options:
+    max-size: ${TREND_GRID_LOG_LOCAL_MAX_SIZE:-20m}
+    max-file: ${TREND_GRID_LOG_LOCAL_MAX_FILES:-5}
+    compress: 'true'
+    mode: non-blocking
+    max-buffer-size: 4m
+
+x-log-on-main: &log-on-main
+  com.trend-grid.logging-network: quant-backtest-net
+
+x-log-on-l2: &log-on-l2
+  com.trend-grid.logging-network: quant-backtest-l2-net
+
+x-log-on-observability: &log-on-observability
+  com.trend-grid.logging-network: quant-backtest-observability-net
+
 services:
   postgres:
     image: postgres:17.4-alpine
     container_name: quant-backtest-postgres
     restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-main
     env_file:
       - .env
     environment:
@@ -108,6 +128,8 @@ services:
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-main
     env_file:
       - .env
     environment:
@@ -123,6 +145,15 @@ services:
       TREND_GRID_CLICKHOUSE_PASSWORD: ${TREND_GRID_CLICKHOUSE_PASSWORD:-}
       TREND_GRID_L2_REDIS_HOST: l2-bar-cache
       TREND_GRID_L2_REDIS_PORT: '6379'
+      TREND_GRID_OBSERVABILITY_ENABLED: ${TREND_GRID_OBSERVABILITY_ENABLED:-false}
+      TREND_GRID_LOKI_URL: http://loki:3100
+      TREND_GRID_LOG_RETENTION_HOURS: ${TREND_GRID_LOG_RETENTION_HOURS:-720}
+      TREND_GRID_LOG_QUERY_TIMEOUT_SECONDS: ${TREND_GRID_LOG_QUERY_TIMEOUT_SECONDS:-3}
+      TREND_GRID_LOG_QUERY_MAX_LINES: ${TREND_GRID_LOG_QUERY_MAX_LINES:-500}
+      TREND_GRID_LOG_QUERY_MAX_HOURS: ${TREND_GRID_LOG_QUERY_MAX_HOURS:-744}
+      TREND_GRID_LOG_LOCAL_MAX_SIZE: ${TREND_GRID_LOG_LOCAL_MAX_SIZE:-20m}
+      TREND_GRID_LOG_LOCAL_MAX_FILES: ${TREND_GRID_LOG_LOCAL_MAX_FILES:-5}
+      TREND_GRID_COMPOSE_PROJECT: quant-backtest-platform
     depends_on:
       postgres:
         condition: service_healthy
@@ -139,11 +170,14 @@ services:
     networks:
       - quant-backtest-net
       - quant-backtest-l2-net
+      - quant-backtest-observability-net
 
   redis:
     image: redis:7.4-alpine
     container_name: quant-backtest-l2-redis
     restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-l2
     command: ['redis-server', '--save', '', '--appendonly', 'no', '--maxmemory-policy', 'allkeys-lru']
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
@@ -155,6 +189,142 @@ services:
         aliases:
           - l2-bar-cache
 
+  docker-socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:v0.4.2@sha256:1f3a6f303320723d199d2316a3e82b2e2685d86c275d5e3deeaf182573b47476
+    profiles: ['observability']
+    container_name: quant-backtest-docker-socket-proxy
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ['ALL']
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      LOG_LEVEL: notice
+      POST: '0'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docker-socket-proxy/haproxy.cfg.template:/usr/local/etc/haproxy/haproxy.cfg.template:ro
+    tmpfs:
+      - /run
+      - /tmp
+      - /var/lib/haproxy
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 64
+    logging: *bounded-logging
+    labels: *log-on-observability
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:2375/_ping']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - quant-backtest-observability-net
+
+  loki:
+    image: grafana/loki:3.7.6@sha256:efd47c67f9bac88ca29bcf8cb997d9ab29d1848bd0aff579282295542a745952
+    profiles: ['observability']
+    container_name: quant-backtest-loki
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/loki/loki-config.yml
+      - -config.expand-env=true
+    environment:
+      TREND_GRID_LOG_RETENTION_HOURS: ${TREND_GRID_LOG_RETENTION_HOURS:-720}
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - quant-backtest-loki-data:/loki
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 256
+    logging: *bounded-logging
+    labels: *log-on-observability
+    healthcheck:
+      test: ['CMD', '/usr/bin/loki', '-version']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - quant-backtest-observability-net
+
+  alloy:
+    image: grafana/alloy:v1.19.2@sha256:b8ec653c44235fbe910879145dac3597d66b0aaecf60bcbbe82580767771a839
+    profiles: ['observability']
+    container_name: quant-backtest-alloy
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    environment:
+      TREND_GRID_COMPOSE_PROJECT: quant-backtest-platform
+      TREND_GRID_ENVIRONMENT: ${TREND_GRID_ENVIRONMENT:-production}
+      TREND_GRID_LOKI_URL: http://loki:3100
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - quant-backtest-alloy-data:/var/lib/alloy/data
+    depends_on:
+      docker-socket-proxy:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    cpus: 0.5
+    mem_limit: 512m
+    pids_limit: 128
+    logging: *bounded-logging
+    labels: *log-on-observability
+    healthcheck:
+      test: ['CMD', '/bin/alloy', '--version']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - quant-backtest-observability-net
+
+  container-event-observer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    profiles: ['observability']
+    container_name: quant-backtest-container-event-observer
+    restart: unless-stopped
+    labels: *log-on-observability
+    env_file:
+      - .env
+    environment:
+      TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
+      TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+      TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+      TREND_GRID_OBSERVABILITY_ENABLED: 'true'
+      TREND_GRID_LOKI_URL: http://loki:3100
+      TREND_GRID_DOCKER_EVENTS_URL: http://docker-socket-proxy:2375
+      TREND_GRID_COMPOSE_PROJECT: quant-backtest-platform
+    command: ['python', '-m', 'backend.container_event_observer']
+    depends_on:
+      postgres:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_healthy
+    cpus: 0.25
+    mem_limit: 256m
+    pids_limit: 64
+    logging: *bounded-logging
+    healthcheck:
+      test: ['CMD', 'python', '-m', 'backend.container_event_observer', '--healthcheck']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - quant-backtest-net
+      - quant-backtest-observability-net
+
   l2-runner:
     build:
       context: ..
@@ -163,11 +333,15 @@ services:
         APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
         CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
     restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-main
     env_file:
       - .env
     environment:
       TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
       TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+      TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
       TREND_GRID_CLICKHOUSE_HTTP_URL: ${TREND_GRID_CLICKHOUSE_HTTP_URL:-}
       TREND_GRID_CLICKHOUSE_USER: ${TREND_GRID_CLICKHOUSE_USER:-default}
       TREND_GRID_CLICKHOUSE_PASSWORD: ${TREND_GRID_CLICKHOUSE_PASSWORD:-}
@@ -176,7 +350,13 @@ services:
       TREND_GRID_L2_EVENT_MAPPING_JSON: ${TREND_GRID_L2_EVENT_MAPPING_JSON:-}
       TREND_GRID_L2_REDIS_HOST: l2-bar-cache
       TREND_GRID_L2_REDIS_PORT: '6379'
-    command: ['python', '-m', 'backend.l2_runner']
+    command:
+      - python
+      - -m
+      - backend.runner_supervisor
+      - l2
+      - --processes
+      - '1'
     depends_on:
       postgres:
         condition: service_healthy
@@ -199,18 +379,28 @@ services:
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-main
     env_file:
       - .env
     environment:
       TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
       TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+      TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
       TREND_GRID_CLICKHOUSE_HTTP_URL: ${TREND_GRID_CLICKHOUSE_HTTP_URL:-}
       TREND_GRID_CLICKHOUSE_USER: ${TREND_GRID_CLICKHOUSE_USER:-default}
       TREND_GRID_CLICKHOUSE_PASSWORD: ${TREND_GRID_CLICKHOUSE_PASSWORD:-}
       TREND_GRID_L2_BAR_MAPPING_JSON: ${TREND_GRID_L2_BAR_MAPPING_JSON:-}
       TREND_GRID_L2_REDIS_HOST: l2-bar-cache
       TREND_GRID_L2_REDIS_PORT: '6379'
-    command: ['python', '-m', 'backend.bar_runner']
+    command:
+      - python
+      - -m
+      - backend.runner_supervisor
+      - bar
+      - --processes
+      - '1'
     depends_on:
       postgres:
         condition: service_healthy
@@ -234,11 +424,15 @@ services:
         CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
     container_name: quant-backtest-signal-export-runner
     restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-main
     env_file:
       - .env
     environment:
       TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
       TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+      TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
       TREND_GRID_OUTPUT_ROOT: /runtime/artifacts
       TREND_GRID_SIGNAL_EXPORT_RETENTION_HOURS: ${TREND_GRID_SIGNAL_EXPORT_RETENTION_HOURS:-24}
       TREND_GRID_SIGNAL_EXPORT_TASK_RETENTION_DAYS: ${TREND_GRID_SIGNAL_EXPORT_TASK_RETENTION_DAYS:-30}
@@ -272,6 +466,8 @@ services:
         VITE_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
     container_name: quant-backtest-frontend
     restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-main
     depends_on:
       backend:
         condition: service_healthy
@@ -311,6 +507,10 @@ volumes:
     name: quant-backtest-postgres-data
   quant-backtest-artifacts:
     name: quant-backtest-artifacts
+  quant-backtest-loki-data:
+    name: quant-backtest-loki-data
+  quant-backtest-alloy-data:
+    name: quant-backtest-alloy-data
 
 networks:
   quant-backtest-net:
@@ -318,5 +518,9 @@ networks:
     driver: bridge
   quant-backtest-l2-net:
     name: quant-backtest-l2-net
+    driver: bridge
+    internal: true
+  quant-backtest-observability-net:
+    name: quant-backtest-observability-net
     driver: bridge
     internal: true

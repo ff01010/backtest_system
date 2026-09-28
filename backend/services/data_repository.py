@@ -16,6 +16,7 @@ from typing import Any
 import pandas as pd
 
 from backend.services import market_data, signal_parser, time_mapper, zigzag_detector
+from backend.services.backtest_faults import BacktestFault
 from backend import settings
 from backend.date_codec import format_api_date, format_legacy_date
 from backend.time_utils import format_epoch_as_shanghai
@@ -152,21 +153,26 @@ def load_chart_bars(symbol: str, date: str, timeframe: str) -> list[dict[str, An
   """读取单日行情，并转换为前端图表统一时间格式。"""
   try:
     frame = market_data.load_bars(symbol, timeframe, date, date)
-  except (market_data.MarketDataError, ValueError) as error:
-    raise ValueError(f"K 线读取失败: {error}") from error
-
-  bars: list[dict[str, Any]] = []
-  for _, row in frame.iterrows():
-    timestamp = str(row["time"])
-    bars.append({
-      "time": f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}T{timestamp[8:10]}:{timestamp[10:12]}:00",
-      "open": float(row["open"]),
-      "high": float(row["high"]),
-      "low": float(row["low"]),
-      "close": float(row["close"]),
-      "volume": int(row.get("volume", 0)),
-    })
-  return bars
+    bars: list[dict[str, Any]] = []
+    for _, row in frame.iterrows():
+      timestamp = str(row["time"])
+      bars.append({
+        "time": f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}T{timestamp[8:10]}:{timestamp[10:12]}:00",
+        "open": float(row["open"]),
+        "high": float(row["high"]),
+        "low": float(row["low"]),
+        "close": float(row["close"]),
+        "volume": int(row.get("volume", 0)),
+      })
+    return bars
+  except BacktestFault:
+    raise
+  except (KeyError, TypeError, ValueError, OverflowError, market_data.MarketDataError) as error:
+    raise BacktestFault(
+      "data.bar_load_failed",
+      "图表 Bar 行情读取失败",
+      {"symbol": symbol, "timeframe": timeframe},
+    ) from error
 
 
 def load_chart_data(symbol: str, date: str, timeframe: str, strategy: str = "trend_grid",

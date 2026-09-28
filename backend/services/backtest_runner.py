@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import math
 import numbers
 import os
@@ -27,7 +28,10 @@ from backend.strategies.catalog import create_bar_strategy, get_strategy_source_
 from backend.strategies.external_engine import load_external_engine
 from backend.strategies.runtime_contract import RUNTIME_CAPABILITY_DIGEST, SCRIPT_RUNTIME_VERSION
 from backend.strategies.script_time_context import normalize_script_bar_time
-from backend.services import bar_data, market_data, state_store
+from backend.services import bar_data, market_data, research_signal_snapshot, state_store
+from backend.services.backtest_faults import BacktestFault
+
+logger = logging.getLogger(__name__)
 
 _BACKTEST_SYSTEM_ROOT = os.path.dirname(
   os.path.dirname(os.path.dirname(__file__))
@@ -150,6 +154,12 @@ def run_user_script_backtest(
     raise ValueError("所选策略代码不是可执行的 on_bar 脚本")
   bars, warmup_bar_count, data_snapshot = _load_user_script_bars(payload)
   formal_bars = bars.iloc[warmup_bar_count:].reset_index(drop=True)
+  signal_snapshot = payload.get("researchSignalSnapshot")
+  if isinstance(signal_snapshot, dict):
+    signal_snapshot = research_signal_snapshot.align_frozen_signal_snapshot(
+      signal_snapshot,
+      [str(row.time) for row in formal_bars.itertuples(index=False)],
+    )
   code_hash = hashlib.sha256(script["code"].encode("utf-8")).hexdigest()
   manifest = _build_script_experiment_manifest(
     payload, formal_bars, script_id, script["name"], code_hash, data_snapshot,
@@ -175,7 +185,7 @@ def run_user_script_backtest(
     or "legacy"
   )
   research_signal_by_bar_time = _research_signal_by_bar_time(
-    payload.get("researchSignalSnapshot"),
+    signal_snapshot,
     [str(row.time) for row in bars.itertuples(index=False)],
   )
   if script_executor is None:
@@ -277,8 +287,8 @@ def run_user_script_backtest(
     "experimentManifest": manifest,
     "warnings": _build_warnings(payload) + benchmark_warnings + execution_result["warnings"],
   }
-  if isinstance(payload.get("researchSignalSnapshot"), dict):
-    response["researchSignalSnapshot"] = payload["researchSignalSnapshot"]
+  if isinstance(signal_snapshot, dict):
+    response["researchSignalSnapshot"] = signal_snapshot
   return response
 
 
@@ -356,7 +366,8 @@ def run_research_signal_backtest(
   }
   script_payload["strategyParams"] = {**dict(payload.get("strategyParams") or {}), "signalsByDate": signals}
   result = run_user_script_backtest(script_payload, script_executor)
-  result["researchSignalSnapshot"] = snapshot
+  if "researchSignalSnapshot" not in result:
+    result["researchSignalSnapshot"] = snapshot
   return result
 
 
@@ -403,16 +414,28 @@ def on_bar(bar, state):
 
 
 def _load_user_script_bars(payload: dict[str, Any]) -> tuple[pd.DataFrame, int, dict[str, Any]]:
-  """标准自定义策略固定走与预检一致的 QMT 来源解析器。"""
+  """标准自定义策略在 Worker 内解析来源并实际读取 QMT Bar。"""
   timeframe = str(payload.get("timeframe", "5m"))
   saved = dict(payload.get("marketDataSnapshot") or {}).get("barSnapshot") or {}
   formal_dates = saved.get("formalDates") if isinstance(saved.get("formalDates"), list) else None
-  resolution = market_data.resolve_backtest_data(
-    payload["symbol"], timeframe, payload["startDate"], payload["endDate"], formal_dates,
-    int(payload.get("warmupTradingDays", 0)),
-  )
-  frame, warmup_bar_count = market_data.load_backtest_bars(payload["symbol"], resolution)
-  return frame, warmup_bar_count, {"provider": "qmt_kline", **market_data.snapshot_for_resolution(payload["symbol"], resolution)}
+  try:
+    if not formal_dates:
+      formal_dates = market_data.required_trade_dates(payload["startDate"], payload["endDate"])
+    resolution = market_data.resolve_backtest_data(
+      payload["symbol"], timeframe, payload["startDate"], payload["endDate"], formal_dates,
+      int(payload.get("warmupTradingDays", 0)),
+    )
+    frame, warmup_bar_count = market_data.load_backtest_bars(payload["symbol"], resolution)
+    snapshot = market_data.snapshot_for_resolution(
+      payload["symbol"], resolution, bar_count=len(frame),
+    )
+  except Exception as error:
+    raise BacktestFault(
+      "data.bar_load_failed",
+      "标准 Bar 行情读取失败",
+      {"symbol": str(payload["symbol"]), "timeframe": timeframe},
+    ) from error
+  return frame, warmup_bar_count, {"provider": "qmt_kline", **snapshot}
 
 
 def _script_output_dir(payload: dict[str, Any]) -> str:
@@ -429,6 +452,11 @@ def _build_script_experiment_manifest(
   data_snapshot = data_snapshot or dict(payload.get("marketDataSnapshot", {}).get(payload["symbol"]) or market_data.snapshot(
     payload["symbol"], timeframe, payload["startDate"], payload["endDate"],
   ))
+  research_signal = payload.get("researchSignalSnapshot")
+  research_signal_hash = (
+    str(research_signal.get("snapshotHash"))
+    if isinstance(research_signal, dict) and research_signal.get("snapshotHash") else None
+  )
   config_hash = _stable_hash({
     "scriptId": script_id,
     "strategyParams": payload.get("strategyParams", {}),
@@ -452,6 +480,7 @@ def _build_script_experiment_manifest(
     "baseQuantity": int(payload.get("baseQuantity", 0)),
     "baseCostPrice": float(payload.get("baseCostPrice", 0)),
     "t0Enabled": bool(payload.get("t0Enabled", False)),
+    "researchSignalSnapshotHash": research_signal_hash,
     "resultSchemaVersion": 3,
   })
   experiment_hash = _stable_hash({
@@ -985,10 +1014,19 @@ def _apply_position_params(strategy: dict[str, Any], payload: dict[str, Any]) ->
 
 
 def _load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
-  df, _ = bar_data.load_bars_with_snapshot(symbol, timeframe, start_date, end_date)
-  df["hhmm"] = df["time"].str[8:12].astype(int)
-  df = df[df["hhmm"].apply(is_trading_time)]
-  return df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+  try:
+    df, _ = bar_data.load_bars_with_snapshot(symbol, timeframe, start_date, end_date)
+    df["hhmm"] = df["time"].str[8:12].astype(int)
+    df = df[df["hhmm"].apply(is_trading_time)]
+    return df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+  except BacktestFault:
+    raise
+  except Exception as error:
+    raise BacktestFault(
+      "data.bar_load_failed",
+      "标准 Bar 行情读取失败",
+      {"symbol": symbol, "timeframe": timeframe},
+    ) from error
 
 
 def _to_backtest_bars(bars: pd.DataFrame, symbol: str) -> list[Bar]:
@@ -1389,8 +1427,9 @@ def _build_benchmark_equity(
 ) -> tuple[list[dict[str, Any]], list[str]]:
   try:
     bars = _load_bars(symbol, timeframe, start_date, end_date)
-  except (FileNotFoundError, ValueError) as e:
-    return [], [f"对比标的 {symbol} {timeframe} 数据不可用：{e}"]
+  except (BacktestFault, FileNotFoundError, ValueError):
+    logger.exception("读取对比标的行情失败: %s %s", symbol, timeframe)
+    return [], [f"对比标的 {symbol} {timeframe} 行情数据异常，请联系管理员"]
 
   daily_close = (
     bars.assign(date=bars["time"].str[:8])
