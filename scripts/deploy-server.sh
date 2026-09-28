@@ -196,7 +196,29 @@ wait_for_observability() {
     sleep 2
   done
   "${compose[@]}" ps docker-socket-proxy loki alloy container-event-observer
-  fail "日志基础设施未能在 90 秒内通过内部健康检查"
+  echo "警告：日志基础设施未能在 90 秒内通过内部健康检查" >&2
+  return 1
+}
+
+wait_for_observability_services() {
+  local attempt service health all_healthy
+  for attempt in $(seq 1 45); do
+    all_healthy=true
+    for service in quant-backtest-docker-socket-proxy quant-backtest-loki quant-backtest-alloy; do
+      health="$(docker inspect --format '{{.State.Health.Status}}' "$service" 2>/dev/null || true)"
+      if [[ "$health" != "healthy" ]]; then
+        all_healthy=false
+        break
+      fi
+    done
+    if [[ "$all_healthy" == "true" ]]; then
+      echo "日志基础设施预检通过"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "警告：日志基础设施预检未通过" >&2
+  return 1
 }
 
 verify_frontend_build() {
@@ -290,10 +312,6 @@ if [[ "$script_digest_before" != "$script_digest_after" \
 fi
 
 require_release_database_password
-release_activated=false
-trap report_incomplete_release EXIT
-close_submission_gate
-
 APPLICATION_BUILD_ID="$(git rev-parse HEAD)"
 CLIENT_COMPATIBILITY_VERSION="$(read_client_compatibility_version)"
 RELEASE_ADMIN_IMAGE="quant-backtest-release-admin:${APPLICATION_BUILD_ID}"
@@ -306,13 +324,32 @@ bar_runner_replicas="$(read_runner_replicas TREND_GRID_BAR_RUNNER_REPLICAS)"
 l2_runner_replicas="$(read_runner_replicas TREND_GRID_L2_RUNNER_REPLICAS)"
 validate_clickhouse_network
 "${compose[@]}" config >/dev/null || fail "Docker Compose 配置校验失败"
+# 不依赖业务迁移的日志服务先预检，避免其故障发生在停服之后。
+observability_preflight_ready=false
+if "${compose[@]}" up -d --build docker-socket-proxy loki alloy \
+  && wait_for_observability_services; then
+  observability_preflight_ready=true
+else
+  echo "警告：可观测性未通过预检，将继续核心回测发布" >&2
+fi
+
+release_activated=false
+trap report_incomplete_release EXIT
+close_submission_gate
 "${compose[@]}" up -d postgres
 wait_for_postgres
 stop_submission_and_wait_for_backtests
 check_active_backtests || fail "回测任务未完全排空；backend 保持停止"
 "${compose[@]}" --profile migration run --rm migrate
-"${compose[@]}" up -d --build docker-socket-proxy loki alloy container-event-observer
-wait_for_observability
+# 事件观察器需要迁移后的表结构；启动失败仅降级故障归因。
+if [[ "$observability_preflight_ready" == "true" ]]; then
+  if "${compose[@]}" up -d --build container-event-observer; then
+    echo "容器事件观察器已启动"
+  else
+    observability_preflight_ready=false
+    echo "警告：容器事件观察器启动失败，将继续核心回测发布" >&2
+  fi
+fi
 "${compose[@]}" up -d --build --remove-orphans \
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \
@@ -345,3 +382,12 @@ preserve_recovery_image
 release_activated=true
 open_submission_gate
 echo "版本通知已激活：buildId=${APPLICATION_BUILD_ID}"
+# 完整链路探针放在恢复业务之后，避免辅助服务延长停机窗口。
+if [[ "$observability_preflight_ready" == "true" ]]; then
+  if ! wait_for_observability; then
+    observability_preflight_ready=false
+  fi
+fi
+if [[ "$observability_preflight_ready" != "true" ]]; then
+  echo "警告：可观测性未通过，核心回测服务已完成发布，日志与容器事件需单独修复" >&2
+fi
