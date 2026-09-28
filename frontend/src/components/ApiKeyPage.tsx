@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   createApiKey,
   fetchApiKeys,
@@ -6,17 +6,33 @@ import {
   type ApiAccessKey,
 } from '../api/client';
 
-const ALL_SCOPES: ApiAccessKey['scopes'] = [
+const DEFAULT_SCOPES: ApiAccessKey['scopes'] = [
   'backtest:submit',
   'backtest:read',
   'backtest:cancel',
+  'strategy:read',
 ];
 
 const SCOPE_LABELS: Record<ApiAccessKey['scopes'][number], string> = {
   'backtest:submit': '提交回测',
   'backtest:read': '查询结果',
   'backtest:cancel': '取消任务',
+  'strategy:read': '读取策略与版本',
+  'strategy:write': '创建、修改与恢复策略',
+  'strategy:publish': '发布策略版本',
+  'strategy:delete': '归档策略',
 };
+
+const SCOPE_GROUPS: Array<{ title: string; scopes: ApiAccessKey['scopes'] }> = [
+  {
+    title: '回测任务',
+    scopes: ['backtest:submit', 'backtest:read', 'backtest:cancel'],
+  },
+  {
+    title: '策略管理',
+    scopes: ['strategy:read', 'strategy:write', 'strategy:publish', 'strategy:delete'],
+  },
+];
 
 function formatTime(value: string | null): string {
   return value ? value.replace('T', ' ').slice(0, 16) : '—';
@@ -26,10 +42,12 @@ export default function ApiKeyPage() {
   const [keys, setKeys] = useState<ApiAccessKey[]>([]);
   const [name, setName] = useState('');
   const [expiresAt, setExpiresAt] = useState('');
-  const [scopes, setScopes] = useState<ApiAccessKey['scopes']>(ALL_SCOPES);
+  const [scopes, setScopes] = useState<ApiAccessKey['scopes']>(DEFAULT_SCOPES);
   const [plainTextKey, setPlainTextKey] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const creatingRef = useRef(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -53,11 +71,13 @@ export default function ApiKeyPage() {
   };
 
   const handleCreate = async () => {
+    if (creatingRef.current) return;
     if (!name.trim() || scopes.length === 0) {
       setError('请填写名称并至少选择一项权限');
       return;
     }
-    setLoading(true);
+    creatingRef.current = true;
+    setCreating(true);
     setError('');
     try {
       const created = await createApiKey({
@@ -72,7 +92,8 @@ export default function ApiKeyPage() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '创建 API Key 失败');
     } finally {
-      setLoading(false);
+      creatingRef.current = false;
+      setCreating(false);
     }
   };
 
@@ -123,15 +144,25 @@ export default function ApiKeyPage() {
               到期日期（可选）
               <input type="date" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} style={inputStyle} />
             </label>
-            <button type="button" onClick={() => { void handleCreate(); }} disabled={loading} style={primaryButtonStyle}>{loading ? '处理中…' : '创建 Key'}</button>
+            <button type="button" onClick={() => { void handleCreate(); }} disabled={creating} style={primaryButtonStyle}>{creating ? '处理中…' : '创建 Key'}</button>
           </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 9, marginTop: 15 }}>
-            {ALL_SCOPES.map((scope) => (
-              <label key={scope} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 9px', border: '1px solid #dbe3eb', background: scopes.includes(scope) ? '#eff6ff' : '#fff', color: '#334155', fontSize: 12, cursor: 'pointer' }}>
-                <input type="checkbox" checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} />
-                {SCOPE_LABELS[scope]}
-              </label>
+          <div style={{ display: 'grid', gap: 12, marginTop: 15 }}>
+            {SCOPE_GROUPS.map((group) => (
+              <div key={group.title}>
+                <div style={{ color: '#64748b', fontSize: 11, fontWeight: 720, marginBottom: 7 }}>{group.title}</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 9 }}>
+                  {group.scopes.map((scope) => (
+                    <label key={scope} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 9px', border: '1px solid #dbe3eb', background: scopes.includes(scope) ? '#eff6ff' : '#fff', color: '#334155', fontSize: 12, cursor: 'pointer' }}>
+                      <input type="checkbox" checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} />
+                      {SCOPE_LABELS[scope]}
+                    </label>
+                  ))}
+                </div>
+              </div>
             ))}
+            <div style={{ color: '#b45309', fontSize: 11, lineHeight: 1.5 }}>
+              创建、修改、发布和归档会改变策略资源；这些高权限默认不勾选，请按调用方最小需要授权。
+            </div>
           </div>
         </section>
 

@@ -24,7 +24,15 @@ from backend.time_utils import format_shanghai_datetime
 SESSION_COOKIE = "quant_backtest_session"
 SESSION_LIFETIME = timedelta(hours=12)
 PASSWORD_ITERATIONS = 210_000
-API_KEY_SCOPES = {"backtest:submit", "backtest:read", "backtest:cancel"}
+API_KEY_SCOPES = {
+  "backtest:submit",
+  "backtest:read",
+  "backtest:cancel",
+  "strategy:read",
+  "strategy:write",
+  "strategy:publish",
+  "strategy:delete",
+}
 
 
 class AuthenticationError(RuntimeError):

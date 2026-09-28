@@ -61,6 +61,7 @@ import type {
 } from '../types';
 import { typography } from '../styles/typography';
 import { backtestErrorPresentation } from '../utils/backtestErrorPresentation';
+import { createBrowserUuid } from '../utils/browserUuid';
 import {
   areAllPageRunsSelected,
   backtestRunFilterKey,
@@ -460,6 +461,34 @@ export function hasLegacyTimeSlice(code: string): boolean {
 
 export function hasEnabledTradeDirection(allowLong: boolean, allowShort: boolean): boolean {
   return allowLong || allowShort;
+}
+
+export type StrategySaveNoticeTone = 'blocked' | 'warning' | 'ready';
+
+export function getStrategySaveNoticeState(
+  versionDirty: boolean,
+  experimentDirty: boolean,
+  hasSelectedConfig: boolean,
+): { tone: StrategySaveNoticeTone; message: string } {
+  if (!hasSelectedConfig) {
+    return {
+      tone: 'blocked',
+      message: '当前为新建策略，尚未保存；请先保存后再运行回测。',
+    };
+  }
+  if (versionDirty) {
+    return {
+      tone: 'blocked',
+      message: '策略内容已修改，暂不可运行；请先保存后再运行回测。',
+    };
+  }
+  if (experimentDirty) {
+    return {
+      tone: 'warning',
+      message: '仅本次实验参数已修改，可直接运行；不会影响已保存策略。',
+    };
+  }
+  return { tone: 'ready', message: '当前策略内容已保存，可直接运行回测。' };
 }
 
 export function getResearchSignalSelectionError(
@@ -1174,8 +1203,10 @@ export function buildStrategyDraftFingerprint(input: {
   benchmarkSymbol: string;
   accountId: number | '';
   params: Record<string, unknown>;
+  strategyParameterNames?: string[];
   script: { code: string; entryType: string; signalRequired: boolean };
 }): string {
+  const strategyParameterNames = new Set(input.strategyParameterNames || []);
   return JSON.stringify(sortFingerprintValue({
     strategy: input.strategy,
     mode: input.mode,
@@ -1183,13 +1214,19 @@ export function buildStrategyDraftFingerprint(input: {
     timeframe: input.timeframe,
     benchmarkSymbol: input.benchmarkSymbol,
     accountId: input.accountId || null,
-    params: input.params,
+    params: Object.fromEntries(Object.entries(input.params).filter(
+      ([key]) => !EXPERIMENT_PARAM_KEYS.has(key) && !strategyParameterNames.has(key)
+    )),
     script: input.script,
   }));
 }
 
 export function buildSavedStrategyFingerprint(config: StrategyConfig): string {
   const savedParams = config.paramsJson.params as Record<string, unknown> | undefined;
+  const definitions = config.paramsJson.strategyParameterDefinitions;
+  const strategyParameterNames = definitions != null && typeof definitions === 'object'
+    ? Object.keys(definitions)
+    : [];
   return buildStrategyDraftFingerprint({
     strategy: config.strategy,
     mode: config.mode,
@@ -1200,12 +1237,86 @@ export function buildSavedStrategyFingerprint(config: StrategyConfig): string {
     params: Object.fromEntries(
       Object.entries(savedParams || {}).filter(([key]) => key !== 'warmupTradingDays')
     ),
+    strategyParameterNames,
     script: {
       code: config.code,
       entryType: config.entryType,
       signalRequired: config.signalRequired,
     },
   });
+}
+
+export function buildExperimentFingerprint(
+  params: Record<string, unknown>,
+  strategyParameterNames: string[],
+): string {
+  const included = new Set([...EXPERIMENT_PARAM_KEYS, ...strategyParameterNames]);
+  return JSON.stringify(sortFingerprintValue(Object.fromEntries(
+    Object.entries(params).filter(([key]) => included.has(key))
+  )));
+}
+
+export function strategyParameterSchemaFromConfig(config: StrategyConfig): StrategyParameterSchema {
+  const raw = config.paramsJson.strategyParameterDefinitions;
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return Object.fromEntries(Object.entries(raw).flatMap(([name, value]) => {
+    if (value == null || typeof value !== 'object' || Array.isArray(value)) return [];
+    const field = value as Record<string, unknown>;
+    if (typeof field.type !== 'string') return [];
+    return [[name, {
+      type: field.type,
+      label: name,
+      default: typeof field.default === 'string'
+        || typeof field.default === 'number'
+        || typeof field.default === 'boolean'
+        ? field.default
+        : undefined,
+    }]];
+  }));
+}
+
+function strategyParameterInputValue(value: unknown): BacktestParamValue | undefined {
+  if (typeof value === 'boolean' || typeof value === 'string') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+export function serializeStrategyParameterValues(
+  params: Record<string, BacktestParamValue>,
+  schema: StrategyParameterSchema | null,
+): Record<string, string | number | boolean> {
+  return Object.fromEntries(Object.entries(schema || {}).map(([name, field]) => {
+    const value = params[name];
+    if (field.type === 'integer' || field.type === 'number') {
+      const numericValue = typeof value === 'string' && value.trim() !== ''
+        ? Number(value)
+        : Number.NaN;
+      if (!Number.isFinite(numericValue)) {
+        throw new Error(`策略参数 ${name} 必须是有效数字`);
+      }
+      if (field.type === 'integer' && !Number.isInteger(numericValue)) {
+        throw new Error(`策略参数 ${name} 必须是整数`);
+      }
+      return [name, numericValue];
+    }
+    if (field.type === 'boolean' && typeof value !== 'boolean') {
+      throw new Error(`策略参数 ${name} 必须是布尔值`);
+    }
+    if (field.type === 'string' && typeof value !== 'string') {
+      throw new Error(`策略参数 ${name} 必须是文本`);
+    }
+    return [name, value];
+  }));
+}
+
+async function runBacktestWithIdempotentRetry(payload: BacktestRunPayload) {
+  const idempotencyKey = createBrowserUuid();
+  try {
+    return await runBacktest(payload, idempotencyKey);
+  } catch (requestError) {
+    if (!(requestError instanceof TypeError)) throw requestError;
+    return runBacktest(payload, idempotencyKey);
+  }
 }
 
 export default function BacktestPage({
@@ -1232,6 +1343,7 @@ export default function BacktestPage({
   const [error, setError] = useState('');
   const [backtestErrorDetail, setBacktestErrorDetail] = useState<BacktestErrorDetail | null>(null);
   const [running, setRunning] = useState(false);
+  const runSubmissionRef = useRef(false);
   const [cancellingRun, setCancellingRun] = useState(false);
   const [result, setResult] = useState<BacktestRunResponse | null>(null);
   const [pendingRun, setPendingRun] = useState<{ runId: string; displayNo: number } | null>(null);
@@ -1292,9 +1404,12 @@ export default function BacktestPage({
   const [selectedConfigId, setSelectedConfigId] = useState<string>('');
   const lastRequestedConfigIdRef = useRef<string | null>(null);
   const [versionDirty, setVersionDirty] = useState(false);
+  const [experimentDirty, setExperimentDirty] = useState(false);
+  const [savedStrategyParams, setSavedStrategyParams] = useState<Record<string, BacktestParamValue>>({});
   const [strategySavePending, setStrategySavePending] = useState(false);
   const strategySaveActionRef = useRef<() => Promise<string | null>>(async () => null);
   const [publishedFingerprint, setPublishedFingerprint] = useState('');
+  const [publishedExperimentFingerprint, setPublishedExperimentFingerprint] = useState('');
   const [configName, setConfigName] = useState('');
   const [scriptForm, setScriptForm] = useState(createEmptyScriptForm());
   const [strategyGuideOpen, setStrategyGuideOpen] = useState(false);
@@ -1381,6 +1496,10 @@ export default function BacktestPage({
     () => Object.entries(strategyParameterSchema || {}),
     [strategyParameterSchema]
   );
+  const strategyParameterNames = useMemo(
+    () => strategyParameterFields.map(([name]) => name),
+    [strategyParameterFields]
+  );
   const selectedResearchSignal = useMemo(
     () => researchSignalDatasets.find((item) => item.id === selectedSignalDatasetId) ?? null,
     [researchSignalDatasets, selectedSignalDatasetId]
@@ -1404,6 +1523,7 @@ export default function BacktestPage({
     benchmarkSymbol: selectedBenchmarkSymbol,
     accountId: selectedAccountId,
     params,
+    strategyParameterNames,
     script: {
       code: scriptForm.code,
       entryType: scriptForm.entryType,
@@ -1419,7 +1539,15 @@ export default function BacktestPage({
     selectedStrategy,
     selectedSymbol,
     selectedTimeframe,
+    strategyParameterNames,
   ]);
+  const experimentFingerprint = useMemo(
+    () => buildExperimentFingerprint(params, strategyParameterNames),
+    [params, strategyParameterNames]
+  );
+  const strategyParamsDirty = strategyParameterNames.some(
+    (name) => params[name] !== savedStrategyParams[name]
+  );
 
   useEffect(() => {
     setInstrumentList(instruments);
@@ -1563,6 +1691,11 @@ export default function BacktestPage({
     if (!hasSelectedConfig || !publishedFingerprint) return;
     setVersionDirty(draftFingerprint !== publishedFingerprint);
   }, [draftFingerprint, publishedFingerprint, selectedConfigId]);
+
+  useEffect(() => {
+    if (!hasSelectedConfig || !publishedExperimentFingerprint) return;
+    setExperimentDirty(experimentFingerprint !== publishedExperimentFingerprint);
+  }, [experimentFingerprint, publishedExperimentFingerprint, selectedConfigId]);
 
   useEffect(() => {
     refreshDataStatus(
@@ -1794,6 +1927,11 @@ export default function BacktestPage({
       setStrategySchemaError('');
       return;
     }
+    if (targetStrategy === 'user_script') {
+      setLoadingStrategySchema(false);
+      setStrategySchemaError('');
+      return;
+    }
     setLoadingStrategySchema(true);
     setStrategySchemaError('');
     try {
@@ -1813,6 +1951,16 @@ export default function BacktestPage({
 
   const applyStrategyConfig = (config: StrategyConfig) => {
     const savedParams = config.paramsJson.params as Partial<BacktestParams> | undefined;
+    const parameterSchema = strategyParameterSchemaFromConfig(config);
+    const parameterNames = Object.keys(parameterSchema);
+    const rawStrategyParams = config.paramsJson.strategyParams;
+    const nextSavedStrategyParams = Object.fromEntries(parameterNames.flatMap((name) => {
+      const source = rawStrategyParams != null && typeof rawStrategyParams === 'object'
+        ? (rawStrategyParams as Record<string, unknown>)[name]
+        : savedParams?.[name];
+      const value = strategyParameterInputValue(source);
+      return value === undefined ? [] : [[name, value]];
+    }));
     setSelectedConfigId(config.id);
     setConfigVersions([]);
     setPublishedFingerprint('');
@@ -1827,12 +1975,16 @@ export default function BacktestPage({
       setParams((prev) => {
         const next: BacktestParams = { ...prev };
         Object.entries(savedParams).forEach(([key, value]) => {
-          if (key !== 'warmupTradingDays' && value !== undefined) next[key] = value;
+          const inputValue = strategyParameterInputValue(value);
+          if (key !== 'warmupTradingDays' && inputValue !== undefined) next[key] = inputValue;
         });
         return next;
       });
     }
+    setStrategyParameterSchema(parameterSchema);
+    setSavedStrategyParams(nextSavedStrategyParams);
     setVersionDirty(false);
+    setExperimentDirty(false);
     setScriptForm({
       name: config.name,
       description: config.description,
@@ -1846,6 +1998,10 @@ export default function BacktestPage({
         : ''
     );
     setPublishedFingerprint(buildSavedStrategyFingerprint(config));
+    setPublishedExperimentFingerprint(buildExperimentFingerprint(
+      { ...(savedParams || {}), ...nextSavedStrategyParams },
+      parameterNames,
+    ));
     setStatus(`已加载策略 ${config.name}`);
     setError('');
   };
@@ -1904,6 +2060,7 @@ export default function BacktestPage({
     accountId: typeof selectedAccountId === 'number' ? selectedAccountId : null,
     paramsJson: {
       params: Object.fromEntries(Object.entries(params).filter(([key]) => key !== 'warmupTradingDays')),
+      strategyParams: serializeStrategyParameterValues(params, strategyParameterSchema),
       scriptName: scriptForm.name.trim(),
     },
     enabled: true,
@@ -2054,14 +2211,14 @@ export default function BacktestPage({
             checked={Boolean(rawValue)}
             onChange={(e) => setParam(key, e.target.checked)}
           />
-          {field.label}
+          {field.label || key}
         </label>
       );
     }
     if (field.type === 'select') {
       return (
         <label key={key} title={key}>
-          <div style={labelStyle}>{field.label}</div>
+          <div style={labelStyle}>{field.label || key}</div>
           <select
             value={typeof rawValue === 'string' ? rawValue : ''}
             onChange={(e) => setParam(key, e.target.value)}
@@ -2078,9 +2235,10 @@ export default function BacktestPage({
     }
     return (
       <label key={key} title={key}>
-        <div style={labelStyle}>{field.label}</div>
+        <div style={labelStyle}>{field.label || key}</div>
         <input
-          type={field.type === 'number' ? 'number' : 'text'}
+          type={field.type === 'number' || field.type === 'integer' ? 'number' : 'text'}
+          step={field.type === 'integer' ? 1 : undefined}
           min={field.min}
           max={field.max}
           value={typeof rawValue === 'string' ? rawValue : ''}
@@ -2110,8 +2268,35 @@ export default function BacktestPage({
       return null;
     }
     return (
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-        {strategyParameterFields.map(renderStrategyParameterControl)}
+      <div style={{ display: 'grid', gap: 9 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+          <span style={{ color: experimentDirty ? '#b45309' : '#64748b', fontSize: 11 }}>
+            {strategyParamsDirty ? '已设置本次覆盖；运行不会修改策略默认值。' : '当前使用已保存默认值。'}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setParams((current) => ({ ...current, ...savedStrategyParams }));
+              setError('');
+              setStatus('已恢复已保存的策略参数默认值');
+            }}
+            disabled={!strategyParamsDirty}
+            style={{
+              padding: '4px 8px',
+              border: '1px solid #cbd5e1',
+              borderRadius: 3,
+              background: '#fff',
+              color: '#475569',
+              fontSize: 11,
+              cursor: strategyParamsDirty ? 'pointer' : 'not-allowed',
+            }}
+          >
+            恢复默认参数
+          </button>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          {strategyParameterFields.map(renderStrategyParameterControl)}
+        </div>
       </div>
     );
   };
@@ -2139,7 +2324,11 @@ export default function BacktestPage({
     setConfigName('');
     setConfigVersions([]);
     setPublishedFingerprint('');
+    setPublishedExperimentFingerprint('');
     setVersionDirty(false);
+    setExperimentDirty(false);
+    setStrategyParameterSchema(null);
+    setSavedStrategyParams({});
     setSelectedStrategy('user_script');
     setScriptForm(createEmptyScriptForm(selectedTimeframe));
     setStatus('已新建策略草稿，请编辑后保存');
@@ -2162,7 +2351,9 @@ export default function BacktestPage({
     setConfigName(copiedName);
     setScriptForm((previous) => ({ ...previous, name: copiedName }));
     setPublishedFingerprint('');
+    setPublishedExperimentFingerprint('');
     setVersionDirty(true);
+    setExperimentDirty(false);
     setStatus('已复制为新策略草稿；保存后会创建独立脚本和独立版本链');
     setError('');
   };
@@ -2211,7 +2402,7 @@ export default function BacktestPage({
       };
       const currentConfig = strategyConfigs.find((item) => item.id === selectedConfigId);
       const targetConfigId = hasSelectedConfig ? selectedConfigId : null;
-      const { script: savedScript, config } = await saveCompleteStrategy(
+      const { config } = await saveCompleteStrategy(
         scriptPayload,
         configPayload,
         hasSelectedConfig ? selectedScriptId : null,
@@ -2219,19 +2410,7 @@ export default function BacktestPage({
         currentConfig?.revision ?? null,
       );
       await refreshStrategyAssets();
-      setSelectedConfigId(config.id);
-      setSelectedScriptId(savedScript.id);
-      setSelectedStrategy(strategyId);
-      setConfigName(config.name);
-      setScriptForm({
-        name: savedScript.name,
-        description: savedScript.description,
-        code: savedScript.code,
-        entryType: savedScript.entryType,
-        signalRequired: savedScript.signalRequired,
-      });
-      setPublishedFingerprint(buildSavedStrategyFingerprint(config));
-      setVersionDirty(false);
+      applyStrategyConfig(config);
       setStatus(`已保存策略 ${config.name}`);
       return config.id;
     } catch (e) {
@@ -2255,10 +2434,16 @@ export default function BacktestPage({
       setSelectedScriptId('');
       setConfigVersions([]);
       setConfigName('');
+      setPublishedFingerprint('');
+      setPublishedExperimentFingerprint('');
+      setVersionDirty(false);
+      setExperimentDirty(false);
+      setStrategyParameterSchema(null);
+      setSavedStrategyParams({});
       setScriptForm(createEmptyScriptForm(selectedTimeframe));
-      setStatus('已删除策略');
+      setStatus('已归档策略');
     } catch (e) {
-      setError(e instanceof Error ? e.message : '删除策略失败');
+      setError(e instanceof Error ? e.message : '归档策略失败');
     }
   };
 
@@ -2322,9 +2507,20 @@ export default function BacktestPage({
       revealConfigSection(getConfigSectionForError(validationErrors[0]));
       return;
     }
+    if (runSubmissionRef.current) return;
+    runSubmissionRef.current = true;
     setRunning(true);
     try {
       const account = accounts.find((item) => item.id === selectedAccountId);
+      const serializedStrategyParams = serializeStrategyParameterValues(
+        params,
+        strategyParameterSchema,
+      );
+      const strategyParamOverrides = Object.fromEntries(
+        Object.entries(serializedStrategyParams).filter(([name]) => (
+          params[name] !== savedStrategyParams[name]
+        )),
+      );
       const payload: BacktestRunPayload = {
         configId: selectedConfigId || null,
         configVersionId: null,
@@ -2363,9 +2559,10 @@ export default function BacktestPage({
         t0Enabled: params.strategyCategory === 'core_position_overlay',
         isDefault: false,
         strategyParams: Object.fromEntries(Object.entries(params).filter(([key]) => !EXECUTION_PARAM_KEYS.has(key))),
+        strategyParamOverrides,
         runDraft: false,
       };
-      const data = await runBacktest(payload);
+      const data = await runBacktestWithIdempotentRetry(payload);
       if (!('summary' in data)) {
         setHistoryPage(1);
         await refreshBacktestRuns(1);
@@ -2388,6 +2585,7 @@ export default function BacktestPage({
         setError(e instanceof Error ? e.message : '回测失败');
       }
     } finally {
+      runSubmissionRef.current = false;
       setRunning(false);
     }
   };
@@ -2398,9 +2596,13 @@ export default function BacktestPage({
       applyAccount(account);
       setStatus(`已恢复账号 ${account.name} 的参数`);
     } else {
-      setParams(DEFAULT_PARAMS);
+      setParams((current) => ({
+        ...DEFAULT_PARAMS,
+        ...Object.fromEntries(strategyParameterNames.map((name) => [name, current[name]])),
+      }));
       setStatus('已恢复默认参数');
     }
+    setParams((current) => ({ ...current, ...savedStrategyParams }));
     setError('');
   };
 
@@ -2877,6 +3079,11 @@ export default function BacktestPage({
     : activeConfig ? `当前策略：${activeConfig.name}` : '请先新建并保存策略');
   const statusColor = error ? '#b91c1c' : status ? '#0f766e' : '#94a3b8';
   const statusBackground = error ? '#fef2f2' : status ? '#ecfdf5' : '#f8fafc';
+  const strategySaveNotice = getStrategySaveNoticeState(
+    versionDirty,
+    experimentDirty,
+    hasSelectedConfig,
+  );
   const handleExportTrades = () => {
     downloadSignalDetailCsv(
       `trades_${selectedSymbol}_${params.startDate}_${params.endDate}.csv`,
@@ -2976,6 +3183,8 @@ export default function BacktestPage({
   };
 
   const handleRerunHistory = async (run: BacktestRunHistory) => {
+    if (runSubmissionRef.current) return;
+    runSubmissionRef.current = true;
     const saved = run.paramsJson;
     const account = accounts.find((item) => item.id === run.accountId);
     setError('');
@@ -2992,7 +3201,7 @@ export default function BacktestPage({
     const rerunInitialPositionEnabled = rerunStrategyCategory === 'core_position_overlay'
       || saved.initialPositionEnabled === true;
     try {
-      const data = await runBacktest({
+      const data = await runBacktestWithIdempotentRetry({
         configId: run.configId,
         configVersionId: run.configVersionId,
         scriptId: run.scriptId,
@@ -3047,6 +3256,7 @@ export default function BacktestPage({
         setError(e instanceof Error ? e.message : '重新运行回测失败');
       }
     } finally {
+      runSubmissionRef.current = false;
       setRunning(false);
     }
   };
@@ -3807,19 +4017,13 @@ export default function BacktestPage({
                     style={fieldStyle}
                   />
                   {renderStrategyDirectionControls()}
-                  <div className={`strategy-save-notice ${versionDirty ? 'is-dirty' : hasSelectedConfig ? 'is-ready' : ''}`} style={{
+                  <div className={`strategy-save-notice is-${strategySaveNotice.tone}`} style={{
                     borderRadius: 4,
                     padding: '8px 10px',
-                    background: versionDirty ? '#fffbeb' : '#ecfdf5',
-                    color: versionDirty ? '#b45309' : '#0f766e',
                     fontSize: 12,
                     lineHeight: 1.55,
                   }}>
-                    {versionDirty
-                      ? '策略内容已修改，请先保存后再运行回测。'
-                      : hasSelectedConfig
-                        ? '当前策略内容已保存，可直接运行回测。'
-                        : '新建策略保存后即可运行回测。'}
+                    {strategySaveNotice.message}
                   </div>
                   <div className="strategy-asset-actions" style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 8 }}>
                     <button
@@ -3882,7 +4086,7 @@ export default function BacktestPage({
                         opacity: hasSelectedConfig ? 1 : 0.55,
                       }}
                     >
-                      删除策略
+                      归档策略
                     </button>
                   </div>
                   <div className="strategy-asset-note" style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
@@ -5675,7 +5879,7 @@ export default function BacktestPage({
                   opacity: hasSelectedConfig ? 1 : 0.55,
                 }}
               >
-                删除策略
+                归档策略
               </button>
             </div>
           </div>

@@ -18,6 +18,7 @@ CONFIGURATION_FIELDS = (
   "allowShort", "holdingPolicy", "overlaySettlementPolicy", "fillModel",
   "executionAlgorithm", "executionParameters", "baseQuantity", "baseCostPrice",
   "initialPositionEnabled", "t0Enabled", "warmupTradingDays", "strategyParams",
+  "savedStrategyParams", "strategyParamOverrides", "effectiveStrategyParams",
 )
 ORIGIN_FIELDS = ("publicationId", "authorName", "title")
 MARKET_DATA_FIELDS = (

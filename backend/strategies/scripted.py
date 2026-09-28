@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
+import math
+import re
 from typing import Any, Sequence
 
 from backend.backtesting.models import (
@@ -36,12 +39,33 @@ _ACTIONS: dict[str, tuple[OrderSide, PositionEffect]] = {
   "sell_close": (OrderSide.SELL, PositionEffect.CLOSE_LONG),
   "buy_close": (OrderSide.BUY, PositionEffect.CLOSE_SHORT),
 }
-def warmup_trading_days_for_script(code: str) -> int:
-  """静态读取策略声明的预热交易日数，不执行用户代码。"""
+
+MAX_STRATEGY_PARAMETERS = 64
+MAX_STRATEGY_PARAMETER_NAME_LENGTH = 64
+MAX_STRATEGY_PARAMETER_STRING_LENGTH = 1024
+MAX_STRATEGY_PARAMETERS_JSON_BYTES = 64 * 1024
+STRATEGY_PARAMETER_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+RESERVED_STRATEGY_PARAMETER_NAMES = frozenset({
+  "account", "accountId", "allowLong", "allowShort", "baseCostPrice",
+  "baseQuantity", "benchmarkSymbol", "commissionRate", "configId",
+  "configVersionId", "endDate", "executionAlgorithm", "executionParameters",
+  "fillModel", "holdingPolicy", "initialCapital", "initialPositionEnabled",
+  "mode", "orderCash", "orderPct", "overlaySettlementPolicy", "positionMode",
+  "runDraft", "scriptId", "signalDatasetId", "slippage", "startDate",
+  "strategy", "strategyCategory", "strategyParams", "symbol", "t0Enabled",
+  "timeframe", "twapDurationSeconds", "twapIntervalSeconds",
+  "twapMinChildQuantity", "warmupTradingDays",
+})
+
+
+def _parse_script(code: str) -> ast.Module:
   try:
-    tree = ast.parse(code)
+    return ast.parse(code)
   except SyntaxError as error:
     raise ValueError(f"Python 语法错误: 第 {error.lineno} 行 {error.msg}") from error
+
+
+def _warmup_trading_days_for_tree(tree: ast.Module) -> int:
   declarations = [
     node
     for node in tree.body
@@ -62,6 +86,103 @@ def warmup_trading_days_for_script(code: str) -> int:
   if not 0 <= warmup_days <= 250:
     raise ValueError("WARMUP_TRADING_DAYS 必须为 0 到 250 的整数")
   return warmup_days
+
+
+def warmup_trading_days_for_script(code: str) -> int:
+  """静态读取策略声明的预热交易日数，不执行用户代码。"""
+  return _warmup_trading_days_for_tree(_parse_script(code))
+
+
+def _strategy_parameter_declarations(tree: ast.Module) -> list[ast.stmt]:
+  declarations: list[ast.stmt] = []
+  for node in tree.body:
+    if isinstance(node, ast.Assign):
+      if any(isinstance(target, ast.Name) and target.id == "STRATEGY_PARAMETERS" for target in node.targets):
+        declarations.append(node)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+      if isinstance(node.target, ast.Name) and node.target.id == "STRATEGY_PARAMETERS":
+        declarations.append(node)
+  return declarations
+
+
+def _strategy_parameter_value(node: ast.expr) -> tuple[str, bool | int | float | str]:
+  value: object
+  if isinstance(node, ast.Constant):
+    value = node.value
+  elif (
+    isinstance(node, ast.UnaryOp)
+    and isinstance(node.op, (ast.UAdd, ast.USub))
+    and isinstance(node.operand, ast.Constant)
+    and not isinstance(node.operand.value, bool)
+    and isinstance(node.operand.value, (int, float))
+  ):
+    value = node.operand.value if isinstance(node.op, ast.UAdd) else -node.operand.value
+  else:
+    raise ValueError("STRATEGY_PARAMETERS 只允许标量字面量")
+  if isinstance(value, bool):
+    return "boolean", value
+  if isinstance(value, int):
+    return "integer", value
+  if isinstance(value, float):
+    if not math.isfinite(value):
+      raise ValueError("STRATEGY_PARAMETERS 浮点数必须是有限值")
+    return "number", value
+  if isinstance(value, str):
+    if len(value) > MAX_STRATEGY_PARAMETER_STRING_LENGTH:
+      raise ValueError(
+        f"STRATEGY_PARAMETERS 字符串最长 {MAX_STRATEGY_PARAMETER_STRING_LENGTH} 个字符",
+      )
+    return "string", value
+  raise ValueError("STRATEGY_PARAMETERS 只支持 int、float、bool 和 str")
+
+
+def _strategy_parameters_for_tree(tree: ast.Module) -> dict[str, dict[str, Any]]:
+  declarations = _strategy_parameter_declarations(tree)
+  if not declarations:
+    return {}
+  if len(declarations) > 1:
+    raise ValueError("STRATEGY_PARAMETERS 只能声明一次")
+  declaration = declarations[0]
+  if (
+    not isinstance(declaration, ast.Assign)
+    or len(declaration.targets) != 1
+    or not isinstance(declaration.targets[0], ast.Name)
+    or not isinstance(declaration.value, ast.Dict)
+  ):
+    raise ValueError("STRATEGY_PARAMETERS 必须是模块顶层唯一字典")
+  if len(declaration.value.keys) > MAX_STRATEGY_PARAMETERS:
+    raise ValueError(f"STRATEGY_PARAMETERS 最多声明 {MAX_STRATEGY_PARAMETERS} 个参数")
+  definitions: dict[str, dict[str, Any]] = {}
+  for key_node, value_node in zip(declaration.value.keys, declaration.value.values):
+    if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+      raise ValueError("STRATEGY_PARAMETERS 参数名必须是字符串字面量")
+    name = key_node.value
+    if not STRATEGY_PARAMETER_NAME_PATTERN.fullmatch(name):
+      raise ValueError(
+        "STRATEGY_PARAMETERS 参数名必须以英文字母开头，且只能包含字母、数字和下划线",
+      )
+    if name in RESERVED_STRATEGY_PARAMETER_NAMES:
+      raise ValueError(f"STRATEGY_PARAMETERS 参数名属于系统保留字段: {name}")
+    if name in definitions:
+      raise ValueError(f"STRATEGY_PARAMETERS 参数名重复: {name}")
+    parameter_type, default = _strategy_parameter_value(value_node)
+    definitions[name] = {
+      "type": parameter_type,
+      "default": default,
+    }
+  encoded = json.dumps(
+    definitions, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+  ).encode("utf-8")
+  if len(encoded) > MAX_STRATEGY_PARAMETERS_JSON_BYTES:
+    raise ValueError(
+      f"STRATEGY_PARAMETERS 规范化后不得超过 {MAX_STRATEGY_PARAMETERS_JSON_BYTES} 字节",
+    )
+  return definitions
+
+
+def strategy_parameters_for_script(code: str) -> dict[str, dict[str, Any]]:
+  """静态读取策略参数声明，保持声明顺序且不执行用户代码。"""
+  return _strategy_parameters_for_tree(_parse_script(code))
 
 
 class _ScriptValidator(ast.NodeVisitor):
@@ -118,11 +239,9 @@ def _validate_static_imports(tree: ast.Module) -> None:
 
 def validate_script_code(code: str) -> None:
   """校验脚本语法及可选的 L2 事件回调接口。"""
-  try:
-    tree = ast.parse(code)
-  except SyntaxError as error:
-    raise ValueError(f"Python 语法错误: 第 {error.lineno} 行 {error.msg}") from error
-  warmup_trading_days_for_script(code)
+  tree = _parse_script(code)
+  _warmup_trading_days_for_tree(tree)
+  _strategy_parameters_for_tree(tree)
   _ScriptValidator().visit(tree)
   _validate_static_imports(tree)
   callback = next(

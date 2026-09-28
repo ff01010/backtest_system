@@ -4,7 +4,9 @@
 from contextlib import contextmanager
 
 import pytest
+from pydantic import ValidationError
 
+from backend import schemas
 from backend.services import auth
 from backend.services.auth import hash_password, verify_password
 
@@ -14,6 +16,29 @@ def test_password_hash_round_trip() -> None:
 
   assert verify_password("correct-horse-battery-staple", encoded) is True
   assert verify_password("wrong-password", encoded) is False
+
+
+def test_api_key_schema_accepts_strategy_scopes() -> None:
+  request = schemas.ApiKeyCreateRequest(
+    name="strategy-client",
+    scopes=[
+      "strategy:read",
+      "strategy:write",
+      "strategy:publish",
+      "strategy:delete",
+    ],
+  )
+
+  assert set(request.scopes) <= auth.API_KEY_SCOPES
+
+
+def test_api_key_schema_rejects_unknown_scope() -> None:
+  with pytest.raises(ValidationError):
+    schemas.ApiKeyCreateRequest(name="invalid", scopes=["strategy:admin"])
+
+
+def test_existing_api_key_scopes_are_not_implicitly_expanded() -> None:
+  assert auth._json_scopes(["backtest:read"]) == ("backtest:read",)
 
 
 def test_delete_user_rejects_current_login() -> None:

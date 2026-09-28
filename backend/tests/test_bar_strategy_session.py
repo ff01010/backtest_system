@@ -49,6 +49,24 @@ def on_bar(bar, state):
   assert result["skippedSignals"] == []
 
 
+def test_bar_strategy_session_exposes_effective_strategy_parameters() -> None:
+  payload = _payload("""
+def on_bar(bar, state):
+  if bar['time'] == '20260901093500':
+    return [{'action': 'buy_open', 'quantity': state['params']['window']}]
+  return []
+""")
+  payload["params"] = {"window": 200}
+  payload["bars"].append({
+    "time": "20260901094000", "symbol": "688981.SH", "open": 10,
+    "high": 10, "low": 10, "close": 10, "volume": 1000,
+  })
+
+  result = BarStrategySession().run_script(payload)
+
+  assert result["trades"][0]["quantity"] == 200
+
+
 def test_bar_strategy_session_supports_standard_tuple_builtin() -> None:
   result = BarStrategySession().run_script(_payload("""
 def on_bar(bar, state):

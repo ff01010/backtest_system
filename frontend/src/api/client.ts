@@ -210,7 +210,15 @@ export interface ApiAccessKey {
   id: string;
   name: string;
   prefix: string;
-  scopes: Array<'backtest:submit' | 'backtest:read' | 'backtest:cancel'>;
+  scopes: Array<
+    | 'backtest:submit'
+    | 'backtest:read'
+    | 'backtest:cancel'
+    | 'strategy:read'
+    | 'strategy:write'
+    | 'strategy:publish'
+    | 'strategy:delete'
+  >;
   expiresAt: string | null;
   revokedAt: string | null;
   lastUsedAt: string | null;
@@ -526,6 +534,7 @@ export interface BacktestRunPayload {
   t0Enabled: boolean;
   isDefault: boolean;
   strategyParams?: Record<string, string | boolean>;
+  strategyParamOverrides?: Record<string, string | boolean | number>;
   runDraft?: boolean;
 }
 
@@ -555,10 +564,16 @@ export interface QueuedBacktestResponse {
   message: string;
 }
 
-export async function runBacktest(payload: BacktestRunPayload): Promise<BacktestRunResponse | QueuedBacktestResponse> {
+export async function runBacktest(
+  payload: BacktestRunPayload,
+  idempotencyKey?: string,
+): Promise<BacktestRunResponse | QueuedBacktestResponse> {
   const res = await fetch(`${BASE}/backtest/run`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+    },
     body: JSON.stringify(payload),
     credentials: 'include',
   });

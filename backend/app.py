@@ -69,6 +69,7 @@ from backend.services import (
   shared_backtest_discovery,
   state_store,
   strategy_adapters,
+  strategy_lifecycle,
   task_diagnostics,
 )
 from backend.services import auth
@@ -185,16 +186,23 @@ def _public_api_error(
 @app.exception_handler(HTTPException)
 async def handle_http_exception(request: Request, error: HTTPException) -> JSONResponse:
   if request.url.path.startswith("/api/v1/"):
-    detail = error.detail if isinstance(error.detail, str) else "请求无法完成"
-    code = "backtest.validation_failed" if error.status_code == 422 else "request.failed"
-    if error.status_code == 403:
-      code = "api_scope_denied"
-    elif error.status_code == 404:
-      code = "resource.not_found"
-    elif error.status_code == 409:
-      code = "idempotency.conflict"
-    elif error.status_code == 429:
-      code = "rate_limit.exceeded"
+    structured = error.detail if isinstance(error.detail, dict) else {}
+    detail = (
+      str(structured.get("message"))
+      if structured.get("message")
+      else error.detail if isinstance(error.detail, str) else "请求无法完成"
+    )
+    code = str(structured.get("code") or "")
+    if not code:
+      code = "backtest.validation_failed" if error.status_code == 422 else "request.failed"
+      if error.status_code == 403:
+        code = "api_scope_denied"
+      elif error.status_code == 404:
+        code = "resource.not_found"
+      elif error.status_code == 409:
+        code = "idempotency.conflict"
+      elif error.status_code == 429:
+        code = "rate_limit.exceeded"
     return _public_api_error(request, error.status_code, code, detail, error.status_code >= 500)
   return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
 
@@ -202,7 +210,12 @@ async def handle_http_exception(request: Request, error: HTTPException) -> JSONR
 @app.exception_handler(RequestValidationError)
 async def handle_request_validation_error(request: Request, error: RequestValidationError) -> JSONResponse:
   if request.url.path.startswith("/api/v1/"):
-    return _public_api_error(request, 422, "backtest.validation_failed", "请求参数不符合接口约束")
+    code = (
+      "strategy.validation_failed"
+      if request.url.path.startswith("/api/v1/strategies")
+      else "backtest.validation_failed"
+    )
+    return _public_api_error(request, 422, code, "请求参数不符合接口约束")
   return JSONResponse(status_code=422, content={"detail": error.errors()})
 
 
@@ -329,15 +342,27 @@ _EXPERIMENT_PARAM_KEYS = {
 
 def _validate_saved_params(request: dict, config: dict) -> None:
   """策略语义参数必须来自已保存的当前策略。"""
-  saved_params = config.get("paramsJson", {}).get("params", {})
+  params_json = config.get("paramsJson", {})
+  saved_params = params_json.get("params", {}) if isinstance(params_json, dict) else {}
   if not isinstance(saved_params, dict):
     return
+  definitions = (
+    params_json.get("strategyParameterDefinitions", {})
+    if isinstance(params_json, dict)
+    else {}
+  )
+  declared_names = set(definitions) if isinstance(definitions, dict) else set()
   request_params = request.get("strategyParams", {})
   if not isinstance(request_params, dict):
     raise HTTPException(422, "策略参数格式非法")
   mismatches: list[str] = []
   for key, value in saved_params.items():
-    if key != "warmupTradingDays" and key not in _EXPERIMENT_PARAM_KEYS and request_params.get(key) != value:
+    if (
+      key != "warmupTradingDays"
+      and key not in _EXPERIMENT_PARAM_KEYS
+      and key not in declared_names
+      and request_params.get(key) != value
+    ):
       mismatches.append(key)
   if mismatches:
     raise HTTPException(422, f"策略内容已修改，请先保存策略：{', '.join(sorted(mismatches))}")
@@ -385,6 +410,36 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     raise HTTPException(422, str(error)) from error
   if request.get("fillModel") == "l2_quote" and warmup_days != 0:
     raise HTTPException(422, "L2 盘口回测不支持策略声明预热交易日")
+  params_json = config.get("paramsJson") if isinstance(config.get("paramsJson"), dict) else {}
+  definitions = params_json.get("strategyParameterDefinitions")
+  declared_names = set(definitions) if isinstance(definitions, dict) else set()
+  overrides = request.get("strategyParamOverrides")
+  if not isinstance(overrides, dict):
+    request_params = request.get("strategyParams")
+    overrides = {
+      name: request_params[name]
+      for name in declared_names
+      if isinstance(request_params, dict) and name in request_params
+    }
+  try:
+    saved_strategy_params, strategy_param_overrides, effective_strategy_params = (
+      strategy_lifecycle.effective_strategy_parameters(config, overrides)
+    )
+  except strategy_lifecycle.StrategyLifecycleError as error:
+    raise HTTPException(422, {
+      "code": error.code,
+      "message": str(error),
+    }) from error
+  request_params = request.get("strategyParams")
+  structural_params = request_params if isinstance(request_params, dict) else {}
+  request["strategyParams"] = {
+    key: value
+    for key, value in structural_params.items()
+    if key not in declared_names
+  } | effective_strategy_params
+  request["savedStrategyParams"] = saved_strategy_params
+  request["strategyParamOverrides"] = strategy_param_overrides
+  request["effectiveStrategyParams"] = effective_strategy_params
   _validate_saved_params(request, config)
   request["strategy"] = config["strategy"]
   request["scriptId"] = script["id"]
@@ -408,6 +463,9 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "benchmarkSymbol": config.get("benchmarkSymbol"), "accountId": config.get("accountId"),
     "params": config.get("paramsJson", {}).get("params", {}),
     "description": script["description"], "runParams": request.get("strategyParams", {}),
+    "savedStrategyParams": request.get("savedStrategyParams", {}),
+    "strategyParamOverrides": request.get("strategyParamOverrides", {}),
+    "effectiveStrategyParams": request.get("effectiveStrategyParams", {}),
     "warmupTradingDays": warmup_days,
     "signalRequired": signal_required,
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
@@ -525,11 +583,26 @@ def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest)
   except KeyError as error:
     raise HTTPException(404, "策略方案不存在") from error
   if not config.get("enabled") or not config.get("published", True):
-    raise HTTPException(409, "策略方案未启用或尚未发布")
+    raise HTTPException(409, {
+      "code": "backtest.strategy_unavailable",
+      "message": "策略方案未启用或尚未发布",
+    })
   params_json = config.get("paramsJson")
   saved_params = params_json.get("params", {}) if isinstance(params_json, dict) else {}
   if not isinstance(saved_params, dict):
     raise HTTPException(422, "策略方案缺少可运行参数")
+
+  try:
+    saved_strategy_params, strategy_param_overrides, effective_strategy_params = (
+      strategy_lifecycle.effective_strategy_parameters(
+        config, dict(payload.overrides.strategy_params),
+      )
+    )
+  except strategy_lifecycle.StrategyLifecycleError as error:
+    raise HTTPException(422, {
+      "code": error.code,
+      "message": str(error),
+    }) from error
 
   values = dict(saved_params)
   overrides = _model_dump(payload.overrides)
@@ -584,9 +657,12 @@ def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest)
     strategyParams={
       key: value for key, value in saved_params.items()
       if key not in _EXPERIMENT_PARAM_KEYS
-    },
+    } | effective_strategy_params,
   )
   request = _model_dump(request_model)
+  request["savedStrategyParams"] = saved_strategy_params
+  request["strategyParamOverrides"] = strategy_param_overrides
+  request["effectiveStrategyParams"] = effective_strategy_params
   _validate_backtest_request(request)
   return request
 
@@ -594,6 +670,130 @@ def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest)
 def _public_request_hash(payload: schemas.PublicBacktestCreateRequest) -> str:
   canonical = json.dumps(_model_dump(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
   return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _public_write_hash(method: str, path: str, payload: Any) -> str:
+  canonical = json.dumps({
+    "method": method.upper(),
+    "path": path,
+    "body": _model_dump(payload),
+  }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+  return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _public_idempotency_key(request: Request) -> str:
+  value = request.headers.get("idempotency-key", "").strip()
+  if not 8 <= len(value) <= 128:
+    raise HTTPException(422, {
+      "code": "strategy.validation_failed",
+      "message": "Idempotency-Key 必须为 8 至 128 个字符",
+    })
+  return value
+
+
+def _public_write_context(
+  request: Request,
+  api_key: auth.ApiKeyPrincipal,
+  operation_type: str,
+  payload: Any,
+) -> strategy_lifecycle.PublicWriteContext:
+  return strategy_lifecycle.PublicWriteContext(
+    api_key_id=api_key.id,
+    idempotency_key=_public_idempotency_key(request),
+    request_hash=_public_write_hash(request.method, request.url.path, payload),
+    operation_type=operation_type,
+    request_id=getattr(request.state, "request_id", None),
+  )
+
+
+def _public_backtest_params_to_internal(
+  parameters: schemas.PublicStrategyBacktestParameters,
+) -> dict[str, Any]:
+  values = _model_dump(parameters)
+  execution = values.get("execution_parameters") or {}
+  return {
+    "startDate": values["start_date"],
+    "endDate": values["end_date"],
+    "initialCapital": values["initial_capital"],
+    "commissionRate": values["commission_rate"],
+    "slippage": values["slippage"],
+    "allowLong": values["allow_long"],
+    "allowShort": values["allow_short"],
+    "strategyCategory": values["strategy_category"],
+    "holdingPolicy": values["holding_policy"],
+    "overlaySettlementPolicy": values["overlay_settlement_policy"],
+    "fillModel": values["fill_model"],
+    "executionAlgorithm": values["execution_algorithm"],
+    "twapDurationSeconds": execution.get("duration_seconds"),
+    "twapIntervalSeconds": execution.get("interval_seconds"),
+    "twapMinChildQuantity": execution.get("min_child_quantity"),
+    "baseQuantity": values["base_quantity"],
+    "baseCostPrice": values["base_cost_price"],
+    "initialPositionEnabled": values["initial_position_enabled"],
+    "t0Enabled": values["t0_enabled"],
+  }
+
+
+def _public_strategy_command(
+  payload: schemas.PublicStrategyCreateRequest | schemas.PublicStrategyUpdateRequest,
+  config_id: str | None = None,
+) -> strategy_lifecycle.StrategySaveCommand:
+  return strategy_lifecycle.StrategySaveCommand(
+    name=payload.name,
+    description=payload.description,
+    code=payload.code,
+    entry_type=payload.entry_type,
+    signal_required=payload.signal_required,
+    strategy="user_script",
+    mode="backtest",
+    symbol=payload.symbol,
+    timeframe=payload.timeframe,
+    benchmark_symbol=payload.benchmark_symbol or payload.symbol,
+    account_id=None,
+    params_json={"params": _public_backtest_params_to_internal(payload.backtest_parameters)},
+    strategy_parameters=dict(payload.strategy_parameters),
+    enabled=payload.enabled,
+    config_id=config_id,
+    expected_revision=(
+      payload.expected_revision
+      if isinstance(payload, schemas.PublicStrategyUpdateRequest)
+      else None
+    ),
+  )
+
+
+def _raise_public_strategy_error(error: Exception) -> None:
+  if isinstance(error, strategy_lifecycle.StrategyLifecycleError):
+    raise HTTPException(error.status_code, {
+      "code": error.code,
+      "message": str(error),
+    }) from error
+  if isinstance(error, state_store.RevisionConflictError):
+    raise HTTPException(409, {
+      "code": "strategy.revision_conflict",
+      "message": str(error),
+    }) from error
+  if isinstance(error, state_store.NameConflictError):
+    raise HTTPException(409, {
+      "code": "strategy.name_conflict",
+      "message": str(error),
+    }) from error
+  if isinstance(error, state_store.IdempotencyConflictError):
+    raise HTTPException(409, {
+      "code": "idempotency.conflict",
+      "message": str(error),
+    }) from error
+  if isinstance(error, KeyError):
+    raise HTTPException(404, {
+      "code": "strategy.not_found",
+      "message": "策略不存在",
+    }) from error
+  if isinstance(error, state_store.ConflictError):
+    raise HTTPException(409, {
+      "code": "strategy.state_conflict",
+      "message": str(error),
+    }) from error
+  raise error
 
 
 def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
@@ -1192,23 +1392,41 @@ def update_strategy_config(config_id: str, payload: schemas.StrategyConfigUpdate
 def save_complete_strategy(payload: schemas.CompleteStrategySave):
   script_request = _model_dump(payload.script)
   config_request = _model_dump(payload.config)
-  _validate_strategy_script(script_request)
-  _apply_script_warmup_to_config(script_request, config_request)
-  if not settings.validate_symbol(config_request["symbol"]):
-    raise HTTPException(422, f"非法标的: {config_request['symbol']}")
-  if config_request.get("benchmarkSymbol") and not settings.validate_symbol(config_request["benchmarkSymbol"]):
-    raise HTTPException(422, f"非法买入持有基准: {config_request['benchmarkSymbol']}")
-  _validate_strategy_config_timeframe(config_request)
+  params_json = config_request.get("paramsJson")
+  strategy_parameters = (
+    params_json.get("strategyParams")
+    if isinstance(params_json, dict) and isinstance(params_json.get("strategyParams"), dict)
+    else None
+  )
   try:
-    saved = state_store.save_complete_strategy(
-      script_request, config_request, payload.scriptId, payload.configId,
-      payload.expectedRevision,
+    saved = strategy_lifecycle.save_strategy(
+      strategy_lifecycle.StrategySaveCommand(
+        name=str(config_request["name"]),
+        description=str(script_request.get("description", "")),
+        code=str(script_request["code"]),
+        entry_type=str(script_request.get("entryType", "on_bar")),
+        signal_required=bool(script_request.get("signalRequired", False)),
+        strategy=str(config_request.get("strategy", "user_script")),
+        mode=str(config_request.get("mode", "backtest")),
+        symbol=str(config_request["symbol"]),
+        timeframe=str(config_request.get("timeframe", "5m")),
+        benchmark_symbol=config_request.get("benchmarkSymbol"),
+        account_id=config_request.get("accountId"),
+        params_json=dict(params_json) if isinstance(params_json, dict) else {},
+        strategy_parameters=strategy_parameters,
+        enabled=bool(config_request.get("enabled", True)),
+        script_id=payload.scriptId,
+        config_id=payload.configId,
+        expected_revision=payload.expectedRevision,
+      ),
     )
     return {
       **saved,
       "runtimeVersion": SCRIPT_RUNTIME_VERSION,
       "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     }
+  except strategy_lifecycle.StrategyLifecycleError as error:
+    raise HTTPException(error.status_code, str(error)) from error
   except KeyError as error:
     raise HTTPException(404, "策略脚本或策略配置不存在") from error
   except state_store.ConflictError as error:
@@ -1225,21 +1443,6 @@ def get_complete_strategy(config_id: str):
     raise HTTPException(404, f"策略不存在: {config_id}") from error
   except state_store.DatabaseError as error:
     raise HTTPException(500, f"PostgreSQL 读取完整策略失败: {error}") from error
-
-
-def _apply_script_warmup_to_config(script: dict[str, Any], config: dict[str, Any]) -> None:
-  """保存完整策略时，将代码声明写入与代码绑定的配置快照。"""
-  params_json = config.get("paramsJson")
-  params = params_json.get("params") if isinstance(params_json, dict) else None
-  if not isinstance(params, dict):
-    raise HTTPException(422, "完整策略必须包含回测参数")
-  try:
-    warmup_days = warmup_trading_days_for_script(str(script.get("code", "")))
-  except ValueError as error:
-    raise HTTPException(422, str(error)) from error
-  if params.get("fillModel", "bar_next_open") == "l2_quote" and warmup_days != 0:
-    raise HTTPException(422, "L2 盘口回测不支持策略声明预热交易日")
-  params["warmupTradingDays"] = warmup_days
 
 
 def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
@@ -1828,6 +2031,155 @@ def backtest_timeframes_batch(
   }
 
 
+@app.get("/api/v1/strategies")
+def public_strategies(
+  request: Request,
+  limit: int = Query(20, ge=1, le=100),
+  cursor: int = Query(0, ge=0),
+  archived: bool | None = None,
+  enabled: bool | None = None,
+):
+  _require_public_scope(request, "strategy:read")
+  return strategy_lifecycle.list_strategies(limit, cursor, archived, enabled)
+
+
+@app.get("/api/v1/strategies/{config_id}")
+def public_strategy_detail(config_id: str, request: Request):
+  _require_public_scope(request, "strategy:read")
+  try:
+    return {"strategy": strategy_lifecycle.get_strategy(config_id)}
+  except Exception as error:
+    _raise_public_strategy_error(error)
+
+
+@app.post("/api/v1/strategies")
+def public_create_strategy(
+  payload: schemas.PublicStrategyCreateRequest,
+  request: Request,
+):
+  api_key = _require_public_scope(request, "strategy:write")
+  try:
+    result = strategy_lifecycle.save_strategy(
+      _public_strategy_command(payload),
+      _public_write_context(request, api_key, "strategy.create", payload),
+    )
+  except Exception as error:
+    _raise_public_strategy_error(error)
+  status_code = int(result.pop("response_status"))
+  return JSONResponse(
+    status_code=status_code,
+    content={**result, "request_id": request.state.request_id},
+  )
+
+
+@app.put("/api/v1/strategies/{config_id}")
+def public_update_strategy(
+  config_id: str,
+  payload: schemas.PublicStrategyUpdateRequest,
+  request: Request,
+):
+  api_key = _require_public_scope(request, "strategy:write")
+  try:
+    result = strategy_lifecycle.save_strategy(
+      _public_strategy_command(payload, config_id),
+      _public_write_context(request, api_key, "strategy.update", payload),
+    )
+  except Exception as error:
+    _raise_public_strategy_error(error)
+  status_code = int(result.pop("response_status"))
+  return JSONResponse(
+    status_code=status_code,
+    content={**result, "request_id": request.state.request_id},
+  )
+
+
+def _public_strategy_revision_action(
+  config_id: str,
+  payload: schemas.PublicStrategyRevisionRequest,
+  request: Request,
+  scope: str,
+  operation_type: str,
+  action: Any,
+) -> JSONResponse:
+  api_key = _require_public_scope(request, scope)
+  try:
+    result = action(
+      config_id,
+      payload.expected_revision,
+      _public_write_context(request, api_key, operation_type, payload),
+    )
+  except Exception as error:
+    _raise_public_strategy_error(error)
+  status_code = int(result.pop("response_status"))
+  return JSONResponse(
+    status_code=status_code,
+    content={**result, "request_id": request.state.request_id},
+  )
+
+
+@app.post("/api/v1/strategies/{config_id}/publish")
+def public_publish_strategy(
+  config_id: str,
+  payload: schemas.PublicStrategyRevisionRequest,
+  request: Request,
+):
+  return _public_strategy_revision_action(
+    config_id, payload, request, "strategy:publish", "strategy.publish",
+    strategy_lifecycle.publish_strategy,
+  )
+
+
+@app.post("/api/v1/strategies/{config_id}/archive")
+def public_archive_strategy(
+  config_id: str,
+  payload: schemas.PublicStrategyRevisionRequest,
+  request: Request,
+):
+  return _public_strategy_revision_action(
+    config_id, payload, request, "strategy:delete", "strategy.archive",
+    strategy_lifecycle.archive_strategy,
+  )
+
+
+@app.post("/api/v1/strategies/{config_id}/restore")
+def public_restore_strategy(
+  config_id: str,
+  payload: schemas.PublicStrategyRevisionRequest,
+  request: Request,
+):
+  return _public_strategy_revision_action(
+    config_id, payload, request, "strategy:write", "strategy.restore",
+    strategy_lifecycle.restore_strategy,
+  )
+
+
+@app.get("/api/v1/strategies/{config_id}/versions")
+def public_strategy_versions(
+  config_id: str,
+  request: Request,
+  limit: int = Query(20, ge=1, le=100),
+  cursor: int = Query(0, ge=0),
+):
+  _require_public_scope(request, "strategy:read")
+  try:
+    return strategy_lifecycle.list_versions(config_id, limit, cursor)
+  except Exception as error:
+    _raise_public_strategy_error(error)
+
+
+@app.get("/api/v1/strategies/{config_id}/versions/{version_id}")
+def public_strategy_version_detail(
+  config_id: str,
+  version_id: str,
+  request: Request,
+):
+  _require_public_scope(request, "strategy:read")
+  try:
+    return {"version": strategy_lifecycle.get_version(config_id, version_id)}
+  except Exception as error:
+    _raise_public_strategy_error(error)
+
+
 @app.post("/api/v1/backtests")
 def public_create_backtest(payload: schemas.PublicBacktestCreateRequest, request: Request):
   api_key = _require_public_scope(request, "backtest:submit")
@@ -1930,10 +2282,37 @@ def public_cancel_backtest(run_id: str, request: Request):
 
 
 @app.post("/api/backtest/run")
-def run_backtest(payload: schemas.BacktestRunRequest):
+def run_backtest(payload: schemas.BacktestRunRequest, http_request: Request):
   request = _model_dump(payload)
   _validate_backtest_request(request)
   _require_backtest_runner(str(request.get("fillModel", "bar_next_open")))
+
+  idempotency_key = http_request.headers.get("idempotency-key", "").strip()
+  if idempotency_key:
+    if not 8 <= len(idempotency_key) <= 128:
+      raise HTTPException(422, "Idempotency-Key 必须为 8 至 128 个字符")
+    request_hash = hashlib.sha256(json.dumps(
+      request, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    try:
+      run_id, display_no, replayed, run_status, fill_model = (
+        state_store.create_browser_backtest_job(
+          request, idempotency_key, request_hash,
+        )
+      )
+    except state_store.IdempotencyConflictError as error:
+      raise HTTPException(409, str(error)) from error
+    return {
+      "runId": run_id,
+      "displayNo": display_no,
+      "configId": request.get("configId"),
+      "configVersionId": request.get("configVersionId"),
+      "scriptId": request.get("scriptId"),
+      "status": run_status,
+      "fillModel": fill_model,
+      "replayed": replayed,
+      "message": "回测幂等请求已返回原任务" if replayed else "回测已进入队列，等待执行",
+    }
 
   if request.get("fillModel") == "l2_quote":
     try:

@@ -59,6 +59,9 @@ def complete_run() -> dict[str, Any]:
       "fillModel": "bar_next_open",
       "executionAlgorithm": "immediate",
       "strategyParams": {"window": 20},
+      "savedStrategyParams": {"window": 20},
+      "strategyParamOverrides": {"window": 10},
+      "effectiveStrategyParams": {"window": 10},
       "requestKey": "private-request",
     },
     "dataVersion": {"barSnapshot": {
@@ -126,6 +129,9 @@ def test_snapshot_uses_business_whitelist_and_removes_system_fields() -> None:
 
   assert snapshot["strategy"]["code"].startswith("def on_bar")
   assert snapshot["configuration"]["initialCapital"] == 1_000_000
+  assert snapshot["configuration"]["savedStrategyParams"] == {"window": 20}
+  assert snapshot["configuration"]["strategyParamOverrides"] == {"window": 10}
+  assert snapshot["configuration"]["effectiveStrategyParams"] == {"window": 10}
   assert snapshot["result"]["summary"]["totalReturn"] == 0.12
   assert snapshot["data"]["dependencies"][0]["summary"]["snapshotHash"] == "b" * 64
   assert snapshot["data"]["dependencies"][0]["summary"]["alignment"]["alignedCount"] == 7

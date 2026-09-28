@@ -6,24 +6,8 @@ import {
   retrySignalDetailExport,
 } from '../api/client';
 import type { BacktestRunSelection, SignalDetailExportTask } from '../types';
+import { createBrowserUuid } from '../utils/browserUuid';
 
-
-function idempotencyKey(): string {
-  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
-
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0'));
-  return [
-    hex.slice(0, 4).join(''),
-    hex.slice(4, 6).join(''),
-    hex.slice(6, 8).join(''),
-    hex.slice(8, 10).join(''),
-    hex.slice(10, 16).join(''),
-  ].join('-');
-}
 
 async function retryOnceOnNetworkError<T>(request: () => Promise<T>): Promise<T> {
   try {
@@ -84,7 +68,7 @@ export function useSignalDetailExports(active: boolean) {
   }, [active, activeCount, refresh]);
 
   const create = useCallback(async (selection: BacktestRunSelection) => {
-    const key = idempotencyKey();
+    const key = createBrowserUuid();
     const task = await retryOnceOnNetworkError(
       () => createSignalDetailExport(selection, key),
     );
@@ -101,7 +85,7 @@ export function useSignalDetailExports(active: boolean) {
   }, [refresh]);
 
   const retry = useCallback(async (exportId: string) => {
-    const key = idempotencyKey();
+    const key = createBrowserUuid();
     const task = await retryOnceOnNetworkError(
       () => retrySignalDetailExport(exportId, key),
     );

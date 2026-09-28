@@ -116,10 +116,28 @@ def test_strategy_config_save_does_not_run_market_data_preflight(
 
 
 def test_strategy_config_uses_warmup_declared_by_script() -> None:
-  config = {"paramsJson": {"params": {"fillModel": "bar_next_open"}}}
-  script = {"code": "WARMUP_TRADING_DAYS = 140\n\ndef on_bar(bar, state):\n  return []"}
-
-  api_app._apply_script_warmup_to_config(script, config)
+  _, config = api_app.strategy_lifecycle._validated_payloads(
+    api_app.strategy_lifecycle.StrategySaveCommand(
+      name="预热策略",
+      description="",
+      code="WARMUP_TRADING_DAYS = 140\n\ndef on_bar(bar, state):\n  return []",
+      entry_type="on_bar",
+      signal_required=False,
+      strategy="user_script",
+      mode="backtest",
+      symbol="688981.SH",
+      timeframe="1d",
+      benchmark_symbol=None,
+      account_id=None,
+      params_json={"params": {
+        "fillModel": "bar_next_open",
+        "startDate": "2026-07-01",
+        "endDate": "2026-07-30",
+      }},
+      strategy_parameters=None,
+      enabled=True,
+    ),
+  )
 
   assert config["paramsJson"]["params"]["warmupTradingDays"] == 140
 
@@ -128,45 +146,49 @@ def test_saved_warmup_is_derived_from_current_script(monkeypatch: pytest.MonkeyP
   config = {
     "id": "config-1", "name": "测试策略", "scriptId": "script-1", "strategy": "user_script",
     "mode": "backtest", "symbol": "688981.SH", "timeframe": "1d", "benchmarkSymbol": None,
-    "accountId": None, "paramsJson": {"params": {"warmupTradingDays": 0}},
+    "accountId": None, "paramsJson": {
+      "params": {"warmupTradingDays": 0, "window": 20},
+      "strategyParameterDefinitions": {
+        "window": {"type": "integer", "default": 20},
+      },
+      "strategyParams": {"window": 20},
+    },
   }
   script = {
     "id": "script-1", "name": "测试策略", "description": "", "entryType": "on_bar",
-    "code": "WARMUP_TRADING_DAYS = 140\n\ndef on_bar(bar, state):\n  return []",
+    "code": (
+      "WARMUP_TRADING_DAYS = 140\n"
+      'STRATEGY_PARAMETERS = {"window": 20}\n\n'
+      "def on_bar(bar, state):\n  return []"
+    ),
   }
   monkeypatch.setattr(state_store, "get_strategy_config", lambda _: config)
   monkeypatch.setattr(state_store, "get_strategy_script", lambda _: script)
   request: dict[str, Any] = {
     "configId": "config-1", "symbol": "688981.SH", "timeframe": "1d", "strategy": "user_script",
     "benchmarkSymbol": None, "accountId": None, "fillModel": "bar_next_open",
-    "executionAlgorithm": "immediate", "executionParameters": {}, "strategyParams": {},
+    "executionAlgorithm": "immediate", "executionParameters": {},
+    "strategyParams": {"window": 10}, "strategyParamOverrides": {"window": 10},
   }
 
   api_app._prepare_saved_strategy_snapshot(request)
 
   assert request["warmupTradingDays"] == 140
+  assert request["savedStrategyParams"] == {"window": 20}
+  assert request["strategyParamOverrides"] == {"window": 10}
+  assert request["effectiveStrategyParams"] == {"window": 10}
+  assert request["savedConfigSnapshot"]["savedStrategyParams"] == {"window": 20}
+  assert request["savedConfigSnapshot"]["effectiveStrategyParams"] == {"window": 10}
 
 
-def test_complete_strategy_save_uses_one_store_call(monkeypatch: pytest.MonkeyPatch) -> None:
-  captured: dict[str, Any] = {}
+def test_complete_strategy_save_uses_one_lifecycle_call(monkeypatch: pytest.MonkeyPatch) -> None:
+  captured: list[Any] = []
 
-  def save(
-    script: dict[str, Any], config: dict[str, Any], script_id: str | None, config_id: str | None,
-    expected_revision: int | None,
-  ) -> dict[str, dict[str, Any]]:
-    captured.update(
-      script=script,
-      config=config,
-      script_id=script_id,
-      config_id=config_id,
-      expected_revision=expected_revision,
-    )
-    return {'script': {'id': 'script-1'}, 'config': {'id': 'config-1'}}
+  def save(command: Any) -> dict[str, dict[str, Any]]:
+    captured.append(command)
+    return {"script": {"id": "script-1"}, "config": {"id": "config-1"}}
 
-  monkeypatch.setattr(api_app, '_validate_strategy_script', lambda _: None)
-  monkeypatch.setattr(api_app, '_validate_strategy_config_timeframe', lambda _: None)
-  monkeypatch.setattr(api_app.settings, 'validate_symbol', lambda _: True)
-  monkeypatch.setattr(api_app.state_store, 'save_complete_strategy', save)
+  monkeypatch.setattr(api_app.strategy_lifecycle, "save_strategy", save)
   payload = schemas.CompleteStrategySave(
     script={'name': '完整策略', 'code': 'def on_bar(bar, state):\n  return []'},
     config={
@@ -177,8 +199,10 @@ def test_complete_strategy_save_uses_one_store_call(monkeypatch: pytest.MonkeyPa
 
   result = api_app.save_complete_strategy(payload)
 
-  assert result['script']['id'] == 'script-1'
-  assert captured['script_id'] is None
-  assert captured['config_id'] is None
-  assert captured['expected_revision'] is None
-  assert captured['config']['scriptId'] is None
+  assert result["script"]["id"] == "script-1"
+  assert len(captured) == 1
+  command = captured[0]
+  assert command.script_id is None
+  assert command.config_id is None
+  assert command.expected_revision is None
+  assert command.params_json["params"]["startDate"] == "2026-08-27"

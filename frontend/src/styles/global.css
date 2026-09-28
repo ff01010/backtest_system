@@ -1759,13 +1759,29 @@ button, input, select, textarea {
 }
 
 .strategy-save-notice {
-  border: 1px solid #c7e4dc;
-  border-left: 3px solid var(--accent);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
 }
 
-.strategy-save-notice.is-dirty {
+.strategy-save-notice.is-blocked {
+  border-color: #fecaca;
+  border-left-color: #dc2626;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.strategy-save-notice.is-warning {
   border-color: #ead298;
   border-left-color: #b7791f;
+  background: #fffbeb;
+  color: #b45309;
+}
+
+.strategy-save-notice.is-ready {
+  border-color: #c7e4dc;
+  border-left-color: var(--accent);
+  background: #ecfdf5;
+  color: #0f766e;
 }
 
 .strategy-asset-actions button,

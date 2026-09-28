@@ -237,8 +237,11 @@ def test_new_complete_strategy_ignores_client_script_identity(monkeypatch: Any) 
     lambda *_: {"id": "new-config", "strategyVersionId": "new-version"},
   )
   monkeypatch.setattr(state_store, "_publish_strategy_config_with_cursor", lambda *_: ("published", True))
-  monkeypatch.setattr(state_store, "get_strategy_script", lambda _: {"id": "new-script"})
-  monkeypatch.setattr(state_store, "get_strategy_config", lambda _: {"id": "new-config"})
+  monkeypatch.setattr(
+    state_store,
+    "_get_strategy_script_with_cursor",
+    lambda *_: {"id": "new-script"},
+  )
 
   result = state_store.save_complete_strategy(
     {"name": "复制策略", "code": "return []"},
@@ -251,3 +254,99 @@ def test_new_complete_strategy_ignores_client_script_identity(monkeypatch: Any) 
   assert captured["script_name"] == "复制策略-1"
   assert captured["config_name"] == "复制策略-1"
   assert result["script"]["id"] == "new-script"
+
+
+def test_strategy_config_read_does_not_reveal_other_owner(monkeypatch: Any) -> None:
+  cursor = FakeCursor([None])  # type: ignore[list-item]
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  with pytest.raises(KeyError, match="config-2"):
+    state_store._get_strategy_config_with_cursor(
+      cursor, "config-2", include_archived=True,
+    )
+
+  assert "c.owner_user_id=%s" in cursor.statements[0]
+
+
+def test_archive_rejects_stale_revision_before_updates(monkeypatch: Any) -> None:
+  cursor = FakeCursor([])
+  monkeypatch.setattr(
+    state_store,
+    "_get_strategy_config_with_cursor",
+    lambda *_args, **_kwargs: {"id": "config-1", "revision": 4},
+  )
+
+  with pytest.raises(state_store.RevisionConflictError):
+    state_store.archive_strategy_config_in_transaction(cursor, "config-1", 3)
+
+  assert cursor.statements == []
+
+
+def test_archive_updates_config_and_owned_script(monkeypatch: Any) -> None:
+  cursor = FakeCursor([{"strategy_id": "script-1"}])
+  calls = 0
+
+  def get_config(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+    nonlocal calls
+    calls += 1
+    return {
+      "id": "config-1",
+      "revision": 1 if calls == 1 else 2,
+      "archivedAt": "2026-09-28T10:00:00+08:00" if kwargs.get("include_archived") else None,
+    }
+
+  monkeypatch.setattr(state_store, "_get_strategy_config_with_cursor", get_config)
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  result = state_store.archive_strategy_config_in_transaction(cursor, "config-1", 1)
+
+  assert result["revision"] == 2
+  sql = "\n".join(cursor.statements)
+  assert "archived_at=now(), published=false, revision=revision + 1" in sql
+  assert "UPDATE user_strategy SET status='archived'" in sql
+
+
+def test_restore_rejects_active_name_conflict_without_renaming(monkeypatch: Any) -> None:
+  cursor = FakeCursor([{"exists": 1}])
+  monkeypatch.setattr(
+    state_store,
+    "_get_strategy_config_with_cursor",
+    lambda *_args, **_kwargs: {
+      "id": "config-1",
+      "name": "策略 A",
+      "revision": 2,
+      "archivedAt": "2026-09-28T10:00:00+08:00",
+    },
+  )
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  with pytest.raises(state_store.NameConflictError, match="同名"):
+    state_store.restore_strategy_config_in_transaction(cursor, "config-1", 2)
+
+  sql = "\n".join(cursor.statements)
+  assert "SET archived_at=NULL" not in sql
+
+
+def test_restore_reactivates_config_and_owned_script(monkeypatch: Any) -> None:
+  cursor = FakeCursor([None, {"strategy_id": "script-1"}])  # type: ignore[list-item]
+  calls = 0
+
+  def get_config(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    nonlocal calls
+    calls += 1
+    return {
+      "id": "config-1",
+      "name": "策略 A",
+      "revision": calls + 1,
+      "archivedAt": "2026-09-28T10:00:00+08:00" if calls == 1 else None,
+    }
+
+  monkeypatch.setattr(state_store, "_get_strategy_config_with_cursor", get_config)
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  result = state_store.restore_strategy_config_in_transaction(cursor, "config-1", 2)
+
+  assert result["revision"] == 3
+  sql = "\n".join(cursor.statements)
+  assert "SET archived_at=NULL, published=true, revision=revision + 1" in sql
+  assert "UPDATE user_strategy SET status='active'" in sql
