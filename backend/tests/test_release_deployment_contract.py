@@ -22,6 +22,18 @@ def test_release_admin_uses_target_sha_and_preserves_recovery_image() -> None:
   assert "${RELEASE_ADMIN_IMAGE" in compose
 
 
+def test_deployment_has_no_trade_calendar_runtime_dependency() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(
+    encoding="utf-8",
+  )
+
+  assert "calendar-sync" not in script
+  assert "verify_trade_calendar" not in script
+  assert "calendar-sync" not in compose
+  assert "backend.trade_calendar_sync" not in compose
+
+
 def test_deploy_script_reexecutes_after_self_update_under_same_lock() -> None:
   script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
 

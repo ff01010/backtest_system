@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from backend.services import bar_data, clickhouse_client, market_data, state_store
+from backend.services import bar_data, clickhouse_client, market_data
 from backend.services.backtest_faults import BacktestFault
 from backend.l2.models import NormalizedBar
 
@@ -21,6 +21,10 @@ def test_load_bars_prefers_history_dev_for_sh_symbol(monkeypatch: pytest.MonkeyP
 
   def query_rows(query: str) -> list[dict[str, object]]:
     queries.append(query)
+    if "min(eligible_runs.target_date)" in query:
+      return [{"first_date": "2024-03-07", "last_date": "2026-07-30"}]
+    if "min(trade_date) AS first_date" in query:
+      return [{"first_date": "2024-03-07", "last_date": "2026-07-30"}]
     if "WITH latest_runs" in query:
       return [{"trade_date": "2026-07-30", "status": "complete"}]
     if "qmt_kline_coverage" in query:
@@ -49,6 +53,8 @@ def test_bj_load_uses_published_history_dev_period_table(monkeypatch: pytest.Mon
 
   def query_rows(query: str) -> list[dict[str, object]]:
     queries.append(query)
+    if "min(eligible_runs.target_date)" in query:
+      return [{"first_date": "2024-03-07", "last_date": "2026-09-11"}]
     if "WITH latest_runs" in query:
       return [{"trade_date": "2026-09-11", "status": "complete"}]
     if "qmt_kline_coverage" in query:
@@ -67,7 +73,9 @@ def test_bj_load_uses_published_history_dev_period_table(monkeypatch: pytest.Mon
     "open": 1.0, "high": 6.0, "low": 1.0, "close": 6.0, "volume": 60,
     "time": "202609110930",
   }]
-  coverage_query = next(query for query in queries if "WITH latest_runs" in query)
+  coverage_query = next(
+    query for query in queries if "eligible_runs.target_date AS trade_date" in query
+  )
   raw_query = next(query for query in queries if "GROUP BY bar_time" in query)
   assert "qmt_history_dev.qmt_ingest_runs" in coverage_query
   assert "qmt_history_dev.qmt_universe_snapshot" in coverage_query
@@ -232,10 +240,11 @@ def test_published_history_bar_ignores_source_quality_status(
 def test_history_dev_missing_warmup_falls_back_to_legacy_for_entire_run(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  monkeypatch.setattr(state_store, "is_trade_calendar_range_covered", lambda *_: True)
-  monkeypatch.setattr(state_store, "list_open_trade_dates", lambda *_: ["2026-09-10"])
-
   def query_rows(query: str) -> list[dict[str, object]]:
+    if "min(eligible_runs.target_date)" in query:
+      return [{"first_date": "2026-09-11", "last_date": "2026-09-11"}]
+    if "min(trade_date) AS first_date" in query:
+      return [{"first_date": "2026-09-10", "last_date": "2026-09-11"}]
     is_warmup = "2026-09-10" in query and "2026-09-11" not in query
     if "WITH latest_runs" in query:
       return [] if is_warmup else [{"trade_date": "2026-09-11", "status": "complete"}]
@@ -287,11 +296,124 @@ def test_incomplete_qmt_coverage_rejects_backtest(monkeypatch: pytest.MonkeyPatc
     market_data.ensure_cached("688981.SH", "1m", "20260730", "20260730")
 
 
+def test_calendar_lag_does_not_block_latest_complete_bar(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  epochs = [
+    int(datetime(2026, 9, day, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
+    for day in (23, 24)
+  ]
+  monkeypatch.setattr(
+    market_data,
+    "_coverage_range_for_source",
+    lambda *_: {"firstDate": "2024-03-07", "lastDate": "2026-09-24"},
+  )
+  monkeypatch.setattr(
+    market_data,
+    "_coverage_for_source",
+    lambda *_: [
+      {"date": "2026-09-23", "status": "complete"},
+      {"date": "2026-09-24", "status": "complete"},
+    ],
+  )
+  monkeypatch.setattr(
+    market_data,
+    "_query_kline_rows",
+    lambda *_: [
+      {
+        "time": epoch, "open": 10.0, "high": 10.5,
+        "low": 9.8, "close": 10.2, "volume": 100,
+      }
+      for epoch in epochs
+    ],
+  )
+
+  resolution = market_data.resolve_backtest_data(
+    "600000.SH", "1m", "2024-03-07", "2026-09-24",
+  )
+  frame, _ = market_data.load_backtest_bars("600000.SH", resolution)
+
+  assert resolution.formal_dates[-1] == "2026-09-24"
+  assert frame["time"].tolist()[-1].startswith("20260924")
+
+
+def test_request_end_after_source_boundary_is_rejected(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    market_data,
+    "_coverage_range_for_source",
+    lambda *_: {"firstDate": "2024-03-07", "lastDate": "2026-09-24"},
+  )
+  monkeypatch.setattr(
+    market_data,
+    "_coverage_for_source",
+    lambda *_: pytest.fail("越界请求不应读取区间覆盖日期"),
+  )
+
+  with pytest.raises(market_data.MarketDataError) as raised:
+    market_data.resolve_backtest_data(
+      "600000.SH", "1m", "2024-03-07", "2026-09-25",
+    )
+
+  assert raised.value.reason == "range_out_of_bounds"
+
+
+def test_in_range_without_complete_dates_is_not_reported_as_out_of_range(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    market_data,
+    "_coverage_range_for_source",
+    lambda *_: {"firstDate": "2024-03-07", "lastDate": "2026-09-24"},
+  )
+  monkeypatch.setattr(market_data, "_coverage_for_source", lambda *_: [])
+
+  with pytest.raises(market_data.MarketDataError) as raised:
+    market_data.resolve_backtest_data(
+      "600000.SH", "1m", "2026-09-20", "2026-09-21",
+    )
+
+  assert raised.value.reason == "no_complete_coverage"
+
+
+def test_frozen_snapshot_restores_source_without_current_coverage_lookup(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    market_data,
+    "_coverage_for_source",
+    lambda *_: pytest.fail("历史冻结快照不应查询当前覆盖"),
+  )
+  snapshot = {
+    "provider": "qmt_kline",
+    "sourceDatabase": "qmt_history_dev",
+    "sourceTable": "qmt_kline_1m_raw",
+    "sourcePeriod": "1m",
+    "derivation": None,
+    "formalDates": ["2026-09-23", "2026-09-24"],
+    "warmupDates": ["2026-09-22"],
+  }
+
+  resolution = market_data.resolve_backtest_data(
+    "600000.SH", "1m", "2026-09-23", "2026-09-24",
+    snapshot["formalDates"], 1, snapshot,
+  )
+
+  assert resolution.source == "history_dev"
+  assert resolution.formal_dates == ("2026-09-23", "2026-09-24")
+  assert resolution.warmup_dates == ("2026-09-22",)
+
+
 def test_weekend_start_date_uses_available_qmt_bars(monkeypatch: pytest.MonkeyPatch) -> None:
   first_epoch = int(datetime(2025, 1, 6, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
   second_epoch = int(datetime(2025, 1, 7, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
 
   def query_rows(query: str) -> list[dict[str, object]]:
+    if "min(eligible_runs.target_date)" in query:
+      return [{"first_date": None, "last_date": None}]
+    if "min(trade_date) AS first_date" in query:
+      return [{"first_date": "2025-01-03", "last_date": "2025-01-07"}]
     if "WITH latest_runs" in query:
       return []
     if "qmt_kline_coverage" in query:
@@ -385,15 +507,76 @@ def test_mapped_bar_source_does_not_require_bar_on_every_exchange_day(
       del symbol, period, start_date, end_date
       return [bar]
 
+    def bar_date_range(self, symbol: str, period: str) -> tuple[str, str]:
+      del symbol, period
+      return "2025-01-01", "2025-12-31"
+
+    def coverage(self, symbol: str, start_date: str, end_date: str) -> object:
+      del symbol, start_date, end_date
+      return type("Coverage", (), {})()
+
+    def bar_source_identity(self, period: str) -> dict[str, object]:
+      return {
+        "sourceDatabase": "mapped", "sourceTable": "bars",
+        "sourcePeriod": period, "derivation": None,
+      }
+
   monkeypatch.setattr(bar_data, "has_profile", lambda *_: True)
   monkeypatch.setattr(bar_data, "load_profile", lambda *_: object())
   monkeypatch.setattr(bar_data, "ClickHouseL2Adapter", FakeAdapter)
-  monkeypatch.setattr(bar_data.market_data, "required_trade_dates", lambda *_: ["2025-02-24", "2025-03-10"])
 
   frame, snapshot = bar_data.load_bars_with_snapshot("688126.SH", "1m", "2025-02-24", "2025-03-10")
 
   assert frame["time"].tolist() == ["20250310093000"]
   assert snapshot["provider"] == "mapped_l2_bar"
+
+
+def test_mapped_bar_source_outside_boundary_is_not_partially_loaded(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class FakeAdapter:
+    def __init__(self, profile: object) -> None:
+      del profile
+
+    def bar_date_range(self, symbol: str, period: str) -> tuple[str, str]:
+      del symbol, period
+      return "2026-07-01", "2026-07-30"
+
+    def load_bars(self, *_: object) -> list[NormalizedBar]:
+      pytest.fail("越界请求不应读取并返回部分正式映射 Bar")
+
+  monkeypatch.setattr(bar_data, "has_profile", lambda *_: True)
+  monkeypatch.setattr(bar_data, "load_profile", lambda *_: object())
+  monkeypatch.setattr(bar_data, "ClickHouseL2Adapter", FakeAdapter)
+
+  assert bar_data._load_mapped_bars(
+    "688981.SH", "1m", "2026-07-01", "2026-07-31",
+  ) is None
+
+
+def test_qmt_source_read_failure_does_not_fall_back_to_temporary_quotes(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(bar_data, "has_profile", lambda *_: False)
+  monkeypatch.setattr(
+    bar_data.market_data,
+    "resolve_backtest_data",
+    lambda *_: (_ for _ in ()).throw(
+      market_data.MarketDataError("ClickHouse 查询超时", "source_read_failed"),
+    ),
+  )
+  monkeypatch.setattr(
+    bar_data,
+    "_temporary_provider",
+    lambda: pytest.fail("来源读取失败不应静默切换到临时 Quote"),
+  )
+
+  with pytest.raises(market_data.MarketDataError) as raised:
+    bar_data.load_bars_with_snapshot(
+      "688981.SH", "1m", "2026-07-01", "2026-07-30",
+    )
+
+  assert raised.value.reason == "source_read_failed"
 
 
 def test_qmt_normalized_bar_accepts_minute_time_without_seconds() -> None:
@@ -448,19 +631,24 @@ def test_15m_aggregation_uses_qmt_right_closed_opening_window() -> None:
 
 
 def test_daily_resolution_falls_back_to_complete_minutes_for_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
-  def query_rows(query: str) -> list[dict[str, object]]:
-    if "period = '1d'" in query:
-      return [{"trade_date": "2026-07-30", "status": "partial"}]
-    if "period = '1m'" in query:
-      return [
-        {"trade_date": "2026-07-29", "status": "complete"},
-        {"trade_date": "2026-07-30", "status": "complete"},
-      ]
-    return []
+  def coverage(
+    _symbol: str,
+    candidate: market_data._SourceCandidate,
+    start_date: str,
+    end_date: str,
+  ) -> list[dict[str, object]]:
+    del start_date
+    if candidate.source_period == "1d":
+      return [{"date": "2026-07-30", "status": "partial"}]
+    date_value = "2026-07-29" if end_date == "2026-07-29" else "2026-07-30"
+    return [{"date": date_value, "status": "complete"}]
 
-  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
-  monkeypatch.setattr(state_store, "is_trade_calendar_range_covered", lambda *_: True)
-  monkeypatch.setattr(state_store, "list_open_trade_dates", lambda *_: ["2026-07-29"])
+  monkeypatch.setattr(market_data, "_coverage_for_source", coverage)
+  monkeypatch.setattr(
+    market_data,
+    "_coverage_range_for_source",
+    lambda *_: {"firstDate": "2026-07-29", "lastDate": "2026-07-30"},
+  )
 
   resolution = market_data.resolve_backtest_data(
     "688981.SH", "1d", "2026-07-30", "2026-07-30", ["2026-07-30"], 1,
@@ -473,12 +661,10 @@ def test_daily_resolution_falls_back_to_complete_minutes_for_warmup(monkeypatch:
 
 
 def test_warmup_skips_halted_exchange_days(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.setattr(state_store, "is_trade_calendar_range_covered", lambda *_: True)
   monkeypatch.setattr(
-    state_store,
-    "list_open_trade_dates",
-    lambda *_: ["2025-09-01", "2025-09-02", "2025-09-03", "2025-09-04", "2025-09-05",
-                "2025-09-08", "2025-09-09", "2025-09-10", "2025-09-11"],
+    market_data,
+    "_coverage_range_for_source",
+    lambda *_: {"firstDate": "2025-09-01", "lastDate": "2025-09-11"},
   )
   monkeypatch.setattr(
     market_data,

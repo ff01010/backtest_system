@@ -162,25 +162,6 @@ verify_clickhouse_connectivity() {
   done <<< "$runner_ids"
 }
 
-verify_trade_calendar() {
-  local check_code
-  check_code="$(cat <<'PY'
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-from backend.services import state_store
-
-today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-latest = state_store.latest_trade_calendar_date()
-covered = state_store.is_trade_calendar_range_covered(today, today)
-if latest != today or not covered:
-  raise SystemExit(f"交易日历校验失败：latest={latest}, expected={today}, covered={covered}")
-print(f"交易日历校验通过：覆盖至 {today}")
-PY
-)"
-  "${compose[@]}" --profile calendar-sync run --rm --no-deps calendar-sync python -c "$check_code"
-}
-
 wait_for_application() {
   local port="$1" bar_replicas="$2" l2_replicas="$3" attempt health_url response
   health_url="http://127.0.0.1:${port}/api/health"
@@ -332,8 +313,6 @@ check_active_backtests || fail "回测任务未完全排空；backend 保持停�
 "${compose[@]}" --profile migration run --rm migrate
 "${compose[@]}" up -d --build docker-socket-proxy loki alloy container-event-observer
 wait_for_observability
-"${compose[@]}" --profile calendar-sync run --rm --build calendar-sync
-verify_trade_calendar || fail "交易日历同步后校验失败"
 "${compose[@]}" up -d --build --remove-orphans \
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \

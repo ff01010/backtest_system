@@ -94,10 +94,12 @@ def _sanitize_json_value(value: Any) -> Any:
 def run_trend_grid_backtest(payload: dict[str, Any]) -> dict[str, Any]:
   """运行单标的同步回测，返回 summary/equity/trades。"""
   config = _build_config(payload)
-  bars = _load_bars(
+  bars, data_snapshot = _load_bars_with_snapshot(
     payload["symbol"], payload.get("timeframe", "5m"), payload["startDate"], payload["endDate"],
   )
-  experiment_manifest = _build_experiment_manifest(payload, config, bars)
+  experiment_manifest = _build_experiment_manifest(
+    payload, config, bars, data_snapshot,
+  )
   strategy_source = get_strategy_source_snapshot(payload["strategy"])
   experiment_manifest["strategySource"] = {
     "id": strategy_source["id"],
@@ -419,11 +421,14 @@ def _load_user_script_bars(payload: dict[str, Any]) -> tuple[pd.DataFrame, int, 
   saved = dict(payload.get("marketDataSnapshot") or {}).get("barSnapshot") or {}
   formal_dates = saved.get("formalDates") if isinstance(saved.get("formalDates"), list) else None
   try:
-    if not formal_dates:
-      formal_dates = market_data.required_trade_dates(payload["startDate"], payload["endDate"])
+    source_snapshot = (
+      saved
+      if formal_dates and all(saved.get(key) for key in ("sourceDatabase", "sourceTable", "sourcePeriod"))
+      else None
+    )
     resolution = market_data.resolve_backtest_data(
       payload["symbol"], timeframe, payload["startDate"], payload["endDate"], formal_dates,
-      int(payload.get("warmupTradingDays", 0)),
+      int(payload.get("warmupTradingDays", 0)), source_snapshot,
     )
     frame, warmup_bar_count = market_data.load_backtest_bars(payload["symbol"], resolution)
     snapshot = market_data.snapshot_for_resolution(
@@ -868,6 +873,7 @@ def _build_experiment_manifest(
   payload: dict[str, Any],
   config: dict[str, Any],
   bars: pd.DataFrame,
+  database_snapshot: dict[str, Any],
 ) -> dict[str, Any]:
   timeframe = str(payload.get("timeframe", "5m"))
   code_files = [
@@ -879,9 +885,6 @@ def _build_experiment_manifest(
     _file_fingerprint(config["backtest"].get("htf_data_path")),
   ]
   strategy_hash = _fingerprint_hash(code_files)
-  database_snapshot = market_data.snapshot(
-    payload["symbol"], timeframe, payload["startDate"], payload["endDate"],
-  )
   data_hash = database_snapshot["hash"]
   seed_material = {
     "payload": payload,
@@ -1014,11 +1017,26 @@ def _apply_position_params(strategy: dict[str, Any], payload: dict[str, Any]) ->
 
 
 def _load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
+  frame, _ = _load_bars_with_snapshot(symbol, timeframe, start_date, end_date)
+  return frame
+
+
+def _load_bars_with_snapshot(
+  symbol: str,
+  timeframe: str,
+  start_date: str,
+  end_date: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
   try:
-    df, _ = bar_data.load_bars_with_snapshot(symbol, timeframe, start_date, end_date)
+    df, snapshot = bar_data.load_bars_with_snapshot(
+      symbol, timeframe, start_date, end_date,
+    )
     df["hhmm"] = df["time"].str[8:12].astype(int)
     df = df[df["hhmm"].apply(is_trading_time)]
-    return df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+    return (
+      df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True),
+      snapshot,
+    )
   except BacktestFault:
     raise
   except Exception as error:

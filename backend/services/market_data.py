@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import hashlib
@@ -13,7 +14,7 @@ import pandas as pd
 
 from backend import settings
 from backend.date_codec import TradingDateError, format_api_date, normalize_date_range, parse_trading_date
-from backend.services import clickhouse_client, state_store
+from backend.services import clickhouse_client
 
 
 _LEGACY_SOURCE = "legacy"
@@ -43,6 +44,10 @@ _TIMEZONE = ZoneInfo("Asia/Shanghai")
 class MarketDataError(ValueError):
   """QMT 行情未导入、未覆盖或数据结构无效。"""
 
+  def __init__(self, message: str, reason: str = "source_read_failed") -> None:
+    super().__init__(message)
+    self.reason = reason
+
 
 @dataclass(frozen=True)
 class BacktestDataResolution:
@@ -68,6 +73,15 @@ class _SourceCandidate:
   derivation: str | None = None
 
 
+@dataclass(frozen=True)
+class _CandidateResolution:
+  resolution: BacktestDataResolution | None = None
+  has_formal_bars: bool = False
+  available_warmup_days: int = 0
+  source_range: tuple[str, str] | None = None
+  in_request_range: bool = False
+
+
 def resolve_backtest_data(
   symbol: str,
   timeframe: str,
@@ -75,44 +89,167 @@ def resolve_backtest_data(
   end_date: str,
   formal_dates: Sequence[str] | None = None,
   warmup_trading_days: int = 0,
+  source_snapshot: Mapping[str, Any] | None = None,
 ) -> BacktestDataResolution:
   """为标准 QMT Bar 回测选择一个覆盖正式和预热区间的唯一来源。"""
   start_date, end_date = _normalized_range(start_date, end_date)
   _validate_request(symbol, timeframe, start_date, end_date)
   _validate_warmup_days(warmup_trading_days)
+  if source_snapshot is not None and formal_dates:
+    return _resolution_from_snapshot(
+      timeframe, start_date, end_date, formal_dates, warmup_trading_days, source_snapshot,
+    )
   candidates = _source_candidates(timeframe)
-  calendar_dates = None if formal_dates is None else {format_api_date(item) for item in formal_dates}
-  if calendar_dates is not None and not calendar_dates:
-    raise MarketDataError(f"{symbol} {timeframe} 区间内未导入 QMT 行情")
+  frozen_dates = None if formal_dates is None else {format_api_date(item) for item in formal_dates}
+  if frozen_dates is not None and not frozen_dates:
+    raise MarketDataError(
+      f"{symbol} {timeframe} 区间内未导入 QMT 行情", "no_complete_coverage",
+    )
   available_warmup_days = 0
   has_formal_bars = False
+  source_ranges: list[tuple[str, str]] = []
+  has_in_range_source = False
   for candidate in candidates:
-    statuses = _coverage_for_source(symbol, candidate, start_date, end_date)
-    candidate_dates = sorted({
-      item["date"] for item in statuses
-      if item["status"] == "complete" and (calendar_dates is None or item["date"] in calendar_dates)
-    })
-    if not candidate_dates:
-      continue
-    has_formal_bars = True
-    warmup_dates = _complete_dates_before(symbol, candidate, start_date, warmup_trading_days)
-    available_warmup_days = max(available_warmup_days, len(warmup_dates))
-    if len(warmup_dates) == warmup_trading_days:
-      return BacktestDataResolution(
-        timeframe=timeframe,
-        source_period=candidate.source_period,
-        derivation=candidate.derivation,
-        formal_dates=tuple(candidate_dates),
-        warmup_dates=tuple(warmup_dates),
-        available_warmup_days=len(warmup_dates),
-        source=candidate.source,
-      )
+    result = _resolve_candidate(
+      symbol, timeframe, candidate, start_date, end_date,
+      frozen_dates, warmup_trading_days,
+    )
+    if result.source_range is not None:
+      source_ranges.append(result.source_range)
+    has_in_range_source = has_in_range_source or result.in_request_range
+    has_formal_bars = has_formal_bars or result.has_formal_bars
+    available_warmup_days = max(
+      available_warmup_days, result.available_warmup_days,
+    )
+    if result.resolution is not None:
+      return result.resolution
   if not has_formal_bars:
-    raise MarketDataError(f"{symbol} {timeframe} 区间内无完整 QMT 行情")
+    if frozen_dates is None and source_ranges and not has_in_range_source:
+      boundaries = ", ".join(f"{first} 至 {last}" for first, last in source_ranges)
+      raise MarketDataError(
+        f"{symbol} {timeframe} 请求范围 {start_date} 至 {end_date} 超出行情来源边界: {boundaries}",
+        "range_out_of_bounds",
+      )
+    raise MarketDataError(
+      f"{symbol} {timeframe} 区间内无完整 QMT 行情", "no_complete_coverage",
+    )
   raise MarketDataError(
     f"{symbol} {timeframe} 预热数据不足: 策略声明需要 {warmup_trading_days} 个交易日，"
-    f"实际可用数据只有 {available_warmup_days} 个"
+    f"实际可用数据只有 {available_warmup_days} 个",
+    "warmup_insufficient",
   )
+
+
+def _resolve_candidate(
+  symbol: str,
+  timeframe: str,
+  candidate: _SourceCandidate,
+  start_date: str,
+  end_date: str,
+  formal_dates: set[str] | None,
+  warmup_trading_days: int,
+) -> _CandidateResolution:
+  source_range: tuple[str, str] | None = None
+  source_first_date: str | None = None
+  if formal_dates is None or warmup_trading_days > 0:
+    bounds = _coverage_range_for_source(symbol, candidate)
+    source_first_date = bounds.get("firstDate")
+    source_last_date = bounds.get("lastDate")
+    if not source_first_date or not source_last_date:
+      return _CandidateResolution()
+    source_range = (source_first_date, source_last_date)
+    if formal_dates is None and (
+      start_date < source_first_date or end_date > source_last_date
+    ):
+      return _CandidateResolution(source_range=source_range)
+  statuses = _coverage_for_source(symbol, candidate, start_date, end_date)
+  candidate_dates = sorted({
+    item["date"] for item in statuses
+    if item["status"] == "complete"
+    and (formal_dates is None or item["date"] in formal_dates)
+  })
+  if not candidate_dates:
+    return _CandidateResolution(
+      source_range=source_range, in_request_range=True,
+    )
+  warmup_dates = _complete_dates_before(
+    symbol, candidate, start_date, warmup_trading_days, source_first_date,
+  )
+  resolution = None
+  if len(warmup_dates) == warmup_trading_days:
+    resolution = BacktestDataResolution(
+      timeframe=timeframe,
+      source_period=candidate.source_period,
+      derivation=candidate.derivation,
+      formal_dates=tuple(candidate_dates),
+      warmup_dates=tuple(warmup_dates),
+      available_warmup_days=len(warmup_dates),
+      source=candidate.source,
+    )
+  return _CandidateResolution(
+    resolution=resolution,
+    has_formal_bars=True,
+    available_warmup_days=len(warmup_dates),
+    source_range=source_range,
+    in_request_range=True,
+  )
+
+
+def _resolution_from_snapshot(
+  timeframe: str,
+  start_date: str,
+  end_date: str,
+  formal_dates: Sequence[str],
+  warmup_trading_days: int,
+  snapshot: Mapping[str, Any],
+) -> BacktestDataResolution:
+  """按历史任务冻结的日期和来源恢复解析结果，不使用当前来源优先级重算。"""
+  provider = str(snapshot.get("provider") or "qmt_kline")
+  if provider != "qmt_kline":
+    raise MarketDataError("历史 Bar 快照来源不是 QMT", "snapshot_invalid")
+  normalized_formal = tuple(sorted({format_api_date(item) for item in formal_dates}))
+  if not normalized_formal or normalized_formal[0] < start_date or normalized_formal[-1] > end_date:
+    raise MarketDataError("历史 Bar 快照正式日期超出任务范围", "snapshot_invalid")
+  source = _snapshot_source(snapshot)
+  source_period = str(snapshot.get("sourcePeriod") or "")
+  derivation = snapshot.get("derivation")
+  if not source_period or _source_table(source, source_period) != str(snapshot.get("sourceTable") or ""):
+    raise MarketDataError("历史 Bar 快照物理来源不完整", "snapshot_invalid")
+  expected_database = _source_database(source)
+  if str(snapshot.get("sourceDatabase") or "") != expected_database:
+    raise MarketDataError("历史 Bar 快照数据库来源不一致", "snapshot_invalid")
+  candidate = _SourceCandidate(
+    source=source,
+    source_period=source_period,
+    derivation=str(derivation) if derivation is not None else None,
+  )
+  if candidate not in _source_candidates(timeframe):
+    raise MarketDataError("历史 Bar 快照来源与任务周期不一致", "snapshot_invalid")
+  warmup_dates = tuple(sorted({
+    format_api_date(item) for item in snapshot.get("warmupDates", [])
+  }))
+  if len(warmup_dates) != warmup_trading_days:
+    raise MarketDataError("历史 Bar 快照预热日期数量不一致", "snapshot_invalid")
+  if warmup_dates and warmup_dates[-1] >= start_date:
+    raise MarketDataError("历史 Bar 快照预热日期必须早于正式区间", "snapshot_invalid")
+  return BacktestDataResolution(
+    timeframe=timeframe,
+    source_period=source_period,
+    derivation=candidate.derivation,
+    formal_dates=normalized_formal,
+    warmup_dates=warmup_dates,
+    available_warmup_days=len(warmup_dates),
+    source=source,
+  )
+
+
+def _snapshot_source(snapshot: Mapping[str, Any]) -> str:
+  database = str(snapshot.get("sourceDatabase") or "")
+  if database == _HISTORY_DATABASE:
+    return _HISTORY_SOURCE
+  if database == _LEGACY_DATABASE:
+    return _LEGACY_SOURCE
+  raise MarketDataError("历史 Bar 快照缺少可识别的数据来源", "snapshot_invalid")
 
 
 def preview_backtest_data(
@@ -155,18 +292,22 @@ def load_backtest_bars(
   """按已解析的来源读取 Bar，并返回预热 Bar 数量。"""
   all_dates = resolution.all_dates
   if not all_dates:
-    raise MarketDataError("回测数据范围为空")
+    raise MarketDataError("回测数据范围为空", "no_complete_coverage")
   try:
     rows = _query_kline_rows(symbol, resolution, all_dates[0], all_dates[-1])
     frame = _rows_to_frame(rows)
     frame = _transform_source_frame(frame, resolution)
     if frame.empty:
-      raise MarketDataError(f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情")
+      raise MarketDataError(
+        f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情", "empty_bar_data",
+      )
     allowed_dates = set(all_dates)
     frame_dates = frame["time"].str[:8].map(format_api_date)
     frame = frame[frame_dates.isin(allowed_dates)].reset_index(drop=True)
     if frame.empty:
-      raise MarketDataError(f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情")
+      raise MarketDataError(
+        f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情", "empty_bar_data",
+      )
     warmup_dates = set(resolution.warmup_dates)
     warmup_bar_count = int(frame["time"].str[:8].map(format_api_date).isin(warmup_dates).sum())
   except MarketDataError:
@@ -174,6 +315,7 @@ def load_backtest_bars(
   except Exception as error:
     raise MarketDataError(
       f"{symbol} {resolution.timeframe} QMT Bar 行数据格式无效",
+      "invalid_bar_data",
     ) from error
   return frame[["time", "open", "high", "low", "close", "volume"]], warmup_bar_count
 
@@ -238,20 +380,6 @@ def timeframe_status(symbol: str, start_date: str | None, end_date: str | None) 
     "dataStart": None,
     "dataEnd": None,
   } for timeframe in settings.BACKTEST_TIMEFRAMES]
-
-
-def required_trade_dates(start_date: str, end_date: str) -> list[str]:
-  """在 Worker 执行阶段读取请求区间应包含的交易日。"""
-  start_date, end_date = _normalized_range(start_date, end_date)
-  try:
-    if not state_store.is_trade_calendar_range_covered(start_date, end_date):
-      raise MarketDataError("交易日历未覆盖本次回测区间")
-    dates = state_store.list_open_trade_dates(start_date, end_date)
-  except state_store.DatabaseError as error:
-    raise MarketDataError("交易日历暂不可用") from error
-  if not dates:
-    raise MarketDataError("回测区间内没有交易日")
-  return dates
 
 
 def coverage_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> list[dict[str, str]]:
@@ -351,28 +479,25 @@ def _source_candidates(timeframe: str) -> tuple[_SourceCandidate, ...]:
   return tuple(candidates)
 
 
-def _complete_dates_before(symbol: str, candidate: _SourceCandidate, start_date: str, count: int) -> list[str]:
+def _complete_dates_before(
+  symbol: str,
+  candidate: _SourceCandidate,
+  start_date: str,
+  count: int,
+  source_first_date: str | None = None,
+) -> list[str]:
   if count == 0:
     return []
-  expected_dates = _expected_warmup_dates(start_date, count)
-  if not expected_dates:
+  end_date = (date.fromisoformat(start_date) - timedelta(days=1)).isoformat()
+  if source_first_date is None:
+    source_first_date = _coverage_range_for_source(symbol, candidate).get("firstDate")
+  if not source_first_date or source_first_date > end_date:
     return []
-  statuses = _coverage_for_source(symbol, candidate, expected_dates[0], expected_dates[-1])
-  complete_dates = {item["date"] for item in statuses if item["status"] == "complete"}
-  return [trade_date for trade_date in expected_dates if trade_date in complete_dates][-count:]
-
-
-def _expected_warmup_dates(start_date: str, count: int) -> list[str]:
-  """返回预热查找窗口内的开市日，停牌日不计入标的实际预热天数。"""
-  end = date.fromisoformat(start_date) - timedelta(days=1)
-  begin = end - timedelta(days=count * 3 + 60)
-  try:
-    if not state_store.is_trade_calendar_range_covered(begin.isoformat(), end.isoformat()):
-      raise MarketDataError("交易日历暂不可用，无法计算预热日期")
-    dates = state_store.list_open_trade_dates(begin.isoformat(), end.isoformat())
-  except state_store.DatabaseError as error:
-    raise MarketDataError("交易日历暂不可用，无法计算预热日期") from error
-  return dates
+  statuses = _coverage_for_source(symbol, candidate, source_first_date, end_date)
+  complete_dates = sorted({
+    item["date"] for item in statuses if item["status"] == "complete"
+  })
+  return complete_dates[-count:]
 
 
 def _preview_warmup_days(symbol: str, timeframe: str, start_date: str, count: int) -> int:
@@ -438,7 +563,7 @@ def _coverage_for_source(
       ORDER BY trade_date
     """
   try:
-    rows = clickhouse_client.query_rows(query)
+    rows = clickhouse_client.query_rows_with_retry(query)
   except clickhouse_client.ClickHouseError as error:
     raise MarketDataError(str(error)) from error
   return [{"date": format_api_date(str(row["trade_date"])), "status": str(row["status"])} for row in rows]
@@ -566,7 +691,7 @@ def _coverage_summary(
       AND status = 'complete'
   """
   try:
-    return clickhouse_client.query_rows(query)[0]
+    return clickhouse_client.query_rows_with_retry(query)[0]
   except (IndexError, clickhouse_client.ClickHouseError) as error:
     raise MarketDataError(f"读取 QMT 数据快照失败: {error}") from error
 
@@ -590,7 +715,7 @@ def _query_kline_rows(
       ORDER BY time
     """
   try:
-    return clickhouse_client.query_rows(query)
+    return clickhouse_client.query_rows_with_retry(query)
   except clickhouse_client.ClickHouseError as error:
     raise MarketDataError(str(error)) from error
 

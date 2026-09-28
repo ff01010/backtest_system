@@ -2,7 +2,7 @@
 """PostgreSQL 状态仓储：仅访问规范表，不在应用启动时建表。"""
 
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 import base64
 import hashlib
@@ -306,67 +306,6 @@ def withdraw_release_record(
         (release_id, deployment_id, expected_generation),
       )
       return dict(cur.fetchone()["result"])
-
-
-def replace_trade_calendar(
-  exchange: str, start_date: str, end_date: str, open_dates: list[str], source: str,
-) -> None:
-  """按自然日覆盖写入交易日历，确保区间内开市和休市状态都可判定。"""
-  start = date.fromisoformat(start_date)
-  end = date.fromisoformat(end_date)
-  all_dates = [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
-  open_set = set(open_dates)
-  rows = [(exchange, value, value.isoformat() in open_set, source) for value in all_dates]
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.executemany("""
-        INSERT INTO market_trade_calendar (exchange, trade_date, is_open, source)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (exchange, trade_date) DO UPDATE SET
-          is_open=EXCLUDED.is_open, source=EXCLUDED.source, updated_at=now()
-      """, rows)
-
-
-def latest_trade_calendar_date(exchange: str = "SSE") -> str | None:
-  """返回交易日历已写入的最新自然日，供增量同步确定起点。"""
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        SELECT max(trade_date) AS latest_date
-        FROM market_trade_calendar
-        WHERE exchange=%s
-      """, (exchange,))
-      value = cur.fetchone()["latest_date"]
-      return str(value) if value else None
-
-
-def list_open_trade_dates(start_date: str, end_date: str, exchange: str = "SSE") -> list[str]:
-  """返回指定交易所的开市日期。"""
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        SELECT trade_date
-        FROM market_trade_calendar
-        WHERE exchange=%s AND trade_date BETWEEN %s AND %s AND is_open=true
-        ORDER BY trade_date
-      """, (exchange, start_date, end_date))
-      return [str(row["trade_date"]) for row in cur.fetchall()]
-
-
-def is_trade_calendar_range_covered(start_date: str, end_date: str, exchange: str = "SSE") -> bool:
-  """仅当每个自然日都有记录时，Worker 才能确定完整目标交易日。"""
-  start = date.fromisoformat(start_date)
-  end = date.fromisoformat(end_date)
-  expected_count = (end - start).days + 1
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        SELECT count(*) AS date_count
-        FROM market_trade_calendar
-        WHERE exchange=%s AND trade_date BETWEEN %s AND %s
-      """, (exchange, start_date, end_date))
-      row = cur.fetchone()
-      return int(row["date_count"] or 0) == expected_count
 
 
 def _to_float(value: Any) -> float | None:

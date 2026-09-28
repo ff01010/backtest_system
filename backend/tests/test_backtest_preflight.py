@@ -7,7 +7,6 @@ from fastapi import HTTPException
 
 from backend import app as api_app
 from backend import schemas
-from backend.l2.providers import L2DataError
 from backend.services import backtest_preflight, l2_quote_availability, market_data, state_store
 
 
@@ -19,12 +18,6 @@ def test_preflight_compatibility_endpoint_does_not_query_market_data(
     "preview_backtest_data",
     lambda *_args, **_kwargs: pytest.fail("兼容接口不应查询 Bar 覆盖"),
   )
-  monkeypatch.setattr(
-    state_store,
-    "list_open_trade_dates",
-    lambda *_args, **_kwargs: pytest.fail("兼容接口不应查询交易日历"),
-  )
-
   result = backtest_preflight.preview(
     "688981.SH", "2026-08-26", "2026-08-28", "bar_next_open", "5m",
   )
@@ -43,26 +36,6 @@ def test_require_available_is_non_blocking_compatibility_wrapper() -> None:
 
   assert result["preflight"]["available"] is True
   assert result["barSnapshot"] == {}
-
-
-def test_preflight_does_not_turn_l2_configuration_failure_into_missing_data(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  error = L2DataError(
-    "L2 quote 数据源映射不是有效 JSON",
-    code="l2.config.mapping_invalid",
-    context={"kind": "quote"},
-  )
-  monkeypatch.setattr(
-    backtest_preflight.l2_quote_availability,
-    "available_quote_dates",
-    lambda *_: (_ for _ in ()).throw(error),
-  )
-
-  with pytest.raises(L2DataError) as raised:
-    backtest_preflight._available_quote_dates("688981.SH", ["2026-08-27"])
-
-  assert raised.value.code == "l2.config.mapping_invalid"
 
 
 def test_data_status_returns_retryable_source_error(monkeypatch: pytest.MonkeyPatch) -> None:

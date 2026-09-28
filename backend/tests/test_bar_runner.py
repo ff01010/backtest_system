@@ -110,11 +110,6 @@ def test_research_result_outbox_failure_does_not_escape(monkeypatch: pytest.Monk
 def test_user_script_bar_load_wraps_data_failure(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setattr(
     bar_runner.backtest_runner.market_data,
-    "required_trade_dates",
-    lambda *_: ["2026-07-01", "2026-07-02"],
-  )
-  monkeypatch.setattr(
-    bar_runner.backtest_runner.market_data,
     "resolve_backtest_data",
     lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("query timed out")),
   )
@@ -131,27 +126,23 @@ def test_user_script_bar_load_wraps_data_failure(monkeypatch: pytest.MonkeyPatch
   assert isinstance(captured.value.__cause__, TimeoutError)
 
 
-def test_user_script_bar_load_validates_the_requested_trade_dates(
+def test_user_script_bar_load_resolves_dates_from_bar_coverage(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  captured_dates: list[str] = []
-  monkeypatch.setattr(
-    bar_runner.backtest_runner.market_data,
-    "required_trade_dates",
-    lambda *_: ["2026-07-01", "2026-07-02"],
-  )
+  captured_dates: list[str] | None = []
 
   def resolve(
     symbol: str,
     timeframe: str,
     start_date: str,
     end_date: str,
-    formal_dates: list[str],
+    formal_dates: list[str] | None,
     *_: object,
     **__: object,
   ) -> object:
     del symbol, timeframe, start_date, end_date
-    captured_dates.extend(formal_dates)
+    nonlocal captured_dates
+    captured_dates = formal_dates
     raise market_data.MarketDataError("2026-07-02 缺少覆盖元数据")
 
   monkeypatch.setattr(bar_runner.backtest_runner.market_data, "resolve_backtest_data", resolve)
@@ -164,7 +155,7 @@ def test_user_script_bar_load_validates_the_requested_trade_dates(
       "endDate": "2026-07-02",
     })
 
-  assert captured_dates == ["2026-07-01", "2026-07-02"]
+  assert captured_dates is None
   assert raised.value.code == "data.bar_load_failed"
 
 
@@ -172,11 +163,7 @@ def test_user_script_bar_load_preserves_queued_snapshot_dates(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   captured_dates: list[str] = []
-  monkeypatch.setattr(
-    bar_runner.backtest_runner.market_data,
-    "required_trade_dates",
-    lambda *_: pytest.fail("旧任务已有冻结日期时不应重算交易日"),
-  )
+  captured_snapshot: dict[str, Any] = {}
 
   def resolve(
     symbol: str,
@@ -184,11 +171,13 @@ def test_user_script_bar_load_preserves_queued_snapshot_dates(
     start_date: str,
     end_date: str,
     formal_dates: list[str],
-    *_: object,
+    _warmup_days: int,
+    source_snapshot: dict[str, Any] | None,
     **__: object,
   ) -> object:
     del symbol, timeframe, start_date, end_date
     captured_dates.extend(formal_dates)
+    captured_snapshot.update(source_snapshot or {})
     raise market_data.MarketDataError("停止测试")
 
   monkeypatch.setattr(bar_runner.backtest_runner.market_data, "resolve_backtest_data", resolve)
@@ -200,11 +189,18 @@ def test_user_script_bar_load_preserves_queued_snapshot_dates(
       "startDate": "2026-07-01",
       "endDate": "2026-07-02",
       "marketDataSnapshot": {
-        "barSnapshot": {"formalDates": ["2026-07-01", "2026-07-02"]},
+        "barSnapshot": {
+          "provider": "qmt_kline",
+          "sourceDatabase": "qmt_history_dev",
+          "sourceTable": "qmt_kline_5m_raw",
+          "sourcePeriod": "5m",
+          "formalDates": ["2026-07-01", "2026-07-02"],
+        },
       },
     })
 
   assert captured_dates == ["2026-07-01", "2026-07-02"]
+  assert captured_snapshot["sourceDatabase"] == "qmt_history_dev"
 
 
 def test_shared_bar_load_wraps_data_failure(monkeypatch: pytest.MonkeyPatch) -> None:
