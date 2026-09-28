@@ -13,13 +13,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from backend import settings
-from backend.date_codec import TradingDateError, format_api_date, normalize_date_range, parse_trading_date
+from backend.date_codec import TradingDateError, format_api_date, normalize_date_range
 from backend.services import clickhouse_client
 
 
-_LEGACY_SOURCE = "legacy"
 _HISTORY_SOURCE = "history_dev"
-_LEGACY_DATABASE = "raw_historical_data"
 _HISTORY_DATABASE = "qmt_history_dev"
 _HISTORY_RUNS_TABLE = "qmt_ingest_runs"
 _HISTORY_UNIVERSE_TABLE = "qmt_universe_snapshot"
@@ -35,8 +33,6 @@ _HISTORY_TABLES = {
 _HISTORY_PERIODS = {
   "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1h", "1d": "1d",
 }
-_LEGACY_DIRECT_PERIODS = {"1m", "5m", "60m", "1d"}
-_LEGACY_DERIVED_PERIODS = {"3m": 3, "15m": 15, "30m": 30, "45m": 45}
 _HISTORY_DERIVED_PERIODS = {"3m": 3, "45m": 45}
 _TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -59,7 +55,7 @@ class BacktestDataResolution:
   formal_dates: tuple[str, ...]
   warmup_dates: tuple[str, ...]
   available_warmup_days: int
-  source: str = _LEGACY_SOURCE
+  source: str = _HISTORY_SOURCE
 
   @property
   def all_dates(self) -> tuple[str, ...]:
@@ -247,9 +243,7 @@ def _snapshot_source(snapshot: Mapping[str, Any]) -> str:
   database = str(snapshot.get("sourceDatabase") or "")
   if database == _HISTORY_DATABASE:
     return _HISTORY_SOURCE
-  if database == _LEGACY_DATABASE:
-    return _LEGACY_SOURCE
-  raise MarketDataError("历史 Bar 快照缺少可识别的数据来源", "snapshot_invalid")
+  raise MarketDataError("历史 Bar 快照的数据来源已不受支持", "snapshot_invalid")
 
 
 def preview_backtest_data(
@@ -326,11 +320,6 @@ def snapshot_for_resolution(
   bar_count: int | None = None,
 ) -> dict[str, Any]:
   """将已选择的数据来源固化为分钟回测兼容的任务快照。"""
-  all_dates = resolution.all_dates
-  row = (
-    _coverage_summary(symbol, resolution, all_dates[0], all_dates[-1])
-    if resolution.source == _LEGACY_SOURCE else {}
-  )
   identity = {
     "symbol": symbol,
     "timeframe": resolution.timeframe,
@@ -339,18 +328,17 @@ def snapshot_for_resolution(
     "formalDates": list(resolution.formal_dates),
     "warmupDates": list(resolution.warmup_dates),
     "warmupTradingDays": len(resolution.warmup_dates),
-    "barCount": int(bar_count if bar_count is not None else row.get("bar_count") or 0),
-    "lastImportedAt": str(row.get("updated_at") or ""),
+    "barCount": int(bar_count or 0),
+    "lastImportedAt": "",
   }
   identity.update({
     "sourceDatabase": _source_database(resolution.source),
     "sourceTable": _source_table(resolution.source, resolution.source_period),
   })
-  if resolution.source == _HISTORY_SOURCE:
-    identity.update({
-      "adjustment": _HISTORY_ADJUSTMENT,
-      "manifestHash": str(row.get("manifest_hash") or ""),
-    })
+  identity.update({
+    "adjustment": _HISTORY_ADJUSTMENT,
+    "manifestHash": "",
+  })
   identity["hash"] = hashlib.sha256(repr(sorted(identity.items())).encode("utf-8")).hexdigest()
   return identity
 
@@ -430,8 +418,6 @@ def _preferred_available_range(
       path = (
         f"{_HISTORY_DATABASE}.{_HISTORY_RUNS_TABLE}+"
         f"{_HISTORY_DATABASE}.{_HISTORY_UNIVERSE_TABLE}"
-        if candidate.source == _HISTORY_SOURCE
-        else f"{_LEGACY_DATABASE}.qmt_kline_coverage"
       )
       return candidate, {**coverage_range, "path": f"clickhouse://{path}"}
   return None, {}
@@ -464,19 +450,12 @@ def _require_complete(symbol: str, timeframe: str, start_date: str, end_date: st
 
 
 def _source_candidates(timeframe: str) -> tuple[_SourceCandidate, ...]:
-  candidates: list[_SourceCandidate] = []
   history_period = _HISTORY_PERIODS.get(timeframe)
   if history_period is not None:
-    candidates.append(_SourceCandidate(_HISTORY_SOURCE, history_period))
-  elif timeframe in _HISTORY_DERIVED_PERIODS:
-    candidates.append(_SourceCandidate(_HISTORY_SOURCE, "1m", f"{timeframe}-from-1m-v1"))
-  if timeframe in _LEGACY_DIRECT_PERIODS:
-    candidates.append(_SourceCandidate(_LEGACY_SOURCE, timeframe))
-  elif timeframe in _LEGACY_DERIVED_PERIODS:
-    candidates.append(_SourceCandidate(_LEGACY_SOURCE, "1m", f"{timeframe}-from-1m-v1"))
-  if timeframe == "1d":
-    candidates.append(_SourceCandidate(_LEGACY_SOURCE, "1m", "daily-from-1m-v1"))
-  return tuple(candidates)
+    return (_SourceCandidate(_HISTORY_SOURCE, history_period),)
+  if timeframe in _HISTORY_DERIVED_PERIODS:
+    return (_SourceCandidate(_HISTORY_SOURCE, "1m", f"{timeframe}-from-1m-v1"),)
+  return ()
 
 
 def _complete_dates_before(
@@ -510,18 +489,12 @@ def _preview_warmup_days(symbol: str, timeframe: str, start_date: str, count: in
 
 
 def _resolution_reason(resolution: BacktestDataResolution) -> str:
-  if resolution.derivation == "daily-from-1m-v1":
-    return "由完整 1m 数据派生日线"
   if resolution.derivation:
     return f"由完整 1m 数据派生 {resolution.timeframe}"
-  if resolution.source == _HISTORY_SOURCE:
-    return "QMT 优先行情可用"
-  return "QMT 兼容行情可用"
+  return "QMT 行情可用"
 
 
 def _transform_source_frame(frame: pd.DataFrame, resolution: BacktestDataResolution) -> pd.DataFrame:
-  if resolution.derivation == "daily-from-1m-v1":
-    return _aggregate_daily_minutes(frame)
   if resolution.derivation:
     return _aggregate_minutes(frame, int(resolution.timeframe.removesuffix("m")))
   return frame
@@ -552,16 +525,8 @@ def _coverage_for_source(
   end_date: str,
 ) -> list[dict[str, str]]:
   _validate_symbol(symbol)
-  if candidate.source == _HISTORY_SOURCE:
-    query = _history_coverage_query(symbol, candidate.source_period, start_date, end_date)
-  else:
-    query = f"""
-      SELECT trade_date, status
-      FROM {_LEGACY_DATABASE}.qmt_kline_coverage FINAL
-      WHERE symbol = '{symbol}' AND period = '{candidate.source_period}'
-        AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
-      ORDER BY trade_date
-    """
+  _require_history_source(candidate.source)
+  query = _history_coverage_query(symbol, candidate.source_period, start_date, end_date)
   try:
     rows = clickhouse_client.query_rows_with_retry(query)
   except clickhouse_client.ClickHouseError as error:
@@ -575,18 +540,8 @@ def _coverage_range_for_source(
 ) -> dict[str, Any]:
   """只读取覆盖元数据聚合范围，避免把多年逐日记录拉回应用层。"""
   _validate_symbol(symbol)
-  if candidate.source == _HISTORY_SOURCE:
-    query = _history_coverage_range_query(symbol, candidate.source_period)
-  else:
-    query = f"""
-      SELECT min(trade_date) AS first_date,
-             max(trade_date) AS last_date,
-             sum(valid_row_count) AS bar_count,
-             max(updated_at) AS updated_at
-      FROM {_LEGACY_DATABASE}.qmt_kline_coverage FINAL
-      WHERE symbol = '{symbol}' AND period = '{candidate.source_period}'
-        AND status = 'complete'
-    """
+  _require_history_source(candidate.source)
+  query = _history_coverage_range_query(symbol, candidate.source_period)
   try:
     rows = clickhouse_client.query_rows_with_retry(query)
   except clickhouse_client.ClickHouseError as error:
@@ -677,25 +632,6 @@ def _history_coverage_range_query(symbol: str, period: str) -> str:
   """
 
 
-def _coverage_summary(
-  symbol: str,
-  resolution: BacktestDataResolution,
-  start_date: str,
-  end_date: str,
-) -> dict[str, Any]:
-  query = f"""
-    SELECT sum(valid_row_count) AS bar_count, max(updated_at) AS updated_at
-    FROM {_LEGACY_DATABASE}.qmt_kline_coverage FINAL
-    WHERE symbol = '{symbol}' AND period = '{resolution.source_period}'
-      AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
-      AND status = 'complete'
-  """
-  try:
-    return clickhouse_client.query_rows_with_retry(query)[0]
-  except (IndexError, clickhouse_client.ClickHouseError) as error:
-    raise MarketDataError(f"读取 QMT 数据快照失败: {error}") from error
-
-
 def _query_kline_rows(
   symbol: str,
   resolution: BacktestDataResolution,
@@ -703,17 +639,8 @@ def _query_kline_rows(
   end_date: str,
 ) -> list[dict[str, Any]]:
   _validate_symbol(symbol)
-  if resolution.source == _HISTORY_SOURCE:
-    query = _history_kline_query(symbol, resolution.source_period, start_date, end_date)
-  else:
-    start_time, end_time = _epoch_range(start_date, end_date)
-    query = f"""
-      SELECT qmt_index, time, open, high, low, close, volume
-      FROM {_LEGACY_DATABASE}.qmt_kline FINAL
-      WHERE symbol = '{symbol}' AND period = '{resolution.source_period}'
-        AND time BETWEEN {start_time} AND {end_time}
-      ORDER BY time
-    """
+  _require_history_source(resolution.source)
+  query = _history_kline_query(symbol, resolution.source_period, start_date, end_date)
   try:
     return clickhouse_client.query_rows_with_retry(query)
   except clickhouse_client.ClickHouseError as error:
@@ -729,19 +656,10 @@ def _query_preview(
 ) -> list[dict[str, Any]]:
   _validate_symbol(symbol)
   row_limit = max(1, min(limit, 200))
-  if candidate.source == _HISTORY_SOURCE:
-    query = _history_kline_query(
-      symbol, candidate.source_period, start_date, end_date, descending=True, limit=row_limit,
-    )
-  else:
-    start_time, end_time = _epoch_range(start_date, end_date)
-    query = f"""
-      SELECT qmt_index, time, open, high, low, close, volume
-      FROM {_LEGACY_DATABASE}.qmt_kline FINAL
-      WHERE symbol = '{symbol}' AND period = '{candidate.source_period}'
-        AND time BETWEEN {start_time} AND {end_time}
-      ORDER BY time DESC LIMIT {row_limit}
-    """
+  _require_history_source(candidate.source)
+  query = _history_kline_query(
+    symbol, candidate.source_period, start_date, end_date, descending=True, limit=row_limit,
+  )
   rows = clickhouse_client.query_rows(query)
   return [_row_preview(row) for row in rows]
 
@@ -800,19 +718,6 @@ def _aggregate_minutes(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
   return result
 
 
-def _aggregate_daily_minutes(frame: pd.DataFrame) -> pd.DataFrame:
-  """将完整分钟数据按交易日聚合；午间休市不是日线边界。"""
-  if frame.empty:
-    return frame
-  frame = frame.copy().sort_values("_timestamp")
-  frame["_trade_date"] = frame["_timestamp"].dt.strftime("%Y%m%d")
-  grouped = frame.groupby("_trade_date", sort=True)
-  result = grouped.agg({
-    "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum", "time": "last",
-  }).reset_index(drop=True)
-  return result[["time", "open", "high", "low", "close", "volume"]]
-
-
 def _period_end(value: datetime, minutes: int) -> datetime:
   morning = value.replace(hour=9, minute=30, second=0, microsecond=0)
   afternoon = value.replace(hour=13, minute=0, second=0, microsecond=0)
@@ -849,28 +754,21 @@ def _validate_symbol(symbol: str) -> None:
 
 
 def _source_database(source: str) -> str:
-  if source == _HISTORY_SOURCE:
-    return _HISTORY_DATABASE
-  if source == _LEGACY_SOURCE:
-    return _LEGACY_DATABASE
-  raise MarketDataError(f"未知 QMT 行情来源: {source}")
+  _require_history_source(source)
+  return _HISTORY_DATABASE
 
 
 def _source_table(source: str, source_period: str) -> str:
-  if source == _HISTORY_SOURCE:
-    table = _HISTORY_TABLES.get(source_period)
-    if table is None:
-      raise MarketDataError(f"新库不支持物理周期: {source_period}")
-    return table
-  if source == _LEGACY_SOURCE:
-    return "qmt_kline"
-  raise MarketDataError(f"未知 QMT 行情来源: {source}")
+  _require_history_source(source)
+  table = _HISTORY_TABLES.get(source_period)
+  if table is None:
+    raise MarketDataError(f"新库不支持物理周期: {source_period}")
+  return table
 
 
-def _epoch_range(start_date: str, end_date: str) -> tuple[int, int]:
-  start = datetime.combine(parse_trading_date(start_date), datetime.min.time(), tzinfo=_TIMEZONE)
-  end = datetime.combine(parse_trading_date(end_date), datetime.max.time(), tzinfo=_TIMEZONE)
-  return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+def _require_history_source(source: str) -> None:
+  if source != _HISTORY_SOURCE:
+    raise MarketDataError("标准 Bar 行情来源已不受支持", "snapshot_invalid")
 
 
 def _date_sql(value: str) -> str:
