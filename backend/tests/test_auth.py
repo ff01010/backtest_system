@@ -161,6 +161,40 @@ def test_concurrent_csrf_rotation_keeps_both_returned_tokens_temporarily_valid(
   assert auth.validate_csrf_token("old-session", "wrong-token") is False
 
 
+def test_validate_csrf_rejects_expired_previous_token(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class Cursor:
+    def __enter__(self) -> "Cursor":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def execute(self, _sql: str, _params: object = None) -> None:
+      return None
+
+    def fetchone(self) -> dict[str, object]:
+      return {
+        "csrf_token_hash": auth._token_hash("current-token"),
+        "csrf_previous_token_hash": auth._token_hash("expired-token"),
+        "previous_is_valid": False,
+      }
+
+  class Connection:
+    def cursor(self) -> Cursor:
+      return Cursor()
+
+  @contextmanager
+  def system_db():
+    yield Connection()
+
+  monkeypatch.setattr(auth, "_system_db", system_db)
+
+  assert auth.validate_csrf_token("session-token", "current-token") is True
+  assert auth.validate_csrf_token("session-token", "expired-token") is False
+
+
 def test_api_key_audit_uses_request_id_without_credential_material() -> None:
   class Cursor:
     def __init__(self) -> None:

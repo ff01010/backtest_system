@@ -57,6 +57,27 @@ def test_read_bool_rejects_ambiguous_value(monkeypatch: pytest.MonkeyPatch) -> N
     settings._read_bool("TEST_RESEARCH_REPORT_ENABLED", False)
 
 
+def test_read_http_origins_normalizes_and_deduplicates(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv(
+    "TEST_CSRF_TRUSTED_ORIGINS",
+    "https://Example.com:443/,http://127.0.0.1:5174,https://example.com",
+  )
+
+  assert settings._read_http_origins("TEST_CSRF_TRUSTED_ORIGINS", ()) == (
+    "https://example.com",
+    "http://127.0.0.1:5174",
+  )
+
+
+def test_read_http_origins_rejects_path(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setenv("TEST_CSRF_TRUSTED_ORIGINS", "https://example.com/app")
+
+  with pytest.raises(ValueError, match="不能包含路径"):
+    settings._read_http_origins("TEST_CSRF_TRUSTED_ORIGINS", ())
+
+
 def test_research_reporting_requires_target_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setattr(settings, "BACKTEST_INSTANCE_ID", "server")
   monkeypatch.setattr(settings, "RESEARCH_RESULT_REPORT_ENABLED", True)

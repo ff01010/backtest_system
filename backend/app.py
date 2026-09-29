@@ -18,6 +18,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 _viewer_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -116,17 +117,70 @@ def sync_instrument_directory() -> None:
 
 app.add_middleware(
   CORSMiddleware,
-  allow_origins=[
-    "http://localhost:5174", "http://127.0.0.1:5174",
-    "http://localhost:5175", "http://127.0.0.1:5175",
-    "http://localhost:5176", "http://127.0.0.1:5176",
-    "http://localhost:5177", "http://127.0.0.1:5177",
-  ],
+  allow_origins=list(settings.CSRF_TRUSTED_ORIGINS),
   allow_credentials=True,
   allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
   allow_headers=["*"],
   expose_headers=["X-Request-Id"],
 )
+
+_COOKIE_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_CSRF_LOGIN_PATH = "/api/auth/login"
+
+
+def _normalized_url_origin(value: str, require_origin_only: bool = False) -> str | None:
+  try:
+    parsed = urlsplit(value.strip())
+    port = parsed.port
+  except ValueError:
+    return None
+  if (
+    parsed.scheme not in {"http", "https"}
+    or not parsed.hostname
+    or parsed.username
+    or parsed.password
+    or (require_origin_only and (parsed.path not in {"", "/"} or parsed.query or parsed.fragment))
+  ):
+    return None
+  hostname = parsed.hostname.lower()
+  host = f"[{hostname}]" if ":" in hostname else hostname
+  default_port = 80 if parsed.scheme == "http" else 443
+  port_suffix = f":{port}" if port is not None and port != default_port else ""
+  return f"{parsed.scheme}://{host}{port_suffix}"
+
+
+def _requires_cookie_csrf(method: str, path: str) -> bool:
+  is_api_path = path == "/api" or path.startswith("/api/")
+  return (
+    method.upper() in _COOKIE_WRITE_METHODS
+    and is_api_path
+    and not path.startswith("/api/v1/")
+    and not (method.upper() == "POST" and path == _CSRF_LOGIN_PATH)
+  )
+
+
+def _csrf_origin_is_valid(request: Request) -> bool:
+  origin = request.headers.get("origin")
+  if origin:
+    candidate = _normalized_url_origin(origin, require_origin_only=True)
+  else:
+    referer = request.headers.get("referer")
+    candidate = _normalized_url_origin(referer) if referer else None
+  if candidate is None:
+    return False
+  request_origin = _normalized_url_origin(str(request.url))
+  trusted_origins = {*settings.CSRF_TRUSTED_ORIGINS}
+  if request_origin:
+    trusted_origins.add(request_origin)
+  return candidate in trusted_origins
+
+
+def _csrf_error(request: Request) -> JSONResponse:
+  return _legacy_api_error(request, 403, {
+    "code": "auth.csrf_invalid",
+    "message": "请求安全验证失败，请刷新页面后重试",
+    "retryable": False,
+  })
 
 
 async def _call_as_user(
@@ -168,13 +222,24 @@ async def _dispatch_authenticated_request(
   path = request.url.path
   if path.startswith("/api/v1/"):
     return await _authenticate_public_api_request(request, call_next)
-  if request.method == "OPTIONS" or not path.startswith("/api/") or path in {
-    "/api/health", "/api/auth/login", "/api/auth/logout",
-  }:
+  is_api_path = path == "/api" or path.startswith("/api/")
+  is_public_route = (
+    request.method == "GET" and path == "/api/health"
+  ) or (
+    request.method == "POST" and path == _CSRF_LOGIN_PATH
+  )
+  if request.method == "OPTIONS" or not is_api_path or is_public_route:
     return await call_next(request)
-  user = auth.get_user_by_token(request.cookies.get(auth.SESSION_COOKIE))
+  session_token = request.cookies.get(auth.SESSION_COOKIE)
+  user = auth.get_user_by_token(session_token)
   if not user:
     return _legacy_api_error(request, 401, "登录已失效，请重新登录")
+  request.state.auth_type = "cookie"
+  if _requires_cookie_csrf(request.method, path) and not (
+    _csrf_origin_is_valid(request)
+    and auth.validate_csrf_token(session_token, request.headers.get("x-csrf-token"))
+  ):
+    return _csrf_error(request)
   return await _call_as_user(request, call_next, user, "cookie")
 
 

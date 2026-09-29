@@ -8,11 +8,35 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 import pytest
 
 from backend import app as app_module
 from backend.services import auth
-from backend.services.user_context import CurrentUser
+from backend.services.user_context import CurrentUser, get_current_user
+
+
+USER = CurrentUser(
+  id="00000000-0000-0000-0000-000000000123",
+  username="cookie-user",
+  display_name="Cookie User",
+  role="user",
+)
+
+
+def _security_headers(
+  origin: str | None = "http://testserver",
+  referer: str | None = None,
+  csrf_token: str | None = "csrf-token",
+) -> list[tuple[bytes, bytes]]:
+  headers = [(b"cookie", f"{auth.SESSION_COOKIE}=session-token".encode("ascii"))]
+  if origin is not None:
+    headers.append((b"origin", origin.encode("ascii")))
+  if referer is not None:
+    headers.append((b"referer", referer.encode("ascii")))
+  if csrf_token is not None:
+    headers.append((b"x-csrf-token", csrf_token.encode("ascii")))
+  return headers
 
 
 def _request(
@@ -163,25 +187,167 @@ def test_authentication_failure_still_returns_correlated_sanitized_error(
   assert "secret" not in response.body.decode("utf-8")
 
 
+@pytest.mark.parametrize("path", [
+  "/api/auth/logout",
+  "/api/strategy-configs",
+  "/api/backtest/run",
+  "/api/backtest/runs/run-1/cancel",
+  "/api/backtest/runs/run-1/publication",
+  "/api/shared-backtests/publication-1/favorite",
+  "/api/backtest/signal-detail-exports",
+])
+def test_representative_cookie_write_flows_accept_valid_csrf_context(
+  monkeypatch: pytest.MonkeyPatch,
+  path: str,
+) -> None:
+  monkeypatch.setattr(auth, "get_user_by_token", lambda _token: USER)
+
+  def validate_csrf_token(session_token: str | None, csrf_token: str | None) -> bool:
+    return session_token == "session-token" and csrf_token == "csrf-token"
+
+  monkeypatch.setattr(auth, "validate_csrf_token", validate_csrf_token)
+  request = _request(path, "POST", _security_headers())
+
+  async def call_next(received_request: Request) -> Response:
+    assert received_request.state.auth_type == "cookie"
+    assert get_current_user() == USER
+    return JSONResponse({"ok": True})
+
+  response = _run_middleware(request, call_next)
+
+  assert response.status_code == 200
+  assert json.loads(response.body) == {"ok": True}
+
+
+def test_same_origin_referer_is_accepted_when_origin_is_absent(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(auth, "get_user_by_token", lambda _token: USER)
+  monkeypatch.setattr(auth, "validate_csrf_token", lambda *_args: True)
+  request = _request(
+    "/api/backtest/run",
+    "POST",
+    _security_headers(origin=None, referer="http://testserver/backtest"),
+  )
+
+  async def call_next(_request: Request) -> Response:
+    return JSONResponse({"ok": True})
+
+  assert _run_middleware(request, call_next).status_code == 200
+
+
+def test_same_origin_with_external_non_default_port_is_accepted(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(auth, "get_user_by_token", lambda _token: USER)
+  monkeypatch.setattr(auth, "validate_csrf_token", lambda *_args: True)
+  headers = _security_headers(origin="http://192.168.251.1:28601")
+  headers.append((b"host", b"192.168.251.1:28601"))
+  request = _request("/api/backtest/run", "POST", headers)
+
+  async def call_next(_request: Request) -> Response:
+    return JSONResponse({"ok": True})
+
+  assert _run_middleware(request, call_next).status_code == 200
+
+
+@pytest.mark.parametrize(("headers", "reason"), [
+  (_security_headers(csrf_token=None), "missing_token"),
+  (_security_headers(csrf_token="wrong-token"), "wrong_token"),
+  (_security_headers(csrf_token="expired-token"), "expired_token"),
+  (_security_headers(origin=None, referer=None), "missing_origin_and_referer"),
+  (_security_headers(origin="https://evil.example"), "foreign_origin"),
+  (
+    _security_headers(origin="https://evil.example", referer="http://testserver/backtest"),
+    "foreign_origin_takes_precedence",
+  ),
+  (_security_headers(origin=None, referer="https://evil.example/backtest"), "foreign_referer"),
+])
+def test_invalid_csrf_context_returns_stable_403_before_business_route(
+  monkeypatch: pytest.MonkeyPatch,
+  headers: list[tuple[bytes, bytes]],
+  reason: str,
+) -> None:
+  monkeypatch.setattr(auth, "get_user_by_token", lambda _token: USER)
+  monkeypatch.setattr(
+    auth,
+    "validate_csrf_token",
+    lambda _session, token: token == "csrf-token",
+  )
+  request = _request("/api/backtest/run", "POST", headers)
+  route_entered = False
+
+  async def call_next(_request: Request) -> Response:
+    nonlocal route_entered
+    route_entered = True
+    return JSONResponse({"unexpected": reason})
+
+  response = _run_middleware(request, call_next)
+  body = json.loads(response.body)
+
+  assert response.status_code == 403
+  assert body["detail"] == {
+    "code": "auth.csrf_invalid",
+    "message": "请求安全验证失败，请刷新页面后重试",
+    "retryable": False,
+  }
+  assert body["requestId"] == response.headers["X-Request-Id"]
+  assert route_entered is False
+
+
+def test_all_cookie_write_routes_are_rejected_before_dispatch_without_csrf(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(auth, "get_user_by_token", lambda _token: USER)
+  write_methods = {"POST", "PUT", "PATCH", "DELETE"}
+  protected_routes: list[tuple[str, str]] = []
+
+  for route in app_module.app.routes:
+    if not isinstance(route, APIRoute):
+      continue
+    for method in sorted((route.methods or set()) & write_methods):
+      if route.path.startswith("/api/v1/") or (
+        method == "POST" and route.path == "/api/auth/login"
+      ):
+        continue
+      if route.path == "/api" or route.path.startswith("/api/"):
+        protected_routes.append((method, route.path))
+
+  assert protected_routes
+  for method, path in protected_routes:
+    assert app_module._requires_cookie_csrf(method, path)
+    request = _request(
+      path,
+      method,
+      _security_headers(origin="http://testserver", csrf_token=None),
+    )
+
+    async def call_next(_request: Request) -> Response:
+      raise AssertionError(f"未保护的 Cookie 写路由: {method} {path}")
+
+    response = _run_middleware(request, call_next)
+    assert response.status_code == 403, f"{method} {path}"
+    assert json.loads(response.body)["detail"]["code"] == "auth.csrf_invalid"
+
+
 def test_api_key_request_does_not_depend_on_cookie_csrf_token(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  user = CurrentUser(
-    id="00000000-0000-0000-0000-000000000123",
-    username="api-user",
-    display_name="API User",
-    role="user",
-  )
   principal = auth.ApiKeyPrincipal(
     id="00000000-0000-0000-0000-000000000456",
-    owner_user_id=user.id,
-    scopes=frozenset({"backtest:read"}),
+    owner_user_id=USER.id,
+    scopes=frozenset({"backtest:submit"}),
   )
   monkeypatch.setattr(app_module.settings, "PUBLIC_API_ENABLED", True)
-  monkeypatch.setattr(auth, "get_api_key_principal", lambda _token: (user, principal))
+  monkeypatch.setattr(auth, "get_api_key_principal", lambda _token: (USER, principal))
   request = _request(
     "/api/v1/backtests",
-    headers=[(b"authorization", b"Bearer qbk_test_secret")],
+    "POST",
+    headers=[
+      (b"authorization", b"Bearer qbk_test_secret"),
+      (b"cookie", f"{auth.SESSION_COOKIE}=ignored-cookie".encode("ascii")),
+      (b"origin", b"https://evil.example"),
+    ],
   )
 
   async def call_next(received_request: Request) -> Response:

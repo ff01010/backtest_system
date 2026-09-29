@@ -43,6 +43,15 @@ def test_deploy_script_reexecutes_after_self_update_under_same_lock() -> None:
   assert "script_digest_after" in script
 
 
+def test_nginx_preserves_external_host_port_for_same_origin_csrf() -> None:
+  nginx = (ROOT / "deploy" / "nginx.conf").read_text(encoding="utf-8")
+
+  assert "proxy_set_header Host $host;" not in nginx
+  assert nginx.count("proxy_set_header Host $http_host;") == nginx.count(
+    "proxy_pass http://quant-backtest-backend:8000",
+  )
+
+
 def test_deploy_script_rejects_incomplete_market_directory() -> None:
   script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
 
