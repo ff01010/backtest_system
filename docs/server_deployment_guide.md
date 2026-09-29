@@ -10,7 +10,7 @@
 | 项目代码目录 | `/opt/projects/quant_backtest_platform_git` |
 | 运行方式 | Docker Compose |
 | 业务数据库 | PostgreSQL 容器 |
-| 行情数据库 | 共享 ClickHouse：`raw_historical_data` |
+| 行情数据库 | 共享 ClickHouse：运行时 `qmt_history_dev`，证券目录 `xl_derived` |
 | 对外访问端口 | `28601` |
 | 预留端口 | `28681`，当前未使用 |
 
@@ -348,9 +348,9 @@ docker compose --env-file deploy/.env -f deploy/compose.infrastructure.yml -f de
 
 ### 当前状态
 
-服务器已创建 ClickHouse 数据库 `raw_historical_data`，用于保存本地 QMT 下载的原始历史 K 线。该数据库与回测系统的 PostgreSQL 业务库分离。
+服务器使用 ClickHouse 数据库 `qmt_history_dev` 提供标准 QMT Bar 行情，并从 `xl_derived` 读取证券目录。离线旧版导入工具仍可维护 `raw_historical_data`，但当前回测运行时不查询该库。ClickHouse 与回测系统的 PostgreSQL 业务库分离。
 
-本版本后端通过 Docker 内网读取这些表。PostgreSQL 只保留用户、策略、账户和回测记录，不再承担分钟行情缓存或运行时外部拉取。
+本版本后端通过 Docker 内网读取 `qmt_history_dev` 的六周期表、`qmt_ingest_runs` 和 `qmt_universe_snapshot`。PostgreSQL 只保留用户、策略、账户和回测记录，不再承担分钟行情缓存或运行时外部拉取。
 
 ### 数据库与表
 
@@ -365,7 +365,7 @@ raw_historical_data
 | --- | --- |
 | `qmt_kline` | 保存 QMT 返回的原始 K 线，可同时保存 `1m`、`5m`、`15m`、`30m`、`60m`、`1d` 等周期。 |
 | `qmt_import_batch` | 记录每个 QMT 文件的校验值、导入范围、导入行数、QMT 客户端版本和执行结果。 |
-| `qmt_kline_coverage` | 按标的、周期、交易日记录旧版数据覆盖状态，供页面展示范围和 Worker 执行时选择来源。 |
+| `qmt_kline_coverage` | 按标的、周期、交易日记录旧版离线导入覆盖状态；当前页面和 Worker 不读取。 |
 
 ### `qmt_kline` 原始字段约定
 
@@ -391,7 +391,7 @@ QMT 原始返回为 DataFrame。分钟线与日线均含 11 个字段，导入�
 
 ### 数据完整度与读取规则
 
-`qmt_kline_coverage` 以 `symbol + period + trade_date` 为一条记录，保存首末时间、期望行数、实际行数、有效行数和状态。状态仅使用：
+旧版离线导入的 `qmt_kline_coverage` 以 `symbol + period + trade_date` 为一条记录，保存首末时间、期望行数、实际行数、有效行数和状态。状态仅使用：
 
 ```text
 complete
@@ -400,9 +400,9 @@ empty
 failed
 ```
 
-页面只依据覆盖元数据展示可回测起止日期：优先展示 `qmt_ingest_runs` 与 `qmt_universe_snapshot` 的新版范围，仅当新版元数据查询成功且没有该标的时才展示 `qmt_kline_coverage` 的旧版范围，不合并两套范围。范围查询对超时和临时网络错误进行有限重试；重试耗尽或发生确定性查询错误时返回行情数据异常，不回退旧版范围。用户选择日期时只修改本地草稿；点击“应用”才校验所选闭区间是否完整落在展示范围内，校验不扫描原始行情，也不判断逐日完整性。保存配置和提交回测时不做行情完整性预检。Worker 执行时才依据覆盖元数据选择来源并读取实际行情；无法完成读取时任务失败，用户端统一显示“行情数据异常，请联系管理员”，具体缺失日期、表名和底层异常只保留在服务端诊断日志。不允许在回测过程中临时联网拉取行情。
+页面只依据 `qmt_history_dev.qmt_ingest_runs` 与 `qmt_history_dev.qmt_universe_snapshot` 展示可回测起止日期，不查询或合并其他 QMT 数据库。范围查询对超时和临时网络错误进行有限重试；没有覆盖、重试耗尽或发生确定性查询错误时返回无可用范围或行情数据异常。用户选择日期时只修改本地草稿；点击“应用”才校验所选闭区间是否完整落在展示范围内，校验不扫描原始行情，也不判断逐日完整性。保存配置和提交回测时不做行情完整性预检。Worker 执行时依据同一发布元数据读取实际行情；范围不足、预热不足或无法读取时任务失败，不切换其他 QMT 数据库。用户端统一显示“行情数据异常，请联系管理员”，具体缺失日期、表名和底层异常只保留在服务端诊断日志。不允许在回测过程中临时联网拉取行情。尚未执行且快照指向已退役 QMT 数据库的任务不再受支持，发布前必须先排空或处理。
 
-QMT 直接原始周期为 `1m`、`5m`、`60m`、`1d`；`15m`、`30m` 由 `1m` 原始数据按 QMT 的区间结束时间规则聚合生成，不写回原始表。
+运行时直接读取 `qmt_history_dev` 的 `1m`、`5m`、`15m`、`30m`、`1h`、`1d` 六个原始周期；平台 `60m` 映射物理 `1h`，`3m`、`45m` 由同库 `1m` 数据按 QMT 的区间结束时间规则聚合生成，不写回原始表。旧版离线导入工具原有的周期处理只用于维护旧库，不参与回测。
 
 ### 导入 QMT 原始文件
 
@@ -434,6 +434,6 @@ unset QMT_CLICKHOUSE_PASSWORD
 ### 安全与运维要求
 
 - 后端必须使用 `deploy/compose.clickhouse.yml` 接入服务器现有 `quant-net`，通过 `http://quant-clickhouse:8123` 访问 ClickHouse；不新增行情数据对外端口。
-- 当前阶段复用 ClickHouse `default` 管理员账号连接 `raw_historical_data`；该账号权限覆盖共享 ClickHouse 的其他数据库，凭据必须仅保存在服务器 `deploy/.env`，不得提交、外传或写入文档。后续具备条件时应改为仅授予 `raw_historical_data.*` 访问权限的专用账号。
+- 当前阶段复用 ClickHouse `default` 管理员账号；其权限覆盖共享 ClickHouse 的多个数据库，凭据必须仅保存在服务器 `deploy/.env`，不得提交、外传或写入文档。后续应为回测运行时改用最小权限账号，只授予 `qmt_history_dev.*` 和所需 `xl_derived.stock_directory` 的读取权限；若继续运行旧版离线导入工具，应使用独立写入账号维护 `raw_historical_data`。
 - QMT 原始文件先上传至热盘导入目录，成功导入并校验后再归档；不得直接修改 ClickHouse Docker 数据卷中的文件。
 - 任何导入脚本、环境文件和文档都不得记录 ClickHouse 明文密码。

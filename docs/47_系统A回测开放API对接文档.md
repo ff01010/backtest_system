@@ -2,7 +2,7 @@
 
 ## 1. 文档信息
 
-- 文档版本：`1.0`
+- 文档版本：`1.1`
 - 接口版本：`v1`
 - 接口状态：当前已实现
 - 调用方：系统 A 策略 Hub
@@ -16,8 +16,10 @@
 
 系统 A 可以通过开放 API：
 
+- 分页读取当前用户的活动或归档策略及不可变版本；
+- 创建、完整修改、显式发布、可恢复归档和恢复回测策略；
 - 引用玄龄回测系统中已经保存的策略方案提交回测；
-- 覆盖本次回测的日期、初始资金和滑点；
+- 覆盖本次回测的日期、初始资金、滑点和策略声明参数；
 - 查询当前 API Key 所属用户的回测任务；
 - 查询回测任务详情；
 - 分页查询信号和成交明细；
@@ -30,7 +32,7 @@
 - 已发布；
 - 已保存完整的策略、标的、周期和运行参数。
 
-策略方案通过玄龄回测系统页面创建和维护，当前开放 API 不提供策略方案新增或修改接口。
+策略方案既可通过玄龄回测系统页面维护，也可通过本文第 15 节的完整策略接口维护。开放策略接口只接受回测模式，不接受实盘账户、交易凭据或实盘执行配置。
 
 ## 3. 鉴权
 
@@ -53,8 +55,12 @@ API Key 无效、已撤销、已过期，或者所属用户已停用时，接口
 | `backtest:submit` | 创建回测任务 |
 | `backtest:read` | 查询任务、信号和成交 |
 | `backtest:cancel` | 取消回测任务 |
+| `strategy:read` | 读取策略、归档状态和不可变版本 |
+| `strategy:write` | 创建、修改和恢复完整策略 |
+| `strategy:publish` | 显式发布或复用当前不可变版本 |
+| `strategy:delete` | 可恢复地归档策略，不执行物理删除 |
 
-策略方案提交、任务列表、任务详情、信号和成交查询均按 API Key 所属用户隔离。API Key 不继承管理员权限。
+策略、版本、回测任务、信号和成交查询均按 API Key 所属用户隔离。API Key 不继承管理员权限。已有 Key 不会自动增加策略 Scope，必须由用户重新创建并明确授权。
 
 当前取消接口只校验 `backtest:cancel` Scope 和 `run_id`，尚未按任务所有者过滤。因此只应向受信任的系统 A 调用凭据授予 `backtest:cancel`，并将 `run_id` 视为敏感的不透明标识。
 
@@ -66,7 +72,7 @@ API Key 无效、已撤销、已过期，或者所属用户已停用时，接口
 |---|---:|---|
 | `Authorization` | 是 | Bearer API Key |
 | `Content-Type` | POST JSON 接口必填 | `application/json` |
-| `Idempotency-Key` | 提交回测时必填 | 8～128 个字符，建议使用 UUID |
+| `Idempotency-Key` | 提交回测及策略 POST/PUT 写接口必填 | 8～128 个字符，建议使用 UUID；查询接口和取消回测不要求 |
 
 ### 4.2 日期和数值
 
@@ -114,7 +120,10 @@ Content-Type: application/json
     "start_date": "2026-06-01",
     "end_date": "2026-06-30",
     "initial_capital": 1000000,
-    "slippage": 0
+    "slippage": 0,
+    "strategy_params": {
+      "window": 10
+    }
   }
 }
 ```
@@ -129,6 +138,7 @@ Content-Type: application/json
 | `overrides.end_date` | 否 | `YYYY-MM-DD` | 回测结束日期 |
 | `overrides.initial_capital` | 否 | 大于 0 | 初始资金 |
 | `overrides.slippage` | 否 | 大于等于 0 | 滑点 |
+| `overrides.strategy_params` | 否 | object | 只覆盖当前已发布策略声明的参数；名称和类型必须匹配声明 |
 
 覆盖参数只影响本次回测，不修改已保存策略方案。
 
@@ -139,7 +149,7 @@ Content-Type: application/json
 - 策略脚本及版本；
 - 标的和基准标的；
 - 回测周期；
-- 策略参数；
+- 未声明的策略参数和策略参数声明；
 - 多空方向；
 - 仓位和底仓配置；
 - 撮合模式；
@@ -158,7 +168,10 @@ curl -X POST "{BASE_URL}/api/v1/backtests" \
       "start_date": "2026-06-01",
       "end_date": "2026-06-30",
       "initial_capital": 1000000,
-      "slippage": 0
+      "slippage": 0,
+      "strategy_params": {
+        "window": 10
+      }
     }
   }'
 ```
@@ -430,8 +443,15 @@ Authorization: Bearer qbk_xxx
 | 403 | `api_scope_denied` | Key 缺少接口要求的 Scope |
 | 404 | `api.disabled` | 当前部署未启用开放 API |
 | 404 | `resource.not_found` | 提交或读取接口中的策略方案、回测任务不存在，或者不属于当前用户 |
-| 409 | `idempotency.conflict` | 幂等键冲突，或策略方案未启用、未发布 |
+| 404 | `strategy.not_found` | 策略或版本不存在，或者不属于当前用户 |
+| 409 | `strategy.revision_conflict` | `expected_revision` 已过期，应重新读取策略后再决定是否重试 |
+| 409 | `strategy.name_conflict` | 恢复归档策略时已有同名活动策略 |
+| 409 | `strategy.state_conflict` | 策略当前状态不允许该操作，或完整策略身份不一致 |
+| 409 | `backtest.strategy_unavailable` | 策略未启用或尚未发布，不能提交新回测 |
+| 409 | `idempotency.conflict` | 同一幂等键用于不同请求 |
 | 422 | `backtest.validation_failed` | 请求字段、方案参数或数据覆盖不符合要求 |
+| 422 | `strategy.validation_failed` | 策略代码、结构、日期、标的或回测配置无效 |
+| 422 | `strategy.parameter_invalid` | 策略参数未声明或值与声明类型不匹配 |
 | 429 | `rate_limit.exceeded` | 活动任务数或当日提交数达到上限 |
 | 503 | `request.failed` | 回测 Runner 暂时不可用 |
 | 503 | `backtest.unavailable` | 接口发生未预期的服务异常 |
@@ -450,6 +470,7 @@ Authorization: Bearer qbk_xxx
 - 联调环境 `{BASE_URL}`；
 - 具备所需 Scope 的 API Key；
 - 可用于联调的已保存、已启用、已发布策略方案 `config_id`；
+- 需要维护策略时，具备对应策略 Scope 的独立 API Key；
 - 该方案的标的、周期、撮合模式及允许覆盖参数说明；
 - 当前部署环境的提交额度；
 - 问题反馈联系人。
@@ -475,3 +496,267 @@ Authorization: Bearer qbk_xxx
 7. 使用新的 `Idempotency-Key` 创建任务并调用取消接口，确认状态进入 `cancelled` 或 `cancelling`。
 8. 使用缺少 Scope 的 Key 验证 HTTP `403`。
 9. 使用不存在或不属于当前用户的 `config_id` 验证 HTTP `404`。
+
+## 15. 完整策略管理
+
+### 15.1 参数声明与完整策略模型
+
+策略代码使用模块顶层 `STRATEGY_PARAMETERS` 字典声明允许保存和单次覆盖的参数：
+
+```python
+STRATEGY_PARAMETERS = {
+  "window": 20,
+  "threshold": 0.5,
+  "enabled": True,
+  "label": "breakout",
+}
+
+def on_bar(bar, state):
+  params = state["params"]
+  return []
+```
+
+支持 `integer`、有限 `number`、`boolean` 和 `string`。最多 64 个参数，名称必须匹配 `^[A-Za-z][A-Za-z0-9_]{0,63}$`，单个字符串最长 1024 个字符，规范化声明最大 64 KiB。表达式、变量引用、函数调用、列表、`None` 和嵌套对象会被拒绝。未声明参数的旧策略继续按空自定义参数运行。
+
+创建和完整更新使用同一主体。创建时不传 `expected_revision`，更新时必须传：
+
+```json
+{
+  "name": "均线策略",
+  "description": "均线方向策略",
+  "code": "STRATEGY_PARAMETERS = {\"window\": 20}\n\ndef on_bar(bar, state):\n  return []",
+  "entry_type": "on_bar",
+  "signal_required": false,
+  "symbol": "688981.SH",
+  "timeframe": "5m",
+  "benchmark_symbol": "688981.SH",
+  "enabled": true,
+  "backtest_parameters": {
+    "start_date": "2026-06-01",
+    "end_date": "2026-06-30",
+    "initial_capital": 1000000,
+    "commission_rate": 0.0003,
+    "slippage": 0,
+    "allow_long": true,
+    "allow_short": false,
+    "strategy_category": "directional_holding",
+    "holding_policy": "overnight",
+    "overlay_settlement_policy": "intraday_restore",
+    "fill_model": "bar_next_open",
+    "execution_algorithm": "immediate",
+    "execution_parameters": {},
+    "base_quantity": 0,
+    "base_cost_price": 0,
+    "initial_position_enabled": false,
+    "t0_enabled": false
+  },
+  "strategy_parameters": {
+    "window": 10
+  }
+}
+```
+
+`fill_model` 支持 `bar_next_open` 或 `l2_quote`；`execution_algorithm` 支持 `immediate` 或 `twap`。TWAP 的 `execution_parameters` 使用 `duration_seconds`、`interval_seconds` 和 `min_child_quantity`。保存时，明确提供的 `strategy_parameters` 优先；未提供时保留同名同类型旧值，否则使用代码声明默认值。删除的声明从当前默认值中移除。
+
+### 15.2 分页查询策略
+
+```http
+GET {BASE_URL}/api/v1/strategies?limit=20&cursor=0&archived=false&enabled=true
+```
+
+需要 `strategy:read`。`limit` 为 `1～100`，默认 `20`；`cursor` 是大于等于 `0` 的偏移量；`archived` 和 `enabled` 可省略。响应：
+
+```json
+{
+  "items": [
+    {
+      "config_id": "932a0ce2-9d8d-4060-8614-5df0adbbf8a9",
+      "script_id": "8ea79532-a885-49ab-a623-69e51647f12d",
+      "strategy_version_id": "d799136a-bf0c-4474-a814-a8a864e751cd",
+      "published_version_id": "62737778-daf6-431d-b4c4-09b558d317ea",
+      "revision": 3,
+      "name": "均线策略",
+      "description": "均线方向策略",
+      "code": "STRATEGY_PARAMETERS = {\"window\": 20}\n\ndef on_bar(bar, state):\n  return []",
+      "entry_type": "on_bar",
+      "signal_required": false,
+      "mode": "backtest",
+      "symbol": "688981.SH",
+      "timeframe": "5m",
+      "benchmark_symbol": "688981.SH",
+      "enabled": true,
+      "published": true,
+      "archived": false,
+      "archived_at": null,
+      "backtest_parameters": {
+        "start_date": "2026-06-01",
+        "end_date": "2026-06-30",
+        "initial_capital": 1000000,
+        "commission_rate": 0.0003,
+        "slippage": 0,
+        "allow_long": true,
+        "allow_short": false,
+        "strategy_category": "directional_holding",
+        "holding_policy": "overnight",
+        "overlay_settlement_policy": "intraday_restore",
+        "fill_model": "bar_next_open",
+        "execution_algorithm": "immediate",
+        "execution_parameters": {},
+        "base_quantity": 0,
+        "base_cost_price": 0,
+        "initial_position_enabled": false,
+        "t0_enabled": false
+      },
+      "parameter_definitions": {
+        "window": {"type": "integer", "default": 20}
+      },
+      "strategy_parameters": {"window": 10},
+      "created_at": "2026-09-28T10:00:00+08:00",
+      "updated_at": "2026-09-28T10:05:00+08:00"
+    }
+  ],
+  "next_cursor": null,
+  "total": 1
+}
+```
+
+`next_cursor` 为字符串或 `null`。有下一页时直接把返回值用于下一次 `cursor`。可直接运行的 cURL：
+
+```bash
+curl -sS "{BASE_URL}/api/v1/strategies?limit=20&cursor=0&archived=false" \
+  -H "Authorization: Bearer qbk_xxx"
+```
+
+### 15.3 读取单个策略
+
+```http
+GET {BASE_URL}/api/v1/strategies/{config_id}
+```
+
+需要 `strategy:read`。响应为 `{"strategy": <15.2 items 中的完整策略>}`，包括当前 `revision`。归档策略仍可由所有者读取；归档策略不能用于新回测。
+
+```bash
+curl -sS "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9" \
+  -H "Authorization: Bearer qbk_xxx"
+```
+
+### 15.4 创建策略
+
+```http
+POST {BASE_URL}/api/v1/strategies
+```
+
+需要 `strategy:write`、`Content-Type: application/json` 和 `Idempotency-Key`。请求体使用 15.1 的创建主体。成功返回 HTTP `201`：
+
+```json
+{
+  "strategy": {
+    "config_id": "932a0ce2-9d8d-4060-8614-5df0adbbf8a9",
+    "script_id": "8ea79532-a885-49ab-a623-69e51647f12d",
+    "strategy_version_id": "d799136a-bf0c-4474-a814-a8a864e751cd",
+    "published_version_id": "62737778-daf6-431d-b4c4-09b558d317ea",
+    "revision": 1
+  },
+  "replayed": false,
+  "request_id": "req_01J..."
+}
+```
+
+```bash
+curl -sS -X POST "{BASE_URL}/api/v1/strategies" \
+  -H "Authorization: Bearer qbk_xxx" \
+  -H "Idempotency-Key: 52923cb2-74c5-4a3b-a3e1-0a0b154f44b7" \
+  -H "Content-Type: application/json" \
+  --data-binary @strategy-create.json
+```
+
+### 15.5 完整更新策略
+
+```http
+PUT {BASE_URL}/api/v1/strategies/{config_id}
+```
+
+需要 `strategy:write` 和 `Idempotency-Key`。请求体与 15.1 相同，并增加从最新读取结果取得的 `"expected_revision": 3`。成功返回 HTTP `200`，响应结构与创建相同，revision 已递增。更新成功后会冻结当前完整发布版本；相同脚本内容会复用不可变脚本版本。
+
+```bash
+curl -sS -X PUT "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9" \
+  -H "Authorization: Bearer qbk_xxx" \
+  -H "Idempotency-Key: 169450d2-15d0-47d9-8bdd-b541819c12cc" \
+  -H "Content-Type: application/json" \
+  --data-binary @strategy-update.json
+```
+
+### 15.6 发布、归档和恢复
+
+三个接口都接收 `{"expected_revision": 3}`，都要求新的 `Idempotency-Key`，成功返回 HTTP `200`。
+
+| 接口 | Scope | 结果 |
+|---|---|---|
+| `POST /api/v1/strategies/{config_id}/publish` | `strategy:publish` | 发布当前内容；内容未变化时复用版本并返回 `created=false` |
+| `POST /api/v1/strategies/{config_id}/archive` | `strategy:delete` | 设置归档、取消发布并递增 revision，不删除历史 |
+| `POST /api/v1/strategies/{config_id}/restore` | `strategy:write` | 恢复并重新启用发布；同名活动策略存在时返回名称冲突 |
+
+发布响应示例：
+
+```json
+{
+  "strategy": {
+    "config_id": "932a0ce2-9d8d-4060-8614-5df0adbbf8a9",
+    "revision": 4,
+    "published_version_id": "62737778-daf6-431d-b4c4-09b558d317ea"
+  },
+  "created": false,
+  "replayed": false,
+  "request_id": "req_01J..."
+}
+```
+
+```bash
+curl -sS -X POST "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9/publish" \
+  -H "Authorization: Bearer qbk_xxx" -H "Idempotency-Key: 39cde407-b68b-4c71-a7d1-cdf2962086f2" \
+  -H "Content-Type: application/json" -d '{"expected_revision":3}'
+
+curl -sS -X POST "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9/archive" \
+  -H "Authorization: Bearer qbk_xxx" -H "Idempotency-Key: 00423566-8e6e-4654-82f1-965fc24717d8" \
+  -H "Content-Type: application/json" -d '{"expected_revision":4}'
+
+curl -sS -X POST "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9/restore" \
+  -H "Authorization: Bearer qbk_xxx" -H "Idempotency-Key: 4e5490bf-f0d9-4d9b-ae34-c7cca0c435c7" \
+  -H "Content-Type: application/json" -d '{"expected_revision":5}'
+```
+
+归档和恢复响应中的 `strategy` 使用 15.4 的资源引用结构。归档不会删除策略版本、回测任务或共享快照。
+
+### 15.7 查询版本历史和单个版本
+
+```http
+GET {BASE_URL}/api/v1/strategies/{config_id}/versions?limit=20&cursor=0
+GET {BASE_URL}/api/v1/strategies/{config_id}/versions/{version_id}
+```
+
+都需要 `strategy:read`。列表响应使用 `items`、`next_cursor` 和 `total`；分页参数与 15.2 相同。单个版本响应为 `{"version": <版本>}`。版本字段包括 `version_id`、`version_no`、`config_id`、`strategy_version_id`、`name`、冻结代码、入口、信号声明、标的、周期、基准、`backtest_parameters`、`parameter_definitions`、`strategy_parameters` 和 `created_at`。
+
+```bash
+curl -sS "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9/versions?limit=20&cursor=0" \
+  -H "Authorization: Bearer qbk_xxx"
+
+curl -sS "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9/versions/62737778-daf6-431d-b4c4-09b558d317ea" \
+  -H "Authorization: Bearer qbk_xxx"
+```
+
+### 15.8 revision、幂等和安全日志
+
+- 修改、发布、归档和恢复必须使用最新 `expected_revision`。冲突后先重新 GET，不能盲目改用更大的数字重试。
+- 策略写入的幂等记录和资源变更在同一数据库事务中完成。相同 Key 与相同方法、路径、正文重放首次最小响应，`replayed=true`；资源后来更新或归档也不改变该重放结果。
+- 不同请求复用同一 Key 返回 `409 idempotency.conflict`。网络超时重试必须复用原 Key，新的业务操作必须生成新 Key。
+- 审计只记录操作类型、资源类型、资源 ID、请求摘要和结果，不记录策略源码与完整参数。
+- 不存在与跨用户访问都返回 `404 strategy.not_found`。API Key 所属账号即使是管理员，也不会绕过 Scope 或所有权隔离。
+
+### 15.9 建议联调顺序
+
+1. 用 `strategy:write` 创建策略，再用 `strategy:read` 读取并保存 `config_id` 和 `revision`。
+2. 使用读取结果完整更新，验证过期 revision 返回 `strategy.revision_conflict`。
+3. 显式发布并重复同一幂等请求，确认 `replayed=true`；再查询版本列表。
+4. 使用 `POST /api/v1/backtests` 的 `overrides.strategy_params` 做一次局部覆盖，确认它不修改策略读取结果中的 `strategy_parameters`。
+5. 归档后确认活动列表不再返回该策略、`archived=true` 查询可见、历史版本仍可读且新回测被拒绝。
+6. 恢复后重新读取最新 revision，并验证同名冲突不会静默改名。

@@ -2,7 +2,7 @@
 """PostgreSQL 状态仓储：仅访问规范表，不在应用启动时建表。"""
 
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 import base64
 import hashlib
@@ -10,7 +10,7 @@ import json
 import logging
 from pathlib import Path
 import re
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from uuid import uuid4
 
 import psycopg
@@ -41,6 +41,18 @@ class DatabaseError(RuntimeError):
 
 class ConflictError(DatabaseError):
   """违反唯一约束等写入冲突。"""
+
+
+class RevisionConflictError(ConflictError):
+  """策略 revision 与调用方预期不一致。"""
+
+
+class NameConflictError(ConflictError):
+  """活动策略名称与恢复目标冲突。"""
+
+
+class IdempotencyConflictError(ConflictError):
+  """同一幂等键被用于不同请求。"""
 
 
 class RunnerUnavailableError(DatabaseError):
@@ -306,67 +318,6 @@ def withdraw_release_record(
         (release_id, deployment_id, expected_generation),
       )
       return dict(cur.fetchone()["result"])
-
-
-def replace_trade_calendar(
-  exchange: str, start_date: str, end_date: str, open_dates: list[str], source: str,
-) -> None:
-  """按自然日覆盖写入交易日历，确保区间内开市和休市状态都可判定。"""
-  start = date.fromisoformat(start_date)
-  end = date.fromisoformat(end_date)
-  all_dates = [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
-  open_set = set(open_dates)
-  rows = [(exchange, value, value.isoformat() in open_set, source) for value in all_dates]
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.executemany("""
-        INSERT INTO market_trade_calendar (exchange, trade_date, is_open, source)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (exchange, trade_date) DO UPDATE SET
-          is_open=EXCLUDED.is_open, source=EXCLUDED.source, updated_at=now()
-      """, rows)
-
-
-def latest_trade_calendar_date(exchange: str = "SSE") -> str | None:
-  """返回交易日历已写入的最新自然日，供增量同步确定起点。"""
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        SELECT max(trade_date) AS latest_date
-        FROM market_trade_calendar
-        WHERE exchange=%s
-      """, (exchange,))
-      value = cur.fetchone()["latest_date"]
-      return str(value) if value else None
-
-
-def list_open_trade_dates(start_date: str, end_date: str, exchange: str = "SSE") -> list[str]:
-  """返回指定交易所的开市日期。"""
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        SELECT trade_date
-        FROM market_trade_calendar
-        WHERE exchange=%s AND trade_date BETWEEN %s AND %s AND is_open=true
-        ORDER BY trade_date
-      """, (exchange, start_date, end_date))
-      return [str(row["trade_date"]) for row in cur.fetchall()]
-
-
-def is_trade_calendar_range_covered(start_date: str, end_date: str, exchange: str = "SSE") -> bool:
-  """仅当每个自然日都有记录时，Worker 才能确定完整目标交易日。"""
-  start = date.fromisoformat(start_date)
-  end = date.fromisoformat(end_date)
-  expected_count = (end - start).days + 1
-  with _db() as conn:
-    with conn.cursor() as cur:
-      cur.execute("""
-        SELECT count(*) AS date_count
-        FROM market_trade_calendar
-        WHERE exchange=%s AND trade_date BETWEEN %s AND %s
-      """, (exchange, start_date, end_date))
-      row = cur.fetchone()
-      return int(row["date_count"] or 0) == expected_count
 
 
 def _to_float(value: Any) -> float | None:
@@ -659,6 +610,7 @@ def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
     "published": bool(row["published"]),
     "publishedVersionId": _uuid(row.get("published_version_id")),
     "revision": int(row.get("revision") or 1),
+    "archivedAt": _format_time(row.get("archived_at")) if row.get("archived_at") else None,
     "sharedSource": {
       "publicationId": source_publication_id,
       "authorName": row.get("source_author_name_snapshot"),
@@ -995,11 +947,15 @@ def update_strategy_script(script_id: str, payload: dict[str, Any]) -> dict[str,
 def get_strategy_script(script_id: str) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(_script_query("AND s.id=%s"), (current_user_id(), script_id))
-      row = cur.fetchone()
-      if not row:
-        raise KeyError(script_id)
-      return _normalize_script(row)
+      return _get_strategy_script_with_cursor(cur, script_id)
+
+
+def _get_strategy_script_with_cursor(cur: Any, script_id: str) -> dict[str, Any]:
+  cur.execute(_script_query("AND s.id=%s"), (current_user_id(), script_id))
+  row = cur.fetchone()
+  if not row:
+    raise KeyError(script_id)
+  return _normalize_script(row)
 
 
 def get_strategy_script_version(version_id: str, script_id: str | None = None) -> dict[str, Any]:
@@ -1032,7 +988,8 @@ def delete_strategy_script(script_id: str) -> bool:
       return cur.rowcount > 0
 
 
-def _config_query(where: str = "") -> str:
+def _config_query(where: str = "", *, include_archived: bool = False) -> str:
+  archive_filter = "" if include_archived else "AND c.archived_at IS NULL"
   return f"""
     SELECT c.*, i.symbol, i.exchange,
       CASE WHEN b.id IS NULL THEN NULL ELSE b.symbol || '.' || b.exchange END AS benchmark_symbol,
@@ -1057,7 +1014,7 @@ def _config_query(where: str = "") -> str:
       ORDER BY config_version.version_no DESC
       LIMIT 1
     ) latest_version ON true
-    WHERE c.owner_user_id=%s AND c.archived_at IS NULL {where}
+    WHERE c.owner_user_id=%s {archive_filter} {where}
   """
 
 
@@ -1066,6 +1023,36 @@ def list_strategy_configs() -> list[dict[str, Any]]:
     with conn.cursor() as cur:
       cur.execute(_config_query("ORDER BY c.updated_at DESC, c.id DESC"), (current_user_id(),))
       return [_normalize_config(row) for row in cur.fetchall()]
+
+
+def list_owned_strategy_configs(
+  limit: int,
+  offset: int,
+  archived: bool | None = None,
+  enabled: bool | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+  """分页读取当前用户策略，可显式查询归档资源。"""
+  conditions: list[str] = []
+  params: list[Any] = [current_user_id()]
+  if archived is not None:
+    conditions.append("c.archived_at IS NOT NULL" if archived else "c.archived_at IS NULL")
+  if enabled is not None:
+    conditions.append("c.enabled=%s")
+    params.append(enabled)
+  filter_sql = " AND ".join(conditions)
+  where = f"AND {filter_sql}" if filter_sql else ""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        f"SELECT count(*) AS value FROM strategy_config c WHERE c.owner_user_id=%s {where}",
+        tuple(params),
+      )
+      total = int(cur.fetchone()["value"])
+      cur.execute(
+        _config_query(f"{where} ORDER BY c.updated_at DESC, c.id DESC LIMIT %s OFFSET %s", include_archived=True),
+        (*params, limit, offset),
+      )
+      return [_normalize_config(row) for row in cur.fetchall()], total
 
 
 def _config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
@@ -1143,9 +1130,13 @@ def _get_strategy_config_with_cursor(
   cur: Any,
   config_id: str,
   for_update: bool = False,
+  include_archived: bool = False,
 ) -> dict[str, Any]:
   suffix = "AND c.id=%s FOR UPDATE OF c" if for_update else "AND c.id=%s"
-  cur.execute(_config_query(suffix), (current_user_id(), config_id))
+  cur.execute(
+    _config_query(suffix, include_archived=include_archived),
+    (current_user_id(), config_id),
+  )
   row = cur.fetchone()
   if not row:
     raise KeyError(config_id)
@@ -1186,7 +1177,8 @@ def create_published_strategy_in_transaction(
 
 
 
-def save_complete_strategy(
+def save_complete_strategy_in_transaction(
+  cur: Any,
   script_payload: dict[str, Any],
   config_payload: dict[str, Any],
   script_id: str | None,
@@ -1194,39 +1186,51 @@ def save_complete_strategy(
   expected_revision: int | None = None,
 ) -> dict[str, dict[str, Any]]:
   """原子保存一对一完整策略，并自动创建精确的发布版本。"""
+  owned_script_id: str | None = None
+  if config_id is not None:
+    cur.execute("""
+      SELECT strategy_id, revision FROM strategy_config
+      WHERE id=%s AND owner_user_id=%s AND archived_at IS NULL FOR UPDATE
+    """, (config_id, current_user_id()))
+    current = cur.fetchone()
+    if not current:
+      raise KeyError(config_id)
+    owned_script_id = _uuid(current["strategy_id"])
+    if script_id and script_id != owned_script_id:
+      raise ConflictError("策略脚本归属不一致，禁止将方案改绑到其他脚本")
+    if expected_revision is None or int(current["revision"]) != expected_revision:
+      raise RevisionConflictError("该策略已在其他会话中更新，请刷新后重试")
+  resolved_name = _resolve_unique_strategy_name(
+    cur, str(config_payload["name"]), config_id,
+  )
+  resolved_script = {**script_payload, "name": resolved_name}
+  saved_script_id, strategy_version_id, _ = _write_strategy_script(
+    cur, owned_script_id, resolved_script,
+  )
+  config = {**config_payload, "name": resolved_name, "scriptId": saved_script_id}
+  saved_config_id = _write_config(
+    cur, config_id, config, saved_script_id, strategy_version_id,
+  )
+  saved_config = _get_strategy_config_with_cursor(cur, saved_config_id)
+  _publish_strategy_config_with_cursor(cur, saved_config)
+  return {
+    "script": _get_strategy_script_with_cursor(cur, saved_script_id),
+    "config": _get_strategy_config_with_cursor(cur, saved_config_id),
+  }
+
+
+def save_complete_strategy(
+  script_payload: dict[str, Any],
+  config_payload: dict[str, Any],
+  script_id: str | None,
+  config_id: str | None,
+  expected_revision: int | None = None,
+) -> dict[str, dict[str, Any]]:
   with _db() as conn:
     with conn.cursor() as cur:
-      owned_script_id: str | None = None
-      if config_id is not None:
-        cur.execute("""
-          SELECT strategy_id, revision FROM strategy_config
-          WHERE id=%s AND owner_user_id=%s FOR UPDATE
-        """, (config_id, current_user_id()))
-        current = cur.fetchone()
-        if not current:
-          raise KeyError(config_id)
-        owned_script_id = _uuid(current["strategy_id"])
-        if script_id and script_id != owned_script_id:
-          raise ConflictError("策略脚本归属不一致，禁止将方案改绑到其他脚本")
-        if expected_revision is None or int(current["revision"]) != expected_revision:
-          raise ConflictError("该策略已在其他会话中更新，请刷新后重试")
-      resolved_name = _resolve_unique_strategy_name(
-        cur, str(config_payload["name"]), config_id,
+      return save_complete_strategy_in_transaction(
+        cur, script_payload, config_payload, script_id, config_id, expected_revision,
       )
-      resolved_script = {**script_payload, "name": resolved_name}
-      saved_script_id, strategy_version_id, _ = _write_strategy_script(
-        cur, owned_script_id, resolved_script,
-      )
-      config = {**config_payload, "name": resolved_name, "scriptId": saved_script_id}
-      saved_config_id = _write_config(
-        cur, config_id, config, saved_script_id, strategy_version_id,
-      )
-      saved_config = _get_strategy_config_with_cursor(cur, saved_config_id)
-      _publish_strategy_config_with_cursor(cur, saved_config)
-  return {
-    "script": get_strategy_script(saved_script_id),
-    "config": get_strategy_config(saved_config_id),
-  }
 
 
 def _version_fingerprint(snapshot: dict[str, Any]) -> str:
@@ -1263,32 +1267,56 @@ def _publish_strategy_config_with_cursor(
   return version_id, True
 
 
-def publish_strategy_config(config_id: str) -> tuple[dict[str, Any], bool]:
-  with _db() as conn:
-    with conn.cursor() as cur:
-      config = _get_strategy_config_with_cursor(cur, config_id, for_update=True)
-      version_id, created = _publish_strategy_config_with_cursor(cur, config)
-  return get_strategy_config_version(version_id), created
+def publish_strategy_config_in_transaction(
+  cur: Any,
+  config_id: str,
+  expected_revision: int | None = None,
+) -> tuple[dict[str, Any], bool]:
+  config = _get_strategy_config_with_cursor(cur, config_id, for_update=True)
+  if expected_revision is not None and config["revision"] != expected_revision:
+    raise RevisionConflictError("该策略已在其他会话中更新，请刷新后重试")
+  version_id, created = _publish_strategy_config_with_cursor(cur, config)
+  if expected_revision is not None:
+    cur.execute("""
+      UPDATE strategy_config SET revision=revision + 1, updated_at=now()
+      WHERE id=%s AND owner_user_id=%s
+    """, (config_id, current_user_id()))
+  return _get_strategy_config_version_with_cursor(cur, version_id), created
 
 
-def get_strategy_config(config_id: str) -> dict[str, Any]:
+def publish_strategy_config(
+  config_id: str,
+  expected_revision: int | None = None,
+) -> tuple[dict[str, Any], bool]:
   with _db() as conn:
     with conn.cursor() as cur:
-      return _get_strategy_config_with_cursor(cur, config_id)
+      return publish_strategy_config_in_transaction(cur, config_id, expected_revision)
+
+
+def get_strategy_config(config_id: str, include_archived: bool = False) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      return _get_strategy_config_with_cursor(
+        cur, config_id, include_archived=include_archived,
+      )
+
+
+def _get_strategy_config_version_with_cursor(cur: Any, version_id: str) -> dict[str, Any]:
+  cur.execute("""
+    SELECT v.* FROM strategy_config_version v
+    JOIN strategy_config c ON c.id=v.config_id
+    WHERE v.id=%s AND c.owner_user_id=%s
+  """, (version_id, current_user_id()))
+  row = cur.fetchone()
+  if not row:
+    raise KeyError(version_id)
+  return _normalize_version(row)
 
 
 def get_strategy_config_version(version_id: str) -> dict[str, Any]:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute("""
-        SELECT v.* FROM strategy_config_version v
-        JOIN strategy_config c ON c.id=v.config_id
-        WHERE v.id=%s AND c.owner_user_id=%s
-      """, (version_id, current_user_id()))
-      row = cur.fetchone()
-      if not row:
-        raise KeyError(version_id)
-      return _normalize_version(row)
+      return _get_strategy_config_version_with_cursor(cur, version_id)
 
 
 def get_latest_strategy_config_version(config_id: str) -> dict[str, Any] | None:
@@ -1315,22 +1343,129 @@ def list_strategy_config_versions(config_id: str) -> list[dict[str, Any]]:
       return [_normalize_version(row) for row in cur.fetchall()]
 
 
-def delete_strategy_config(config_id: str) -> bool:
+def list_strategy_config_versions_page(
+  config_id: str,
+  limit: int,
+  offset: int,
+) -> tuple[list[dict[str, Any]], int]:
   with _db() as conn:
     with conn.cursor() as cur:
       cur.execute("""
-        UPDATE strategy_config
-        SET archived_at=now(), published=false, revision=revision + 1, updated_at=now()
-        WHERE id=%s AND owner_user_id=%s AND archived_at IS NULL
-        RETURNING strategy_id
+        SELECT count(*) AS value FROM strategy_config_version v
+        JOIN strategy_config c ON c.id=v.config_id
+        WHERE v.config_id=%s AND c.owner_user_id=%s
       """, (config_id, current_user_id()))
+      total = int(cur.fetchone()["value"])
+      if total == 0:
+        cur.execute("""
+          SELECT 1 FROM strategy_config WHERE id=%s AND owner_user_id=%s
+        """, (config_id, current_user_id()))
+        if not cur.fetchone():
+          raise KeyError(config_id)
+      cur.execute("""
+        SELECT v.* FROM strategy_config_version v
+        JOIN strategy_config c ON c.id=v.config_id
+        WHERE v.config_id=%s AND c.owner_user_id=%s
+        ORDER BY v.version_no DESC LIMIT %s OFFSET %s
+      """, (config_id, current_user_id(), limit, offset))
+      return [_normalize_version(row) for row in cur.fetchall()], total
+
+
+def get_strategy_config_version_for_config(
+  config_id: str,
+  version_id: str,
+) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT v.* FROM strategy_config_version v
+        JOIN strategy_config c ON c.id=v.config_id
+        WHERE v.id=%s AND v.config_id=%s AND c.owner_user_id=%s
+      """, (version_id, config_id, current_user_id()))
       row = cur.fetchone()
       if not row:
+        raise KeyError(version_id)
+      return _normalize_version(row)
+
+
+def archive_strategy_config_in_transaction(
+  cur: Any,
+  config_id: str,
+  expected_revision: int,
+) -> dict[str, Any]:
+  config = _get_strategy_config_with_cursor(cur, config_id, for_update=True)
+  if config["revision"] != expected_revision:
+    raise RevisionConflictError("该策略已在其他会话中更新，请刷新后重试")
+  cur.execute("""
+    UPDATE strategy_config
+    SET archived_at=now(), published=false, revision=revision + 1, updated_at=now()
+    WHERE id=%s AND owner_user_id=%s AND archived_at IS NULL
+    RETURNING strategy_id
+  """, (config_id, current_user_id()))
+  row = cur.fetchone()
+  if not row:
+    raise KeyError(config_id)
+  cur.execute("""
+    UPDATE user_strategy SET status='archived', updated_at=now()
+    WHERE id=%s AND owner_user_id=%s
+  """, (row["strategy_id"], current_user_id()))
+  return _get_strategy_config_with_cursor(cur, config_id, include_archived=True)
+
+
+def restore_strategy_config_in_transaction(
+  cur: Any,
+  config_id: str,
+  expected_revision: int,
+) -> dict[str, Any]:
+  config = _get_strategy_config_with_cursor(
+    cur, config_id, for_update=True, include_archived=True,
+  )
+  if config.get("archivedAt") is None:
+    raise ConflictError("策略当前未归档")
+  if config["revision"] != expected_revision:
+    raise RevisionConflictError("该策略已在其他会话中更新，请刷新后重试")
+  cur.execute("""
+    SELECT 1 FROM strategy_config
+    WHERE owner_user_id=%s AND name=%s AND archived_at IS NULL AND id<>%s
+  """, (current_user_id(), config["name"], config_id))
+  if cur.fetchone():
+    raise NameConflictError("当前已有同名活动策略，无法恢复")
+  cur.execute("""
+    UPDATE strategy_config
+    SET archived_at=NULL, published=true, revision=revision + 1, updated_at=now()
+    WHERE id=%s AND owner_user_id=%s AND archived_at IS NOT NULL
+    RETURNING strategy_id
+  """, (config_id, current_user_id()))
+  row = cur.fetchone()
+  if not row:
+    raise KeyError(config_id)
+  cur.execute("""
+    UPDATE user_strategy SET status='active', updated_at=now()
+    WHERE id=%s AND owner_user_id=%s
+  """, (row["strategy_id"], current_user_id()))
+  return _get_strategy_config_with_cursor(cur, config_id)
+
+
+def archive_strategy_config(config_id: str, expected_revision: int) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      return archive_strategy_config_in_transaction(cur, config_id, expected_revision)
+
+
+def restore_strategy_config(config_id: str, expected_revision: int) -> dict[str, Any]:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      return restore_strategy_config_in_transaction(cur, config_id, expected_revision)
+
+
+def delete_strategy_config(config_id: str) -> bool:
+  with _db() as conn:
+    with conn.cursor() as cur:
+      try:
+        config = _get_strategy_config_with_cursor(cur, config_id, for_update=True)
+        archive_strategy_config_in_transaction(cur, config_id, int(config["revision"]))
+      except KeyError:
         return False
-      cur.execute("""
-        UPDATE user_strategy SET status='archived', updated_at=now()
-        WHERE id=%s AND owner_user_id=%s
-      """, (row["strategy_id"], current_user_id()))
       return True
 
 
@@ -1502,11 +1637,132 @@ def create_bar_backtest_job(payload: dict[str, Any]) -> tuple[str, int]:
       )
 
 
+def create_browser_backtest_job(
+  payload: dict[str, Any],
+  idempotency_key: str,
+  request_hash: str,
+) -> tuple[str, int, bool, str, str]:
+  """使用用户级事务锁幂等创建网页回测，兼容未使用该请求头的旧客户端。"""
+  owner_user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"browser-backtest:{owner_user_id}:{idempotency_key}",),
+      )
+      cur.execute("""
+        SELECT id, display_no, status, fill_model, requested_params
+        FROM backtest_run
+        WHERE owner_user_id=%s
+          AND requested_params->'_browserIdempotency'->>'key'=%s
+        ORDER BY created_at DESC LIMIT 1
+      """, (owner_user_id, idempotency_key))
+      existing = cur.fetchone()
+      if existing:
+        requested = _json(existing.get("requested_params"), {})
+        idempotency = requested.get("_browserIdempotency", {})
+        if not isinstance(idempotency, dict) or idempotency.get("requestHash") != request_hash:
+          raise IdempotencyConflictError("同一幂等键不能用于不同请求")
+        return (
+          _uuid(existing["id"]) or "",
+          int(existing["display_no"]),
+          True,
+          str(existing["status"]),
+          str(existing.get("fill_model") or "bar_next_open"),
+        )
+      stored_payload = {
+        **payload,
+        "_browserIdempotency": {
+          "key": idempotency_key,
+          "requestHash": request_hash,
+        },
+      }
+      fill_model = str(payload.get("fillModel", "bar_next_open"))
+      queue_table = "l2_backtest_job" if fill_model == "l2_quote" else "bar_backtest_job"
+      run_id, display_no = _create_queued_backtest_job(
+        cur, stored_payload, owner_user_id, queue_table, fill_model,
+      )
+      return run_id, display_no, False, "queued", fill_model
+
+
+def execute_public_write(
+  api_key_id: str,
+  idempotency_key: str,
+  request_hash: str,
+  operation_type: str,
+  resource_type: str,
+  request_id: str | None,
+  operation: Callable[[Any], tuple[str | None, int, dict[str, Any]]],
+) -> tuple[dict[str, Any], bool, int]:
+  """在资源事务内保存开放写入的最小响应、幂等状态和安全审计。"""
+  owner_user_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT id FROM api_access_key
+        WHERE id=%s AND owner_user_id=%s AND revoked_at IS NULL
+          AND (expires_at IS NULL OR expires_at > now())
+        FOR UPDATE
+      """, (api_key_id, owner_user_id))
+      if cur.fetchone() is None:
+        raise KeyError("api_key")
+      cur.execute("""
+        SELECT request_hash, operation_type, response_status, response_body
+        FROM api_idempotency_record
+        WHERE api_key_id=%s AND idempotency_key=%s
+      """, (api_key_id, idempotency_key))
+      existing = cur.fetchone()
+      if existing:
+        if existing["request_hash"] != request_hash:
+          raise IdempotencyConflictError("同一幂等键不能用于不同请求")
+        body = _json(existing.get("response_body"), None)
+        if not isinstance(body, dict) or existing.get("response_status") is None:
+          raise DatabaseError("幂等请求尚未完成，请重试")
+        return body, True, int(existing["response_status"])
+      cur.execute("""
+        INSERT INTO api_idempotency_record (
+          api_key_id, owner_user_id, idempotency_key, request_hash,
+          operation_type, resource_type
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+      """, (
+        api_key_id, owner_user_id, idempotency_key, request_hash,
+        operation_type, resource_type,
+      ))
+      resource_id, response_status, response_body = operation(cur)
+      minimal_response = dict(response_body)
+      cur.execute("""
+        UPDATE api_idempotency_record
+        SET resource_id=%s, response_status=%s, response_body=%s
+        WHERE api_key_id=%s AND idempotency_key=%s
+      """, (
+        resource_id, response_status, Jsonb(minimal_response), api_key_id, idempotency_key,
+      ))
+      cur.execute("""
+        INSERT INTO api_access_audit (
+          api_key_id, owner_user_id, event_type, request_id, detail
+        ) VALUES (%s, %s, %s, %s, %s)
+      """, (
+        api_key_id,
+        owner_user_id,
+        operation_type,
+        request_id,
+        Jsonb({
+          "operation": operation_type,
+          "resourceType": resource_type,
+          "resourceId": resource_id,
+          "requestHash": request_hash,
+          "result": "succeeded",
+        }),
+      ))
+      return minimal_response, False, response_status
+
+
 def create_api_backtest_job(
   payload: dict[str, Any],
   api_key_id: str,
   idempotency_key: str,
   request_hash: str,
+  request_id: str | None = None,
 ) -> tuple[str, int, bool, str, str]:
   """在同一事务内处理 API 限额、幂等记录和回测任务创建。"""
   owner_user_id = current_user_id()
@@ -1527,7 +1783,7 @@ def create_api_backtest_job(
       existing = cur.fetchone()
       if existing:
         if existing["request_hash"] != request_hash:
-          raise ConflictError("同一幂等键不能用于不同请求")
+          raise IdempotencyConflictError("同一幂等键不能用于不同请求")
         if existing["run_id"] is None:
           raise DatabaseError("幂等请求尚未完成，请重试")
         cur.execute("SELECT display_no, status, fill_model FROM backtest_run WHERE id=%s", (existing["run_id"],))
@@ -1563,8 +1819,9 @@ def create_api_backtest_job(
         raise ValueError("API Key 今日回测提交次数已达上限")
       cur.execute("""
         INSERT INTO api_idempotency_record (
-          api_key_id, owner_user_id, idempotency_key, request_hash
-        ) VALUES (%s, %s, %s, %s)
+          api_key_id, owner_user_id, idempotency_key, request_hash,
+          operation_type, resource_type
+        ) VALUES (%s, %s, %s, %s, 'backtest.submit', 'backtest')
       """, (api_key_id, owner_user_id, idempotency_key, request_hash))
       if payload.get("fillModel") == "l2_quote":
         run_id, display_no = _create_queued_backtest_job(
@@ -1575,13 +1832,32 @@ def create_api_backtest_job(
           cur, payload, owner_user_id, "bar_backtest_job", payload.get("fillModel", "bar_next_open"),
         )
       cur.execute("""
-        UPDATE api_idempotency_record SET run_id=%s
+        UPDATE api_idempotency_record
+        SET run_id=%s, resource_id=%s, response_status=202,
+          response_body=%s
         WHERE api_key_id=%s AND idempotency_key=%s
-      """, (run_id, api_key_id, idempotency_key))
+      """, (
+        run_id,
+        run_id,
+        Jsonb({
+          "run_id": run_id,
+          "display_no": display_no,
+          "status": "queued",
+          "fill_model": payload.get("fillModel", "bar_next_open"),
+        }),
+        api_key_id,
+        idempotency_key,
+      ))
       cur.execute("""
-        INSERT INTO api_access_audit (api_key_id, owner_user_id, event_type, detail)
-        VALUES (%s, %s, 'backtest_submitted', %s)
-      """, (api_key_id, owner_user_id, Jsonb({"runId": run_id, "fillModel": payload.get("fillModel")})))
+        INSERT INTO api_access_audit (
+          api_key_id, owner_user_id, event_type, request_id, detail
+        ) VALUES (%s, %s, 'backtest_submitted', %s, %s)
+      """, (
+        api_key_id,
+        owner_user_id,
+        request_id,
+        Jsonb({"runId": run_id, "fillModel": payload.get("fillModel")}),
+      ))
       return run_id, display_no, False, "queued", str(payload.get("fillModel", "bar_next_open"))
 
 
@@ -2687,6 +2963,7 @@ _SHARED_CONFIGURATION_KEYS = (
   "allowShort", "holdingPolicy", "overlaySettlementPolicy", "fillModel",
   "executionAlgorithm", "executionParameters", "baseQuantity", "baseCostPrice",
   "initialPositionEnabled", "t0Enabled", "warmupTradingDays", "strategyParams",
+  "savedStrategyParams", "strategyParamOverrides", "effectiveStrategyParams",
 )
 _SHARED_DETAIL_STRATEGY_KEYS = (
   "name", "description", "entryType", "code", "codeHash", "signalRequired",
@@ -2896,6 +3173,7 @@ def _publication_detail(
   )
   for key in (
     "params", "runParams", "execution", "strategyParams",
+    "savedStrategyParams", "strategyParamOverrides", "effectiveStrategyParams",
     "executionParameters", "feeProfile",
   ):
     if key in configuration:

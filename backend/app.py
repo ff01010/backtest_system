@@ -13,8 +13,9 @@ import hmac
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -69,6 +70,7 @@ from backend.services import (
   shared_backtest_discovery,
   state_store,
   strategy_adapters,
+  strategy_lifecycle,
   task_diagnostics,
 )
 from backend.services import auth
@@ -123,43 +125,104 @@ app.add_middleware(
   allow_credentials=True,
   allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
   allow_headers=["*"],
+  expose_headers=["X-Request-Id"],
 )
 
 
-@app.middleware("http")
-async def authenticate_api_request(request: Request, call_next):
-  """按 Cookie 或 API Key 认证业务接口，并将用户写入当前请求上下文。"""
-  if request.url.path.startswith("/api/v1/"):
-    request.state.request_id = f"req_{uuid4().hex}"
-    if not settings.PUBLIC_API_ENABLED:
-      return _public_api_error(request, 404, "api.disabled", "开放 API 未启用")
-    authorization = request.headers.get("authorization", "")
-    token_value = authorization[7:] if authorization.lower().startswith("bearer ") else None
-    principal = auth.get_api_key_principal(token_value)
-    if principal is None:
-      return _public_api_error(request, 401, "api_key_invalid", "API Key 无效、已撤销或已过期")
-    user, api_key = principal
-    request.state.api_key = api_key
-    token = set_current_user(user)
-    try:
-      return await call_next(request)
-    finally:
-      reset_current_user(token)
-  path = request.url.path
-  if request.method == "OPTIONS" or not path.startswith("/api/") or path in {
-    "/api/health",
-    "/api/auth/login",
-    "/api/auth/logout",
-  }:
-    return await call_next(request)
-  user = auth.get_user_by_token(request.cookies.get(auth.SESSION_COOKIE))
-  if not user:
-    return JSONResponse(status_code=401, content={"detail": "登录已失效，请重新登录"})
+async def _call_as_user(
+  request: Request,
+  call_next: Callable[[Request], Awaitable[Response]],
+  user: CurrentUser,
+  auth_type: str,
+) -> Response:
+  request.state.auth_type = auth_type
   token = set_current_user(user)
   try:
     return await call_next(request)
   finally:
     reset_current_user(token)
+
+
+async def _authenticate_public_api_request(
+  request: Request,
+  call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+  if not settings.PUBLIC_API_ENABLED:
+    return _public_api_error(request, 404, "api.disabled", "开放 API 未启用")
+  authorization = request.headers.get("authorization", "")
+  token_value = authorization[7:] if authorization.lower().startswith("bearer ") else None
+  principal = auth.get_api_key_principal(token_value)
+  if principal is None:
+    return _public_api_error(
+      request, 401, "api_key_invalid", "API Key 无效、已撤销或已过期",
+    )
+  user, api_key = principal
+  request.state.api_key = api_key
+  return await _call_as_user(request, call_next, user, "api_key")
+
+
+async def _dispatch_authenticated_request(
+  request: Request,
+  call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+  path = request.url.path
+  if path.startswith("/api/v1/"):
+    return await _authenticate_public_api_request(request, call_next)
+  if request.method == "OPTIONS" or not path.startswith("/api/") or path in {
+    "/api/health", "/api/auth/login", "/api/auth/logout",
+  }:
+    return await call_next(request)
+  user = auth.get_user_by_token(request.cookies.get(auth.SESSION_COOKIE))
+  if not user:
+    return _legacy_api_error(request, 401, "登录已失效，请重新登录")
+  return await _call_as_user(request, call_next, user, "cookie")
+
+
+def _finish_api_request(
+  request: Request,
+  response: Response,
+  started_at: float,
+) -> Response:
+  request_id = request.state.request_id
+  response.headers["X-Request-Id"] = request_id
+  logger.info("api_request %s", json.dumps({
+    "requestId": request_id,
+    "method": request.method,
+    "path": request.url.path,
+    "statusCode": response.status_code,
+    "durationMs": round((perf_counter() - started_at) * 1000, 3),
+    "authType": request.state.auth_type,
+  }, ensure_ascii=False, separators=(",", ":")))
+  return response
+
+
+@app.middleware("http")
+async def authenticate_api_request(
+  request: Request,
+  call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+  """按 Cookie 或 API Key 认证业务接口，并将用户写入当前请求上下文。"""
+  path = request.url.path
+  is_api_request = path == "/api" or path.startswith("/api/")
+  started_at = perf_counter()
+  if is_api_request:
+    request.state.request_id = f"req_{uuid4().hex}"
+  request.state.auth_type = "anonymous"
+  try:
+    response = await _dispatch_authenticated_request(request, call_next)
+  except Exception as error:
+    response = await handle_unexpected_exception(request, error)
+  return _finish_api_request(request, response, started_at) if is_api_request else response
+
+
+def _legacy_api_error(request: Request, status_code: int, detail: Any) -> JSONResponse:
+  return JSONResponse(
+    status_code=status_code,
+    content={
+      "detail": detail,
+      "requestId": getattr(request.state, "request_id", None),
+    },
+  )
 
 
 def _public_api_error(
@@ -176,6 +239,7 @@ def _public_api_error(
         "code": code,
         "message": message,
         "retryable": retryable,
+        "requestId": getattr(request.state, "request_id", None),
         "request_id": getattr(request.state, "request_id", None),
       },
     },
@@ -185,32 +249,55 @@ def _public_api_error(
 @app.exception_handler(HTTPException)
 async def handle_http_exception(request: Request, error: HTTPException) -> JSONResponse:
   if request.url.path.startswith("/api/v1/"):
-    detail = error.detail if isinstance(error.detail, str) else "请求无法完成"
-    code = "backtest.validation_failed" if error.status_code == 422 else "request.failed"
-    if error.status_code == 403:
-      code = "api_scope_denied"
-    elif error.status_code == 404:
-      code = "resource.not_found"
-    elif error.status_code == 409:
-      code = "idempotency.conflict"
-    elif error.status_code == 429:
-      code = "rate_limit.exceeded"
+    structured = error.detail if isinstance(error.detail, dict) else {}
+    detail = (
+      str(structured.get("message"))
+      if structured.get("message")
+      else error.detail if isinstance(error.detail, str) else "请求无法完成"
+    )
+    code = str(structured.get("code") or "")
+    if not code:
+      code = "backtest.validation_failed" if error.status_code == 422 else "request.failed"
+      if error.status_code == 403:
+        code = "api_scope_denied"
+      elif error.status_code == 404:
+        code = "resource.not_found"
+      elif error.status_code == 409:
+        code = "idempotency.conflict"
+      elif error.status_code == 429:
+        code = "rate_limit.exceeded"
     return _public_api_error(request, error.status_code, code, detail, error.status_code >= 500)
+  if request.url.path == "/api" or request.url.path.startswith("/api/"):
+    return _legacy_api_error(request, error.status_code, error.detail)
   return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
 
 
 @app.exception_handler(RequestValidationError)
 async def handle_request_validation_error(request: Request, error: RequestValidationError) -> JSONResponse:
   if request.url.path.startswith("/api/v1/"):
-    return _public_api_error(request, 422, "backtest.validation_failed", "请求参数不符合接口约束")
+    code = (
+      "strategy.validation_failed"
+      if request.url.path.startswith("/api/v1/strategies")
+      else "backtest.validation_failed"
+    )
+    return _public_api_error(request, 422, code, "请求参数不符合接口约束")
+  if request.url.path == "/api" or request.url.path.startswith("/api/"):
+    return _legacy_api_error(request, 422, "请求参数不符合接口约束")
   return JSONResponse(status_code=422, content={"detail": error.errors()})
 
 
 @app.exception_handler(Exception)
 async def handle_unexpected_exception(request: Request, error: Exception) -> JSONResponse:
-  logger.exception("未处理接口异常: %s", request.url.path, exc_info=error)
+  logger.exception(
+    "未处理接口异常: path=%s request_id=%s",
+    request.url.path,
+    getattr(request.state, "request_id", None),
+    exc_info=error,
+  )
   if request.url.path.startswith("/api/v1/"):
     return _public_api_error(request, 503, "backtest.unavailable", "服务暂时不可用，请稍后重试", True)
+  if request.url.path == "/api" or request.url.path.startswith("/api/"):
+    return _legacy_api_error(request, 500, "服务器内部错误")
   return JSONResponse(status_code=500, content={"detail": "服务器内部错误"})
 
 
@@ -329,15 +416,27 @@ _EXPERIMENT_PARAM_KEYS = {
 
 def _validate_saved_params(request: dict, config: dict) -> None:
   """策略语义参数必须来自已保存的当前策略。"""
-  saved_params = config.get("paramsJson", {}).get("params", {})
+  params_json = config.get("paramsJson", {})
+  saved_params = params_json.get("params", {}) if isinstance(params_json, dict) else {}
   if not isinstance(saved_params, dict):
     return
+  definitions = (
+    params_json.get("strategyParameterDefinitions", {})
+    if isinstance(params_json, dict)
+    else {}
+  )
+  declared_names = set(definitions) if isinstance(definitions, dict) else set()
   request_params = request.get("strategyParams", {})
   if not isinstance(request_params, dict):
     raise HTTPException(422, "策略参数格式非法")
   mismatches: list[str] = []
   for key, value in saved_params.items():
-    if key != "warmupTradingDays" and key not in _EXPERIMENT_PARAM_KEYS and request_params.get(key) != value:
+    if (
+      key != "warmupTradingDays"
+      and key not in _EXPERIMENT_PARAM_KEYS
+      and key not in declared_names
+      and request_params.get(key) != value
+    ):
       mismatches.append(key)
   if mismatches:
     raise HTTPException(422, f"策略内容已修改，请先保存策略：{', '.join(sorted(mismatches))}")
@@ -385,6 +484,36 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     raise HTTPException(422, str(error)) from error
   if request.get("fillModel") == "l2_quote" and warmup_days != 0:
     raise HTTPException(422, "L2 盘口回测不支持策略声明预热交易日")
+  params_json = config.get("paramsJson") if isinstance(config.get("paramsJson"), dict) else {}
+  definitions = params_json.get("strategyParameterDefinitions")
+  declared_names = set(definitions) if isinstance(definitions, dict) else set()
+  overrides = request.get("strategyParamOverrides")
+  if not isinstance(overrides, dict):
+    request_params = request.get("strategyParams")
+    overrides = {
+      name: request_params[name]
+      for name in declared_names
+      if isinstance(request_params, dict) and name in request_params
+    }
+  try:
+    saved_strategy_params, strategy_param_overrides, effective_strategy_params = (
+      strategy_lifecycle.effective_strategy_parameters(config, overrides)
+    )
+  except strategy_lifecycle.StrategyLifecycleError as error:
+    raise HTTPException(422, {
+      "code": error.code,
+      "message": str(error),
+    }) from error
+  request_params = request.get("strategyParams")
+  structural_params = request_params if isinstance(request_params, dict) else {}
+  request["strategyParams"] = {
+    key: value
+    for key, value in structural_params.items()
+    if key not in declared_names
+  } | effective_strategy_params
+  request["savedStrategyParams"] = saved_strategy_params
+  request["strategyParamOverrides"] = strategy_param_overrides
+  request["effectiveStrategyParams"] = effective_strategy_params
   _validate_saved_params(request, config)
   request["strategy"] = config["strategy"]
   request["scriptId"] = script["id"]
@@ -408,6 +537,9 @@ def _prepare_saved_strategy_snapshot(request: dict) -> None:
     "benchmarkSymbol": config.get("benchmarkSymbol"), "accountId": config.get("accountId"),
     "params": config.get("paramsJson", {}).get("params", {}),
     "description": script["description"], "runParams": request.get("strategyParams", {}),
+    "savedStrategyParams": request.get("savedStrategyParams", {}),
+    "strategyParamOverrides": request.get("strategyParamOverrides", {}),
+    "effectiveStrategyParams": request.get("effectiveStrategyParams", {}),
     "warmupTradingDays": warmup_days,
     "signalRequired": signal_required,
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
@@ -525,11 +657,26 @@ def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest)
   except KeyError as error:
     raise HTTPException(404, "策略方案不存在") from error
   if not config.get("enabled") or not config.get("published", True):
-    raise HTTPException(409, "策略方案未启用或尚未发布")
+    raise HTTPException(409, {
+      "code": "backtest.strategy_unavailable",
+      "message": "策略方案未启用或尚未发布",
+    })
   params_json = config.get("paramsJson")
   saved_params = params_json.get("params", {}) if isinstance(params_json, dict) else {}
   if not isinstance(saved_params, dict):
     raise HTTPException(422, "策略方案缺少可运行参数")
+
+  try:
+    saved_strategy_params, strategy_param_overrides, effective_strategy_params = (
+      strategy_lifecycle.effective_strategy_parameters(
+        config, dict(payload.overrides.strategy_params),
+      )
+    )
+  except strategy_lifecycle.StrategyLifecycleError as error:
+    raise HTTPException(422, {
+      "code": error.code,
+      "message": str(error),
+    }) from error
 
   values = dict(saved_params)
   overrides = _model_dump(payload.overrides)
@@ -584,9 +731,12 @@ def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest)
     strategyParams={
       key: value for key, value in saved_params.items()
       if key not in _EXPERIMENT_PARAM_KEYS
-    },
+    } | effective_strategy_params,
   )
   request = _model_dump(request_model)
+  request["savedStrategyParams"] = saved_strategy_params
+  request["strategyParamOverrides"] = strategy_param_overrides
+  request["effectiveStrategyParams"] = effective_strategy_params
   _validate_backtest_request(request)
   return request
 
@@ -594,6 +744,130 @@ def _build_public_backtest_request(payload: schemas.PublicBacktestCreateRequest)
 def _public_request_hash(payload: schemas.PublicBacktestCreateRequest) -> str:
   canonical = json.dumps(_model_dump(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
   return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _public_write_hash(method: str, path: str, payload: Any) -> str:
+  canonical = json.dumps({
+    "method": method.upper(),
+    "path": path,
+    "body": _model_dump(payload),
+  }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+  return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _public_idempotency_key(request: Request) -> str:
+  value = request.headers.get("idempotency-key", "").strip()
+  if not 8 <= len(value) <= 128:
+    raise HTTPException(422, {
+      "code": "strategy.validation_failed",
+      "message": "Idempotency-Key 必须为 8 至 128 个字符",
+    })
+  return value
+
+
+def _public_write_context(
+  request: Request,
+  api_key: auth.ApiKeyPrincipal,
+  operation_type: str,
+  payload: Any,
+) -> strategy_lifecycle.PublicWriteContext:
+  return strategy_lifecycle.PublicWriteContext(
+    api_key_id=api_key.id,
+    idempotency_key=_public_idempotency_key(request),
+    request_hash=_public_write_hash(request.method, request.url.path, payload),
+    operation_type=operation_type,
+    request_id=getattr(request.state, "request_id", None),
+  )
+
+
+def _public_backtest_params_to_internal(
+  parameters: schemas.PublicStrategyBacktestParameters,
+) -> dict[str, Any]:
+  values = _model_dump(parameters)
+  execution = values.get("execution_parameters") or {}
+  return {
+    "startDate": values["start_date"],
+    "endDate": values["end_date"],
+    "initialCapital": values["initial_capital"],
+    "commissionRate": values["commission_rate"],
+    "slippage": values["slippage"],
+    "allowLong": values["allow_long"],
+    "allowShort": values["allow_short"],
+    "strategyCategory": values["strategy_category"],
+    "holdingPolicy": values["holding_policy"],
+    "overlaySettlementPolicy": values["overlay_settlement_policy"],
+    "fillModel": values["fill_model"],
+    "executionAlgorithm": values["execution_algorithm"],
+    "twapDurationSeconds": execution.get("duration_seconds"),
+    "twapIntervalSeconds": execution.get("interval_seconds"),
+    "twapMinChildQuantity": execution.get("min_child_quantity"),
+    "baseQuantity": values["base_quantity"],
+    "baseCostPrice": values["base_cost_price"],
+    "initialPositionEnabled": values["initial_position_enabled"],
+    "t0Enabled": values["t0_enabled"],
+  }
+
+
+def _public_strategy_command(
+  payload: schemas.PublicStrategyCreateRequest | schemas.PublicStrategyUpdateRequest,
+  config_id: str | None = None,
+) -> strategy_lifecycle.StrategySaveCommand:
+  return strategy_lifecycle.StrategySaveCommand(
+    name=payload.name,
+    description=payload.description,
+    code=payload.code,
+    entry_type=payload.entry_type,
+    signal_required=payload.signal_required,
+    strategy="user_script",
+    mode="backtest",
+    symbol=payload.symbol,
+    timeframe=payload.timeframe,
+    benchmark_symbol=payload.benchmark_symbol or payload.symbol,
+    account_id=None,
+    params_json={"params": _public_backtest_params_to_internal(payload.backtest_parameters)},
+    strategy_parameters=dict(payload.strategy_parameters),
+    enabled=payload.enabled,
+    config_id=config_id,
+    expected_revision=(
+      payload.expected_revision
+      if isinstance(payload, schemas.PublicStrategyUpdateRequest)
+      else None
+    ),
+  )
+
+
+def _raise_public_strategy_error(error: Exception) -> None:
+  if isinstance(error, strategy_lifecycle.StrategyLifecycleError):
+    raise HTTPException(error.status_code, {
+      "code": error.code,
+      "message": str(error),
+    }) from error
+  if isinstance(error, state_store.RevisionConflictError):
+    raise HTTPException(409, {
+      "code": "strategy.revision_conflict",
+      "message": str(error),
+    }) from error
+  if isinstance(error, state_store.NameConflictError):
+    raise HTTPException(409, {
+      "code": "strategy.name_conflict",
+      "message": str(error),
+    }) from error
+  if isinstance(error, state_store.IdempotencyConflictError):
+    raise HTTPException(409, {
+      "code": "idempotency.conflict",
+      "message": str(error),
+    }) from error
+  if isinstance(error, KeyError):
+    raise HTTPException(404, {
+      "code": "strategy.not_found",
+      "message": "策略不存在",
+    }) from error
+  if isinstance(error, state_store.ConflictError):
+    raise HTTPException(409, {
+      "code": "strategy.state_conflict",
+      "message": str(error),
+    }) from error
+  raise error
 
 
 def _public_run_payload(run: dict[str, Any]) -> dict[str, Any]:
@@ -754,14 +1028,19 @@ def public_strategy_guide() -> Response:
 
 
 @app.post("/api/auth/login")
-def login(payload: schemas.LoginRequest, request: Request, response: Response):
+def login(
+  payload: schemas.LoginRequest,
+  request: Request,
+  response: Response,
+) -> dict[str, Any]:
   """校验用户名密码并签发仅浏览器可见的 HttpOnly 会话 Cookie。"""
   try:
-    token, user = auth.authenticate(
+    token, user, csrf_token = auth.authenticate(
       payload.username,
       payload.password,
       request.client.host if request.client else None,
       request.headers.get("user-agent"),
+      getattr(request.state, "request_id", None),
     )
   except auth.AuthenticationError as error:
     raise HTTPException(401, str(error)) from error
@@ -774,20 +1053,39 @@ def login(payload: schemas.LoginRequest, request: Request, response: Response):
     secure=settings.AUTH_COOKIE_SECURE,
     path="/",
   )
-  return {"user": {
-    "id": user.id,
-    "username": user.username,
-    "displayName": user.display_name,
-    "role": user.role,
-  }}
+  return {
+    "user": {
+      "id": user.id,
+      "username": user.username,
+      "displayName": user.display_name,
+      "role": user.role,
+    },
+    "csrfToken": csrf_token,
+  }
 
 
 @app.post("/api/auth/logout")
-def logout(request: Request, response: Response):
+def logout(request: Request, response: Response) -> dict[str, bool]:
   """撤销服务端会话并清除浏览器 Cookie。"""
-  auth.revoke_session(request.cookies.get(auth.SESSION_COOKIE))
+  auth.revoke_session(
+    request.cookies.get(auth.SESSION_COOKIE),
+    getattr(request.state, "request_id", None),
+    request.client.host if request.client else None,
+  )
   response.delete_cookie(auth.SESSION_COOKIE, path="/")
   return {"ok": True}
+
+
+@app.get("/api/auth/csrf")
+def refresh_csrf_token(request: Request) -> dict[str, str]:
+  """为有效 Cookie 会话签发或轮换仅本次响应可见的 CSRF Token。"""
+  csrf_token = auth.rotate_csrf_token(
+    request.cookies.get(auth.SESSION_COOKIE),
+    getattr(request.state, "request_id", None),
+  )
+  if not csrf_token:
+    raise HTTPException(401, "登录已失效，请重新登录")
+  return {"csrfToken": csrf_token}
 
 
 @app.get("/api/auth/me")
@@ -856,13 +1154,17 @@ def api_keys():
 
 
 @app.post("/api/api-keys")
-def create_api_key(payload: schemas.ApiKeyCreateRequest):
+def create_api_key(
+  payload: schemas.ApiKeyCreateRequest,
+  request: Request,
+) -> dict[str, Any]:
   try:
     key, plain_text_key = auth.create_api_key(
       get_current_user().id,
       payload.name,
       list(payload.scopes),
       payload.expiresAt,
+      getattr(request.state, "request_id", None),
     )
   except auth.ApiKeyError as error:
     raise HTTPException(422, str(error)) from error
@@ -870,8 +1172,10 @@ def create_api_key(payload: schemas.ApiKeyCreateRequest):
 
 
 @app.delete("/api/api-keys/{key_id}")
-def revoke_api_key(key_id: str):
-  if not auth.revoke_api_key(get_current_user().id, key_id):
+def revoke_api_key(key_id: str, request: Request) -> dict[str, bool]:
+  if not auth.revoke_api_key(
+    get_current_user().id, key_id, getattr(request.state, "request_id", None),
+  ):
     raise HTTPException(404, "API Key 不存在")
   return {"revoked": True}
 
@@ -1192,23 +1496,41 @@ def update_strategy_config(config_id: str, payload: schemas.StrategyConfigUpdate
 def save_complete_strategy(payload: schemas.CompleteStrategySave):
   script_request = _model_dump(payload.script)
   config_request = _model_dump(payload.config)
-  _validate_strategy_script(script_request)
-  _apply_script_warmup_to_config(script_request, config_request)
-  if not settings.validate_symbol(config_request["symbol"]):
-    raise HTTPException(422, f"非法标的: {config_request['symbol']}")
-  if config_request.get("benchmarkSymbol") and not settings.validate_symbol(config_request["benchmarkSymbol"]):
-    raise HTTPException(422, f"非法买入持有基准: {config_request['benchmarkSymbol']}")
-  _validate_strategy_config_timeframe(config_request)
+  params_json = config_request.get("paramsJson")
+  strategy_parameters = (
+    params_json.get("strategyParams")
+    if isinstance(params_json, dict) and isinstance(params_json.get("strategyParams"), dict)
+    else None
+  )
   try:
-    saved = state_store.save_complete_strategy(
-      script_request, config_request, payload.scriptId, payload.configId,
-      payload.expectedRevision,
+    saved = strategy_lifecycle.save_strategy(
+      strategy_lifecycle.StrategySaveCommand(
+        name=str(config_request["name"]),
+        description=str(script_request.get("description", "")),
+        code=str(script_request["code"]),
+        entry_type=str(script_request.get("entryType", "on_bar")),
+        signal_required=bool(script_request.get("signalRequired", False)),
+        strategy=str(config_request.get("strategy", "user_script")),
+        mode=str(config_request.get("mode", "backtest")),
+        symbol=str(config_request["symbol"]),
+        timeframe=str(config_request.get("timeframe", "5m")),
+        benchmark_symbol=config_request.get("benchmarkSymbol"),
+        account_id=config_request.get("accountId"),
+        params_json=dict(params_json) if isinstance(params_json, dict) else {},
+        strategy_parameters=strategy_parameters,
+        enabled=bool(config_request.get("enabled", True)),
+        script_id=payload.scriptId,
+        config_id=payload.configId,
+        expected_revision=payload.expectedRevision,
+      ),
     )
     return {
       **saved,
       "runtimeVersion": SCRIPT_RUNTIME_VERSION,
       "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     }
+  except strategy_lifecycle.StrategyLifecycleError as error:
+    raise HTTPException(error.status_code, str(error)) from error
   except KeyError as error:
     raise HTTPException(404, "策略脚本或策略配置不存在") from error
   except state_store.ConflictError as error:
@@ -1225,21 +1547,6 @@ def get_complete_strategy(config_id: str):
     raise HTTPException(404, f"策略不存在: {config_id}") from error
   except state_store.DatabaseError as error:
     raise HTTPException(500, f"PostgreSQL 读取完整策略失败: {error}") from error
-
-
-def _apply_script_warmup_to_config(script: dict[str, Any], config: dict[str, Any]) -> None:
-  """保存完整策略时，将代码声明写入与代码绑定的配置快照。"""
-  params_json = config.get("paramsJson")
-  params = params_json.get("params") if isinstance(params_json, dict) else None
-  if not isinstance(params, dict):
-    raise HTTPException(422, "完整策略必须包含回测参数")
-  try:
-    warmup_days = warmup_trading_days_for_script(str(script.get("code", "")))
-  except ValueError as error:
-    raise HTTPException(422, str(error)) from error
-  if params.get("fillModel", "bar_next_open") == "l2_quote" and warmup_days != 0:
-    raise HTTPException(422, "L2 盘口回测不支持策略声明预热交易日")
-  params["warmupTradingDays"] = warmup_days
 
 
 def _validate_strategy_config_timeframe(request: dict[str, Any]) -> None:
@@ -1828,6 +2135,155 @@ def backtest_timeframes_batch(
   }
 
 
+@app.get("/api/v1/strategies")
+def public_strategies(
+  request: Request,
+  limit: int = Query(20, ge=1, le=100),
+  cursor: int = Query(0, ge=0),
+  archived: bool | None = None,
+  enabled: bool | None = None,
+):
+  _require_public_scope(request, "strategy:read")
+  return strategy_lifecycle.list_strategies(limit, cursor, archived, enabled)
+
+
+@app.get("/api/v1/strategies/{config_id}")
+def public_strategy_detail(config_id: str, request: Request):
+  _require_public_scope(request, "strategy:read")
+  try:
+    return {"strategy": strategy_lifecycle.get_strategy(config_id)}
+  except Exception as error:
+    _raise_public_strategy_error(error)
+
+
+@app.post("/api/v1/strategies")
+def public_create_strategy(
+  payload: schemas.PublicStrategyCreateRequest,
+  request: Request,
+):
+  api_key = _require_public_scope(request, "strategy:write")
+  try:
+    result = strategy_lifecycle.save_strategy(
+      _public_strategy_command(payload),
+      _public_write_context(request, api_key, "strategy.create", payload),
+    )
+  except Exception as error:
+    _raise_public_strategy_error(error)
+  status_code = int(result.pop("response_status"))
+  return JSONResponse(
+    status_code=status_code,
+    content={**result, "request_id": request.state.request_id},
+  )
+
+
+@app.put("/api/v1/strategies/{config_id}")
+def public_update_strategy(
+  config_id: str,
+  payload: schemas.PublicStrategyUpdateRequest,
+  request: Request,
+):
+  api_key = _require_public_scope(request, "strategy:write")
+  try:
+    result = strategy_lifecycle.save_strategy(
+      _public_strategy_command(payload, config_id),
+      _public_write_context(request, api_key, "strategy.update", payload),
+    )
+  except Exception as error:
+    _raise_public_strategy_error(error)
+  status_code = int(result.pop("response_status"))
+  return JSONResponse(
+    status_code=status_code,
+    content={**result, "request_id": request.state.request_id},
+  )
+
+
+def _public_strategy_revision_action(
+  config_id: str,
+  payload: schemas.PublicStrategyRevisionRequest,
+  request: Request,
+  scope: str,
+  operation_type: str,
+  action: Any,
+) -> JSONResponse:
+  api_key = _require_public_scope(request, scope)
+  try:
+    result = action(
+      config_id,
+      payload.expected_revision,
+      _public_write_context(request, api_key, operation_type, payload),
+    )
+  except Exception as error:
+    _raise_public_strategy_error(error)
+  status_code = int(result.pop("response_status"))
+  return JSONResponse(
+    status_code=status_code,
+    content={**result, "request_id": request.state.request_id},
+  )
+
+
+@app.post("/api/v1/strategies/{config_id}/publish")
+def public_publish_strategy(
+  config_id: str,
+  payload: schemas.PublicStrategyRevisionRequest,
+  request: Request,
+):
+  return _public_strategy_revision_action(
+    config_id, payload, request, "strategy:publish", "strategy.publish",
+    strategy_lifecycle.publish_strategy,
+  )
+
+
+@app.post("/api/v1/strategies/{config_id}/archive")
+def public_archive_strategy(
+  config_id: str,
+  payload: schemas.PublicStrategyRevisionRequest,
+  request: Request,
+):
+  return _public_strategy_revision_action(
+    config_id, payload, request, "strategy:delete", "strategy.archive",
+    strategy_lifecycle.archive_strategy,
+  )
+
+
+@app.post("/api/v1/strategies/{config_id}/restore")
+def public_restore_strategy(
+  config_id: str,
+  payload: schemas.PublicStrategyRevisionRequest,
+  request: Request,
+):
+  return _public_strategy_revision_action(
+    config_id, payload, request, "strategy:write", "strategy.restore",
+    strategy_lifecycle.restore_strategy,
+  )
+
+
+@app.get("/api/v1/strategies/{config_id}/versions")
+def public_strategy_versions(
+  config_id: str,
+  request: Request,
+  limit: int = Query(20, ge=1, le=100),
+  cursor: int = Query(0, ge=0),
+):
+  _require_public_scope(request, "strategy:read")
+  try:
+    return strategy_lifecycle.list_versions(config_id, limit, cursor)
+  except Exception as error:
+    _raise_public_strategy_error(error)
+
+
+@app.get("/api/v1/strategies/{config_id}/versions/{version_id}")
+def public_strategy_version_detail(
+  config_id: str,
+  version_id: str,
+  request: Request,
+):
+  _require_public_scope(request, "strategy:read")
+  try:
+    return {"version": strategy_lifecycle.get_version(config_id, version_id)}
+  except Exception as error:
+    _raise_public_strategy_error(error)
+
+
 @app.post("/api/v1/backtests")
 def public_create_backtest(payload: schemas.PublicBacktestCreateRequest, request: Request):
   api_key = _require_public_scope(request, "backtest:submit")
@@ -1841,6 +2297,7 @@ def public_create_backtest(payload: schemas.PublicBacktestCreateRequest, request
       api_key.id,
       idempotency_key,
       _public_request_hash(payload),
+      getattr(request.state, "request_id", None),
     )
   except state_store.ConflictError as error:
     raise HTTPException(409, str(error)) from error
@@ -1930,10 +2387,37 @@ def public_cancel_backtest(run_id: str, request: Request):
 
 
 @app.post("/api/backtest/run")
-def run_backtest(payload: schemas.BacktestRunRequest):
+def run_backtest(payload: schemas.BacktestRunRequest, http_request: Request):
   request = _model_dump(payload)
   _validate_backtest_request(request)
   _require_backtest_runner(str(request.get("fillModel", "bar_next_open")))
+
+  idempotency_key = http_request.headers.get("idempotency-key", "").strip()
+  if idempotency_key:
+    if not 8 <= len(idempotency_key) <= 128:
+      raise HTTPException(422, "Idempotency-Key 必须为 8 至 128 个字符")
+    request_hash = hashlib.sha256(json.dumps(
+      request, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    try:
+      run_id, display_no, replayed, run_status, fill_model = (
+        state_store.create_browser_backtest_job(
+          request, idempotency_key, request_hash,
+        )
+      )
+    except state_store.IdempotencyConflictError as error:
+      raise HTTPException(409, str(error)) from error
+    return {
+      "runId": run_id,
+      "displayNo": display_no,
+      "configId": request.get("configId"),
+      "configVersionId": request.get("configVersionId"),
+      "scriptId": request.get("scriptId"),
+      "status": run_status,
+      "fillModel": fill_model,
+      "replayed": replayed,
+      "message": "回测幂等请求已返回原任务" if replayed else "回测已进入队列，等待执行",
+    }
 
   if request.get("fillModel") == "l2_quote":
     try:

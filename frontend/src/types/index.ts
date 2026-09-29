@@ -383,8 +383,9 @@ export interface StrategySource {
 }
 
 export interface StrategyParameterField {
-  type: 'number' | 'select' | 'boolean' | string;
-  label: string;
+  type: 'integer' | 'number' | 'string' | 'select' | 'boolean' | string;
+  label?: string;
+  default?: string | number | boolean;
   options?: string[];
   min?: number;
   max?: number;
@@ -418,6 +419,7 @@ export interface StrategyConfig {
   published: boolean;
   publishedVersionId: string | null;
   revision: number;
+  archivedAt?: string | null;
   sharedSource?: {
     publicationId: string;
     authorName: string;

@@ -22,6 +22,18 @@ def test_release_admin_uses_target_sha_and_preserves_recovery_image() -> None:
   assert "${RELEASE_ADMIN_IMAGE" in compose
 
 
+def test_deployment_has_no_trade_calendar_runtime_dependency() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(
+    encoding="utf-8",
+  )
+
+  assert "calendar-sync" not in script
+  assert "verify_trade_calendar" not in script
+  assert "calendar-sync" not in compose
+  assert "backend.trade_calendar_sync" not in compose
+
+
 def test_deploy_script_reexecutes_after_self_update_under_same_lock() -> None:
   script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
 
@@ -114,13 +126,45 @@ def test_observability_services_are_pinned_isolated_and_started_before_applicati
   assert compose.count("backend.runner_supervisor") == 2
   assert "- l2\n      - --processes\n      - '1'" in compose
   assert "- bar\n      - --processes\n      - '1'" in compose
-  assert "wait_for_observability" in script
+  assert script.index("up -d --build docker-socket-proxy loki alloy") < script.index(
+    "\nclose_submission_gate\n",
+  )
   assert script.index("run --rm migrate") < script.index(
-    "up -d --build docker-socket-proxy loki alloy container-event-observer",
+    "up -d --build container-event-observer",
   )
-  assert script.index("wait_for_observability") < script.index(
-    "backend bar-runner l2-runner signal-export-runner",
+  assert script.index("backend bar-runner l2-runner signal-export-runner") < (
+    script.index("if ! wait_for_observability; then")
   )
+
+
+def test_observability_failure_cannot_stop_core_release_after_cutover() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+
+  preflight = script.index("up -d --build docker-socket-proxy loki alloy")
+  gate_close = script.index("\nclose_submission_gate\n")
+  core_stop = script.index("\nstop_submission_and_wait_for_backtests\n")
+  assert preflight < gate_close < core_stop
+
+  migration = script.index("run --rm migrate")
+  observer = script.index("up -d --build container-event-observer")
+  core_start = script.index("backend bar-runner l2-runner signal-export-runner")
+
+  assert core_stop < migration < observer < core_start
+  assert 'if "${compose[@]}" up -d --build docker-socket-proxy loki alloy' in script
+  assert 'if "${compose[@]}" up -d --build container-event-observer' in script
+  assert "fail " not in script[preflight:gate_close]
+  assert "fail " not in script[observer:core_start]
+  gate_open = script.index("\nopen_submission_gate\n")
+  core_health = script.index('wait_for_application "$http_port"')
+  assert core_start < core_health < gate_open
+  assert gate_open < script.index("if ! wait_for_observability; then")
+  assert gate_open < script.index("核心回测服务已完成发布")
+  observability_check = script.split("wait_for_observability() {", 1)[1].split(
+    "\n}\n", 1,
+  )[0]
+  assert "return 1" in observability_check
+  assert "fail " not in observability_check
+  assert "可观测性未通过" in script
 
 
 def test_socket_proxy_uses_exact_read_only_endpoint_allowlist() -> None:

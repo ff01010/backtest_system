@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from backend import settings
+from backend.date_codec import format_api_date
 from backend.l2.config import has_profile, load_profile, load_temporary_quote_profile
 from backend.l2.models import NormalizedBar
 from backend.l2.providers import ClickHouseL2Adapter, L2DataError, RedisJsonCache, TemporaryQuoteBarProvider, VersionedBarCache
@@ -23,27 +24,15 @@ def load_bars_with_snapshot(
   end_date: str,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
   """一次任务只选择一个 Bar 来源，禁止跨来源拼接。"""
-  required_dates = _required_trade_dates(symbol, timeframe, start_date, end_date)
-  if has_profile("bar"):
-    try:
-      bars = ClickHouseL2Adapter(load_profile("bar")).load_bars(symbol, timeframe, start_date, end_date)
-      return _normalized_frame(bars), _snapshot("mapped_l2_bar", symbol, timeframe, start_date, end_date, len(bars))
-    except L2DataError as error:
-      if error.code != "data.l2_bar_missing":
-        raise
-  try:
-    resolution = market_data.resolve_backtest_data(
-      symbol, timeframe, start_date, end_date, required_dates,
-    )
-    frame, _ = market_data.load_backtest_bars(symbol, resolution)
-    snapshot = market_data.snapshot_for_resolution(symbol, resolution, bar_count=len(frame))
-    return frame, {**snapshot, "provider": "qmt_kline"}
-  except market_data.MarketDataError:
-    provider = _temporary_provider()
-    bars = provider.load_bars(symbol, timeframe, start_date, end_date)
-    snapshot = _snapshot("temporary_tick_quote_aggregation", symbol, timeframe, start_date, end_date, len(bars))
-    snapshot.update(provider.cache_snapshot())
+  mapped = _load_mapped_bars(symbol, timeframe, start_date, end_date)
+  if mapped is not None:
+    bars, snapshot = mapped
     return _normalized_frame(bars), snapshot
+  qmt = _load_qmt_bars(symbol, timeframe, start_date, end_date)
+  if qmt is not None:
+    return qmt
+  bars, snapshot = _load_temporary_bars(symbol, timeframe, start_date, end_date)
+  return _normalized_frame(bars), snapshot
 
 
 def ensure_available(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:
@@ -64,36 +53,86 @@ def load_normalized_bars_with_snapshot(
   end_date: str,
 ) -> tuple[list[NormalizedBar], dict[str, Any]]:
   """供 L2 回放使用，与标准回测保持完全相同的来源优先级。"""
-  required_dates = _required_trade_dates(symbol, timeframe, start_date, end_date)
-  if has_profile("bar"):
-    try:
-      provider = ClickHouseL2Adapter(load_profile("bar"))
-      bars = provider.load_bars(symbol, timeframe, start_date, end_date)
-      snapshot = _snapshot(
-        "mapped_l2_bar", symbol, timeframe, start_date, end_date, len(bars),
-      )
-      snapshot.update(provider.coverage(symbol, start_date, end_date).__dict__)
-      snapshot["provider"] = "mapped_l2_bar"
-      return bars, snapshot
-    except L2DataError as error:
-      if error.code != "data.l2_bar_missing":
-        raise
+  mapped = _load_mapped_bars(symbol, timeframe, start_date, end_date)
+  if mapped is not None:
+    return mapped
+  qmt = _load_qmt_bars(symbol, timeframe, start_date, end_date)
+  if qmt is not None:
+    frame, snapshot = qmt
+    return _qmt_normalized_bars(symbol, timeframe, frame), snapshot
+  return _load_temporary_bars(symbol, timeframe, start_date, end_date)
+
+
+def _load_mapped_bars(
+  symbol: str,
+  timeframe: str,
+  start_date: str,
+  end_date: str,
+) -> tuple[list[NormalizedBar], dict[str, Any]] | None:
+  if not has_profile("bar"):
+    return None
+  provider = ClickHouseL2Adapter(load_profile("bar"))
+  bounds = provider.bar_date_range(symbol, timeframe)
+  if not _range_is_covered(start_date, end_date, bounds):
+    return None
+  try:
+    bars = provider.load_bars(symbol, timeframe, start_date, end_date)
+  except L2DataError as error:
+    if error.code == "data.l2_bar_missing":
+      return None
+    raise
+  snapshot = _snapshot(
+    "mapped_l2_bar", symbol, timeframe, start_date, end_date, bars, bounds,
+  )
+  snapshot.update(provider.coverage(symbol, start_date, end_date).__dict__)
+  snapshot.update(provider.bar_source_identity(timeframe))
+  snapshot["provider"] = "mapped_l2_bar"
+  _refresh_snapshot_hash(snapshot)
+  return bars, snapshot
+
+
+def _load_qmt_bars(
+  symbol: str,
+  timeframe: str,
+  start_date: str,
+  end_date: str,
+) -> tuple[pd.DataFrame, dict[str, Any]] | None:
   try:
     resolution = market_data.resolve_backtest_data(
-      symbol, timeframe, start_date, end_date, required_dates,
+      symbol, timeframe, start_date, end_date,
     )
-    frame, _ = market_data.load_backtest_bars(symbol, resolution)
-    snapshot = {
-      **market_data.snapshot_for_resolution(symbol, resolution, bar_count=len(frame)),
-      "provider": "qmt_kline",
-    }
-    return _qmt_normalized_bars(symbol, timeframe, frame), snapshot
-  except market_data.MarketDataError:
-    provider = _temporary_provider()
-    bars = provider.load_bars(symbol, timeframe, start_date, end_date)
-    snapshot = _snapshot("temporary_tick_quote_aggregation", symbol, timeframe, start_date, end_date, len(bars))
-    snapshot.update(provider.cache_snapshot())
-    return bars, snapshot
+  except market_data.MarketDataError as error:
+    if error.reason in {"range_out_of_bounds", "no_complete_coverage"}:
+      return None
+    raise
+  frame, _ = market_data.load_backtest_bars(symbol, resolution)
+  snapshot = market_data.snapshot_for_resolution(symbol, resolution, bar_count=len(frame))
+  return frame, {**snapshot, "provider": "qmt_kline"}
+
+
+def _load_temporary_bars(
+  symbol: str,
+  timeframe: str,
+  start_date: str,
+  end_date: str,
+) -> tuple[list[NormalizedBar], dict[str, Any]]:
+  provider = _temporary_provider()
+  bounds = provider.available_date_range(symbol)
+  _require_source_range(symbol, timeframe, start_date, end_date, bounds)
+  bars = provider.load_bars(symbol, timeframe, start_date, end_date)
+  snapshot = _snapshot(
+    "temporary_tick_quote_aggregation", symbol, timeframe, start_date, end_date, bars, bounds,
+  )
+  snapshot.update(provider.cache_snapshot())
+  database, table = str(snapshot["inputTable"]).split(".", 1)
+  snapshot.update({
+    "sourceDatabase": database,
+    "sourceTable": table,
+    "sourcePeriod": timeframe,
+    "derivation": f"{timeframe}-from-quote-{settings.L2_TEMP_BAR_AGGREGATION_VERSION}",
+  })
+  _refresh_snapshot_hash(snapshot)
+  return bars, snapshot
 
 
 def _temporary_provider() -> TemporaryQuoteBarProvider:
@@ -109,20 +148,31 @@ def _temporary_provider() -> TemporaryQuoteBarProvider:
   )
 
 
-def _required_trade_dates(
+def _require_source_range(
   symbol: str,
   timeframe: str,
   start_date: str,
   end_date: str,
-) -> list[str]:
-  try:
-    return market_data.required_trade_dates(start_date, end_date)
-  except market_data.MarketDataError as error:
+  bounds: tuple[str, str] | None,
+) -> None:
+  if not _range_is_covered(start_date, end_date, bounds):
     raise BacktestFault(
       "data.bar_load_failed",
-      "回测交易日范围不可用",
+      "回测日期超出 Bar 来源可用边界",
       {"symbol": symbol, "timeframe": timeframe},
-    ) from error
+    )
+
+
+def _range_is_covered(
+  start_date: str,
+  end_date: str,
+  bounds: tuple[str, str] | None,
+) -> bool:
+  if bounds is None:
+    return False
+  start = format_api_date(start_date)
+  end = format_api_date(end_date)
+  return bounds[0] <= start <= end <= bounds[1]
 
 
 def derived_bar_available_dates(symbol: str, timeframe: str, trade_dates: list[str]) -> list[str]:
@@ -146,17 +196,38 @@ def _bar_time(value: str) -> str:
   return datetime.fromisoformat(str(value)).strftime("%Y%m%d%H%M%S")
 
 
-def _snapshot(provider: str, symbol: str, timeframe: str, start_date: str, end_date: str, count: int) -> dict[str, Any]:
+def _snapshot(
+  provider: str,
+  symbol: str,
+  timeframe: str,
+  start_date: str,
+  end_date: str,
+  bars: list[Any],
+  bounds: tuple[str, str] | None,
+) -> dict[str, Any]:
+  formal_dates = sorted({format_api_date(item.trade_date) for item in bars})
   identity = {
     "provider": provider,
     "symbol": symbol,
     "timeframe": timeframe,
     "startDate": start_date,
     "endDate": end_date,
-    "barCount": count,
+    "formalDates": formal_dates,
+    "warmupDates": [],
+    "warmupTradingDays": 0,
+    "barCount": len(bars),
+    "sourceFirstDate": bounds[0] if bounds else None,
+    "sourceLastDate": bounds[1] if bounds else None,
   }
   identity["hash"] = hashlib.sha256(repr(sorted(identity.items())).encode("utf-8")).hexdigest()
   return identity
+
+
+def _refresh_snapshot_hash(snapshot: dict[str, Any]) -> None:
+  identity = {key: value for key, value in snapshot.items() if key != "hash"}
+  snapshot["hash"] = hashlib.sha256(
+    repr(sorted(identity.items())).encode("utf-8"),
+  ).hexdigest()
 
 
 def _qmt_normalized_bars(symbol: str, period: str, frame: pd.DataFrame) -> list[NormalizedBar]:

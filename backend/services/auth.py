@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import secrets
 from typing import Any, Iterator
+from uuid import uuid4
 
 import psycopg
 from psycopg.errors import IntegrityError
@@ -23,8 +24,17 @@ from backend.time_utils import format_shanghai_datetime
 
 SESSION_COOKIE = "quant_backtest_session"
 SESSION_LIFETIME = timedelta(hours=12)
+CSRF_ROTATION_GRACE = timedelta(seconds=30)
 PASSWORD_ITERATIONS = 210_000
-API_KEY_SCOPES = {"backtest:submit", "backtest:read", "backtest:cancel"}
+API_KEY_SCOPES = {
+  "backtest:submit",
+  "backtest:read",
+  "backtest:cancel",
+  "strategy:read",
+  "strategy:write",
+  "strategy:publish",
+  "strategy:delete",
+}
 
 
 class AuthenticationError(RuntimeError):
@@ -123,6 +133,35 @@ def _api_key_hash(secret: str) -> str:
   ).hexdigest()
 
 
+def _token_hash(token: str) -> str:
+  """生成会话类随机令牌摘要，避免数据库保存可直接使用的凭据。"""
+  return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _audit_auth_event(
+  cur: psycopg.Cursor[Any],
+  user_id: str,
+  action: str,
+  session_id: str,
+  request_id: str | None,
+  client_ip: str | None = None,
+) -> None:
+  """只记录认证事件的关联标识，不保存令牌、凭据或请求内容。"""
+  cur.execute("""
+    INSERT INTO audit_log (
+      actor_user_id, target_user_id, action, resource_type, resource_id,
+      client_ip, metadata
+    ) VALUES (%s, %s, %s, 'auth_session', %s, %s, %s)
+  """, (
+    user_id,
+    user_id,
+    action,
+    session_id,
+    client_ip,
+    Jsonb({"requestId": request_id} if request_id else {}),
+  ))
+
+
 def _parse_api_key(value: str | None) -> tuple[str, str] | None:
   if not value or not value.startswith("qbk_"):
     return None
@@ -157,11 +196,13 @@ def _audit_api_key(
   owner_user_id: str,
   event_type: str,
   detail: dict[str, Any] | None = None,
+  request_id: str | None = None,
 ) -> None:
   cur.execute("""
-    INSERT INTO api_access_audit (api_key_id, owner_user_id, event_type, detail)
-    VALUES (%s, %s, %s, %s)
-  """, (key_id, owner_user_id, event_type, Jsonb(detail or {})))
+    INSERT INTO api_access_audit (
+      api_key_id, owner_user_id, event_type, request_id, detail
+    ) VALUES (%s, %s, %s, %s, %s)
+  """, (key_id, owner_user_id, event_type, request_id, Jsonb(detail or {})))
 
 
 def create_api_key(
@@ -169,6 +210,7 @@ def create_api_key(
   name: str,
   scopes: list[str],
   expires_at: datetime | None,
+  request_id: str | None = None,
 ) -> tuple[dict[str, Any], str]:
   """创建仅展示一次的 API Key，数据库只保存随机 secret 的 HMAC 摘要。"""
   normalized_name = name.strip()
@@ -192,7 +234,14 @@ def create_api_key(
           """, (owner_user_id, normalized_name, prefix, _api_key_hash(secret),
                 Jsonb(normalized_scopes), expires_at))
           row = cur.fetchone()
-          _audit_api_key(cur, str(row["id"]), owner_user_id, "created", {"scopes": normalized_scopes})
+          _audit_api_key(
+            cur,
+            str(row["id"]),
+            owner_user_id,
+            "created",
+            {"scopes": normalized_scopes},
+            request_id,
+          )
           return _normalize_api_key(row), f"qbk_{prefix}_{secret}"
         except IntegrityError:
           continue
@@ -209,7 +258,11 @@ def list_api_keys(owner_user_id: str) -> list[dict[str, Any]]:
       return [_normalize_api_key(row) for row in cur.fetchall()]
 
 
-def revoke_api_key(owner_user_id: str, key_id: str) -> bool:
+def revoke_api_key(
+  owner_user_id: str,
+  key_id: str,
+  request_id: str | None = None,
+) -> bool:
   with _system_db() as conn:
     with conn.cursor() as cur:
       cur.execute("""
@@ -219,7 +272,9 @@ def revoke_api_key(owner_user_id: str, key_id: str) -> bool:
       row = cur.fetchone()
       if not row:
         return False
-      _audit_api_key(cur, str(row["id"]), owner_user_id, "revoked")
+      _audit_api_key(
+        cur, str(row["id"]), owner_user_id, "revoked", request_id=request_id,
+      )
       return True
 
 
@@ -270,8 +325,14 @@ def get_api_key_principal(value: str | None) -> tuple[CurrentUser, ApiKeyPrincip
       )
 
 
-def authenticate(username: str, password: str, client_ip: str | None, user_agent: str | None) -> tuple[str, CurrentUser]:
-  """验证凭据并创建新的不透明会话令牌。"""
+def authenticate(
+  username: str,
+  password: str,
+  client_ip: str | None,
+  user_agent: str | None,
+  request_id: str | None = None,
+) -> tuple[str, CurrentUser, str]:
+  """验证凭据并创建新的不透明会话令牌与 CSRF Token。"""
   with _system_db() as conn:
     with conn.cursor() as cur:
       cur.execute("SELECT * FROM app_user WHERE lower(username)=lower(%s)", (username.strip(),))
@@ -279,20 +340,33 @@ def authenticate(username: str, password: str, client_ip: str | None, user_agent
       if not row or row["status"] != "active" or not verify_password(password, row["password_hash"]):
         raise AuthenticationError("用户名或密码错误")
       token = secrets.token_urlsafe(32)
-      token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+      csrf_token = secrets.token_urlsafe(32)
+      session_id = str(uuid4())
       cur.execute("""
-        INSERT INTO auth_session (id, user_id, token_hash, expires_at, client_ip, user_agent)
-        VALUES (gen_random_uuid(), %s, %s, %s, %s, %s)
-      """, (row["id"], token_hash, datetime.now(timezone.utc) + SESSION_LIFETIME, client_ip, user_agent))
+        INSERT INTO auth_session (
+          id, user_id, token_hash, csrf_token_hash, expires_at, client_ip, user_agent
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+      """, (
+        session_id,
+        row["id"],
+        _token_hash(token),
+        _token_hash(csrf_token),
+        datetime.now(timezone.utc) + SESSION_LIFETIME,
+        client_ip,
+        user_agent,
+      ))
       cur.execute("UPDATE app_user SET last_login_at=now(), updated_at=now() WHERE id=%s", (row["id"],))
-      return token, _to_current_user(row)
+      _audit_auth_event(
+        cur, str(row["id"]), "auth.session.created", session_id, request_id, client_ip,
+      )
+      return token, _to_current_user(row), csrf_token
 
 
 def get_user_by_token(token: str | None) -> CurrentUser | None:
   """由 Cookie 令牌解析有效且未禁用的用户。"""
   if not token:
     return None
-  token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+  token_hash = _token_hash(token)
   with _system_db() as conn:
     with conn.cursor() as cur:
       cur.execute("""
@@ -308,14 +382,91 @@ def get_user_by_token(token: str | None) -> CurrentUser | None:
       return _to_current_user(row)
 
 
-def revoke_session(token: str | None) -> None:
+def rotate_csrf_token(token: str | None, request_id: str | None = None) -> str | None:
+  """原子轮换当前会话 Token；短暂保留上一摘要以兼容并发刷新。"""
+  if not token:
+    return None
+  csrf_token = secrets.token_urlsafe(32)
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE auth_session
+        SET csrf_previous_token_hash=csrf_token_hash,
+          csrf_previous_valid_until=CASE
+            WHEN csrf_token_hash IS NULL THEN NULL
+            ELSE now() + %s
+          END,
+          csrf_token_hash=%s,
+          csrf_rotated_at=now(),
+          last_seen_at=now()
+        WHERE token_hash=%s AND revoked_at IS NULL AND expires_at > now()
+        RETURNING id, user_id
+      """, (CSRF_ROTATION_GRACE, _token_hash(csrf_token), _token_hash(token)))
+      row = cur.fetchone()
+      if not row:
+        return None
+      _audit_auth_event(
+        cur,
+        str(row["user_id"]),
+        "auth.csrf.rotated",
+        str(row["id"]),
+        request_id,
+      )
+      return csrf_token
+
+
+def validate_csrf_token(session_token: str | None, csrf_token: str | None) -> bool:
+  """校验当前或并发轮换宽限期内的上一 Token，不改变会话状态。"""
+  if not session_token or not csrf_token:
+    return False
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT csrf_token_hash, csrf_previous_token_hash,
+          csrf_previous_valid_until > now() AS previous_is_valid
+        FROM auth_session
+        WHERE token_hash=%s AND revoked_at IS NULL AND expires_at > now()
+      """, (_token_hash(session_token),))
+      row = cur.fetchone()
+  if not row:
+    return False
+  candidate_hash = _token_hash(csrf_token)
+  current_hash = str(row.get("csrf_token_hash") or "")
+  previous_hash = str(row.get("csrf_previous_token_hash") or "")
+  return (
+    bool(current_hash) and hmac.compare_digest(candidate_hash, current_hash)
+  ) or (
+    bool(row.get("previous_is_valid"))
+    and bool(previous_hash)
+    and hmac.compare_digest(candidate_hash, previous_hash)
+  )
+
+
+def revoke_session(
+  token: str | None,
+  request_id: str | None = None,
+  client_ip: str | None = None,
+) -> None:
   """撤销当前会话；无令牌时保持幂等。"""
   if not token:
     return
-  token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
   with _system_db() as conn:
     with conn.cursor() as cur:
-      cur.execute("UPDATE auth_session SET revoked_at=now() WHERE token_hash=%s AND revoked_at IS NULL", (token_hash,))
+      cur.execute("""
+        UPDATE auth_session SET revoked_at=now()
+        WHERE token_hash=%s AND revoked_at IS NULL
+        RETURNING id, user_id
+      """, (_token_hash(token),))
+      row = cur.fetchone()
+      if row:
+        _audit_auth_event(
+          cur,
+          str(row["user_id"]),
+          "auth.session.revoked",
+          str(row["id"]),
+          request_id,
+          client_ip,
+        )
 
 
 def _authorization_code_hash(value: str) -> str:

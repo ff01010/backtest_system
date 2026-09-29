@@ -149,6 +149,7 @@ class BacktestRunRequest(BaseModel):
   t0Enabled: bool = False
   warmupTradingDays: int = Field(default=0, ge=0, le=250)
   strategyParams: dict[str, Any] = Field(default_factory=dict)
+  strategyParamOverrides: dict[str, Any] = Field(default_factory=dict)
   runDraft: bool = False
 
   @field_validator("startDate", "endDate", mode="before")
@@ -195,7 +196,15 @@ class BacktestRunRequest(BaseModel):
 
 class ApiKeyCreateRequest(BaseModel):
   name: str = Field(min_length=1, max_length=80)
-  scopes: list[Literal["backtest:submit", "backtest:read", "backtest:cancel"]]
+  scopes: list[Literal[
+    "backtest:submit",
+    "backtest:read",
+    "backtest:cancel",
+    "strategy:read",
+    "strategy:write",
+    "strategy:publish",
+    "strategy:delete",
+  ]]
   expiresAt: datetime | None = None
 
 
@@ -205,6 +214,7 @@ class PublicBacktestOverrides(BaseModel):
   initial_capital: float | None = Field(default=None, gt=0)
   commission_rate: float | None = Field(default=None, ge=0)
   slippage: float | None = Field(default=None, ge=0)
+  strategy_params: dict[str, Any] = Field(default_factory=dict)
 
   @field_validator("start_date", "end_date", mode="before")
   @classmethod
@@ -220,6 +230,72 @@ class PublicBacktestOverrides(BaseModel):
 class PublicBacktestCreateRequest(BaseModel):
   config_id: str = Field(min_length=1, max_length=64)
   overrides: PublicBacktestOverrides = Field(default_factory=PublicBacktestOverrides)
+
+
+class PublicStrategyBacktestParameters(BaseModel):
+  start_date: str
+  end_date: str
+  initial_capital: float = Field(gt=0)
+  commission_rate: float = Field(default=0.00008, ge=0)
+  slippage: float = Field(default=0, ge=0)
+  allow_long: bool = True
+  allow_short: bool = True
+  strategy_category: Literal["core_position_overlay", "directional_holding"] = "directional_holding"
+  holding_policy: Literal["intraday", "overnight"] = "overnight"
+  overlay_settlement_policy: Literal["intraday_restore", "cross_day_carry"] = "intraday_restore"
+  fill_model: Literal["bar_next_open", "l2_quote"] = "bar_next_open"
+  execution_algorithm: Literal["immediate", "twap"] = "immediate"
+  execution_parameters: dict[str, int | float | str] = Field(default_factory=dict)
+  base_quantity: int = Field(default=0, ge=0)
+  base_cost_price: float = Field(default=0, ge=0)
+  initial_position_enabled: bool = False
+  t0_enabled: bool = False
+
+  @field_validator("start_date", "end_date", mode="before")
+  @classmethod
+  def normalize_public_strategy_date(cls, value: object) -> str:
+    try:
+      return format_api_date(value)  # type: ignore[arg-type]
+    except TradingDateError as error:
+      raise ValueError(str(error)) from error
+
+
+class PublicStrategyCreateRequest(BaseModel):
+  name: str = Field(min_length=1, max_length=64)
+  description: str = Field(default="", max_length=2000)
+  code: str = Field(min_length=1, max_length=262_144)
+  entry_type: Literal["on_bar"] = "on_bar"
+  signal_required: bool = False
+  symbol: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
+  timeframe: str = Field(default="5m", max_length=16)
+  benchmark_symbol: str | None = Field(
+    default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$",
+  )
+  enabled: bool = True
+  backtest_parameters: PublicStrategyBacktestParameters
+  strategy_parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class PublicStrategyUpdateRequest(PublicStrategyCreateRequest):
+  expected_revision: int = Field(ge=1)
+
+
+class PublicStrategyRevisionRequest(BaseModel):
+  expected_revision: int = Field(ge=1)
+
+
+class PublicStrategyReference(BaseModel):
+  config_id: str
+  script_id: str | None = None
+  strategy_version_id: str | None = None
+  published_version_id: str | None = None
+  revision: int
+
+
+class PublicStrategyWriteResponse(BaseModel):
+  strategy: PublicStrategyReference
+  replayed: bool
+  request_id: str | None = None
 
 
 class BacktestSummary(BaseModel):

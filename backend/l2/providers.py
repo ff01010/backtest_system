@@ -171,7 +171,7 @@ class ClickHouseL2Adapter:
 
   def load_bars(self, symbol: str, period: str, start_date: str, end_date: str) -> list[NormalizedBar]:
     self._validate_profile({"symbol", "trade_date", "period", "start_time", "end_time", "open", "high", "low", "close", "volume", "amount", "quality", "source_version"})
-    rows = clickhouse_client.query_rows(self._select("symbol, trade_date, period, start_time, end_time, open, high, low, close, volume, amount, quality, source_version, snapshot_count, max_gap_ms, valid_price_count, actual_duration_seconds", symbol, start_date, end_date, "period"))
+    rows = clickhouse_client.query_rows_with_retry(self._select("symbol, trade_date, period, start_time, end_time, open, high, low, close, volume, amount, quality, source_version, snapshot_count, max_gap_ms, valid_price_count, actual_duration_seconds", symbol, start_date, end_date, "period"))
     try:
       bars = [self._bar_from_row(row) for row in rows if str(row["period"]) == period]
     except (KeyError, TypeError, ValueError, OverflowError) as error:
@@ -196,6 +196,36 @@ class ClickHouseL2Adapter:
         context={"symbol": symbol, "tradeDates": ", ".join(partial_dates)},
       )
     return bars
+
+  def bar_date_range(self, symbol: str, period: str) -> tuple[str, str] | None:
+    """返回正式映射 Bar 来源中质量完整的全量日期边界。"""
+    required = {"symbol", "trade_date", "period", "quality"}
+    self._validate_profile(required)
+    columns = self._profile.columns
+    query = (
+      f"SELECT minOrNull({columns['trade_date']}) AS first_date, "
+      f"maxOrNull({columns['trade_date']}) AS last_date "
+      f"FROM {self._profile.table_name} "
+      f"WHERE {columns['symbol']}={self._literal(symbol)} "
+      f"AND {columns['period']}={self._literal(period)} "
+      f"AND {columns['quality']} IN ('complete', 'ok')"
+    )
+    rows = clickhouse_client.query_rows_with_retry(query)
+    row = rows[0] if rows else {}
+    if row.get("first_date") is None or row.get("last_date") is None:
+      return None
+    return format_api_date(row["first_date"]), format_api_date(row["last_date"])
+
+  def bar_source_identity(self, period: str) -> dict[str, Any]:
+    """返回任务快照所需的正式映射 Bar 物理来源。"""
+    database, table = self._profile.table_name.split(".", 1)
+    return {
+      "sourceDatabase": database,
+      "sourceTable": table,
+      "sourcePeriod": period,
+      "derivation": None,
+      "sourceVersion": self._profile.source_version or "",
+    }
 
   def iter_quotes(self, symbol: str, trade_date: str, page_size: int) -> Iterator[list[QuoteSnapshot]]:
     fields = self._quote_fields(symbol, trade_date)
@@ -670,6 +700,29 @@ class TemporaryQuoteBarProvider:
       warnings=tuple(f"{day}:{status}" for day, status in sorted(self._cache_status.items())),
     )
 
+  def available_date_range(self, symbol: str) -> tuple[str, str] | None:
+    """返回可聚合临时 Bar 的实际 Quote 日期边界。"""
+    self._validate_profile()
+    column = self._profile.columns
+    morning_start = "toDateTime(concat(toString(trade_date), ' 09:30:00'))"
+    morning_end = "toDateTime(concat(toString(trade_date), ' 11:30:00'))"
+    afternoon_start = "toDateTime(concat(toString(trade_date), ' 13:00:00'))"
+    afternoon_end = "toDateTime(concat(toString(trade_date), ' 14:57:00'))"
+    query = (
+      f"SELECT minOrNull({column['trade_date']}) AS first_date, "
+      f"maxOrNull({column['trade_date']}) AS last_date "
+      f"FROM {self._profile.table_name} "
+      f"WHERE {column['symbol']}={ClickHouseL2Adapter._literal(symbol)} "
+      f"AND {column['last_price']} > 0 "
+      f"AND (({column['time']} >= {morning_start} AND {column['time']} < {morning_end}) "
+      f"OR ({column['time']} >= {afternoon_start} AND {column['time']} < {afternoon_end}))"
+    )
+    rows = clickhouse_client.query_rows_with_retry(query)
+    row = rows[0] if rows else {}
+    if row.get("first_date") is None or row.get("last_date") is None:
+      return None
+    return format_api_date(row["first_date"]), format_api_date(row["last_date"])
+
   def cache_snapshot(self) -> dict[str, Any]:
     """返回持久化到任务结果的派生 Bar 审计信息。"""
     return {
@@ -740,7 +793,9 @@ class TemporaryQuoteBarProvider:
 
   def _aggregate_day(self, symbol: str, trade_date: str, period: str) -> list[NormalizedBar]:
     seconds = self._PERIOD_SECONDS[period]
-    rows = clickhouse_client.query_rows(self._aggregation_query(symbol, trade_date, period, seconds))
+    rows = clickhouse_client.query_rows_with_retry(
+      self._aggregation_query(symbol, trade_date, period, seconds),
+    )
     bars: list[NormalizedBar] = []
     try:
       for row in rows:
@@ -881,7 +936,10 @@ ORDER BY trade_date, bucket_start
       f"OR ({column['time']} >= {afternoon_start} AND {column['time']} < {afternoon_end})) "
       f"GROUP BY {column['trade_date']} ORDER BY trade_date"
     )
-    return [str(row["trade_date"]) for row in clickhouse_client.query_rows(query)]
+    return [
+      str(row["trade_date"])
+      for row in clickhouse_client.query_rows_with_retry(query)
+    ]
 
   def _validate_profile(self) -> None:
     if self._validated:

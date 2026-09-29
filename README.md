@@ -64,21 +64,21 @@
 
 `auth_session`、策略、回测、产物和计数器表启用行级安全策略；常规用户只能读取和修改自己拥有的数据，管理员可执行管理职责。
 
-迁移中还保留 `market_trade_calendar`、`market_bar`、`market_data_coverage`、`market_fetch_log`、`market_minute_bar`、`market_minute_coverage` 等历史兼容结构。它们包含标的、周期、OHLCV、来源、覆盖日期和校验状态等字段；当前回测路径不读取这些 PostgreSQL 行情表，而是只读取下列 ClickHouse QMT 表。
+迁移中还保留 `market_trade_calendar`、`market_bar`、`market_data_coverage`、`market_fetch_log`、`market_minute_bar`、`market_minute_coverage` 等历史兼容结构。它们包含标的、周期、OHLCV、来源、覆盖日期和校验状态等字段；当前回测路径不读取这些 PostgreSQL 行情表。标准 QMT Bar 只读取 ClickHouse `qmt_history_dev` 的行情表和发布元数据；下表同时列出仍由离线旧版导入工具维护、但回测不再读取的表。
 
 ### ClickHouse 行情与证券目录表
 
-沪、深、北交所统一优先从 `qmt_history_dev` 的六张周期原始表读取 `none` 口径的有效最终数据。界面优先展示 `qmt_ingest_runs` 与 `qmt_universe_snapshot` 声明的新版范围；仅当新版元数据查询成功且没有该标的时，才展示 `qmt_kline_coverage` 声明的旧版范围，不合并两套范围，也不在保存或提交时扫描原始 Bar。范围查询会对超时和临时网络错误进行有限重试；重试耗尽或发生确定性查询错误时直接报告行情数据异常，不回退旧版范围。Worker 实际执行时使用覆盖元数据选择来源并读取行情；新库不能覆盖预热期和正式回测期时，整次任务回退到 `raw_historical_data.qmt_kline`，同一任务不跨两库拼接。统一证券目录位于 `xl_derived`。
+沪、深、北交所统一从 `qmt_history_dev` 的六张周期原始表读取 `none` 口径的有效最终数据。界面只展示 `qmt_ingest_runs` 与 `qmt_universe_snapshot` 声明的范围，不在保存或提交时扫描原始 Bar。范围查询会对超时和临时网络错误进行有限重试；没有覆盖、范围不足、预热不足或查询失败时直接报告行情数据异常，不切换其他 QMT 数据库。Worker 使用同一套发布元数据确定实际回放日期并读取行情。统一证券目录位于 `xl_derived`。
 
 日期选择过程只修改本地草稿；用户点击“应用”时，页面才校验所选闭区间是否完整落在当前可回测起止范围内。范围端点可以选取，越界、倒置或范围尚不可用时不更新正式参数；该边界校验不扫描行情，也不判断范围内逐日数据完整性。
 
 | 表 | 字段 | 用途 |
 | --- | --- | --- |
-| `qmt_kline` | `symbol`、`period`、`qmt_index`、`time`、`open`、`high`、`low`、`close`、`volume`、`amount`、`settelementPrice`、`openInterest`、`preClose`、`suspendFlag`、`import_batch_id`、`ingested_at`、`ingest_version` | QMT 原始 K 线。按 `symbol`、`period`、时间索引保存，保留 QMT 原字段与导入版本。 |
-| `qmt_kline_coverage` | `symbol`、`period`、`trade_date`、`first_bar_time`、`last_bar_time`、`expected_row_count`、`observed_row_count`、`valid_row_count`、`status`、`quality_note`、`import_batch_id`、`record_version` | 每标的、周期、交易日的完整度。`status` 只能为 `complete`、`partial`、`empty`、`failed`；非完整数据拒绝回测。 |
-| `qmt_import_batch` | `batch_id`、`source_file`、`source_file_sha256`、`symbol`、`period`、`data_start_time`、`data_end_time`、`source_row_count`、`imported_row_count`、`invalid_row_count`、`status`、`failure_reason`、`qmt_client_version`、`created_at`、`updated_at`、`record_version` | 每个原始 CSV 的导入审计与失败原因。 |
-| `qmt_history_dev.qmt_kline_{1m,5m,15m,30m,1h,1d}_raw` | `symbol`、`period`、`adjustment`、`trade_date`、`bar_time`、OHLCV、`is_final`、`quality_status`、`run_id`、`manifest_sha256`、`revision` | 优先行情来源；平台 `60m` 映射到物理 `1h`，仅读取 `none`、有效且定稿的当前修订。 |
-| `qmt_history_dev.qmt_ingest_runs` | `run_id`、`state`、`target_date`、路由数量、缺失与重复计数、`validation_result`、`actual_routes` | 新库独立的发布和完整性依据，不与旧库 `qmt_kline_coverage` 的状态语义混用。 |
+| `raw_historical_data.qmt_kline` | `symbol`、`period`、`qmt_index`、`time`、`open`、`high`、`low`、`close`、`volume`、`amount`、`settelementPrice`、`openInterest`、`preClose`、`suspendFlag`、`import_batch_id`、`ingested_at`、`ingest_version` | 旧版离线导入工具保留的 QMT 原始 K 线；当前回测不读取。 |
+| `raw_historical_data.qmt_kline_coverage` | `symbol`、`period`、`trade_date`、`first_bar_time`、`last_bar_time`、`expected_row_count`、`observed_row_count`、`valid_row_count`、`status`、`quality_note`、`import_batch_id`、`record_version` | 旧版离线导入覆盖记录；当前回测不读取。 |
+| `raw_historical_data.qmt_import_batch` | `batch_id`、`source_file`、`source_file_sha256`、`symbol`、`period`、`data_start_time`、`data_end_time`、`source_row_count`、`imported_row_count`、`invalid_row_count`、`status`、`failure_reason`、`qmt_client_version`、`created_at`、`updated_at`、`record_version` | 旧版离线 CSV 导入审计；当前回测不读取。 |
+| `qmt_history_dev.qmt_kline_{1m,5m,15m,30m,1h,1d}_raw` | `symbol`、`period`、`adjustment`、`trade_date`、`bar_time`、OHLCV、`is_final`、`quality_status`、`run_id`、`manifest_sha256`、`revision` | 标准 QMT Bar 的唯一行情来源；平台 `60m` 映射到物理 `1h`，仅读取 `none` 且定稿的当前修订。 |
+| `qmt_history_dev.qmt_ingest_runs` | `run_id`、`state`、`target_date`、路由数量、缺失与重复计数、`validation_result`、`actual_routes` | 标准 QMT Bar 的发布和完整性依据。 |
 | `qmt_history_dev.qmt_universe_snapshot` | `universe_snapshot_id`、`effective_date`、`symbol`、`exchange`、`is_active` | 记录每次发布对应的标的范围；与 `qmt_ingest_runs` 结合后用于展示标的可回测日期范围。 |
 | `xl_derived.stock_directory` | `symbol`、`exchange`、`name`、`type`、`status`、`board_type`、`listed_date`、`de_listed_date`、`source`、`__ver` | 全市场证券主数据。后端启动时筛选 `CS/Active`，规范化交易所和板块后同步到 PostgreSQL `market_instrument`。 |
 
@@ -91,13 +91,12 @@ app_user → user_strategy → user_strategy_version
          → backtest_run → backtest_run_event / artifact_file
 
 ClickHouse xl_derived.stock_directory → PostgreSQL market_instrument
-ClickHouse qmt_history_dev 六周期表/qmt_ingest_runs/qmt_universe_snapshot → 可回测范围与优先回测行情
-ClickHouse raw_historical_data.qmt_kline/qmt_kline_coverage → 整段兼容回退
+ClickHouse qmt_history_dev 六周期表/qmt_ingest_runs/qmt_universe_snapshot → 可回测范围与唯一 QMT 回测行情
 ```
 
 - 策略源码、方案、账户、回测快照和结果始终保存于 PostgreSQL，不写入 ClickHouse。
 - ClickHouse 保存行情、导入审计和统一证券目录；回测不会触发外部行情下载。
-- 新库直接读取 `1m`、`5m`、`15m`、`30m`、`1h`、`1d` 六个原始周期；平台 `3m`、`45m` 由新库完整 `1m` 数据派生。新库不能覆盖整个任务范围时，旧库保持原有直接周期和分钟派生规则。
+- 标准 QMT Bar 直接读取 `1m`、`5m`、`15m`、`30m`、`1h`、`1d` 六个原始周期；平台 `3m`、`45m` 由 `qmt_history_dev` 的完整 `1m` 数据派生。该来源不能覆盖整个任务或预热范围时任务失败，不切换其他 QMT 数据库。
 - 本地启动成功后，后端会从远程 ClickHouse 的 `xl_derived.stock_directory` 同步活跃 A 股目录；本机和服务器共享相同的目录映射规则。
 
 

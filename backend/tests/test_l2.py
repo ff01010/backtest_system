@@ -603,6 +603,22 @@ def test_l2_session_rules_follow_frontend_short_permission() -> None:
   assert session["runtimeVersion"] == "legacy"
 
 
+def test_l2_session_payload_exposes_effective_strategy_parameters() -> None:
+  session = L2Runner._session_payload({
+    "symbol": "688981.SH",
+    "scriptId": "script-1",
+    "savedScriptSnapshot": {
+      "id": "script-1",
+      "code": "def on_bar(bar, state):\n  return []",
+    },
+    "strategyParams": {"window": 12},
+    "initialCapital": 1_000_000,
+    "commissionRate": 0.0003,
+  })
+
+  assert session["params"]["window"] == 12
+
+
 def test_l2_session_uses_continuous_mode_for_quote_script() -> None:
   payload = {
     "symbol": "600584.SH",

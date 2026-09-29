@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import argparse
 from typing import Any
 
 import pytest
 
+from backend import l2_quote_coverage_sync
 from backend.l2.config import load_temporary_quote_profile
+from backend.l2.models import NormalizedBar
 from backend.l2.providers import ClickHouseL2Adapter, L2DataCoverageError
-from backend.services import backtest_preflight, l2_quote_availability, state_store
+from backend.services import backtest_preflight, bar_data, l2_quote_availability, state_store
 
 
 def test_quote_availability_uses_cached_daily_records(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -149,16 +152,13 @@ def test_worker_quote_check_rejects_missing_or_incomplete_summary(
 
 def test_l2_preview_does_not_read_availability(monkeypatch: pytest.MonkeyPatch) -> None:
   calls: list[list[str]] = []
-  monkeypatch.setattr(state_store, "list_open_trade_dates", lambda *_: ["2026-08-26", "2026-08-27"])
-  monkeypatch.setattr(state_store, "is_trade_calendar_range_covered", lambda *_: True)
-  monkeypatch.setattr(backtest_preflight, "_shanghai_today", lambda: __import__("datetime").date(2026, 8, 27))
   monkeypatch.setattr(
     l2_quote_availability,
     "available_quote_dates",
     lambda _symbol, dates: calls.append(dates) or dates,
   )
   monkeypatch.setattr(
-    backtest_preflight.bar_data,
+    bar_data,
     "derived_bar_available_dates",
     lambda *_: (_ for _ in ()).throw(AssertionError("L2 预览不应按周期查询派生 Bar")),
   )
@@ -169,3 +169,39 @@ def test_l2_preview_does_not_read_availability(monkeypatch: pytest.MonkeyPatch) 
   assert all(item["available"] for item in result["timeframes"])
   assert result["missingDates"] == []
   assert result["calendarDays"] == []
+
+
+def test_quote_coverage_sync_uses_actual_bar_dates(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  bars = [
+    NormalizedBar(
+      symbol="688981.SH", trade_date=trade_date, period="5m",
+      start_time=f"{trade_date} 09:30:00", end_time=f"{trade_date} 09:35:00",
+      open=10.0, high=10.1, low=9.9, close=10.0, volume=100.0,
+      amount=1000.0, quality="complete", source_version="test",
+    )
+    for trade_date in ("2026-08-26", "2026-08-27")
+  ]
+  captured_dates: list[str] = []
+  monkeypatch.setattr(
+    l2_quote_coverage_sync,
+    "_arguments",
+    lambda: argparse.Namespace(
+      symbol="688981.SH", start="2026-08-26", end="2026-08-27", timeframe="5m",
+    ),
+  )
+  monkeypatch.setattr(
+    l2_quote_coverage_sync.bar_data,
+    "load_normalized_bars_with_snapshot",
+    lambda *_: (bars, {"provider": "qmt_kline"}),
+  )
+  monkeypatch.setattr(
+    l2_quote_coverage_sync.l2_quote_availability,
+    "rebuild_quote_availability",
+    lambda _symbol, dates: captured_dates.extend(dates) or {"checked": 2, "available": 2},
+  )
+
+  l2_quote_coverage_sync.main()
+
+  assert captured_dates == ["2026-08-26", "2026-08-27"]

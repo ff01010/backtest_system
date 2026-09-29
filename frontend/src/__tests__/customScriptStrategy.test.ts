@@ -2,13 +2,17 @@ import { describe, expect, it } from 'vitest';
 import {
   buildStrategyDraftFingerprint,
   buildSavedStrategyFingerprint,
+  buildExperimentFingerprint,
   getConfigSectionForError,
   getResearchSignalSelectionError,
   getResearchSignalTimeframeError,
+  getStrategySaveNoticeState,
   hasEnabledTradeDirection,
   hasLegacyTimeSlice,
   hasSavedStrategyId,
   isCustomScriptStrategy,
+  serializeStrategyParameterValues,
+  strategyParameterSchemaFromConfig,
 } from '../components/BacktestPage';
 
 describe('isCustomScriptStrategy', () => {
@@ -27,6 +31,25 @@ describe('isCustomScriptStrategy', () => {
   it('空策略 ID 不应被当作已保存的策略', () => {
     expect(hasSavedStrategyId('')).toBe(false);
     expect(hasSavedStrategyId('9f5e9cf6-83d5-44d5-a070-0d1d062d11aa')).toBe(true);
+  });
+
+  it('用红黄绿区分策略保存与实验参数状态', () => {
+    expect(getStrategySaveNoticeState(false, false, false)).toEqual({
+      tone: 'blocked',
+      message: '当前为新建策略，尚未保存；请先保存后再运行回测。',
+    });
+    expect(getStrategySaveNoticeState(true, false, true)).toEqual({
+      tone: 'blocked',
+      message: '策略内容已修改，暂不可运行；请先保存后再运行回测。',
+    });
+    expect(getStrategySaveNoticeState(false, true, true)).toEqual({
+      tone: 'warning',
+      message: '仅本次实验参数已修改，可直接运行；不会影响已保存策略。',
+    });
+    expect(getStrategySaveNoticeState(false, false, true)).toEqual({
+      tone: 'ready',
+      message: '当前策略内容已保存，可直接运行回测。',
+    });
   });
 
   it('识别应迁移的旧时间切片写法', () => {
@@ -77,6 +100,30 @@ describe('isCustomScriptStrategy', () => {
     expect(buildStrategyDraftFingerprint(base)).not.toBe(buildStrategyDraftFingerprint(signalDriven));
   });
 
+  it('已声明策略参数只改变实验指纹，不改变版本指纹', () => {
+    const base = {
+      strategy: 'user_script',
+      mode: 'backtest',
+      symbol: '688981.SH',
+      timeframe: '5m',
+      benchmarkSymbol: '688981.SH',
+      accountId: '' as const,
+      params: { window: '20', allowLong: true, startDate: '2026-06-01' },
+      strategyParameterNames: ['window'],
+      script: { code: 'def on_bar(bar, state): return []', entryType: 'on_bar', signalRequired: false },
+    };
+    const override = { ...base, params: { ...base.params, window: '10' } };
+    const structuralChange = { ...base, params: { ...base.params, allowLong: false } };
+
+    expect(buildStrategyDraftFingerprint(base)).toBe(buildStrategyDraftFingerprint(override));
+    expect(buildStrategyDraftFingerprint(base)).not.toBe(
+      buildStrategyDraftFingerprint(structuralChange),
+    );
+    expect(buildExperimentFingerprint(base.params, ['window'])).not.toBe(
+      buildExperimentFingerprint(override.params, ['window']),
+    );
+  });
+
   it('保存后立即运行不会被判定为未保存修改', () => {
     const saved = {
       id: 'config-1',
@@ -94,7 +141,11 @@ describe('isCustomScriptStrategy', () => {
       timeframe: '5m',
       benchmarkSymbol: '688981.SH',
       accountId: null,
-      paramsJson: { params: { startDate: '2026-08-27', endDate: '2026-08-28' } },
+      paramsJson: {
+        params: { startDate: '2026-08-27', endDate: '2026-08-28', window: 20 },
+        strategyParameterDefinitions: { window: { type: 'integer', default: 20 } },
+        strategyParams: { window: 20 },
+      },
       enabled: true,
       published: true,
       publishedVersionId: 'config-version-1',
@@ -110,6 +161,7 @@ describe('isCustomScriptStrategy', () => {
       benchmarkSymbol: saved.benchmarkSymbol,
       accountId: '',
       params: saved.paramsJson.params,
+      strategyParameterNames: ['window'],
       script: {
         code: saved.code,
         entryType: saved.entryType,
@@ -118,5 +170,34 @@ describe('isCustomScriptStrategy', () => {
     });
 
     expect(buildSavedStrategyFingerprint(saved)).toBe(draft);
+  });
+
+  it('从完整策略生成四种基础参数控件并按声明类型序列化', () => {
+    const config = {
+      id: 'config-1', name: '参数策略', scriptId: 'script-1', strategyVersionId: 'version-1',
+      scriptVersionNo: 1, description: '', code: 'def on_bar(bar, state): return []',
+      entryType: 'on_bar', signalRequired: false, strategy: 'user_script', mode: 'backtest',
+      symbol: '688981.SH', timeframe: '5m', benchmarkSymbol: null, accountId: null,
+      paramsJson: {
+        strategyParameterDefinitions: {
+          window: { type: 'integer', default: 20 },
+          threshold: { type: 'number', default: 0.5 },
+          enabled: { type: 'boolean', default: true },
+          label: { type: 'string', default: 'demo' },
+        },
+      },
+      enabled: true, published: true, publishedVersionId: 'published-1', revision: 1,
+      createdAt: '2026-09-28', updatedAt: '2026-09-28',
+    };
+    const schema = strategyParameterSchemaFromConfig(config);
+
+    expect(Object.values(schema).map((field) => field.type)).toEqual([
+      'integer', 'number', 'boolean', 'string',
+    ]);
+    expect(serializeStrategyParameterValues({
+      window: '12', threshold: '0.25', enabled: false, label: 'test',
+    }, schema)).toEqual({
+      window: 12, threshold: 0.25, enabled: false, label: 'test',
+    });
   });
 });

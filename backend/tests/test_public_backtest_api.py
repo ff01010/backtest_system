@@ -39,6 +39,10 @@ def _config() -> dict[str, object]:
         "t0Enabled": False,
         "window": "20",
       },
+      "strategyParameterDefinitions": {
+        "window": {"type": "integer", "default": 20},
+      },
+      "strategyParams": {"window": 20},
     },
   }
 
@@ -70,7 +74,64 @@ def test_public_request_only_overrides_allowed_runtime_fields(monkeypatch: pytes
   assert request["endDate"] == "2026-06-03"
   assert request["initialCapital"] == 200_000
   assert request["initialPositionEnabled"] is False
-  assert request["strategyParams"] == {"allowLong": True, "allowShort": True, "strategyCategory": "directional_holding", "holdingPolicy": "overnight", "fillModel": "bar_next_open", "baseQuantity": "0", "baseCostPrice": "0", "initialPositionEnabled": False, "t0Enabled": False, "window": "20"}
+  assert request["strategyParams"] == {"allowLong": True, "allowShort": True, "strategyCategory": "directional_holding", "holdingPolicy": "overnight", "fillModel": "bar_next_open", "baseQuantity": "0", "baseCostPrice": "0", "initialPositionEnabled": False, "t0Enabled": False, "window": 20}
+  assert request["savedStrategyParams"] == {"window": 20}
+  assert request["strategyParamOverrides"] == {}
+  assert request["effectiveStrategyParams"] == {"window": 20}
+
+
+def test_public_request_applies_strategy_parameter_override(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  config = _config()
+  monkeypatch.setattr(api_app.state_store, "get_strategy_config", lambda _: config)
+  monkeypatch.setattr(api_app.state_store, "get_strategy_script", lambda _: {
+    "id": config["scriptId"],
+    "name": "测试策略",
+    "description": "",
+    "code": 'STRATEGY_PARAMETERS = {"window": 20}\n\ndef on_bar(bar, state):\n  return []\n',
+    "entryType": "on_bar",
+  })
+  payload = schemas.PublicBacktestCreateRequest(
+    config_id=str(config["id"]),
+    overrides={"strategy_params": {"window": 10}},
+  )
+
+  request = api_app._build_public_backtest_request(payload)
+
+  assert request["strategyParams"]["window"] == 10
+  assert request["savedStrategyParams"] == {"window": 20}
+  assert request["strategyParamOverrides"] == {"window": 10}
+  assert request["effectiveStrategyParams"] == {"window": 10}
+
+
+@pytest.mark.parametrize(
+  "strategy_params",
+  [{"unknown": 1}, {"window": 1.5}, {"window": True}],
+)
+def test_public_request_rejects_invalid_strategy_parameter_override(
+  monkeypatch: pytest.MonkeyPatch,
+  strategy_params: dict[str, object],
+) -> None:
+  config = _config()
+  monkeypatch.setattr(api_app.state_store, "get_strategy_config", lambda _: config)
+  monkeypatch.setattr(api_app.state_store, "get_strategy_script", lambda _: {
+    "id": config["scriptId"],
+    "name": "测试策略",
+    "description": "",
+    "code": "def on_bar(bar, state):\n  return []\n",
+    "entryType": "on_bar",
+  })
+  payload = schemas.PublicBacktestCreateRequest(
+    config_id=str(config["id"]),
+    overrides={"strategy_params": strategy_params},
+  )
+
+  with pytest.raises(HTTPException) as raised:
+    api_app._build_public_backtest_request(payload)
+
+  assert raised.value.status_code == 422
+  assert raised.value.detail["code"] == "strategy.parameter_invalid"
 
 
 def test_public_request_rejects_unpublished_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -96,9 +157,16 @@ def test_public_request_hash_is_stable_and_changes_with_override() -> None:
     config_id="00000000-0000-0000-0000-000000000007",
     overrides={"start_date": "2026-06-02"},
   )
+  changed_strategy_parameter = schemas.PublicBacktestCreateRequest(
+    config_id="00000000-0000-0000-0000-000000000007",
+    overrides={"start_date": "2026-06-01", "strategy_params": {"window": 10}},
+  )
 
   assert api_app._public_request_hash(first) == api_app._public_request_hash(same)
   assert api_app._public_request_hash(first) != api_app._public_request_hash(changed)
+  assert api_app._public_request_hash(first) != api_app._public_request_hash(
+    changed_strategy_parameter,
+  )
 
 
 def test_public_run_payload_exposes_overlay_result_contract() -> None:

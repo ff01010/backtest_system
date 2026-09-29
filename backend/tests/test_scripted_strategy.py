@@ -11,8 +11,9 @@ from backend.l2.models import InstrumentRules, NormalizedBar, QuoteLevel, QuoteS
 from backend.services.backtest_errors import StrategyExecutionError, error_summary
 from backend.strategies.scripted import (
   ScriptedBarStrategy,
-  script_uses_research_signal,
   quote_mode_for_script,
+  script_uses_research_signal,
+  strategy_parameters_for_script,
   validate_script_code,
   warmup_trading_days_for_script,
 )
@@ -61,6 +62,88 @@ def test_script_warmup_declaration_is_static_integer() -> None:
   assert warmup_trading_days_for_script("def on_bar(bar, state):\n  return []\n") == 0
   with pytest.raises(ValueError, match="模块顶层整数常量"):
     warmup_trading_days_for_script("WARMUP_TRADING_DAYS = 100 + 40\n")
+
+
+def test_strategy_parameters_are_static_typed_and_ordered() -> None:
+  definitions = strategy_parameters_for_script("""
+STRATEGY_PARAMETERS = {
+  "window": 20,
+  "threshold": -0.25,
+  "enabled": True,
+  "label": "动量",
+}
+""")
+
+  assert list(definitions) == ["window", "threshold", "enabled", "label"]
+  assert definitions == {
+    "window": {"type": "integer", "default": 20},
+    "threshold": {"type": "number", "default": -0.25},
+    "enabled": {"type": "boolean", "default": True},
+    "label": {"type": "string", "default": "动量"},
+  }
+  assert strategy_parameters_for_script("def on_bar(bar, state):\n  return []\n") == {}
+  assert strategy_parameters_for_script("STRATEGY_PARAMETERS = {}\n") == {}
+
+
+@pytest.mark.parametrize("declaration", [
+  "STRATEGY_PARAMETERS = {'window': int('20')}",
+  "STRATEGY_PARAMETERS = {'window': 10 + 10}",
+  "default_window = 20\nSTRATEGY_PARAMETERS = {'window': default_window}",
+  "STRATEGY_PARAMETERS = {'window': {'default': 20}}",
+  "STRATEGY_PARAMETERS = {'window': [20]}",
+])
+def test_strategy_parameters_reject_executable_or_nested_values(declaration: str) -> None:
+  with pytest.raises(ValueError, match="标量字面量"):
+    strategy_parameters_for_script(declaration)
+
+
+def test_strategy_parameters_reject_duplicate_declarations_and_names() -> None:
+  with pytest.raises(ValueError, match="只能声明一次"):
+    strategy_parameters_for_script(
+      "STRATEGY_PARAMETERS = {'window': 20}\nSTRATEGY_PARAMETERS = {'threshold': 1.0}",
+    )
+  with pytest.raises(ValueError, match="参数名重复"):
+    strategy_parameters_for_script("STRATEGY_PARAMETERS = {'window': 20, 'window': 30}")
+  with pytest.raises(ValueError, match="模块顶层唯一字典"):
+    strategy_parameters_for_script("STRATEGY_PARAMETERS: dict = {'window': 20}")
+
+
+@pytest.mark.parametrize("name", ["_window", "1window", "窗口", "a-b", "a" * 65])
+def test_strategy_parameters_reject_invalid_names(name: str) -> None:
+  with pytest.raises(ValueError, match="参数名必须"):
+    strategy_parameters_for_script(f"STRATEGY_PARAMETERS = {{{name!r}: 20}}")
+
+
+def test_strategy_parameters_reject_reserved_names_and_size_limits() -> None:
+  with pytest.raises(ValueError, match="系统保留字段"):
+    strategy_parameters_for_script("STRATEGY_PARAMETERS = {'startDate': '2026-01-01'}")
+  with pytest.raises(ValueError, match="最多声明 64"):
+    items = ",".join(f"'p{index}': {index}" for index in range(65))
+    strategy_parameters_for_script(f"STRATEGY_PARAMETERS = {{{items}}}")
+  with pytest.raises(ValueError, match="最长 1024"):
+    strategy_parameters_for_script(f"STRATEGY_PARAMETERS = {{'label': {'x' * 1025!r}}}")
+  with pytest.raises(ValueError, match="规范化后不得超过"):
+    items = ",".join(f"'p{index}': {'x' * 1024!r}" for index in range(64))
+    strategy_parameters_for_script(f"STRATEGY_PARAMETERS = {{{items}}}")
+
+
+def test_strategy_parameters_distinguish_bool_from_int_and_reject_non_finite() -> None:
+  definitions = strategy_parameters_for_script(
+    "STRATEGY_PARAMETERS = {'flag': False, 'count': 0}",
+  )
+  assert definitions["flag"]["type"] == "boolean"
+  assert definitions["count"]["type"] == "integer"
+  with pytest.raises(ValueError, match="有限值"):
+    strategy_parameters_for_script("STRATEGY_PARAMETERS = {'threshold': 1e309}")
+
+
+def test_strategy_parameter_parsing_never_executes_user_code() -> None:
+  definitions = strategy_parameters_for_script("""
+raise RuntimeError('不应执行')
+STRATEGY_PARAMETERS = {"window": 20}
+""")
+
+  assert definitions["window"]["default"] == 20
 
 
 def test_script_supports_classes_and_common_pure_builtins() -> None:

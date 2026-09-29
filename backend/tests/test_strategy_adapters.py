@@ -430,11 +430,11 @@ def test_experiment_manifest_is_deterministic(
     "resolve_kline_path",
     lambda *_args: str(data_path),
   )
-  monkeypatch.setattr(
-    backtest_runner.market_data,
-    "snapshot",
-    lambda *_args: {"hash": "database-cache-hash", "barCount": 1},
-  )
+  database_snapshot = {
+    "provider": "mapped_l2_bar",
+    "hash": "database-cache-hash",
+    "barCount": 1,
+  }
   payload = {
     "strategy": "trend_grid",
     "timeframe": "1m",
@@ -452,17 +452,20 @@ def test_experiment_manifest_is_deterministic(
     payload,
     backtest_runner._build_config(copy.deepcopy(payload)),
     bars,
+    database_snapshot,
   )
   second = backtest_runner._build_experiment_manifest(
     payload,
     backtest_runner._build_config(copy.deepcopy(payload)),
     bars,
+    database_snapshot,
   )
 
   assert first["experimentHash"] == second["experimentHash"]
   assert first["randomSeed"] == second["randomSeed"]
   assert first["costModel"]["commissionRate"] == 0.0003
   assert first["barRange"]["timeframe"] == "1m"
+  assert first["databaseSnapshot"]["provider"] == "mapped_l2_bar"
 
 
 def test_script_experiment_manifest_includes_display_fields(monkeypatch: pytest.MonkeyPatch) -> None:
