@@ -13,8 +13,9 @@ import hmac
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -124,43 +125,104 @@ app.add_middleware(
   allow_credentials=True,
   allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
   allow_headers=["*"],
+  expose_headers=["X-Request-Id"],
 )
 
 
-@app.middleware("http")
-async def authenticate_api_request(request: Request, call_next):
-  """按 Cookie 或 API Key 认证业务接口，并将用户写入当前请求上下文。"""
-  if request.url.path.startswith("/api/v1/"):
-    request.state.request_id = f"req_{uuid4().hex}"
-    if not settings.PUBLIC_API_ENABLED:
-      return _public_api_error(request, 404, "api.disabled", "开放 API 未启用")
-    authorization = request.headers.get("authorization", "")
-    token_value = authorization[7:] if authorization.lower().startswith("bearer ") else None
-    principal = auth.get_api_key_principal(token_value)
-    if principal is None:
-      return _public_api_error(request, 401, "api_key_invalid", "API Key 无效、已撤销或已过期")
-    user, api_key = principal
-    request.state.api_key = api_key
-    token = set_current_user(user)
-    try:
-      return await call_next(request)
-    finally:
-      reset_current_user(token)
-  path = request.url.path
-  if request.method == "OPTIONS" or not path.startswith("/api/") or path in {
-    "/api/health",
-    "/api/auth/login",
-    "/api/auth/logout",
-  }:
-    return await call_next(request)
-  user = auth.get_user_by_token(request.cookies.get(auth.SESSION_COOKIE))
-  if not user:
-    return JSONResponse(status_code=401, content={"detail": "登录已失效，请重新登录"})
+async def _call_as_user(
+  request: Request,
+  call_next: Callable[[Request], Awaitable[Response]],
+  user: CurrentUser,
+  auth_type: str,
+) -> Response:
+  request.state.auth_type = auth_type
   token = set_current_user(user)
   try:
     return await call_next(request)
   finally:
     reset_current_user(token)
+
+
+async def _authenticate_public_api_request(
+  request: Request,
+  call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+  if not settings.PUBLIC_API_ENABLED:
+    return _public_api_error(request, 404, "api.disabled", "开放 API 未启用")
+  authorization = request.headers.get("authorization", "")
+  token_value = authorization[7:] if authorization.lower().startswith("bearer ") else None
+  principal = auth.get_api_key_principal(token_value)
+  if principal is None:
+    return _public_api_error(
+      request, 401, "api_key_invalid", "API Key 无效、已撤销或已过期",
+    )
+  user, api_key = principal
+  request.state.api_key = api_key
+  return await _call_as_user(request, call_next, user, "api_key")
+
+
+async def _dispatch_authenticated_request(
+  request: Request,
+  call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+  path = request.url.path
+  if path.startswith("/api/v1/"):
+    return await _authenticate_public_api_request(request, call_next)
+  if request.method == "OPTIONS" or not path.startswith("/api/") or path in {
+    "/api/health", "/api/auth/login", "/api/auth/logout",
+  }:
+    return await call_next(request)
+  user = auth.get_user_by_token(request.cookies.get(auth.SESSION_COOKIE))
+  if not user:
+    return _legacy_api_error(request, 401, "登录已失效，请重新登录")
+  return await _call_as_user(request, call_next, user, "cookie")
+
+
+def _finish_api_request(
+  request: Request,
+  response: Response,
+  started_at: float,
+) -> Response:
+  request_id = request.state.request_id
+  response.headers["X-Request-Id"] = request_id
+  logger.info("api_request %s", json.dumps({
+    "requestId": request_id,
+    "method": request.method,
+    "path": request.url.path,
+    "statusCode": response.status_code,
+    "durationMs": round((perf_counter() - started_at) * 1000, 3),
+    "authType": request.state.auth_type,
+  }, ensure_ascii=False, separators=(",", ":")))
+  return response
+
+
+@app.middleware("http")
+async def authenticate_api_request(
+  request: Request,
+  call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+  """按 Cookie 或 API Key 认证业务接口，并将用户写入当前请求上下文。"""
+  path = request.url.path
+  is_api_request = path == "/api" or path.startswith("/api/")
+  started_at = perf_counter()
+  if is_api_request:
+    request.state.request_id = f"req_{uuid4().hex}"
+  request.state.auth_type = "anonymous"
+  try:
+    response = await _dispatch_authenticated_request(request, call_next)
+  except Exception as error:
+    response = await handle_unexpected_exception(request, error)
+  return _finish_api_request(request, response, started_at) if is_api_request else response
+
+
+def _legacy_api_error(request: Request, status_code: int, detail: Any) -> JSONResponse:
+  return JSONResponse(
+    status_code=status_code,
+    content={
+      "detail": detail,
+      "requestId": getattr(request.state, "request_id", None),
+    },
+  )
 
 
 def _public_api_error(
@@ -177,6 +239,7 @@ def _public_api_error(
         "code": code,
         "message": message,
         "retryable": retryable,
+        "requestId": getattr(request.state, "request_id", None),
         "request_id": getattr(request.state, "request_id", None),
       },
     },
@@ -204,6 +267,8 @@ async def handle_http_exception(request: Request, error: HTTPException) -> JSONR
       elif error.status_code == 429:
         code = "rate_limit.exceeded"
     return _public_api_error(request, error.status_code, code, detail, error.status_code >= 500)
+  if request.url.path == "/api" or request.url.path.startswith("/api/"):
+    return _legacy_api_error(request, error.status_code, error.detail)
   return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
 
 
@@ -216,14 +281,23 @@ async def handle_request_validation_error(request: Request, error: RequestValida
       else "backtest.validation_failed"
     )
     return _public_api_error(request, 422, code, "请求参数不符合接口约束")
+  if request.url.path == "/api" or request.url.path.startswith("/api/"):
+    return _legacy_api_error(request, 422, "请求参数不符合接口约束")
   return JSONResponse(status_code=422, content={"detail": error.errors()})
 
 
 @app.exception_handler(Exception)
 async def handle_unexpected_exception(request: Request, error: Exception) -> JSONResponse:
-  logger.exception("未处理接口异常: %s", request.url.path, exc_info=error)
+  logger.exception(
+    "未处理接口异常: path=%s request_id=%s",
+    request.url.path,
+    getattr(request.state, "request_id", None),
+    exc_info=error,
+  )
   if request.url.path.startswith("/api/v1/"):
     return _public_api_error(request, 503, "backtest.unavailable", "服务暂时不可用，请稍后重试", True)
+  if request.url.path == "/api" or request.url.path.startswith("/api/"):
+    return _legacy_api_error(request, 500, "服务器内部错误")
   return JSONResponse(status_code=500, content={"detail": "服务器内部错误"})
 
 
@@ -954,14 +1028,19 @@ def public_strategy_guide() -> Response:
 
 
 @app.post("/api/auth/login")
-def login(payload: schemas.LoginRequest, request: Request, response: Response):
+def login(
+  payload: schemas.LoginRequest,
+  request: Request,
+  response: Response,
+) -> dict[str, Any]:
   """校验用户名密码并签发仅浏览器可见的 HttpOnly 会话 Cookie。"""
   try:
-    token, user = auth.authenticate(
+    token, user, csrf_token = auth.authenticate(
       payload.username,
       payload.password,
       request.client.host if request.client else None,
       request.headers.get("user-agent"),
+      getattr(request.state, "request_id", None),
     )
   except auth.AuthenticationError as error:
     raise HTTPException(401, str(error)) from error
@@ -974,20 +1053,39 @@ def login(payload: schemas.LoginRequest, request: Request, response: Response):
     secure=settings.AUTH_COOKIE_SECURE,
     path="/",
   )
-  return {"user": {
-    "id": user.id,
-    "username": user.username,
-    "displayName": user.display_name,
-    "role": user.role,
-  }}
+  return {
+    "user": {
+      "id": user.id,
+      "username": user.username,
+      "displayName": user.display_name,
+      "role": user.role,
+    },
+    "csrfToken": csrf_token,
+  }
 
 
 @app.post("/api/auth/logout")
-def logout(request: Request, response: Response):
+def logout(request: Request, response: Response) -> dict[str, bool]:
   """撤销服务端会话并清除浏览器 Cookie。"""
-  auth.revoke_session(request.cookies.get(auth.SESSION_COOKIE))
+  auth.revoke_session(
+    request.cookies.get(auth.SESSION_COOKIE),
+    getattr(request.state, "request_id", None),
+    request.client.host if request.client else None,
+  )
   response.delete_cookie(auth.SESSION_COOKIE, path="/")
   return {"ok": True}
+
+
+@app.get("/api/auth/csrf")
+def refresh_csrf_token(request: Request) -> dict[str, str]:
+  """为有效 Cookie 会话签发或轮换仅本次响应可见的 CSRF Token。"""
+  csrf_token = auth.rotate_csrf_token(
+    request.cookies.get(auth.SESSION_COOKIE),
+    getattr(request.state, "request_id", None),
+  )
+  if not csrf_token:
+    raise HTTPException(401, "登录已失效，请重新登录")
+  return {"csrfToken": csrf_token}
 
 
 @app.get("/api/auth/me")
@@ -1056,13 +1154,17 @@ def api_keys():
 
 
 @app.post("/api/api-keys")
-def create_api_key(payload: schemas.ApiKeyCreateRequest):
+def create_api_key(
+  payload: schemas.ApiKeyCreateRequest,
+  request: Request,
+) -> dict[str, Any]:
   try:
     key, plain_text_key = auth.create_api_key(
       get_current_user().id,
       payload.name,
       list(payload.scopes),
       payload.expiresAt,
+      getattr(request.state, "request_id", None),
     )
   except auth.ApiKeyError as error:
     raise HTTPException(422, str(error)) from error
@@ -1070,8 +1172,10 @@ def create_api_key(payload: schemas.ApiKeyCreateRequest):
 
 
 @app.delete("/api/api-keys/{key_id}")
-def revoke_api_key(key_id: str):
-  if not auth.revoke_api_key(get_current_user().id, key_id):
+def revoke_api_key(key_id: str, request: Request) -> dict[str, bool]:
+  if not auth.revoke_api_key(
+    get_current_user().id, key_id, getattr(request.state, "request_id", None),
+  ):
     raise HTTPException(404, "API Key 不存在")
   return {"revoked": True}
 
@@ -2193,6 +2297,7 @@ def public_create_backtest(payload: schemas.PublicBacktestCreateRequest, request
       api_key.id,
       idempotency_key,
       _public_request_hash(payload),
+      getattr(request.state, "request_id", None),
     )
   except state_store.ConflictError as error:
     raise HTTPException(409, str(error)) from error

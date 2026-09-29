@@ -1762,6 +1762,7 @@ def create_api_backtest_job(
   api_key_id: str,
   idempotency_key: str,
   request_hash: str,
+  request_id: str | None = None,
 ) -> tuple[str, int, bool, str, str]:
   """在同一事务内处理 API 限额、幂等记录和回测任务创建。"""
   owner_user_id = current_user_id()
@@ -1848,9 +1849,15 @@ def create_api_backtest_job(
         idempotency_key,
       ))
       cur.execute("""
-        INSERT INTO api_access_audit (api_key_id, owner_user_id, event_type, detail)
-        VALUES (%s, %s, 'backtest_submitted', %s)
-      """, (api_key_id, owner_user_id, Jsonb({"runId": run_id, "fillModel": payload.get("fillModel")})))
+        INSERT INTO api_access_audit (
+          api_key_id, owner_user_id, event_type, request_id, detail
+        ) VALUES (%s, %s, 'backtest_submitted', %s, %s)
+      """, (
+        api_key_id,
+        owner_user_id,
+        request_id,
+        Jsonb({"runId": run_id, "fillModel": payload.get("fillModel")}),
+      ))
       return run_id, display_no, False, "queued", str(payload.get("fillModel", "bar_next_open"))
 
 

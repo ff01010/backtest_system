@@ -29,6 +29,10 @@ import type {
 } from '../types';
 
 const BASE = '/api';
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+let csrfToken: string | null = null;
+let csrfRefreshPromise: Promise<string> | null = null;
 
 export class BacktestRequestError extends Error {
   detail: BacktestErrorDetail;
@@ -53,49 +57,83 @@ export class ReleaseApiError extends Error {
 export class ApiResponseError extends Error {
   status: number;
   code: string;
+  requestId: string | null;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, requestId: string | null = null) {
     super(message);
     this.name = 'ApiResponseError';
     this.status = status;
     this.code = code;
+    this.requestId = requestId;
   }
 }
 
+async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const method = (init.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+  const headers = new Headers(init.headers);
+  if (WRITE_METHODS.has(method) && csrfToken && !headers.has('X-CSRF-Token')) {
+    headers.set('X-CSRF-Token', csrfToken);
+  }
+  return fetch(input, {
+    ...init,
+    credentials: init.credentials ?? 'include',
+    headers,
+  });
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { credentials: 'include' });
+  const res = await apiFetch(url);
   if (!res.ok) {
-    const text = await res.text();
-    const detail = getStructuredApiError(text);
-    throw new ApiResponseError(
-      res.status, detail.code, detail.message || `API ${res.status}: 请求失败`,
-    );
+    throw await apiResponseError(res);
   }
   return res.json();
 }
 
 async function fetchNoStoreJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { credentials: 'include', cache: 'no-store' });
+  const res = await apiFetch(url, { cache: 'no-store' });
   if (!res.ok) {
-    const text = await res.text();
-    const detail = getStructuredApiError(text);
-    throw new ApiResponseError(
-      res.status, detail.code, detail.message || `API ${res.status}: 请求失败`,
-    );
+    throw await apiResponseError(res);
   }
   return res.json();
 }
 
-function getStructuredApiError(text: string): { code: string; message: string } {
+function getStructuredApiError(text: string): {
+  code: string;
+  message: string;
+  requestId: string | null;
+} {
   try {
     const body = JSON.parse(text) as {
+      requestId?: unknown;
+      error?: {
+        code?: unknown;
+        message?: unknown;
+        requestId?: unknown;
+        request_id?: unknown;
+      };
       detail?: string | {
         code?: unknown;
         message?: unknown;
         errorDetail?: { code?: unknown; message?: unknown };
       };
     };
-    if (typeof body.detail === 'string') return { code: '', message: body.detail };
+    const requestId = typeof body.error?.requestId === 'string'
+      ? body.error.requestId
+      : typeof body.error?.request_id === 'string'
+      ? body.error.request_id
+      : typeof body.requestId === 'string' ? body.requestId : null;
+    if (body.error && typeof body.error === 'object') {
+      return {
+        code: typeof body.error.code === 'string' ? body.error.code : '',
+        message: typeof body.error.message === 'string'
+          ? body.error.message
+          : getApiErrorMessage(text),
+        requestId,
+      };
+    }
+    if (typeof body.detail === 'string') {
+      return { code: '', message: body.detail, requestId };
+    }
     if (body.detail && typeof body.detail === 'object') {
       const nested = body.detail.errorDetail;
       return {
@@ -107,27 +145,33 @@ function getStructuredApiError(text: string): { code: string; message: string } 
           : typeof body.detail.message === 'string'
           ? body.detail.message
           : getApiErrorMessage(text),
+        requestId,
       };
     }
   } catch {
     // 由通用错误解析器保留原始响应。
   }
-  return { code: '', message: getApiErrorMessage(text) };
+  return { code: '', message: getApiErrorMessage(text), requestId: null };
+}
+
+async function apiResponseError(response: Response): Promise<ApiResponseError> {
+  const detail = getStructuredApiError(await response.text());
+  return new ApiResponseError(
+    response.status,
+    detail.code,
+    detail.message || `API ${response.status}: 请求失败`,
+    detail.requestId ?? response.headers.get('X-Request-Id'),
+  );
 }
 
 async function sendJson<T>(url: string, method: string, payload: unknown): Promise<T> {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-    credentials: 'include',
   });
   if (!res.ok) {
-    const text = await res.text();
-    const detail = getStructuredApiError(text);
-    throw new ApiResponseError(
-      res.status, detail.code, detail.message || `API ${res.status}: 请求失败`,
-    );
+    throw await apiResponseError(res);
   }
   return res.json();
 }
@@ -168,7 +212,7 @@ export async function fetchReleaseStatus(
     clientBuildId,
     clientCompatibilityVersion: String(clientCompatibilityVersion),
   });
-  const res = await fetch(`${BASE}/releases/status?${query}`, {
+  const res = await apiFetch(`${BASE}/releases/status?${query}`, {
     credentials: 'include',
     headers: etag ? { 'If-None-Match': etag } : {},
   });
@@ -178,7 +222,7 @@ export async function fetchReleaseStatus(
 }
 
 export async function acknowledgeRelease(releaseId: string, clientBuildId: string): Promise<void> {
-  const res = await fetch(`${BASE}/releases/${encodeURIComponent(releaseId)}/acknowledge`, {
+  const res = await apiFetch(`${BASE}/releases/${encodeURIComponent(releaseId)}/acknowledge`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ clientBuildId }),
@@ -342,18 +386,45 @@ export interface StrategyRuntimeErrorStat {
   lastOccurredAt: string;
 }
 
+async function requestCsrfToken(): Promise<string> {
+  const response = await apiFetch(`${BASE}/auth/csrf`, { cache: 'no-store' });
+  if (!response.ok) throw await apiResponseError(response);
+  const data = await response.json() as { csrfToken: string };
+  csrfToken = data.csrfToken;
+  return data.csrfToken;
+}
+
+async function refreshCsrfToken(): Promise<string> {
+  if (!csrfRefreshPromise) {
+    csrfRefreshPromise = requestCsrfToken().finally(() => {
+      csrfRefreshPromise = null;
+    });
+  }
+  return csrfRefreshPromise;
+}
+
 export async function login(username: string, password: string): Promise<SessionUser> {
-  const data = await sendJson<{ user: SessionUser }>(`${BASE}/auth/login`, 'POST', { username, password });
+  const data = await sendJson<{ user: SessionUser; csrfToken: string }>(
+    `${BASE}/auth/login`,
+    'POST',
+    { username, password },
+  );
+  csrfToken = data.csrfToken;
   return data.user;
 }
 
 export async function fetchCurrentUser(): Promise<SessionUser> {
   const data = await fetchJson<{ user: SessionUser }>(`${BASE}/auth/me`);
+  await refreshCsrfToken();
   return data.user;
 }
 
 export async function logout(): Promise<void> {
-  await sendJson<{ ok: boolean }>(`${BASE}/auth/logout`, 'POST', {});
+  try {
+    await sendJson<{ ok: boolean }>(`${BASE}/auth/logout`, 'POST', {});
+  } finally {
+    csrfToken = null;
+  }
 }
 
 export async function createResearchAuthorizationCode(state: string): Promise<{
@@ -378,7 +449,7 @@ export async function createApiKey(payload: {
 }
 
 export async function revokeApiKey(keyId: string): Promise<void> {
-  const response = await fetch(`${BASE}/api-keys/${encodeURIComponent(keyId)}`, {
+  const response = await apiFetch(`${BASE}/api-keys/${encodeURIComponent(keyId)}`, {
     method: 'DELETE',
     credentials: 'include',
   });
@@ -415,7 +486,7 @@ export async function resetUserPassword(userId: string, password: string): Promi
 }
 
 export async function deleteUser(userId: string): Promise<{ action: 'deleted' | 'disabled'; message: string }> {
-  const res = await fetch(`${BASE}/admin/users/${userId}`, { method: 'DELETE', credentials: 'include' });
+  const res = await apiFetch(`${BASE}/admin/users/${userId}`, { method: 'DELETE' });
   if (!res.ok) {
     throw new Error(`API ${res.status}: ${await res.text()}`);
   }
@@ -568,7 +639,7 @@ export async function runBacktest(
   payload: BacktestRunPayload,
   idempotencyKey?: string,
 ): Promise<BacktestRunResponse | QueuedBacktestResponse> {
-  const res = await fetch(`${BASE}/backtest/run`, {
+  const res = await apiFetch(`${BASE}/backtest/run`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -856,7 +927,7 @@ export async function cancelBacktestRun(runId: string): Promise<{
   runId: string;
   status: 'queued' | 'running' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
 }> {
-  const res = await fetch(`${BASE}/backtest/runs/${runId}/cancel`, {
+  const res = await apiFetch(`${BASE}/backtest/runs/${runId}/cancel`, {
     method: 'POST',
     credentials: 'include',
   });
@@ -865,7 +936,7 @@ export async function cancelBacktestRun(runId: string): Promise<{
 }
 
 export async function deleteBacktestRun(runId: string): Promise<void> {
-  const res = await fetch(`${BASE}/backtest/runs/${runId}`, {
+  const res = await apiFetch(`${BASE}/backtest/runs/${runId}`, {
     method: 'DELETE',
     credentials: 'include',
   });
@@ -910,7 +981,7 @@ export async function createSignalDetailExport(
   selection: BacktestRunSelection,
   idempotencyKey: string,
 ): Promise<SignalDetailExportTask> {
-  const res = await fetch(`${BASE}/backtest/signal-detail-exports`, {
+  const res = await apiFetch(`${BASE}/backtest/signal-detail-exports`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -945,7 +1016,7 @@ export async function retrySignalDetailExport(
   exportId: string,
   idempotencyKey: string,
 ): Promise<SignalDetailExportTask> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${BASE}/backtest/signal-detail-exports/${encodeURIComponent(exportId)}/retry`,
     {
       method: 'POST',
@@ -1105,7 +1176,7 @@ export async function updateStrategyScript(
 }
 
 export async function deleteStrategyScript(scriptId: string): Promise<boolean> {
-  const data = await fetch(`${BASE}/strategy-scripts/${scriptId}`, { method: 'DELETE', credentials: 'include' });
+  const data = await apiFetch(`${BASE}/strategy-scripts/${scriptId}`, { method: 'DELETE' });
   if (!data.ok) throw new Error(`API ${data.status}: ${await data.text()}`);
   return (await data.json()).deleted;
 }
@@ -1182,7 +1253,7 @@ export async function publishStrategyConfig(
 }
 
 export async function deleteStrategyConfig(configId: string): Promise<boolean> {
-  const data = await fetch(`${BASE}/strategy-configs/${configId}`, { method: 'DELETE', credentials: 'include' });
+  const data = await apiFetch(`${BASE}/strategy-configs/${configId}`, { method: 'DELETE' });
   if (!data.ok) throw new Error(`API ${data.status}: ${await data.text()}`);
   return (await data.json()).deleted;
 }
@@ -1192,7 +1263,7 @@ export async function fetchDataStatus(
   timeframe = '5m',
   fillModel: 'bar_next_open' | 'l2_quote' = 'bar_next_open',
 ): Promise<DataStatus> {
-  const response = await fetch(
+  const response = await apiFetch(
     `${BASE}/data/status?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&fillModel=${encodeURIComponent(fillModel)}`,
     { credentials: 'include' },
   );
