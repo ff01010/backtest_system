@@ -422,6 +422,40 @@ services:
     networks:
       - quant-backtest-net
 
+  evaluation-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    container_name: quant-backtest-evaluation-worker
+    restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-main
+    env_file:
+      - .env
+    environment:
+      TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
+      TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+      TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    command: ['python', '-m', 'backend.evaluation_worker']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 128
+    healthcheck:
+      test: ['CMD', 'python', '-m', 'backend.evaluation_worker', '--healthcheck']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - quant-backtest-net
+
   signal-export-runner:
     build:
       context: ..

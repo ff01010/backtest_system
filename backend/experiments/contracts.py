@@ -113,3 +113,96 @@ class ExperimentCreateRequest(StrictModel):
       return str(UUID(value))
     except ValueError as error:
       raise ValueError("previewToken 必须是 UUID") from error
+
+
+class EvaluationSource(StrictModel):
+  experimentRevisionId: UUID
+  stageIds: list[UUID] = Field(min_length=1, max_length=1)
+  executionSelection: Literal["selected_execution_at_run_creation"]
+
+
+class EvaluationCatalogs(StrictModel):
+  metricCatalogVersion: Literal["metric_catalog_v1"]
+  dimensionCatalogVersion: Literal["dimension_catalog_v1"]
+  normalizerVersion: None = None
+
+
+class EvaluationCompleteness(StrictModel):
+  allowPartial: Literal[False] = False
+  minimumCompletionRate: Literal["1.0000"] = "1.0000"
+  requiredDimensionCoverage: list[Any] = Field(default_factory=list, max_length=0)
+
+
+class EvaluationFilter(StrictModel):
+  type: Literal["metric_comparison_v1"] = "metric_comparison_v1"
+  metricId: str = Field(min_length=1, max_length=160)
+  operator: Literal[">", ">=", "<", "<=", "=", "!=", "is_null", "is_not_null"]
+  value: Any | None = None
+
+  @model_validator(mode="after")
+  def validate_value(self) -> "EvaluationFilter":
+    if self.operator not in {"is_null", "is_not_null"} and self.value is None:
+      raise ValueError("非空值过滤必须提供 value")
+    if self.operator in {"is_null", "is_not_null"} and self.value is not None:
+      raise ValueError("空值过滤不能提供 value")
+    return self
+
+
+class EvaluationSort(StrictModel):
+  type: Literal["metric_sort_v1"] = "metric_sort_v1"
+  metricId: str = Field(min_length=1, max_length=160)
+  direction: Literal["asc", "desc"]
+
+
+class EvaluationSpecRequest(StrictModel):
+  schemaVersion: Literal["evaluation_spec_v1"]
+  name: str = Field(min_length=1, max_length=128)
+  source: EvaluationSource
+  catalogs: EvaluationCatalogs
+  completeness: EvaluationCompleteness = Field(default_factory=EvaluationCompleteness)
+  columns: list[str] = Field(min_length=1, max_length=64)
+  derivedMetrics: list[Any] = Field(default_factory=list, max_length=0)
+  filters: list[EvaluationFilter] = Field(default_factory=list, max_length=32)
+  groupBy: list[Any] = Field(default_factory=list, max_length=0)
+  aggregates: list[Any] = Field(default_factory=list, max_length=0)
+  groupFilters: list[Any] = Field(default_factory=list, max_length=0)
+  sort: list[EvaluationSort] = Field(default_factory=list, max_length=8)
+  visualizations: list[Any] = Field(default_factory=list, max_length=0)
+  reportSections: list[Any] = Field(default_factory=list, max_length=0)
+
+  @field_validator("name")
+  @classmethod
+  def normalize_evaluation_name(cls, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+      raise ValueError("评价名称不能为空")
+    return normalized
+
+  @field_validator("columns")
+  @classmethod
+  def unique_columns(cls, value: list[str]) -> list[str]:
+    if any(not item or len(item) > 160 for item in value):
+      raise ValueError("展示字段 ID 无效")
+    if len(set(value)) != len(value):
+      raise ValueError("展示字段不能重复")
+    return value
+
+  @field_validator("filters")
+  @classmethod
+  def unique_filters(cls, value: list[EvaluationFilter]) -> list[EvaluationFilter]:
+    identities = [(item.metricId, item.operator) for item in value]
+    if len(set(identities)) != len(identities):
+      raise ValueError("相同指标与操作符的过滤条件不能重复")
+    return value
+
+  @field_validator("sort")
+  @classmethod
+  def unique_sort_metrics(cls, value: list[EvaluationSort]) -> list[EvaluationSort]:
+    identities = [item.metricId for item in value]
+    if len(set(identities)) != len(identities):
+      raise ValueError("排序指标不能重复")
+    return value
+
+
+class EvaluationRunCreateRequest(StrictModel):
+  evaluationSpecId: UUID

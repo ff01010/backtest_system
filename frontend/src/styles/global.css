@@ -4310,3 +4310,250 @@ button.experiment-trial-row:hover {
     grid-template-columns: 1fr 1fr;
   }
 }
+
+.experiment-preview-card,
+.experiment-structure-card {
+  max-width: 1280px;
+  margin: 14px auto 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: rgba(255, 254, 250, 0.94);
+  padding: 20px;
+  box-shadow: var(--shadow-sm);
+}
+
+.experiment-preview-heading,
+.experiment-structure-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.experiment-preview-heading > div,
+.experiment-structure-grid > div {
+  display: grid;
+  gap: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  padding: 10px;
+}
+
+.experiment-preview-heading span,
+.experiment-structure-grid span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-heading,
+.evaluation-history-item,
+.evaluation-evidence {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.evaluation-heading p {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.evaluation-heading code,
+.evaluation-evidence code,
+.evaluation-history-item code,
+.evaluation-execution-set code {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evaluation-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(280px, 0.7fr);
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.evaluation-form,
+.evaluation-history {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+.evaluation-form > label,
+.evaluation-form fieldset {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  padding: 11px;
+  font-size: 11px;
+}
+
+.evaluation-form input,
+.evaluation-form select {
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 8px;
+}
+
+.evaluation-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
+  gap: 6px 10px;
+}
+
+.evaluation-columns label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+
+.evaluation-columns input {
+  width: 14px;
+  height: 14px;
+}
+
+.evaluation-rules {
+  display: grid;
+  gap: 7px;
+}
+
+.evaluation-rule {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) 92px minmax(100px, 0.6fr) 32px;
+  align-items: center;
+  gap: 7px;
+}
+
+.evaluation-priority {
+  display: none;
+}
+
+.app-icon-button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.app-icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.evaluation-history h3 {
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+.evaluation-history-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  padding: 8px 9px;
+}
+
+.evaluation-history-item > div,
+.evaluation-run-link {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.evaluation-run-link {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.evaluation-run-link span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-result {
+  margin-top: 20px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+
+.evaluation-evidence {
+  justify-content: flex-start;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-evidence code {
+  max-width: 260px;
+}
+
+.evaluation-table-wrap {
+  overflow-x: auto;
+  margin-top: 12px;
+}
+
+.evaluation-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.evaluation-table th,
+.evaluation-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.evaluation-table th {
+  background: var(--surface-muted);
+  color: var(--text-muted);
+}
+
+.evaluation-execution-set {
+  margin-top: 14px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.evaluation-execution-set > div {
+  display: grid;
+  grid-template-columns: 90px minmax(180px, 0.7fr) minmax(240px, 1fr);
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding: 6px 0;
+}
+
+.evaluation-locked {
+  color: var(--text-muted);
+}
+
+@media (max-width: 900px) {
+  .evaluation-layout,
+  .evaluation-rule,
+  .evaluation-execution-set > div {
+    grid-template-columns: 1fr;
+  }
+}

@@ -232,3 +232,164 @@ export type ExperimentDetail = {
   createdAt: string;
   updatedAt: string;
 };
+
+export type EvaluationMetricDefinition = {
+  metricId: string;
+  displayName: string;
+  dataType: 'decimal' | 'integer' | 'string';
+  unit: string | null;
+  direction: 'higher' | 'lower' | 'neutral';
+  grain: string;
+  currency: string | null;
+  windowSemantics: string;
+  annualization: string;
+  benchmarkSemantics: string;
+  comparabilityKeyVersion: string;
+  nullSemantics: string;
+};
+
+export type EvaluationDimensionDefinition = {
+  dimensionId: string;
+  displayName: string;
+  dataType: string;
+  unit: string | null;
+  nullSemantics: string;
+};
+
+export type EvaluationCatalogs = {
+  experimentId: string;
+  experimentRevisionId: string;
+  stages: Array<{
+    stageId: string;
+    stageIndex: number;
+    stageType: string;
+    status: string;
+    plannedTrialCount: number;
+  }>;
+  metricCatalog: {
+    version: 'metric_catalog_v1';
+    metrics: EvaluationMetricDefinition[];
+  };
+  dimensionCatalog: {
+    version: 'dimension_catalog_v1';
+    dimensions: EvaluationDimensionDefinition[];
+  };
+  pipelineVersion: string;
+  adapter: { type: string; version: string };
+};
+
+export type EvaluationFilter = {
+  type: 'metric_comparison_v1';
+  metricId: string;
+  operator: '>' | '>=' | '<' | '<=' | '=' | '!=' | 'is_null' | 'is_not_null';
+  value?: string | null;
+};
+
+export type EvaluationSort = {
+  type: 'metric_sort_v1';
+  metricId: string;
+  direction: 'asc' | 'desc';
+};
+
+export type EvaluationSpecPayload = {
+  schemaVersion: 'evaluation_spec_v1';
+  name: string;
+  source: {
+    experimentRevisionId: string;
+    stageIds: string[];
+    executionSelection: 'selected_execution_at_run_creation';
+  };
+  catalogs: {
+    metricCatalogVersion: 'metric_catalog_v1';
+    dimensionCatalogVersion: 'dimension_catalog_v1';
+    normalizerVersion: null;
+  };
+  completeness: {
+    allowPartial: false;
+    minimumCompletionRate: '1.0000';
+    requiredDimensionCoverage: [];
+  };
+  columns: string[];
+  derivedMetrics: [];
+  filters: EvaluationFilter[];
+  groupBy: [];
+  aggregates: [];
+  groupFilters: [];
+  sort: EvaluationSort[];
+  visualizations: [];
+  reportSections: [];
+};
+
+export type SavedEvaluationSpec = {
+  evaluationSpecId: string;
+  experimentId: string;
+  revisionId: string;
+  versionNo: number;
+  name: string;
+  specHash: string;
+  spec: EvaluationSpecPayload;
+  metricCatalogVersion: string;
+  dimensionCatalogVersion: string;
+  normalizerVersion: string | null;
+  createdAt: string;
+  replayed: boolean;
+};
+
+export type EvaluationRun = {
+  evaluationRunId: string;
+  evaluationSpecId: string;
+  experimentId: string;
+  revisionId: string;
+  specVersionNo: number | null;
+  specName: string | null;
+  status: 'queued' | 'running' | 'succeeded' | 'failed';
+  pipelineVersion: string;
+  adapterType: string;
+  adapterVersion: string;
+  metricCatalogVersion: string;
+  dimensionCatalogVersion: string;
+  executionCount: number;
+  resultSetHash: string;
+  outputHash: string | null;
+  error: { code: string; message: string } | null;
+  attemptCount: number;
+  createdAt: string;
+  finishedAt: string | null;
+};
+
+export type EvaluationRunDetail = EvaluationRun & {
+  executionSet: Array<{
+    stageId: string;
+    stageIndex: number;
+    stageType: string;
+    trialId: string;
+    trialIndex: number;
+    trialExecutionId: string;
+    runId: string;
+    resultHash: string;
+    resultSchemaVersion: string;
+    actualDataHash: string | null;
+  }>;
+  output: null | {
+    schemaVersion: string;
+    pipelineVersion: string;
+    resultSetHash: string;
+    sourceRowCount: number;
+    matchedRowCount: number;
+    columns: string[];
+    sort: EvaluationSort[];
+    rows: Array<{
+      trialId: string;
+      trialExecutionId: string;
+      runId: string;
+      stageId: string;
+      stageIndex: number;
+      trialIndex: number;
+      resultHash: string;
+      startDate: string | null;
+      values: Record<string, string | number | null>;
+      unsupportedReasons: Record<string, string>;
+    }>;
+  };
+  spec: EvaluationSpecPayload;
+};

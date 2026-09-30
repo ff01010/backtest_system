@@ -10,6 +10,11 @@ import type {
   ExperimentSubject,
   ExperimentSubjectRef,
   ExperimentTrial,
+  EvaluationCatalogs,
+  EvaluationRun,
+  EvaluationRunDetail,
+  EvaluationSpecPayload,
+  SavedEvaluationSpec,
 } from './contracts';
 
 export function fetchExperimentSubject(subject: ExperimentSubjectRef): Promise<ExperimentSubject> {
@@ -65,6 +70,78 @@ export function cancelExperiment(
 ): Promise<{ experimentId: string; status: 'cancelled' }> {
   return sendJson(
     `/api/backtest/experiments/${encodeURIComponent(experimentId)}/cancel`,
+    'POST',
+    {},
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function fetchEvaluationCatalogs(experimentId: string): Promise<EvaluationCatalogs> {
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/evaluation-catalogs`,
+  );
+}
+
+export function saveEvaluationSpec(
+  experimentId: string,
+  spec: EvaluationSpecPayload,
+  idempotencyKey: string,
+): Promise<SavedEvaluationSpec> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/evaluation-specs`,
+    'POST',
+    spec,
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function fetchEvaluationSpecs(
+  experimentId: string,
+): Promise<{ items: SavedEvaluationSpec[]; nextCursor: null }> {
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/evaluation-specs`,
+  );
+}
+
+export function createEvaluationRun(
+  experimentId: string,
+  evaluationSpecId: string,
+  idempotencyKey: string,
+): Promise<EvaluationRun> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/evaluation-runs`,
+    'POST',
+    { evaluationSpecId },
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function fetchEvaluationRuns(
+  experimentId: string,
+): Promise<{ items: EvaluationRun[]; nextCursor: null }> {
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/evaluation-runs`,
+  );
+}
+
+export function fetchEvaluationRun(
+  experimentId: string,
+  evaluationRunId: string,
+): Promise<EvaluationRunDetail> {
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}`
+      + `/evaluation-runs/${encodeURIComponent(evaluationRunId)}`,
+  );
+}
+
+export function retryEvaluationRun(
+  experimentId: string,
+  evaluationRunId: string,
+  idempotencyKey: string,
+): Promise<{ evaluationRunId: string; status: 'queued'; replayed: boolean }> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}`
+      + `/evaluation-runs/${encodeURIComponent(evaluationRunId)}/retry`,
     'POST',
     {},
     { 'Idempotency-Key': idempotencyKey },

@@ -11,9 +11,11 @@ import pytest
 
 from backend import settings
 from backend.experiments.application import ExperimentApplication
-from backend.experiments.contracts import ExperimentCreateRequest
+from backend.experiments.contracts import EvaluationSpecRequest, ExperimentCreateRequest
 from backend.experiments.coordinator import ExperimentCoordinator
 from backend.experiments.errors import ExperimentError
+from backend.experiments.evaluation_application import EvaluationApplication
+from backend.experiments.evaluation_worker import EvaluationWorker
 from backend.experiments.repository import PostgresExperimentRepository
 from backend.services import state_store
 from backend.services.user_context import (
@@ -68,6 +70,8 @@ def users() -> None:
       """)
       cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
       cur.execute("DELETE FROM backtest_experiment_audit")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_run")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_spec")
       cur.execute("DELETE FROM backtest_experiment_trial_execution")
       cur.execute("DELETE FROM backtest_run WHERE origin_type='experiment'")
       cur.execute("DELETE FROM backtest_experiment_trial")
@@ -174,6 +178,8 @@ def _clear_experiment_facts() -> None:
       """)
       cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
       cur.execute("DELETE FROM backtest_experiment_audit")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_run")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_spec")
       cur.execute("DELETE FROM backtest_experiment_trial_execution")
       cur.execute("DELETE FROM backtest_run WHERE origin_type='experiment'")
       cur.execute("DELETE FROM backtest_experiment_trial")
@@ -481,6 +487,117 @@ def test_complete_standard_bar_execution_reconciles_once_and_keeps_window_bounde
   assert page["items"][0]["selectedExecution"]["actualDataHash"] == "d" * 64
 
 
+def test_evaluation_freezes_results_is_deterministic_and_detects_hash_drift(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-evaluation",
+  )
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="evaluation-source-worker",
+  )
+  assert coordinator.run_once()
+  run_id = _run_id_for_experiment(experiment_id)
+  _finish_run_for_reconciliation(run_id)
+  assert coordinator.run_once()
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  application = EvaluationApplication()
+  request = _evaluation_request(detail)
+
+  spec, _ = _as_user(
+    OWNER,
+    lambda: application.save_spec(experiment_id, request, "save-evaluation-1"),
+  )
+  duplicate_spec, duplicate_status = _as_user(
+    OWNER,
+    lambda: application.save_spec(experiment_id, request, "save-evaluation-2"),
+  )
+  assert duplicate_status == 200
+  assert duplicate_spec["evaluationSpecId"] == spec["evaluationSpecId"]
+  assert duplicate_spec["replayed"] is True
+
+  _set_experiment_stage_status(experiment_id, "running")
+  try:
+    with pytest.raises(ExperimentError) as incomplete:
+      _as_user(
+        OWNER,
+        lambda: application.create_run(
+          experiment_id, spec["evaluationSpecId"], "run-evaluation-incomplete",
+        ),
+      )
+    assert incomplete.value.code == "experiment.evaluation_result_set_incomplete"
+  finally:
+    _set_experiment_stage_status(experiment_id, "completed")
+
+  first_run, _ = _as_user(
+    OWNER,
+    lambda: application.create_run(
+      experiment_id, spec["evaluationSpecId"], "run-evaluation-1",
+    ),
+  )
+  second_run, _ = _as_user(
+    OWNER,
+    lambda: application.create_run(
+      experiment_id, spec["evaluationSpecId"], "run-evaluation-2",
+    ),
+  )
+  worker = EvaluationWorker(worker_id="evaluation-worker-test")
+  assert worker.run_once()
+  assert worker.run_once()
+  first = _as_user(
+    OWNER,
+    lambda: application.run_detail(experiment_id, first_run["evaluationRunId"]),
+  )
+  second = _as_user(
+    OWNER,
+    lambda: application.run_detail(experiment_id, second_run["evaluationRunId"]),
+  )
+  assert first["status"] == second["status"] == "succeeded"
+  assert first["resultSetHash"] == second["resultSetHash"]
+  assert first["outputHash"] == second["outputHash"]
+  assert first["output"] == second["output"]
+
+  data_drifted, _ = _as_user(
+    OWNER,
+    lambda: application.create_run(
+      experiment_id, spec["evaluationSpecId"], "run-evaluation-data-drift",
+    ),
+  )
+  _set_execution_actual_data_hash(run_id, "f" * 64)
+  assert worker.run_once()
+  data_failed = _as_user(
+    OWNER,
+    lambda: application.run_detail(
+      experiment_id, data_drifted["evaluationRunId"],
+    ),
+  )
+  assert data_failed["status"] == "failed"
+  assert data_failed["error"]["code"] == "experiment.evaluation_data_hash_mismatch"
+  _set_execution_actual_data_hash(run_id, "d" * 64)
+
+  drifted, _ = _as_user(
+    OWNER,
+    lambda: application.create_run(
+      experiment_id, spec["evaluationSpecId"], "run-evaluation-drift",
+    ),
+  )
+  _mutate_result_after_evaluation_freeze(run_id)
+  assert worker.run_once()
+  failed = _as_user(
+    OWNER,
+    lambda: application.run_detail(experiment_id, drifted["evaluationRunId"]),
+  )
+  assert failed["status"] == "failed"
+  assert failed["error"]["code"] == "experiment.evaluation_result_hash_mismatch"
+  unchanged = _as_user(
+    OWNER,
+    lambda: application.run_detail(experiment_id, first_run["evaluationRunId"]),
+  )
+  assert unchanged["outputHash"] == first["outputHash"]
+  assert unchanged["output"] == first["output"]
+  assert _experiment_run_count(experiment_id) == 1
+
+
 def _execution_facts(experiment_id: str) -> dict[str, Any]:
   with psycopg.connect(
     os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], row_factory=dict_row,
@@ -551,6 +668,83 @@ def _finish_run_for_reconciliation(run_id: str) -> None:
         psycopg.types.json.Jsonb(result),
         run_id,
       ))
+
+
+def _evaluation_request(detail: dict[str, Any]) -> EvaluationSpecRequest:
+  return EvaluationSpecRequest.model_validate({
+    "schemaVersion": "evaluation_spec_v1",
+    "name": "基础收益评价",
+    "source": {
+      "experimentRevisionId": detail["revision"]["revisionId"],
+      "stageIds": [detail["stage"]["stageId"]],
+      "executionSelection": "selected_execution_at_run_creation",
+    },
+    "catalogs": {
+      "metricCatalogVersion": "metric_catalog_v1",
+      "dimensionCatalogVersion": "dimension_catalog_v1",
+      "normalizerVersion": None,
+    },
+    "completeness": {
+      "allowPartial": False,
+      "minimumCompletionRate": "1.0000",
+      "requiredDimensionCoverage": [],
+    },
+    "columns": ["totalReturn"],
+    "derivedMetrics": [],
+    "filters": [],
+    "groupBy": [],
+    "aggregates": [],
+    "groupFilters": [],
+    "sort": [{
+      "type": "metric_sort_v1",
+      "metricId": "totalReturn",
+      "direction": "desc",
+    }],
+    "visualizations": [],
+    "reportSections": [],
+  })
+
+
+def _mutate_result_after_evaluation_freeze(run_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_run
+        SET result_json=jsonb_set(result_json, '{summary,totalReturn}', '0.2'::jsonb)
+        WHERE id=%s
+      """, (run_id,))
+
+
+def _set_execution_actual_data_hash(run_id: str, data_hash: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_experiment_trial_execution
+        SET actual_data_hash=%s
+        WHERE run_id=%s
+      """, (data_hash, run_id))
+
+
+def _set_experiment_stage_status(experiment_id: str, status: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_experiment_stage stage
+        SET status=%s
+        FROM backtest_experiment_revision revision
+        WHERE stage.revision_id=revision.id
+          AND revision.experiment_id=%s
+      """, (status, experiment_id))
+
+
+def _experiment_run_count(experiment_id: str) -> int:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT count(*) FROM backtest_run WHERE origin_experiment_id=%s",
+        (experiment_id,),
+      )
+      return int(cur.fetchone()[0])
 
 
 @contextmanager

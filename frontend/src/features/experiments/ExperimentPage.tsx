@@ -42,6 +42,7 @@ import {
   loadExperimentDraft,
   saveExperimentDraft,
 } from './draftStore';
+import EvaluationBuilder from './EvaluationBuilder';
 
 type Props = {
   userId: string;
@@ -521,6 +522,19 @@ function ExperimentDetailView({
           </button>
         )}
       </section>
+      {detail.status === 'completed' ? (
+        <EvaluationBuilder
+          experimentId={experimentId}
+          symbol={String(fixed.symbol ?? '')}
+          timeframe={String(fixed.timeframe ?? '5m')}
+          onOpenRun={onOpenRun}
+        />
+      ) : (
+        <section className="experiment-preview-card evaluation-locked">
+          <h2>结果评价</h2>
+          <p>基础评价将在全部 Trial 成功并冻结选定执行后开放。</p>
+        </section>
+      )}
       {CANCELLABLE_EXPERIMENT_STATUSES.has(detail.status) && (
         <section className="experiment-command-bar">
           <div><strong>停止生成</strong><span>当前仅支持在执行物化前取消，已生成内容和审计记录继续保留。</span></div>

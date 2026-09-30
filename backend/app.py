@@ -34,6 +34,9 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from backend import settings
 from backend.experiments import (
+  EvaluationApplication,
+  EvaluationRunCreateRequest,
+  EvaluationSpecRequest,
   ExperimentApplication,
   ExperimentCreateRequest,
   ExperimentError,
@@ -97,6 +100,7 @@ app = FastAPI(title="Trend Grid Viewer", version="0.1.0")
 logger = logging.getLogger(__name__)
 _verified_runtime_capabilities = declared_runtime_capabilities()
 _experiment_application = ExperimentApplication()
+_evaluation_application = EvaluationApplication()
 
 
 def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, Any]:
@@ -1840,6 +1844,101 @@ def experiment_trials(
       cursor=cursor,
       status=status,
     )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/experiments/{experiment_id}/evaluation-catalogs")
+def experiment_evaluation_catalogs(experiment_id: UUID) -> dict[str, Any]:
+  try:
+    return _evaluation_application.catalogs(str(experiment_id))
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/evaluation-specs")
+def save_experiment_evaluation_spec(
+  experiment_id: UUID,
+  payload: EvaluationSpecRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _evaluation_application.save_spec(
+      str(experiment_id),
+      payload,
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/experiments/{experiment_id}/evaluation-specs")
+def experiment_evaluation_specs(experiment_id: UUID) -> dict[str, Any]:
+  try:
+    return _evaluation_application.list_specs(str(experiment_id))
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/evaluation-runs")
+def create_experiment_evaluation_run(
+  experiment_id: UUID,
+  payload: EvaluationRunCreateRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _evaluation_application.create_run(
+      str(experiment_id),
+      str(payload.evaluationSpecId),
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/experiments/{experiment_id}/evaluation-runs")
+def experiment_evaluation_runs(experiment_id: UUID) -> dict[str, Any]:
+  try:
+    return _evaluation_application.list_runs(str(experiment_id))
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get(
+  "/api/backtest/experiments/{experiment_id}/evaluation-runs/{evaluation_run_id}",
+)
+def experiment_evaluation_run_detail(
+  experiment_id: UUID,
+  evaluation_run_id: UUID,
+) -> dict[str, Any]:
+  try:
+    return _evaluation_application.run_detail(
+      str(experiment_id), str(evaluation_run_id),
+    )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post(
+  "/api/backtest/experiments/{experiment_id}/evaluation-runs/{evaluation_run_id}/retry",
+)
+def retry_experiment_evaluation_run(
+  experiment_id: UUID,
+  evaluation_run_id: UUID,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _evaluation_application.retry_run(
+      str(experiment_id),
+      str(evaluation_run_id),
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
   except ExperimentError as error:
     _raise_experiment_error(error)
 
