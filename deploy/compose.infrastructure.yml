@@ -394,6 +394,34 @@ services:
       - quant-backtest-net
       - quant-backtest-l2-net
 
+  experiment-coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    container_name: quant-backtest-experiment-coordinator
+    restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-main
+    env_file:
+      - .env
+    environment:
+      TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
+      TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+      TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    command: ['python', '-m', 'backend.experiment_coordinator']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 128
+    networks:
+      - quant-backtest-net
+
   signal-export-runner:
     build:
       context: ..

@@ -230,4 +230,42 @@ def test_health_reports_runner_degradation_without_internal_counts(
     "runtimeCapabilities": api_app._verified_runtime_capabilities,
     "signalExportRunner": {"healthy": True},
     "observability": {"status": "disabled"},
+    "experiments": {
+      "enabled": api_app.settings.EXPERIMENTS_ENABLED,
+      "barPreviewEnabled": api_app.settings.EXPERIMENT_BAR_ENABLED,
+      "capabilityVersion": "experiment_bar_execution_v1",
+    },
   }
+
+
+def test_delete_experiment_run_uses_stable_retention_error(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  def reject(_run_id: str) -> bool:
+    raise api_app.state_store.ExperimentRunRetainedError("实验运行受历史保留约束")
+
+  monkeypatch.setattr(api_app.state_store, "delete_backtest_run", reject)
+
+  with pytest.raises(HTTPException) as raised:
+    api_app.delete_backtest_run("00000000-0000-0000-0000-000000000001")
+
+  assert raised.value.status_code == 409
+  assert raised.value.detail["code"] == "experiment.run_retained"
+
+
+def test_batch_delete_experiment_run_uses_stable_retention_error(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  def reject(_run_ids: list[str]) -> int:
+    raise api_app.state_store.ExperimentRunRetainedError("实验运行受历史保留约束")
+
+  monkeypatch.setattr(api_app.state_store, "delete_backtest_runs", reject)
+  payload = schemas.BacktestRunBatchDeleteRequest(
+    runIds=["00000000-0000-0000-0000-000000000001"],
+  )
+
+  with pytest.raises(HTTPException) as raised:
+    api_app.delete_backtest_runs(payload)
+
+  assert raised.value.status_code == 409
+  assert raised.value.detail["code"] == "experiment.run_retained"

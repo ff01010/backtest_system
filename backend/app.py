@@ -16,7 +16,7 @@ import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -33,6 +33,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend import settings
+from backend.experiments import (
+  ExperimentApplication,
+  ExperimentCreateRequest,
+  ExperimentError,
+  ExperimentPreviewRequest,
+  SubjectRef,
+)
 from backend.execution import execution_algorithm_snapshot, validate_execution_request
 from backend.date_codec import TradingDateError, format_legacy_date, normalize_date_range
 from backend import schemas
@@ -89,6 +96,7 @@ from backend.services.user_context import get_current_user, reset_current_user, 
 app = FastAPI(title="Trend Grid Viewer", version="0.1.0")
 logger = logging.getLogger(__name__)
 _verified_runtime_capabilities = declared_runtime_capabilities()
+_experiment_application = ExperimentApplication()
 
 
 def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, Any]:
@@ -176,6 +184,13 @@ def _csrf_origin_is_valid(request: Request) -> bool:
 
 
 def _csrf_error(request: Request) -> JSONResponse:
+  if _is_experiment_api_path(request.url.path):
+    return _experiment_api_error(
+      request,
+      403,
+      "auth.csrf_invalid",
+      "请求安全验证失败，请刷新页面后重试",
+    )
   return _legacy_api_error(request, 403, {
     "code": "auth.csrf_invalid",
     "message": "请求安全验证失败，请刷新页面后重试",
@@ -233,6 +248,10 @@ async def _dispatch_authenticated_request(
   session_token = request.cookies.get(auth.SESSION_COOKIE)
   user = auth.get_user_by_token(session_token)
   if not user:
+    if _is_experiment_api_path(path):
+      return _experiment_api_error(
+        request, 401, "auth.unauthorized", "登录已失效，请重新登录",
+      )
     return _legacy_api_error(request, 401, "登录已失效，请重新登录")
   request.state.auth_type = "cookie"
   if _requires_cookie_csrf(request.method, path) and not (
@@ -290,6 +309,28 @@ def _legacy_api_error(request: Request, status_code: int, detail: Any) -> JSONRe
   )
 
 
+def _is_experiment_api_path(path: str) -> bool:
+  return path.startswith("/api/backtest/experiment")
+
+
+def _experiment_api_error(
+  request: Request,
+  status_code: int,
+  code: str,
+  message: str,
+  *,
+  retryable: bool = False,
+  details: dict[str, Any] | None = None,
+) -> JSONResponse:
+  return JSONResponse(status_code=status_code, content={"error": {
+    "code": code,
+    "message": message,
+    "retryable": retryable,
+    "requestId": getattr(request.state, "request_id", None),
+    "details": details or {},
+  }})
+
+
 def _public_api_error(
   request: Request,
   status_code: int,
@@ -332,6 +373,16 @@ async def handle_http_exception(request: Request, error: HTTPException) -> JSONR
       elif error.status_code == 429:
         code = "rate_limit.exceeded"
     return _public_api_error(request, error.status_code, code, detail, error.status_code >= 500)
+  if _is_experiment_api_path(request.url.path):
+    detail = error.detail if isinstance(error.detail, dict) else {}
+    return _experiment_api_error(
+      request,
+      error.status_code,
+      str(detail.get("code") or "experiment.command_invalid"),
+      str(detail.get("message") or error.detail),
+      retryable=bool(detail.get("retryable", False)),
+      details=detail.get("details") if isinstance(detail.get("details"), dict) else None,
+    )
   if request.url.path == "/api" or request.url.path.startswith("/api/"):
     return _legacy_api_error(request, error.status_code, error.detail)
   return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
@@ -346,6 +397,15 @@ async def handle_request_validation_error(request: Request, error: RequestValida
       else "backtest.validation_failed"
     )
     return _public_api_error(request, 422, code, "请求参数不符合接口约束")
+  if _is_experiment_api_path(request.url.path):
+    fields = [".".join(str(part) for part in item["loc"][1:]) for item in error.errors()]
+    return _experiment_api_error(
+      request,
+      422,
+      "experiment.validation_failed",
+      "实验预览参数不符合接口约束",
+      details={"fields": fields},
+    )
   if request.url.path == "/api" or request.url.path.startswith("/api/"):
     return _legacy_api_error(request, 422, "请求参数不符合接口约束")
   return JSONResponse(status_code=422, content={"detail": error.errors()})
@@ -361,6 +421,10 @@ async def handle_unexpected_exception(request: Request, error: Exception) -> JSO
   )
   if request.url.path.startswith("/api/v1/"):
     return _public_api_error(request, 503, "backtest.unavailable", "服务暂时不可用，请稍后重试", True)
+  if _is_experiment_api_path(request.url.path):
+    return _experiment_api_error(
+      request, 500, "experiment.internal_error", "服务器内部错误",
+    )
   if request.url.path == "/api" or request.url.path.startswith("/api/"):
     return _legacy_api_error(request, 500, "服务器内部错误")
   return JSONResponse(status_code=500, content={"detail": "服务器内部错误"})
@@ -967,6 +1031,7 @@ def startup():
   settings.validate_research_integration_configuration()
   settings.validate_application_build_configuration()
   settings.validate_observability_configuration()
+  settings.validate_experiment_configuration()
   state_store.ensure_schema()
   state_store.prune_strategy_runtime_error_stats()
 
@@ -985,6 +1050,11 @@ def health():
     "runtimeCapabilities": _verified_runtime_capabilities,
     "signalExportRunner": {"healthy": signal_export_healthy},
     "observability": loki_client.health_status(),
+    "experiments": {
+      "enabled": settings.EXPERIMENTS_ENABLED,
+      "barPreviewEnabled": settings.EXPERIMENT_BAR_ENABLED,
+      "capabilityVersion": "experiment_bar_execution_v1",
+    },
   }
 
 
@@ -1659,6 +1729,132 @@ def strategy_config_versions(config_id: str):
   except KeyError:
     raise HTTPException(404, f"策略配置不存在: {config_id}")
   return {"versions": state_store.list_strategy_config_versions(config_id)}
+
+
+def _raise_experiment_error(error: ExperimentError) -> NoReturn:
+  raise HTTPException(error.status_code, {
+    "code": error.code,
+    "message": str(error),
+    "retryable": error.retryable,
+    "details": error.details,
+  }) from error
+
+
+def _experiment_idempotency_key(request: Request) -> str:
+  value = request.headers.get("idempotency-key", "").strip()
+  if not value or len(value) > 128 or not re.fullmatch(r"[A-Za-z0-9._:-]+", value):
+    raise ExperimentError(
+      "experiment.validation_failed",
+      "Idempotency-Key 缺失或格式无效",
+      422,
+    )
+  return value
+
+
+@app.get(
+  "/api/backtest/experiment-subjects/{subject_type}/{subject_id}/versions/{subject_version}",
+)
+def experiment_subject(
+  subject_type: Literal["legacy_single_strategy"],
+  subject_id: str,
+  subject_version: str,
+) -> dict[str, Any]:
+  try:
+    return _experiment_application.resolve_subject(SubjectRef(
+      subjectType=subject_type,
+      subjectId=subject_id,
+      subjectVersion=subject_version,
+    ))
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/preview")
+def preview_experiment(payload: ExperimentPreviewRequest) -> dict[str, Any]:
+  try:
+    return _experiment_application.preview(payload)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments")
+def create_experiment(payload: ExperimentCreateRequest, request: Request) -> Response:
+  try:
+    body, status_code = _experiment_application.create(
+      payload,
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/experiments/by-idempotency-key/{idempotency_key}")
+def find_created_experiment(idempotency_key: str) -> Response:
+  try:
+    if len(idempotency_key) > 128 or not re.fullmatch(r"[A-Za-z0-9._:-]+", idempotency_key):
+      raise ExperimentError("experiment.not_found", "创建请求不存在", 404)
+    body, status_code = _experiment_application.find_created(idempotency_key)
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/experiments")
+def list_experiments(
+  limit: int = Query(50, ge=1, le=200),
+  cursor: str | None = Query(default=None, max_length=2048),
+) -> dict[str, Any]:
+  try:
+    return _experiment_application.list_experiments(limit=limit, cursor=cursor)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/experiments/{experiment_id}")
+def experiment_detail(experiment_id: UUID, request: Request) -> Response:
+  try:
+    body = _experiment_application.detail(str(experiment_id))
+    etag = f'"{body["snapshotVersion"]}"'
+    if request.headers.get("if-none-match") == etag:
+      return Response(status_code=304, headers={"ETag": etag})
+    return JSONResponse(content=body, headers={"ETag": etag})
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/experiments/{experiment_id}/trials")
+def experiment_trials(
+  experiment_id: UUID,
+  limit: int = Query(50, ge=1, le=200),
+  cursor: str | None = Query(default=None, max_length=2048),
+  status: Literal[
+    "pending", "queued", "running", "cancelling", "succeeded", "failed", "cancelled"
+  ] | None = Query(default=None),
+) -> dict[str, Any]:
+  try:
+    return _experiment_application.list_trials(
+      str(experiment_id),
+      limit=limit,
+      cursor=cursor,
+      status=status,
+    )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/cancel")
+def cancel_experiment(experiment_id: UUID, request: Request) -> Response:
+  try:
+    body, status_code = _experiment_application.cancel(
+      str(experiment_id),
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
 
 
 @app.get("/api/backtest/runs")
@@ -2540,6 +2736,8 @@ def delete_backtest_runs(payload: schemas.BacktestRunBatchDeleteRequest):
     raise _stable_error(404, "backtest.not_found", "部分回测记录不存在") from error
   except state_store.SelectionChangedError as error:
     raise _stable_error(409, "backtest.selection_changed", str(error)) from error
+  except state_store.ExperimentRunRetainedError as error:
+    raise _stable_error(409, "experiment.run_retained", str(error)) from error
   except ValueError as error:
     status_code = 422 if payload.selection is not None else 409
     raise _stable_error(status_code, "backtest.selection_invalid", str(error)) from error
@@ -2552,6 +2750,8 @@ def delete_backtest_run(run_id: str):
     deleted = state_store.delete_backtest_run(run_id)
   except KeyError as error:
     raise HTTPException(404, "回测记录不存在") from error
+  except state_store.ExperimentRunRetainedError as error:
+    raise _stable_error(409, "experiment.run_retained", str(error)) from error
   except ValueError as error:
     raise HTTPException(409, str(error)) from error
   return {"deleted": deleted}

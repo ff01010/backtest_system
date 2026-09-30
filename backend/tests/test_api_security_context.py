@@ -69,6 +69,7 @@ def _invoke_app(
   path: str,
   method: str,
   body: bytes,
+  headers: list[tuple[bytes, bytes]] | None = None,
 ) -> tuple[int, dict[str, str], dict[str, object]]:
   messages: list[dict[str, object]] = []
 
@@ -94,7 +95,7 @@ def _invoke_app(
       "path": path,
       "raw_path": path.encode("ascii"),
       "query_string": b"",
-      "headers": [(b"content-type", b"application/json")],
+      "headers": [(b"content-type", b"application/json"), *(headers or [])],
       "client": ("127.0.0.1", 12345),
       "server": ("testserver", 80),
     }, receive, send)
@@ -154,6 +155,33 @@ def test_legacy_and_public_error_bodies_use_the_request_id() -> None:
   assert public_body["error"]["request_id"] == "req_public"
 
 
+def test_experiment_authentication_and_csrf_errors_use_stable_contract(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(auth, "get_user_by_token", lambda _token: None)
+  unauthorized_request = _request("/api/backtest/experiments/preview", "POST")
+
+  async def should_not_run(_request: Request) -> Response:
+    raise AssertionError("认证失败后不应进入路由")
+
+  unauthorized = _run_middleware(unauthorized_request, should_not_run)
+  unauthorized_body = json.loads(unauthorized.body)
+  assert unauthorized_body["error"]["code"] == "auth.unauthorized"
+  assert unauthorized_body["error"]["requestId"].startswith("req_")
+
+  csrf_request = _request("/api/backtest/experiments/preview", "POST")
+  csrf_request.state.request_id = "req_experiment"
+  csrf_response = app_module._csrf_error(csrf_request)
+  csrf_body = json.loads(csrf_response.body)
+  assert csrf_body == {"error": {
+    "code": "auth.csrf_invalid",
+    "message": "请求安全验证失败，请刷新页面后重试",
+    "retryable": False,
+    "requestId": "req_experiment",
+    "details": {},
+  }}
+
+
 def test_validation_error_through_asgi_has_matching_request_id_header_and_body() -> None:
   status, headers, body = _invoke_app("/api/auth/login", "POST", b"{}")
 
@@ -161,6 +189,58 @@ def test_validation_error_through_asgi_has_matching_request_id_header_and_body()
   assert headers["x-request-id"].startswith("req_")
   assert body["requestId"] == headers["x-request-id"]
   assert body["detail"] == "请求参数不符合接口约束"
+
+
+def test_experiment_preview_rejects_untrusted_trial_count_with_stable_error(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(auth, "get_user_by_token", lambda _token: USER)
+  monkeypatch.setattr(auth, "validate_csrf_token", lambda *_args: True)
+  payload = {
+    "schemaVersion": "experiment_create_v1",
+    "name": "网格预览",
+    "description": "",
+    "subjectRef": {
+      "subjectType": "legacy_single_strategy",
+      "subjectId": "config-1",
+      "subjectVersion": "version-1",
+    },
+    "plan": {
+      "planVersion": "experiment_plan_v1",
+      "stages": [{
+        "stageType": "finite_grid_v1",
+        "generatorVersion": "1",
+        "parameterGrid": [],
+        "dateScenarios": [{
+          "scenarioId": "development-1",
+          "name": "开发集",
+          "role": "development",
+          "startDate": "2026-07-01",
+          "endDate": "2026-07-02",
+        }],
+        "capitalScenarios": ["100000"],
+        "costScenarios": [{"scenarioId": "normal", "slippage": "0"}],
+        "executionScenarios": [{
+          "scenarioId": "immediate",
+          "algorithm": "immediate",
+          "parameters": {},
+        }],
+        "plannedTrialCount": 1,
+      }],
+    },
+  }
+
+  status, headers, body = _invoke_app(
+    "/api/backtest/experiments/preview",
+    "POST",
+    json.dumps(payload).encode("utf-8"),
+    _security_headers(),
+  )
+
+  assert status == 422
+  assert body["error"]["code"] == "experiment.validation_failed"
+  assert body["error"]["requestId"] == headers["x-request-id"]
+  assert "plan.stages.0.plannedTrialCount" in body["error"]["details"]["fields"]
 
 
 def test_authentication_failure_still_returns_correlated_sanitized_error(
@@ -327,7 +407,11 @@ def test_all_cookie_write_routes_are_rejected_before_dispatch_without_csrf(
 
     response = _run_middleware(request, call_next)
     assert response.status_code == 403, f"{method} {path}"
-    assert json.loads(response.body)["detail"]["code"] == "auth.csrf_invalid"
+    body = json.loads(response.body)
+    if path.startswith("/api/backtest/experiment"):
+      assert body["error"]["code"] == "auth.csrf_invalid"
+    else:
+      assert body["detail"]["code"] == "auth.csrf_invalid"
 
 
 def test_api_key_request_does_not_depend_on_cookie_csrf_token(

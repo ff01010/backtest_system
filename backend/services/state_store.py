@@ -63,6 +63,10 @@ class SelectionChangedError(ConflictError):
   """批量删除范围与用户最后确认的快照不一致。"""
 
 
+class ExperimentRunRetainedError(ValueError):
+  """回测运行被实验历史引用，禁止通过普通接口删除。"""
+
+
 _BACKTEST_SCHEDULER_LOCK_KEY = 314159265
 _STRATEGY_NAME_MAX_LENGTH = 64
 # 保留旧名称，避免外部诊断脚本在迁移期间失效。
@@ -178,6 +182,9 @@ def ensure_schema() -> None:
       cur.execute("SELECT to_regclass('public.strategy_runtime_error_stat') AS runtime_error_table")
       if cur.fetchone()["runtime_error_table"] is None:
         raise DatabaseError("数据库缺少策略运行时错误统计迁移 025，请先运行 deploy 的 migrate 服务")
+      cur.execute("SELECT to_regclass('public.backtest_experiment_preview') AS preview_table")
+      if cur.fetchone()["preview_table"] is None:
+        raise DatabaseError("数据库缺少实验预览迁移 044，请先运行 deploy 的 migrate 服务")
       cur.execute("""
         SELECT to_regclass('public.backtest_signal_detail_export') AS export_table,
           to_regclass('public.backtest_signal_detail_export_item') AS item_table,
@@ -1513,6 +1520,9 @@ def _create_backtest_run_row(
   payload: dict[str, Any],
   status: str,
   owner_user_id: str,
+  *,
+  request_key: str | None = None,
+  origin: dict[str, Any] | None = None,
 ) -> tuple[str, int]:
   config_id = payload.get("configId")
   display_no = _next_backtest_display_no(cur, owner_user_id)
@@ -1520,21 +1530,30 @@ def _create_backtest_run_row(
   benchmark_id = _instrument_id(cur, payload["benchmarkSymbol"]) if payload.get("benchmarkSymbol") else None
   script_snapshot = payload.get("savedScriptSnapshot")
   params_snapshot = payload.get("savedConfigSnapshot", {})
+  origin = origin or {}
+  origin_type = str(origin.get("type") or "manual")
+  if origin_type not in {"manual", "experiment"}:
+    raise ValueError("回测任务来源无效")
   db_status = "running" if status == "running" else "queued"
   cur.execute("""
     INSERT INTO backtest_run (
-      id, owner_user_id, display_no, strategy_version_id, status, requested_params, market_data_snapshot,
+      id, owner_user_id, display_no, strategy_version_id, status, request_key,
+      requested_params, market_data_snapshot,
       started_at, config_id, config_version_id, account_id, instrument_id,
-      benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot, execution_kind
+      benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot,
+      execution_kind, origin_type, origin_experiment_id, origin_stage_id,
+      origin_trial_execution_id
     ) VALUES (
-      gen_random_uuid(), %s, %s, %s, %s, %s, %s,
-      CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+      gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s,
+      CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+      %s, %s, %s, %s, %s
     ) RETURNING id, display_no
-  """, (owner_user_id, display_no, payload.get("strategyVersionId"), db_status,
+  """, (owner_user_id, display_no, payload.get("strategyVersionId"), db_status, request_key,
          Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
          config_id, payload.get("configVersionId"), payload.get("accountId"), instrument_id, benchmark_id,
          payload.get("timeframe", "5m"), "bar_close_signal_fill", Jsonb(script_snapshot) if script_snapshot else None,
-         Jsonb(params_snapshot), payload.get("executionKind", "published")))
+         Jsonb(params_snapshot), payload.get("executionKind", "published"), origin_type,
+         origin.get("experimentId"), origin.get("stageId"), origin.get("trialExecutionId")))
   row = cur.fetchone()
   return _uuid(row["id"]) or "", int(row["display_no"])
 
@@ -1552,13 +1571,23 @@ def _create_queued_backtest_job(
   owner_user_id: str,
   job_table: str,
   fill_model: str,
+  *,
+  request_key: str | None = None,
+  origin: dict[str, Any] | None = None,
 ) -> tuple[str, int]:
   routed_payload = {
     **payload,
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
-  run_id, display_no = _create_backtest_run_row(cur, routed_payload, "queued", owner_user_id)
+  run_id, display_no = _create_backtest_run_row(
+    cur,
+    routed_payload,
+    "queued",
+    owner_user_id,
+    request_key=request_key,
+    origin=origin,
+  )
   cur.execute("UPDATE backtest_run SET fill_model=%s WHERE id=%s AND owner_user_id=%s", (
     fill_model, run_id, owner_user_id,
   ))
@@ -1574,6 +1603,28 @@ def _create_queued_backtest_job(
     cur, run_id, owner_user_id, routed_payload.get("researchSignalSnapshot"),
   )
   return run_id, display_no
+
+
+def create_queued_backtest_job_in_transaction(
+  cur: Any,
+  payload: dict[str, Any],
+  owner_user_id: str,
+  *,
+  request_key: str,
+  origin: dict[str, Any],
+) -> tuple[str, int]:
+  """加入调用方事务创建普通任务，供实验物化保持原子性。"""
+  fill_model = str(payload.get("fillModel", "bar_next_open"))
+  job_table = "l2_backtest_job" if fill_model == "l2_quote" else "bar_backtest_job"
+  return _create_queued_backtest_job(
+    cur,
+    payload,
+    owner_user_id,
+    job_table,
+    fill_model,
+    request_key=request_key,
+    origin=origin,
+  )
 
 
 def _save_research_signal_snapshot(cur: Any, run_id: str, owner_user_id: str, snapshot: object) -> None:
@@ -3441,6 +3492,7 @@ def delete_backtest_run(run_id: str) -> bool:
         raise KeyError(run_id)
       if row["status"] not in {"succeeded", "failed", "cancelled"}:
         raise ValueError("排队或运行中的回测不能删除，请先取消任务")
+      _ensure_runs_not_retained_by_experiment(cur, [run_id])
       cur.execute(
         "DELETE FROM backtest_run WHERE id=%s AND owner_user_id=%s",
         (run_id, current_user_id()),
@@ -3464,6 +3516,7 @@ def delete_backtest_runs(run_ids: list[str]) -> int:
         raise KeyError("部分回测记录不存在或无删除权限")
       if any(row["status"] not in {"succeeded", "failed", "cancelled"} for row in rows):
         raise ValueError("选中的回测包含排队或运行中任务，请先取消任务")
+      _ensure_runs_not_retained_by_experiment(cur, unique_run_ids)
       cur.execute(
         "DELETE FROM backtest_run WHERE id=ANY(%s) AND owner_user_id=%s",
         (unique_run_ids, current_user_id()),
@@ -3503,12 +3556,29 @@ def delete_backtest_run_selection(
       actual_count, actual_digest = _selection_digest(iter(cur))
       if actual_count != expected_count or actual_digest != expected_digest:
         raise SelectionChangedError("选择范围已变化，请重新确认")
+      cur.execute("SELECT id FROM selected_backtest_run ORDER BY id")
+      _ensure_runs_not_retained_by_experiment(
+        cur, [str(row["id"]) for row in cur.fetchall()],
+      )
       cur.execute("""
         DELETE FROM backtest_run run
         USING selected_backtest_run selected
         WHERE run.id=selected.id AND run.owner_user_id=%s
       """, (owner_user_id,))
       return cur.rowcount
+
+
+def _ensure_runs_not_retained_by_experiment(cur: Any, run_ids: list[str]) -> None:
+  if not run_ids:
+    return
+  cur.execute("""
+    SELECT 1 FROM backtest_experiment_trial_execution
+    WHERE run_id=ANY(%s) LIMIT 1
+  """, (run_ids,))
+  if cur.fetchone() is not None:
+    raise ExperimentRunRetainedError(
+      "实验关联的回测结果受历史保留约束，不能单独删除",
+    )
 
 
 def get_backtest_result_page(

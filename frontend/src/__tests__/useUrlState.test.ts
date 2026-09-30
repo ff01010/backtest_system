@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { readUrlParams } from '../hooks/useUrlState';
 
 // Mock window.location and localStorage
 const mockSearchParams = new URLSearchParams();
@@ -30,6 +31,31 @@ describe('URL params (sanity check)', () => {
     expect(validPattern.test('20260622')).toBe(true);
     expect(validPattern.test('2026062')).toBe(false);
     expect(validPattern.test('abc')).toBe(false);
+  });
+});
+
+describe('experiment deep link', () => {
+  it('restores the exact published subject from URL parameters', () => {
+    window.history.replaceState(null, '', '/?workspace=experiments&experimentConfigId=config-1&experimentVersionId=version-9');
+
+    expect(readUrlParams()).toMatchObject({
+      workspace: 'experiments',
+      experimentConfigId: 'config-1',
+      experimentVersionId: 'version-9',
+    });
+  });
+
+  it('restores a created experiment detail after refresh', () => {
+    window.history.replaceState(
+      null,
+      '',
+      '/?workspace=experiments&experimentId=experiment-1',
+    );
+
+    expect(readUrlParams()).toMatchObject({
+      workspace: 'experiments',
+      experimentId: 'experiment-1',
+    });
   });
 });
 

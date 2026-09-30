@@ -189,7 +189,7 @@ def test_claim_persists_each_attempt_without_overwriting_expired_attempt() -> No
 def test_queued_job_freezes_runtime_route_in_columns_and_payload(monkeypatch: Any) -> None:
   cursor = FakeCursor(None)
   monkeypatch.setattr(
-    state_store, "_create_backtest_run_row", lambda *_: ("run-42", 42),
+    state_store, "_create_backtest_run_row", lambda *_, **__: ("run-42", 42),
   )
   monkeypatch.setattr(state_store, "_save_research_signal_snapshot", lambda *_: None)
 
@@ -264,7 +264,7 @@ def test_global_scheduler_does_not_burst_for_user_with_active_slot(monkeypatch: 
 
 
 def test_delete_backtest_run_permanently_removes_completed_run(monkeypatch: Any) -> None:
-  cursor = FakeCursor({"status": "succeeded"})
+  cursor = FakeCursor(None, fetch_rows=[{"status": "succeeded"}, None])
   cursor.rowcount = 1
   connection = FakeConnection(cursor)
   monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
@@ -273,8 +273,9 @@ def test_delete_backtest_run_permanently_removes_completed_run(monkeypatch: Any)
   assert state_store.delete_backtest_run("run-1") is True
   assert "FOR UPDATE" in cursor.commands[0][0]
   assert cursor.commands[0][1] == ("run-1", "user-1")
-  assert "DELETE FROM backtest_run" in cursor.commands[1][0]
-  assert cursor.commands[1][1] == ("run-1", "user-1")
+  assert "backtest_experiment_trial_execution" in cursor.commands[1][0]
+  assert "DELETE FROM backtest_run" in cursor.commands[2][0]
+  assert cursor.commands[2][1] == ("run-1", "user-1")
 
 
 def test_delete_backtest_run_rejects_active_run(monkeypatch: Any) -> None:
@@ -286,6 +287,22 @@ def test_delete_backtest_run_rejects_active_run(monkeypatch: Any) -> None:
   with pytest.raises(ValueError, match="不能删除"):
     state_store.delete_backtest_run("run-1")
   assert len(cursor.commands) == 1
+
+
+def test_delete_backtest_run_rejects_experiment_retained_run(
+  monkeypatch: Any,
+) -> None:
+  cursor = FakeCursor(
+    None,
+    fetch_rows=[{"status": "succeeded"}, {"retained": True}],
+  )
+  connection = FakeConnection(cursor)
+  monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  with pytest.raises(state_store.ExperimentRunRetainedError):
+    state_store.delete_backtest_run("run-1")
+  assert not any("DELETE FROM backtest_run" in query for query, _ in cursor.commands)
 
 
 def test_delete_backtest_runs_requires_all_selected_runs_to_be_terminal(monkeypatch: Any) -> None:
@@ -300,7 +317,11 @@ def test_delete_backtest_runs_requires_all_selected_runs_to_be_terminal(monkeypa
 
 
 def test_delete_backtest_runs_deletes_all_selected_runs_atomically(monkeypatch: Any) -> None:
-  cursor = FakeCursor(None, [{"id": "run-1", "status": "succeeded"}, {"id": "run-2", "status": "failed"}])
+  cursor = FakeCursor(
+    None,
+    [{"id": "run-1", "status": "succeeded"}, {"id": "run-2", "status": "failed"}],
+    fetch_rows=[None],
+  )
   cursor.rowcount = 2
   connection = FakeConnection(cursor)
   monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
@@ -309,7 +330,8 @@ def test_delete_backtest_runs_deletes_all_selected_runs_atomically(monkeypatch: 
   assert state_store.delete_backtest_runs(["run-1", "run-2"]) == 2
   assert "FOR UPDATE" in cursor.commands[0][0]
   assert cursor.commands[0][1] == (["run-1", "run-2"], "user-1")
-  assert "DELETE FROM backtest_run" in cursor.commands[1][0]
+  assert "backtest_experiment_trial_execution" in cursor.commands[1][0]
+  assert "DELETE FROM backtest_run" in cursor.commands[2][0]
 
 
 @pytest.mark.parametrize("status", ["succeeded", "cancelled"])

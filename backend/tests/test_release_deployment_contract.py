@@ -74,12 +74,30 @@ def test_signal_export_runner_is_deployed_and_health_checked_with_backend() -> N
   assert "python', '-m', 'backend.signal_export_runner" in compose
   assert "quant-backtest-artifacts:/runtime/artifacts" in compose
   assert "backend.signal_export_runner', '--healthcheck" in compose
-  assert "backend bar-runner l2-runner signal-export-runner" in script
+  assert (
+    "backend bar-runner l2-runner experiment-coordinator signal-export-runner"
+    in script
+  )
   assert "strategy-worker" not in script
   assert "strategy-worker:" not in compose
   assert "Dockerfile.worker" not in compose
   assert 'runner_containers_ready "signal-export-runner" "1"' in script
   assert '"signalExportRunner":{"healthy":true}' in script
+
+
+def test_experiment_coordinator_is_deployed_and_health_checked_with_backend() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(
+    encoding="utf-8",
+  )
+
+  assert "experiment-coordinator:" in compose
+  assert "python', '-m', 'backend.experiment_coordinator" in compose
+  assert 'runner_containers_ready "experiment-coordinator" "1"' in script
+  assert (
+    "backend bar-runner l2-runner experiment-coordinator signal-export-runner"
+    in script
+  )
 
 
 def test_retired_strategy_worker_is_absent_from_runtime_and_deployment() -> None:
@@ -142,7 +160,9 @@ def test_observability_services_are_pinned_isolated_and_started_before_applicati
   assert script.index("run --rm migrate") < script.index(
     "up -d --build container-event-observer",
   )
-  assert script.index("backend bar-runner l2-runner signal-export-runner") < (
+  assert script.index(
+    "backend bar-runner l2-runner experiment-coordinator signal-export-runner",
+  ) < (
     script.index("if ! wait_for_observability; then")
   )
 
@@ -157,7 +177,9 @@ def test_observability_failure_cannot_stop_core_release_after_cutover() -> None:
 
   migration = script.index("run --rm migrate")
   observer = script.index("up -d --build container-event-observer")
-  core_start = script.index("backend bar-runner l2-runner signal-export-runner")
+  core_start = script.index(
+    "backend bar-runner l2-runner experiment-coordinator signal-export-runner",
+  )
 
   assert core_stop < migration < observer < core_start
   assert 'if "${compose[@]}" up -d --build docker-socket-proxy loki alloy' in script
@@ -208,3 +230,21 @@ def test_socket_proxy_reserves_pid_capacity_for_healthcheck() -> None:
   pid_limit = int(pid_limit_match.group(1))
   assert thread_count <= 4
   assert pid_limit >= thread_count + 4
+
+
+def test_production_defaults_provide_32_runner_pool_with_guarded_concurrency() -> None:
+  settings = (ROOT / "backend" / "settings.py").read_text(encoding="utf-8")
+  env_example = (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  runner_validation = script.split("read_runner_replicas() {", 1)[1].split(
+    "\n}", 1,
+  )[0]
+
+  assert '"TREND_GRID_BACKTEST_BASE_CONCURRENCY", 16' in settings
+  assert '"TREND_GRID_BACKTEST_BURST_MAX_CONCURRENCY",\n  24,' in settings
+  assert "TREND_GRID_BAR_RUNNER_REPLICAS=16" in env_example
+  assert "TREND_GRID_L2_RUNNER_REPLICAS=16" in env_example
+  assert "TREND_GRID_BACKTEST_BASE_CONCURRENCY=16" in env_example
+  assert "TREND_GRID_BACKTEST_BURST_MAX_CONCURRENCY=24" in env_example
+  assert 'echo "16"' in runner_validation
+  assert "1 至 32" in runner_validation

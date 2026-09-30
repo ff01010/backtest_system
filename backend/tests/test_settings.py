@@ -181,3 +181,71 @@ def test_backtest_run_insert_has_matching_placeholder_count() -> None:
     assert state_store.create_backtest_run(payload) == ("00000000-0000-0000-0000-000000000002", 1)
   finally:
     state_store._db = original_db  # type: ignore[assignment]
+
+
+def test_experiment_global_switch_requires_bar_capability(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENTS_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_BAR_ENABLED", False)
+
+  with pytest.raises(ValueError, match="必须启用至少一个实验执行路径"):
+    settings.validate_experiment_configuration()
+
+
+def test_experiment_configuration_accepts_safe_disabled_default(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENTS_ENABLED", False)
+  monkeypatch.setattr(settings, "EXPERIMENT_BAR_ENABLED", False)
+
+  settings.validate_experiment_configuration()
+
+
+def test_experiment_configuration_requires_user_plan_limit(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENTS_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_BAR_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_USER_PLANNED_TRIALS", 0)
+
+  with pytest.raises(ValueError, match="用户计划 Trial 上限"):
+    settings.validate_experiment_configuration()
+
+
+def test_experiment_configuration_requires_safe_lease_relationship(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENTS_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_BAR_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_TRIALS", 1000)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_USER_PLANNED_TRIALS", 1000)
+  monkeypatch.setattr(settings, "EXPERIMENT_COORDINATOR_LEASE_SECONDS", 15)
+  monkeypatch.setattr(settings, "EXPERIMENT_COORDINATOR_HEARTBEAT_SECONDS", 5)
+
+  with pytest.raises(ValueError, match="租约必须大于心跳间隔的三倍"):
+    settings.validate_experiment_configuration()
+
+
+def test_experiment_configuration_requires_bounded_window_and_cursor_secret(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENTS_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_BAR_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_TRIALS", 100)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_USER_PLANNED_TRIALS", 100)
+  monkeypatch.setattr(settings, "EXPERIMENT_COORDINATOR_LEASE_SECONDS", 30)
+  monkeypatch.setattr(settings, "EXPERIMENT_COORDINATOR_HEARTBEAT_SECONDS", 5)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 2)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_USER", 1)
+
+  with pytest.raises(ValueError, match="单实验在途上限"):
+    settings.validate_experiment_configuration()
+
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_CURSOR_SIGNING_SECRET", "short")
+  with pytest.raises(ValueError, match="游标签名密钥"):
+    settings.validate_experiment_configuration()
+
+  monkeypatch.setattr(settings, "EXPERIMENT_CURSOR_SIGNING_SECRET", "s" * 32)
+  settings.validate_experiment_configuration()
