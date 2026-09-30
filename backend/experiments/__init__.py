@@ -7,6 +7,7 @@ from backend.experiments.contracts import (
   EvaluationSpecRequest,
   ExperimentCreateRequest,
   ExperimentPreviewRequest,
+  ExperimentResumeRequest,
   SubjectRef,
 )
 from backend.experiments.errors import ExperimentError
@@ -17,6 +18,7 @@ __all__ = [
   "ExperimentCreateRequest",
   "ExperimentError",
   "ExperimentPreviewRequest",
+  "ExperimentResumeRequest",
   "EvaluationRunCreateRequest",
   "EvaluationSpecRequest",
   "SubjectRef",

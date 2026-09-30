@@ -10,6 +10,7 @@ import {
   fetchExperimentTrials,
   findCreatedExperiment,
   previewExperiment,
+  resumeExperiment,
 } from '../features/experiments/api';
 import type {
   ExperimentCreateResult,
@@ -29,6 +30,7 @@ vi.mock('../features/experiments/api', () => ({
   fetchExperimentTrials: vi.fn(),
   findCreatedExperiment: vi.fn(),
   previewExperiment: vi.fn(),
+  resumeExperiment: vi.fn(),
 }));
 
 const SUBJECT_REF: ExperimentSubjectRef = {
@@ -155,6 +157,9 @@ const DETAIL: ExperimentDetail = {
     queuedTrialCount: 2,
   },
   resourceBudget: {},
+  failurePolicy: {},
+  errorAggregates: [],
+  consecutiveFailureCount: 0,
   frozenDefinition: {
     subjectRef: SUBJECT_REF,
     fixedStructure: SUBJECT.fixedStructure,
@@ -181,6 +186,8 @@ const TRIAL: ExperimentTrial = {
   },
   materializationStatus: 'materialized',
   summaryStatus: 'succeeded',
+  automaticRetryCount: 0,
+  retryNotBefore: null,
   activeExecution: null,
   selectedExecution: {
     executionId: 'execution-1',
@@ -211,6 +218,11 @@ beforeEach(() => {
   vi.mocked(cancelExperiment).mockReset().mockResolvedValue({
     experimentId: 'experiment-1',
     status: 'cancelled',
+  });
+  vi.mocked(resumeExperiment).mockReset().mockResolvedValue({
+    experimentId: 'experiment-1',
+    revisionId: 'revision-1',
+    status: 'queued',
   });
 });
 
@@ -349,6 +361,8 @@ describe('ExperimentPage', () => {
       blockedReason: {
         code: 'experiment.capacity_blocked',
         message: '系统容量低于该 Revision 创建时预算',
+        scope: null,
+        blockedAt: null,
       },
     });
     render(
@@ -364,5 +378,53 @@ describe('ExperimentPage', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain('条件恢复后会从当前 Revision 继续');
+  });
+
+  it('resumes an execution block with one idempotent command', async () => {
+    vi.mocked(fetchExperimentDetail).mockResolvedValueOnce({
+      ...DETAIL,
+      status: 'queued',
+      blockedReason: {
+        code: 'experiment.execution_blocked',
+        message: '连续系统性错误已触发实验熔断',
+        scope: 'stage',
+        blockedAt: '2026-09-30T00:00:00Z',
+      },
+      errorAggregates: [{
+        fingerprint: 'f'.repeat(64),
+        category: 'system_error',
+        code: 'runtime.version_mismatch',
+        message: '平台运行时版本不一致',
+        failureStage: 'bar.initialize',
+        component: 'bar_runner',
+        retryable: true,
+        count: 3,
+        lastTerminalSequence: 3,
+      }],
+      consecutiveFailureCount: 3,
+    });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    await screen.findByText('runtime.version_mismatch');
+    const button = screen.getByRole('button', { name: '继续未完成 Trial' });
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(resumeExperiment).toHaveBeenCalledTimes(1));
+    expect(resumeExperiment).toHaveBeenCalledWith(
+      'experiment-1',
+      'revision-1',
+      '用户在实验详情页确认继续未完成 Trial',
+      expect.any(String),
+    );
   });
 });

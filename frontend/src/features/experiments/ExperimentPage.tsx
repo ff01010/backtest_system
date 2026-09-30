@@ -4,6 +4,7 @@ import {
   Ban,
   FlaskConical,
   LockKeyhole,
+  Play,
   Plus,
   RefreshCw,
   ShieldCheck,
@@ -21,6 +22,7 @@ import {
   fetchExperimentTrials,
   findCreatedExperiment,
   previewExperiment,
+  resumeExperiment,
 } from './api';
 import type {
   DateScenarioDraft,
@@ -58,7 +60,9 @@ type Props = {
 type DraftChange = (draft: ExperimentDraft) => ExperimentDraft;
 
 const ACTIVE_EXPERIMENT_STATUSES = new Set(['preparing', 'queued', 'running', 'cancelling']);
-const CANCELLABLE_EXPERIMENT_STATUSES = new Set(['preparing', 'generation_blocked']);
+const CANCELLABLE_EXPERIMENT_STATUSES = new Set([
+  'preparing', 'generation_blocked', 'queued', 'running',
+]);
 const RECOVERABLE_BLOCK_CODES = new Set([
   'experiment.capacity_blocked',
   'experiment.manual_queue_reserved',
@@ -382,6 +386,9 @@ function ExperimentDetailView({
   const [nextTrialCursor, setNextTrialCursor] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [cancelling, setCancelling] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const cancelInFlight = useRef(false);
+  const resumeInFlight = useRef(false);
   const unchangedPolls = useRef(0);
   const lastVersion = useRef<number | null>(null);
 
@@ -419,6 +426,8 @@ function ExperimentDetailView({
   }, [experimentId]);
 
   const handleCancel = async () => {
+    if (cancelInFlight.current) return;
+    cancelInFlight.current = true;
     setCancelling(true);
     setError('');
     try {
@@ -427,7 +436,29 @@ function ExperimentDetailView({
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
+      cancelInFlight.current = false;
       setCancelling(false);
+    }
+  };
+
+  const handleResume = async () => {
+    if (!detail || resumeInFlight.current) return;
+    resumeInFlight.current = true;
+    setResuming(true);
+    setError('');
+    try {
+      await resumeExperiment(
+        experimentId,
+        detail.revision.revisionId,
+        '用户在实验详情页确认继续未完成 Trial',
+        createBrowserUuid(),
+      );
+      setDetail(await fetchExperimentDetail(experimentId));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      resumeInFlight.current = false;
+      setResuming(false);
     }
   };
 
@@ -467,7 +498,33 @@ function ExperimentDetailView({
         >
           {detail.blockedReason.message}（{detail.blockedReason.code}）
           {RECOVERABLE_BLOCK_CODES.has(detail.blockedReason.code) && '。已生成的 Trial 和运行中任务保持不变，条件恢复后会从当前 Revision 继续。'}
+          {detail.blockedReason.scope && `，阻塞范围：${detail.blockedReason.scope}`}
+          {detail.blockedReason.code === 'experiment.execution_blocked' && (
+            <button
+              className="app-button is-quiet"
+              type="button"
+              disabled={resuming}
+              onClick={() => { void handleResume(); }}
+            >
+              <Play size={15} /> {resuming ? '正在校验并恢复…' : '继续未完成 Trial'}
+            </button>
+          )}
         </div>
+      )}
+      {detail.errorAggregates.length > 0 && (
+        <section className="experiment-preview-card">
+          <h2>失败摘要</h2>
+          <div className="experiment-trial-table">
+            {detail.errorAggregates.map((failure) => (
+              <div className="experiment-trial-row" key={failure.fingerprint}>
+                <strong>{failure.code}</strong>
+                <span>{failure.message || '回测执行失败'}</span>
+                <span>{failure.failureStage} · {failure.component}</span>
+                <span>{failure.count} 次</span>
+              </div>
+            ))}
+          </div>
+        </section>
       )}
       <section className="experiment-preview-card">
         <div className="experiment-preview-heading">
@@ -547,7 +604,7 @@ function ExperimentDetailView({
       )}
       {CANCELLABLE_EXPERIMENT_STATUSES.has(detail.status) && (
         <section className="experiment-command-bar">
-          <div><strong>停止生成</strong><span>当前仅支持在执行物化前取消，已生成内容和审计记录继续保留。</span></div>
+          <div><strong>取消实验</strong><span>系统将停止生成和物化新 Trial；已提交任务按普通回测取消语义收敛，已有结果继续保留。</span></div>
           <button className="app-button is-quiet" type="button" disabled={cancelling} onClick={() => { void handleCancel(); }}>
             <Ban size={15} /> {cancelling ? '正在取消…' : '取消实验'}
           </button>

@@ -2609,32 +2609,69 @@ def request_bar_backtest_cancel(run_id: str) -> bool:
 
 def request_backtest_cancel(run_id: str) -> str | None:
   """幂等取消任意回测，返回数据库真实状态。"""
-  status = _request_backtest_cancel(run_id, "l2_backtest_job")
-  return status if status is not None else _request_backtest_cancel(run_id, "bar_backtest_job")
+  owner_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      return request_backtest_cancel_in_transaction(cur, run_id, owner_id)
+
+
+def request_backtest_cancel_in_transaction(
+  cur: Any,
+  run_id: str,
+  owner_user_id: str,
+) -> str | None:
+  """加入调用方事务取消普通任务，供实验取消保持锁顺序和原子性。"""
+  for table in ("l2_backtest_job", "bar_backtest_job"):
+    status = _request_backtest_cancel_with_cursor(
+      cur, run_id, owner_user_id, table,
+    )
+    if status is not None:
+      return status
+  return None
 
 
 def _request_backtest_cancel(run_id: str, table: str) -> str | None:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(f"""
-        UPDATE {table}
-        SET cancel_requested=true,
-          status=CASE WHEN status='queued' THEN 'cancelled' WHEN status='running' THEN 'cancelling' ELSE status END,
-          finished_at=CASE WHEN status='queued' THEN now() ELSE finished_at END,
-          updated_at=now()
-        WHERE run_id=%s
-        RETURNING status
-      """, (run_id,))
-      row = cur.fetchone()
-      if row is None:
-        return None
-      status = str(row["status"])
-      cur.execute("""
-        UPDATE backtest_run
-        SET status=%s, finished_at=CASE WHEN %s='cancelled' THEN COALESCE(finished_at, now()) ELSE finished_at END
-        WHERE id=%s AND status IN ('queued', 'running', 'cancelling')
-      """, (status, status, run_id))
-      return status
+      return _request_backtest_cancel_with_cursor(
+        cur, run_id, current_user_id(), table,
+      )
+
+
+def _request_backtest_cancel_with_cursor(
+  cur: Any,
+  run_id: str,
+  owner_user_id: str,
+  table: str,
+) -> str | None:
+  cur.execute(f"""
+    UPDATE {table}
+    SET cancel_requested=true,
+      status=CASE
+        WHEN status='queued' THEN 'cancelled'
+        WHEN status='running' THEN 'cancelling'
+        ELSE status
+      END,
+      finished_at=CASE WHEN status='queued' THEN now() ELSE finished_at END,
+      updated_at=now()
+    WHERE run_id=%s AND owner_user_id=%s
+    RETURNING status
+  """, (run_id, owner_user_id))
+  row = cur.fetchone()
+  if row is None:
+    return None
+  status = str(row["status"])
+  cur.execute("""
+    UPDATE backtest_run
+    SET status=%s,
+      finished_at=CASE
+        WHEN %s='cancelled' THEN COALESCE(finished_at, now())
+        ELSE finished_at
+      END
+    WHERE id=%s AND owner_user_id=%s
+      AND status IN ('queued', 'running', 'cancelling')
+  """, (status, status, run_id, owner_user_id))
+  return status
 
 
 def get_backtest_scheduler_capacity() -> dict[str, Any]:

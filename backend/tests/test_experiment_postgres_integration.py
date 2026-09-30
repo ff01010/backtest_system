@@ -403,6 +403,17 @@ def _two_trial_execution_request() -> Any:
   )
 
 
+def _four_trial_execution_request() -> Any:
+  return _request(
+    parameterGrid=[{
+      "inputId": "strategyParameters.window",
+      "values": [10, 20, 30, 40],
+    }],
+    capitalScenarios=["100000"],
+    costScenarios=[{"scenarioId": "cost-1", "slippage": "0.01"}],
+  )
+
+
 def test_same_user_experiments_materialize_in_stable_round_robin(
   execution_application: ExperimentApplication,
   monkeypatch: pytest.MonkeyPatch,
@@ -743,6 +754,206 @@ def test_complete_standard_bar_execution_reconciles_once_and_keeps_window_bounde
   assert page["items"][0]["selectedExecution"]["actualDataHash"] == "d" * 64
 
 
+def test_running_experiment_cancel_stops_new_runs_and_releases_permit_after_reconcile(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-running-cancel",
+  )
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="cancel-running-worker",
+  )
+  assert coordinator.run_once()
+  run_id = _run_id_for_experiment(experiment_id)
+  _mark_experiment_run_running(run_id)
+
+  response, _status = _as_user(
+    OWNER,
+    lambda: execution_application.cancel(experiment_id, "cancel-running-key"),
+  )
+
+  assert response["status"] == "cancelling"
+  assert _experiment_run_count(experiment_id) == 1
+  _finish_cancelled_run(run_id)
+  assert coordinator.run_once()
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert detail["status"] == "cancelled"
+  assert detail["stage"]["inFlightTrialCount"] == 0
+  assert _experiment_run_count(experiment_id) == 1
+
+
+def test_cancel_wins_against_late_success_report(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-cancel-late-success",
+  )
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="cancel-race-worker",
+  )
+  assert coordinator.run_once()
+  runner_user = CurrentUser(
+    id=OWNER.id,
+    username=OWNER.username,
+    display_name=OWNER.display_name,
+    role="admin",
+  )
+  claimed = _as_user(
+    runner_user,
+    lambda: state_store.claim_bar_backtest_job("cancel-race-runner", 60),
+  )
+  assert claimed is not None
+  response, _status = _as_user(
+    OWNER,
+    lambda: execution_application.cancel(experiment_id, "cancel-race-key"),
+  )
+  assert response["status"] == "cancelling"
+
+  accepted = _as_user(
+    runner_user,
+    lambda: state_store.finish_bar_backtest_job(
+      claimed["runId"],
+      claimed["attemptToken"],
+      "succeeded",
+      {"totalReturn": 0.1},
+      {
+        "resultSchemaVersion": 3,
+        "summary": {"totalReturn": 0.1},
+        "experimentManifest": {"dataHash": "d" * 64},
+      },
+    ),
+  )
+  assert accepted
+  assert coordinator.run_once()
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert detail["status"] == "cancelled"
+  assert detail["stage"]["succeededTrialCount"] == 0
+  assert detail["stage"]["cancelledTrialCount"] == 1
+
+
+def test_completed_run_wins_against_late_cancel_request(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-success-before-cancel",
+  )
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="success-race-worker",
+  )
+  assert coordinator.run_once()
+  run_id = _run_id_for_experiment(experiment_id)
+  _finish_run_for_reconciliation(run_id)
+
+  response, _status = _as_user(
+    OWNER,
+    lambda: execution_application.cancel(experiment_id, "success-race-key"),
+  )
+  assert response["status"] == "cancelling"
+  assert coordinator.run_once()
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert detail["status"] == "completed"
+  assert detail["stage"]["succeededTrialCount"] == 1
+  assert detail["stage"]["cancelledTrialCount"] == 0
+
+
+def test_retryable_failure_retries_once_then_becomes_terminal(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-bounded-retry",
+  )
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="retry-worker",
+  )
+  assert coordinator.run_once()
+  first_run_id = _latest_run_id_for_experiment(experiment_id)
+  _fail_run_for_reconciliation(first_run_id, retryable=True)
+  assert coordinator.run_once()
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert detail["status"] == "queued"
+  assert detail["errorAggregates"][0]["count"] == 1
+
+  _make_retry_ready(experiment_id)
+  assert coordinator.run_once()
+  second_run_id = _latest_run_id_for_experiment(experiment_id)
+  assert second_run_id != first_run_id
+  _fail_run_for_reconciliation(second_run_id, retryable=True)
+  assert coordinator.run_once()
+
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert detail["status"] == "failed"
+  assert detail["stage"]["failedTrialCount"] == 1
+  assert _experiment_run_count(experiment_id) == 2
+  page = _as_user(
+    OWNER,
+    lambda: execution_application.list_trials(
+      experiment_id, limit=10, cursor=None, status=None,
+    ),
+  )
+  assert page["items"][0]["automaticRetryCount"] == 1
+
+
+def test_three_terminal_sequence_failures_open_circuit_and_resume_same_revision(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application,
+    "postgres-circuit-resume",
+    _four_trial_execution_request(),
+  )
+  _generate_all("circuit-generator")
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="circuit-worker",
+  )
+  assert coordinator.run_once()
+  for _index in range(3):
+    run_id = _latest_run_id_for_experiment(experiment_id)
+    _fail_run_for_reconciliation(run_id, retryable=False)
+    assert coordinator.run_once()
+
+  blocked = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert blocked["status"] == "queued"
+  assert blocked["blockedReason"]["code"] == "experiment.execution_blocked"
+  assert blocked["blockedReason"]["scope"] == "stage"
+  assert blocked["consecutiveFailureCount"] == 3
+  assert _experiment_run_count(experiment_id) == 3
+  assert not coordinator.run_once()
+
+  response, _status = _as_user(
+    OWNER,
+    lambda: execution_application.resume(
+      experiment_id,
+      blocked["revision"]["revisionId"],
+      "已确认临时运行故障恢复",
+      "resume-circuit-key",
+    ),
+  )
+  assert response["revisionId"] == blocked["revision"]["revisionId"]
+  assert response["status"] == "queued"
+  assert coordinator.run_once()
+  assert _experiment_run_count(experiment_id) == 4
+
+
+def test_coordinator_repairs_cached_counts_from_execution_facts(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-aggregate-repair",
+  )
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="repair-worker",
+  )
+  assert coordinator.run_once()
+  _corrupt_aggregate_cache(experiment_id)
+
+  assert PostgresExperimentRepository().repair_next_aggregate()
+
+  facts = _execution_facts(experiment_id)
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert facts["in_flight"] == 1
+  assert detail["stage"]["inFlightTrialCount"] == 1
+
+
 def test_evaluation_freezes_results_is_deterministic_and_detects_hash_drift(
   execution_application: ExperimentApplication,
 ) -> None:
@@ -970,6 +1181,102 @@ def _run_id_for_experiment(experiment_id: str) -> str:
         WHERE origin_experiment_id=%s
       """, (experiment_id,))
       return str(cur.fetchone()[0])
+
+
+def _latest_run_id_for_experiment(experiment_id: str) -> str:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT id FROM backtest_run
+        WHERE origin_experiment_id=%s
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      """, (experiment_id,))
+      return str(cur.fetchone()[0])
+
+
+def _mark_experiment_run_running(run_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE bar_backtest_job
+        SET status='running', lease_expires_at=now() + interval '5 minutes',
+          updated_at=now()
+        WHERE run_id=%s
+      """, (run_id,))
+      cur.execute("""
+        UPDATE backtest_run SET status='running', started_at=now()
+        WHERE id=%s
+      """, (run_id,))
+
+
+def _finish_cancelled_run(run_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE bar_backtest_job
+        SET status='cancelled', cancel_requested=true,
+          finished_at=now(), updated_at=now()
+        WHERE run_id=%s
+      """, (run_id,))
+      cur.execute("""
+        UPDATE backtest_run SET status='cancelled', finished_at=now()
+        WHERE id=%s AND status='cancelling'
+      """, (run_id,))
+
+
+def _fail_run_for_reconciliation(run_id: str, *, retryable: bool) -> None:
+  summary = {
+    "error": "平台运行时版本不一致",
+    "errorDetail": {
+      "category": "system_error",
+      "code": "runtime.version_mismatch",
+      "message": "平台运行时版本不一致",
+      "retryable": retryable,
+    },
+  }
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE bar_backtest_job
+        SET status='failed', finished_at=now(), updated_at=now()
+        WHERE run_id=%s
+      """, (run_id,))
+      cur.execute("""
+        UPDATE backtest_run
+        SET status='failed', result_summary=%s, error_message=%s, finished_at=now()
+        WHERE id=%s
+      """, (psycopg.types.json.Jsonb(summary), summary["error"], run_id))
+
+
+def _make_retry_ready(experiment_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_experiment_trial trial
+        SET retry_not_before=now() - interval '1 second'
+        FROM backtest_experiment_stage stage
+        JOIN backtest_experiment_revision revision ON revision.id=stage.revision_id
+        WHERE trial.stage_id=stage.id AND revision.experiment_id=%s
+      """, (experiment_id,))
+
+
+def _corrupt_aggregate_cache(experiment_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_experiment_stage stage
+        SET in_flight_count=99
+        FROM backtest_experiment_revision revision
+        WHERE stage.revision_id=revision.id AND revision.experiment_id=%s
+      """, (experiment_id,))
+      cur.execute("""
+        UPDATE backtest_experiment_user_quota quota
+        SET experiment_in_flight_count=99
+        FROM backtest_experiment experiment
+        WHERE quota.owner_user_id=experiment.owner_user_id
+          AND experiment.id=%s
+      """, (experiment_id,))
 
 
 def _finish_run_for_reconciliation(run_id: str) -> None:

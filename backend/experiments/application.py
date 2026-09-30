@@ -24,6 +24,7 @@ from backend.experiments.contracts import (
 from backend.experiments.errors import ExperimentError
 from backend.experiments.estimator import ResourceEstimator, SingleBarResourceEstimator
 from backend.experiments.generators import FiniteGridGenerator, GeneratedGrid, seed_bundle
+from backend.experiments.recovery import default_failure_policy
 from backend.experiments.repository import (
   ExperimentRepository,
   PostgresExperimentRepository,
@@ -161,6 +162,33 @@ class ExperimentApplication:
         "operationType": "experiment.cancel.v1",
         "experimentId": experiment_id,
       })),
+      request_id,
+    )
+    return result.response, result.status_code
+
+  def resume(
+    self,
+    experiment_id: str,
+    expected_revision_id: str,
+    reason: str,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    repository = self._experiment_repository()
+    if not hasattr(repository, "resume_experiment"):
+      raise RuntimeError("当前实验仓储不支持恢复操作")
+    request_hash = digest(with_version({
+      "operationType": "experiment.resume.v1",
+      "experimentId": experiment_id,
+      "expectedRevisionId": expected_revision_id,
+      "reason": reason,
+    }))
+    result = repository.resume_experiment(
+      experiment_id,
+      expected_revision_id,
+      reason,
+      idempotency_key,
+      request_hash,
       request_id,
     )
     return result.response, result.status_code
@@ -305,6 +333,7 @@ class ExperimentApplication:
       "datasetSnapshots": list(datasets),
       "resourceEstimate": estimate,
       "capacityPolicy": self._budget_summary(),
+      "failurePolicy": default_failure_policy(),
       "determinism": {
         "seedDerivation": "trial-seed-v1",
         "deterministicLevel": "input_deterministic_only",

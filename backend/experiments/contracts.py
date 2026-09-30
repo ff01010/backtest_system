@@ -115,6 +115,19 @@ class ExperimentCreateRequest(StrictModel):
       raise ValueError("previewToken 必须是 UUID") from error
 
 
+class ExperimentResumeRequest(StrictModel):
+  expectedRevisionId: UUID
+  reason: str = Field(min_length=1, max_length=500)
+
+  @field_validator("reason")
+  @classmethod
+  def normalize_reason(cls, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+      raise ValueError("恢复原因不能为空")
+    return normalized
+
+
 class EvaluationSource(StrictModel):
   experimentRevisionId: UUID
   stageIds: list[UUID] = Field(min_length=1, max_length=1)

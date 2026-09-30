@@ -18,6 +18,15 @@ from backend.experiments.repository import (
   _encode_cursor,
   _manual_capacity_gate,
 )
+from backend.experiments.recovery import (
+  AggregateFacts,
+  allows_automatic_retry,
+  default_failure_policy,
+  derive_aggregate_status,
+  normalize_failure,
+  should_open_circuit,
+  validate_status_transition,
+)
 from backend.experiments.resolvers import ResolvedRunTemplate
 from backend.services import state_store
 from backend.strategies.runtime_contract import (
@@ -297,6 +306,10 @@ def test_coordinator_refreshes_capacity_blocks_before_materialization(
       calls.append("generation")
       return None
 
+    def repair_next_aggregate(self) -> bool:
+      calls.append("repair")
+      return False
+
     def refresh_next_capacity_block(self) -> bool:
       calls.append("refresh")
       return True
@@ -308,7 +321,7 @@ def test_coordinator_refreshes_capacity_blocks_before_materialization(
   monkeypatch.setattr(settings, "EXPERIMENTS_ENABLED", True)
 
   assert ExperimentCoordinator(repository=Repository()).run_once()
-  assert calls == ["reconcile", "generation", "refresh", "materialize"]
+  assert calls == ["reconcile", "repair", "generation", "refresh", "materialize"]
 
 
 def test_capacity_tightening_blocks_without_changing_frozen_budget(
@@ -403,4 +416,90 @@ def test_fair_capacity_migration_persists_round_robin_state() -> None:
   assert "materialization_sequence" in sql
   assert "last_materialized_sequence" in sql
   assert "ix_backtest_experiment_stage_fair_materialization" in sql
+  assert "IF NOT EXISTS" in sql
+
+
+@pytest.mark.parametrize(("facts", "expected"), [
+  (AggregateFacts(3, 3, 0, 0, 0, 0, 3, 0, 0, False), "completed"),
+  (AggregateFacts(3, 3, 0, 0, 0, 0, 1, 2, 0, False), "partially_completed"),
+  (AggregateFacts(3, 3, 0, 0, 0, 0, 0, 3, 0, False), "failed"),
+  (AggregateFacts(3, 2, 0, 0, 0, 0, 0, 0, 3, True), "cancelled"),
+  (AggregateFacts(3, 3, 0, 0, 1, 0, 1, 0, 0, True), "cancelling"),
+  (AggregateFacts(3, 3, 1, 0, 0, 0, 1, 0, 1, False), "queued"),
+])
+def test_aggregate_status_uses_persisted_fact_priority(
+  facts: AggregateFacts,
+  expected: str,
+) -> None:
+  assert derive_aggregate_status(facts) == expected
+
+
+def test_terminal_status_cannot_be_overwritten() -> None:
+  with pytest.raises(ExperimentError) as error:
+    validate_status_transition("cancelled", "completed")
+  assert error.value.code == "experiment.invalid_status_transition"
+
+
+def test_failure_fingerprint_ignores_dynamic_error_text() -> None:
+  context = {
+    "stage_type": "finite_grid_v1",
+    "template_type": "legacy_single_strategy_v1",
+    "run_path": "strategy",
+    "scope_type": "single",
+    "failure_stage": "bar.market_replay",
+    "component": "bar_runner",
+  }
+  first = normalize_failure({
+    "error": "动态文本 1",
+    "errorDetail": {
+      "category": "system_error",
+      "code": "runtime.version_mismatch",
+      "message": "公开消息 1",
+      "retryable": True,
+    },
+  }, **context)
+  second = normalize_failure({
+    "error": "动态文本 2",
+    "errorDetail": {
+      "category": "system_error",
+      "code": "runtime.version_mismatch",
+      "message": "公开消息 2",
+      "retryable": True,
+    },
+  }, **context)
+
+  assert first["fingerprint"] == second["fingerprint"]
+  assert first["message"] != second["message"]
+
+
+def test_failure_policy_bounds_retry_and_circuit_breaker() -> None:
+  policy = default_failure_policy()
+  failure = {"category": "system_error", "retryable": True}
+
+  assert allows_automatic_retry(
+    policy, failure, automatic_retry_count=0, retry_count_in_window=0,
+  )
+  assert not allows_automatic_retry(
+    policy, failure, automatic_retry_count=1, retry_count_in_window=1,
+  )
+  assert should_open_circuit(
+    policy, consecutive_count=3, window_failures=3, window_size=3,
+  )
+  assert not should_open_circuit(
+    policy, consecutive_count=2, window_failures=2, window_size=3,
+  )
+
+
+def test_recovery_migration_adds_retry_and_circuit_state() -> None:
+  sql = Path("db/migrations/050_experiment_recovery.sql").read_text(
+    encoding="utf-8",
+  )
+
+  assert "plan_quota_released_at" in sql
+  assert "automatic_retry_count" in sql
+  assert "terminal_status" in sql
+  assert "error_fingerprint" in sql
+  assert "automatic_retry" in sql
+  assert "effective_backtest_scheduler_capacity" in sql
+  assert "SECURITY DEFINER" in sql
   assert "IF NOT EXISTS" in sql

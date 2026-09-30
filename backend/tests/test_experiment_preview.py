@@ -387,7 +387,7 @@ def test_preview_is_reproducible_but_issues_a_fresh_owner_bound_token(
   second = application.preview(_request())
 
   assert first["specHash"] == second["specHash"]
-  assert first["specHash"] == "16d5aa1ede7b1bcb9482b3f7f29afc1c4e4b9476c56bf9ef6e8d82077e851dcf"
+  assert first["specHash"] == "acc826f703fdc120e49acd3562e06b72d84bd2ceabfedfade6837612e173833a"
   assert first["plannedTrialCount"] == 8
   assert first["examples"] == second["examples"]
   assert first["examples"][0]["trialFingerprint"] == (

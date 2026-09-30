@@ -41,6 +41,7 @@ from backend.experiments import (
   ExperimentCreateRequest,
   ExperimentError,
   ExperimentPreviewRequest,
+  ExperimentResumeRequest,
   SubjectRef,
 )
 from backend.execution import execution_algorithm_snapshot, validate_execution_request
@@ -1948,6 +1949,25 @@ def cancel_experiment(experiment_id: UUID, request: Request) -> Response:
   try:
     body, status_code = _experiment_application.cancel(
       str(experiment_id),
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/resume")
+def resume_experiment(
+  experiment_id: UUID,
+  payload: ExperimentResumeRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _experiment_application.resume(
+      str(experiment_id),
+      str(payload.expectedRevisionId),
+      payload.reason,
       _experiment_idempotency_key(request),
       getattr(request.state, "request_id", None),
     )

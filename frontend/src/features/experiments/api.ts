@@ -67,11 +67,25 @@ export function fetchExperimentTrials(
 export function cancelExperiment(
   experimentId: string,
   idempotencyKey: string,
-): Promise<{ experimentId: string; status: 'cancelled' }> {
+): Promise<{ experimentId: string; status: string }> {
   return sendJson(
     `/api/backtest/experiments/${encodeURIComponent(experimentId)}/cancel`,
     'POST',
     {},
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function resumeExperiment(
+  experimentId: string,
+  expectedRevisionId: string,
+  reason: string,
+  idempotencyKey: string,
+): Promise<{ experimentId: string; revisionId: string; status: string }> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/resume`,
+    'POST',
+    { expectedRevisionId, reason },
     { 'Idempotency-Key': idempotencyKey },
   );
 }

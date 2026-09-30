@@ -178,6 +178,8 @@ export type ExperimentTrial = {
   dimensionAssignment: Record<string, unknown>;
   materializationStatus: 'pending' | 'materialized' | 'cancelled_before_materialization';
   summaryStatus: 'pending' | 'queued' | 'running' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
+  automaticRetryCount: number;
+  retryNotBefore: string | null;
   activeExecution: { executionId: string; runId: string; status: string } | null;
   selectedExecution: {
     executionId: string;
@@ -221,6 +223,19 @@ export type ExperimentDetail = {
     queuedTrialCount: number;
   };
   resourceBudget: Record<string, unknown>;
+  failurePolicy: Record<string, unknown>;
+  errorAggregates: Array<{
+    fingerprint: string;
+    category: string;
+    code: string;
+    message: string | null;
+    failureStage: string;
+    component: string;
+    retryable: boolean;
+    count: number;
+    lastTerminalSequence: number;
+  }>;
+  consecutiveFailureCount: number;
   frozenDefinition: {
     subjectRef: ExperimentSubjectRef;
     fixedStructure: Record<string, unknown>;
@@ -228,7 +243,12 @@ export type ExperimentDetail = {
     datasetSnapshots: Array<Record<string, unknown>>;
     determinism: Record<string, unknown>;
   };
-  blockedReason: { code: string; message: string } | null;
+  blockedReason: {
+    code: string;
+    message: string;
+    scope: 'stage' | 'experiment' | null;
+    blockedAt: string | null;
+  } | null;
   createdAt: string;
   updatedAt: string;
 };

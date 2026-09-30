@@ -61,6 +61,9 @@ class GenerationRepository(Protocol):
   def refresh_next_capacity_block(self) -> bool:
     """重新检查一个可恢复的容量阻塞。"""
 
+  def repair_next_aggregate(self) -> bool:
+    """从持久化事实修复一个聚合或额度缓存漂移。"""
+
 
 class ExperimentCoordinator:
   def __init__(
@@ -93,6 +96,7 @@ class ExperimentCoordinator:
     if not settings.EXPERIMENTS_ENABLED:
       return False
     handled = self._reconcile_once()
+    handled = self._repair_once() or handled
     handled = self._generate_once() or handled
     handled = self._refresh_capacity_block_once() or handled
     handled = self._materialize_once() or handled
@@ -144,6 +148,12 @@ class ExperimentCoordinator:
     if not callable(refresh):
       return False
     return bool(refresh())
+
+  def _repair_once(self) -> bool:
+    repair = getattr(self._repository, "repair_next_aggregate", None)
+    if not callable(repair):
+      return False
+    return bool(repair())
 
   def _generate_batch(self, stage: dict[str, Any]) -> list[dict[str, Any]]:
     template, grid = self._restore_grid(stage)
