@@ -58,6 +58,9 @@ class GenerationRepository(Protocol):
   def reconcile_next_execution(self) -> bool:
     """从普通回测真源对账一个执行。"""
 
+  def refresh_next_capacity_block(self) -> bool:
+    """重新检查一个可恢复的容量阻塞。"""
+
 
 class ExperimentCoordinator:
   def __init__(
@@ -91,6 +94,7 @@ class ExperimentCoordinator:
       return False
     handled = self._reconcile_once()
     handled = self._generate_once() or handled
+    handled = self._refresh_capacity_block_once() or handled
     handled = self._materialize_once() or handled
     return handled
 
@@ -134,6 +138,12 @@ class ExperimentCoordinator:
     if not callable(reconcile):
       return False
     return bool(reconcile())
+
+  def _refresh_capacity_block_once(self) -> bool:
+    refresh = getattr(self._repository, "refresh_next_capacity_block", None)
+    if not callable(refresh):
+      return False
+    return bool(refresh())
 
   def _generate_batch(self, stage: dict[str, Any]) -> list[dict[str, Any]]:
     template, grid = self._restore_grid(stage)

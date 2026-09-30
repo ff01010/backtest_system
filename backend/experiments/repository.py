@@ -31,12 +31,24 @@ from backend.strategies.runtime_contract import validate_runtime_capability
 
 CREATE_OPERATION = "experiment.create.v1"
 CANCEL_OPERATION = "experiment.cancel.v1"
+_TRANSIENT_BLOCK_CODES = {
+  "experiment.capacity_blocked",
+  "experiment.manual_queue_reserved",
+  "experiment.manual_wait_blocked",
+}
 
 
 @dataclass(frozen=True)
 class CommandResult:
   response: dict[str, Any]
   status_code: int
+
+
+@dataclass(frozen=True)
+class MaterializationGate:
+  allowed: bool
+  code: str | None = None
+  message: str | None = None
 
 
 class PreviewRepository(Protocol):
@@ -65,6 +77,9 @@ class ExperimentRepository(PreviewRepository, Protocol):
 
   def reconcile_next_execution(self) -> bool:
     """从普通回测真源同步一个 TrialExecution。"""
+
+  def refresh_next_capacity_block(self) -> bool:
+    """重新检查一个可恢复的容量阻塞。"""
 
   def list_experiments(
     self,
@@ -304,13 +319,30 @@ class PostgresExperimentRepository:
         if candidate is None:
           return False
         locked = _lock_materialization_graph(cur, dict(candidate))
-        if locked is None or not _can_materialize(locked):
+        if locked is None:
+          return False
+        gate = _materialization_gate(cur, locked)
+        if not gate.allowed:
+          return _set_materialization_block(cur, locked, gate)
+        if not _can_materialize(locked):
           return False
         template, assignment, dataset, seed = _materialization_inputs(locked)
         payload = compiler.compile_request(template, assignment, dataset, seed)
         _verify_compiled_request(compiler, template, assignment, locked)
         _insert_trial_execution(cur, locked, payload)
         return True
+
+  def refresh_next_capacity_block(self) -> bool:
+    with _coordinator_session() as conn:
+      with conn.cursor() as cur:
+        candidate = _find_capacity_block_candidate(cur)
+        if candidate is None:
+          return False
+        locked = _lock_capacity_block_graph(cur, dict(candidate))
+        if locked is None:
+          return False
+        gate = _materialization_gate(cur, locked)
+        return _set_materialization_block(cur, locked, gate, touch=True)
 
   def reconcile_next_execution(self) -> bool:
     with _coordinator_session() as conn:
@@ -461,26 +493,30 @@ PostgresPreviewRepository = PostgresExperimentRepository
 
 def _find_materialization_candidate(cur: Any) -> dict[str, Any] | None:
   cur.execute("""
-    SELECT t.id AS trial_id, t.owner_user_id, t.stage_id,
-      s.revision_id, r.experiment_id
-    FROM backtest_experiment_trial t
-    JOIN backtest_experiment_stage s ON s.id=t.stage_id
-    JOIN backtest_experiment_revision r ON r.id=s.revision_id
-    JOIN backtest_experiment_user_quota q ON q.owner_user_id=t.owner_user_id
-    JOIN app_user u ON u.id=t.owner_user_id
-    WHERE t.materialization_status='pending'
-      AND t.active_execution_id IS NULL
-      AND s.status IN ('queued', 'running')
-      AND s.generated_trial_count=s.planned_trial_count
-      AND s.in_flight_count < %s
-      AND r.cancel_requested_at IS NULL AND r.terminal_at IS NULL
-      AND q.experiment_in_flight_count < %s
+    SELECT q.owner_user_id
+    FROM backtest_experiment_user_quota q
+    JOIN app_user u ON u.id=q.owner_user_id
+    WHERE q.experiment_in_flight_count < %s
       AND u.status='active'
-    ORDER BY s.updated_at, s.id, t.trial_index
+      AND EXISTS (
+        SELECT 1
+        FROM backtest_experiment_stage s
+        JOIN backtest_experiment_revision r ON r.id=s.revision_id
+        JOIN backtest_experiment_trial t ON t.stage_id=s.id
+        WHERE s.owner_user_id=q.owner_user_id
+          AND s.status IN ('queued', 'running')
+          AND s.blocked_reason_code IS NULL
+          AND s.generated_trial_count=s.planned_trial_count
+          AND s.in_flight_count < %s
+          AND r.cancel_requested_at IS NULL AND r.terminal_at IS NULL
+          AND t.materialization_status='pending'
+          AND t.active_execution_id IS NULL
+      )
+    ORDER BY q.last_materialized_at NULLS FIRST, q.owner_user_id
     LIMIT 1
   """, (
-    settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT,
     settings.EXPERIMENT_MAX_IN_FLIGHT_PER_USER,
+    settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT,
   ))
   row = cur.fetchone()
   return dict(row) if row else None
@@ -497,30 +533,60 @@ def _lock_materialization_graph(
     WHERE q.owner_user_id=%s FOR UPDATE OF q
   """, (candidate["owner_user_id"],))
   quota = cur.fetchone()
+  if quota is None:
+    return None
+  quota = _sync_manual_reserved_permits(cur, dict(quota))
+  cur.execute("""
+    SELECT s.id AS stage_id, s.revision_id, r.experiment_id
+    FROM backtest_experiment_stage s
+    JOIN backtest_experiment_revision r ON r.id=s.revision_id
+    WHERE s.owner_user_id=%s
+      AND s.status IN ('queued', 'running')
+      AND s.blocked_reason_code IS NULL
+      AND s.generated_trial_count=s.planned_trial_count
+      AND s.in_flight_count < %s
+      AND r.cancel_requested_at IS NULL AND r.terminal_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM backtest_experiment_trial t
+        WHERE t.stage_id=s.id AND t.materialization_status='pending'
+          AND t.active_execution_id IS NULL
+      )
+    ORDER BY s.last_materialized_sequence, s.created_at, s.id
+    LIMIT 1
+  """, (
+    candidate["owner_user_id"], settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT,
+  ))
+  selected = cur.fetchone()
+  if selected is None:
+    return None
   cur.execute(
     "SELECT * FROM backtest_experiment_revision WHERE id=%s FOR UPDATE",
-    (candidate["revision_id"],),
+    (selected["revision_id"],),
   )
   revision = cur.fetchone()
   cur.execute(
     "SELECT * FROM backtest_experiment_stage WHERE id=%s FOR UPDATE",
-    (candidate["stage_id"],),
+    (selected["stage_id"],),
   )
   stage = cur.fetchone()
-  cur.execute(
-    "SELECT * FROM backtest_experiment_trial WHERE id=%s FOR UPDATE",
-    (candidate["trial_id"],),
-  )
+  cur.execute("""
+    SELECT * FROM backtest_experiment_trial
+    WHERE stage_id=%s AND materialization_status='pending'
+      AND active_execution_id IS NULL
+    ORDER BY trial_index
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+  """, (selected["stage_id"],))
   trial = cur.fetchone()
   if not all((quota, revision, stage, trial)):
     return None
   cur.execute("""
     SELECT count(*) AS value FROM backtest_experiment_asset_hold
     WHERE revision_id=%s AND hold_status <> 'held'
-  """, (candidate["revision_id"],))
+  """, (selected["revision_id"],))
   unavailable_assets = int(cur.fetchone()["value"])
   return {
-    "quota": dict(quota),
+    "quota": quota,
     "revision": dict(revision),
     "stage": dict(stage),
     "trial": dict(trial),
@@ -543,12 +609,281 @@ def _can_materialize(locked: dict[str, Any]) -> bool:
     and revision["terminal_at"] is None
     and stage["status"] in {"queued", "running"}
     and int(stage["generated_trial_count"]) == int(stage["planned_trial_count"])
+    and stage["blocked_reason_code"] is None
     and int(stage["in_flight_count"])
       < settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT
     and trial["materialization_status"] == "pending"
     and trial["active_execution_id"] is None
     and locked["unavailable_assets"] == 0
   )
+
+
+def _sync_manual_reserved_permits(cur: Any, quota: dict[str, Any]) -> dict[str, Any]:
+  reserved = settings.EXPERIMENT_MANUAL_RESERVED_PERMITS
+  if int(quota["manual_reserved_permits"]) == reserved:
+    return quota
+  cur.execute("""
+    UPDATE backtest_experiment_user_quota
+    SET manual_reserved_permits=%s, row_version=row_version+1, updated_at=now()
+    WHERE owner_user_id=%s
+  """, (reserved, quota["owner_user_id"]))
+  quota["manual_reserved_permits"] = reserved
+  return quota
+
+
+def _find_capacity_block_candidate(cur: Any) -> dict[str, Any] | None:
+  cur.execute("""
+    SELECT s.id AS stage_id, s.owner_user_id, s.revision_id
+    FROM backtest_experiment_stage s
+    JOIN backtest_experiment_revision r ON r.id=s.revision_id
+    WHERE s.status IN ('queued', 'running')
+      AND s.blocked_reason_code = ANY(%s)
+      AND r.cancel_requested_at IS NULL AND r.terminal_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM backtest_experiment_trial t
+        WHERE t.stage_id=s.id AND t.materialization_status='pending'
+          AND t.active_execution_id IS NULL
+      )
+    ORDER BY s.updated_at, s.id
+    LIMIT 1
+  """, (list(_TRANSIENT_BLOCK_CODES),))
+  row = cur.fetchone()
+  return dict(row) if row else None
+
+
+def _lock_capacity_block_graph(
+  cur: Any,
+  candidate: dict[str, Any],
+) -> dict[str, Any] | None:
+  cur.execute("""
+    SELECT q.*, u.status AS user_status
+    FROM backtest_experiment_user_quota q
+    JOIN app_user u ON u.id=q.owner_user_id
+    WHERE q.owner_user_id=%s FOR UPDATE OF q
+  """, (candidate["owner_user_id"],))
+  quota = cur.fetchone()
+  if quota is None:
+    return None
+  quota = _sync_manual_reserved_permits(cur, dict(quota))
+  cur.execute(
+    "SELECT * FROM backtest_experiment_revision WHERE id=%s FOR UPDATE",
+    (candidate["revision_id"],),
+  )
+  revision = cur.fetchone()
+  cur.execute(
+    "SELECT * FROM backtest_experiment_stage WHERE id=%s FOR UPDATE",
+    (candidate["stage_id"],),
+  )
+  stage = cur.fetchone()
+  if not all((revision, stage)):
+    return None
+  return {"quota": quota, "revision": dict(revision), "stage": dict(stage)}
+
+
+def _materialization_gate(cur: Any, locked: dict[str, Any]) -> MaterializationGate:
+  effective_capacity = _effective_scheduler_capacity(cur)
+  budget_gate = _budget_capacity_gate(locked, effective_capacity)
+  if not budget_gate.allowed:
+    return budget_gate
+  manual_gate = _manual_capacity_gate(cur, locked)
+  if not manual_gate.allowed:
+    return manual_gate
+  global_limit = max(
+    0, effective_capacity - settings.EXPERIMENT_MANUAL_RESERVED_PERMITS,
+  )
+  if _global_experiment_in_flight(cur) >= global_limit:
+    return MaterializationGate(
+      False,
+      "experiment.capacity_blocked",
+      "当前统一调度容量已用尽，容量恢复后将继续运行",
+    )
+  return MaterializationGate(True)
+
+
+def _effective_scheduler_capacity(cur: Any) -> int:
+  cur.execute("""
+    SELECT CASE
+      WHEN override_expires_at > now() THEN override_limit
+      ELSE %s
+    END AS effective_limit
+    FROM backtest_scheduler_capacity
+    WHERE singleton
+    FOR UPDATE
+  """, (settings.BACKTEST_BASE_CONCURRENCY,))
+  row = cur.fetchone()
+  return int(row["effective_limit"]) if row and row["effective_limit"] else 0
+
+
+def _budget_capacity_gate(
+  locked: dict[str, Any],
+  effective_capacity: int,
+) -> MaterializationGate:
+  budget = dict(locked["revision"].get("resource_budget") or {})
+  estimate = dict(budget.get("estimate") or budget)
+  frozen = dict(budget.get("capacityPolicy") or {})
+  current = _current_capacity_policy(effective_capacity)
+  tightened = [
+    key for key in (
+      "maxTrials", "maxUserPlannedTrials", "maxEstimatedBars",
+      "maxInFlightPerExperiment", "maxInFlightPerUser", "schedulerCapacity",
+    )
+    if key in frozen and int(current[key]) < int(frozen[key])
+  ]
+  estimated_bars = int(estimate.get("estimatedBarCount") or 0)
+  over_current_budget = (
+    int(locked["revision"]["planned_trial_count"]) > settings.EXPERIMENT_MAX_TRIALS
+    or estimated_bars > settings.EXPERIMENT_BAR_MAX_ESTIMATED_BARS
+    or int(locked["quota"]["reserved_planned_trial_count"])
+      > settings.EXPERIMENT_MAX_USER_PLANNED_TRIALS
+  )
+  if tightened or over_current_budget:
+    return MaterializationGate(
+      False,
+      "experiment.capacity_blocked",
+      "系统容量低于该 Revision 创建时预算，恢复后将继续运行",
+    )
+  return MaterializationGate(True)
+
+
+def _current_capacity_policy(effective_capacity: int) -> dict[str, int]:
+  return {
+    "maxTrials": settings.EXPERIMENT_MAX_TRIALS,
+    "maxUserPlannedTrials": settings.EXPERIMENT_MAX_USER_PLANNED_TRIALS,
+    "maxEstimatedBars": settings.EXPERIMENT_BAR_MAX_ESTIMATED_BARS,
+    "maxInFlightPerExperiment": settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT,
+    "maxInFlightPerUser": settings.EXPERIMENT_MAX_IN_FLIGHT_PER_USER,
+    "schedulerCapacity": effective_capacity,
+  }
+
+
+def _manual_capacity_gate(cur: Any, locked: dict[str, Any]) -> MaterializationGate:
+  pending_count, oldest_wait_seconds = _manual_queue_state(
+    cur, str(locked["quota"]["owner_user_id"]),
+  )
+  if pending_count == 0:
+    return MaterializationGate(True)
+  if oldest_wait_seconds >= settings.EXPERIMENT_MANUAL_MAX_WAIT_SECONDS:
+    return MaterializationGate(
+      False,
+      "experiment.manual_wait_blocked",
+      "普通手工回测等待时间已达门禁，领取后实验将继续补充",
+    )
+  reserved = int(locked["quota"]["manual_reserved_permits"])
+  experiment_limit = max(0, settings.EXPERIMENT_MAX_IN_FLIGHT_PER_USER - reserved)
+  if int(locked["quota"]["experiment_in_flight_count"]) >= experiment_limit:
+    return MaterializationGate(
+      False,
+      "experiment.manual_queue_reserved",
+      "正在为同一用户的普通手工回测保留容量",
+    )
+  return MaterializationGate(True)
+
+
+def _manual_queue_state(cur: Any, owner_id: str) -> tuple[int, float]:
+  cur.execute("""
+    SELECT count(*) AS pending_count,
+      COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0) AS oldest_wait_seconds
+    FROM (
+      SELECT job.created_at
+      FROM bar_backtest_job job
+      JOIN backtest_run run ON run.id=job.run_id
+      WHERE job.owner_user_id=%s AND run.origin_type='manual'
+        AND NOT job.cancel_requested
+        AND (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
+      UNION ALL
+      SELECT job.created_at
+      FROM l2_backtest_job job
+      JOIN backtest_run run ON run.id=job.run_id
+      WHERE job.owner_user_id=%s AND run.origin_type='manual'
+        AND NOT job.cancel_requested
+        AND (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
+    ) pending
+  """, (owner_id, owner_id))
+  row = cur.fetchone() or {}
+  return int(row.get("pending_count") or 0), float(row.get("oldest_wait_seconds") or 0)
+
+
+def _global_experiment_in_flight(cur: Any) -> int:
+  cur.execute("""
+    SELECT count(*) AS value
+    FROM backtest_experiment_trial_execution
+    WHERE permit_released_at IS NULL
+  """)
+  return int(cur.fetchone()["value"])
+
+
+def _set_materialization_block(
+  cur: Any,
+  locked: dict[str, Any],
+  gate: MaterializationGate,
+  *,
+  touch: bool = False,
+) -> bool:
+  stage = locked["stage"]
+  current_code = stage.get("blocked_reason_code")
+  desired_code = None if gate.allowed else gate.code
+  desired_message = None if gate.allowed else gate.message
+  if current_code not in _TRANSIENT_BLOCK_CODES and current_code is not None:
+    return False
+  changed = (
+    current_code != desired_code
+    or stage.get("blocked_reason_message") != desired_message
+  )
+  if not changed:
+    if touch:
+      cur.execute(
+        "UPDATE backtest_experiment_stage SET updated_at=now() WHERE id=%s",
+        (stage["id"],),
+      )
+    return False
+  _write_materialization_block(cur, locked, desired_code, desired_message)
+  _audit_materialization_block(cur, locked, desired_code)
+  return True
+
+
+def _write_materialization_block(
+  cur: Any,
+  locked: dict[str, Any],
+  code: str | None,
+  message: str | None,
+) -> None:
+  stage = locked["stage"]
+  revision = locked["revision"]
+  cur.execute("""
+    UPDATE backtest_experiment_stage
+    SET blocked_reason_code=%s, blocked_reason_message=%s,
+      row_version=row_version+1, updated_at=now()
+    WHERE id=%s
+  """, (code, message, stage["id"]))
+  cur.execute("""
+    UPDATE backtest_experiment_revision
+    SET blocked_reason_code=%s, blocked_reason_message=%s, updated_at=now()
+    WHERE id=%s
+  """, (code, message, revision["id"]))
+  cur.execute("""
+    UPDATE backtest_experiment
+    SET blocked_reason_code=%s, blocked_reason_message=%s,
+      row_version=row_version+1, updated_at=now()
+    WHERE id=%s
+  """, (code, message, revision["experiment_id"]))
+
+
+def _audit_materialization_block(
+  cur: Any,
+  locked: dict[str, Any],
+  code: str | None,
+) -> None:
+  stage = locked["stage"]
+  revision = locked["revision"]
+  cur.execute("""
+    INSERT INTO backtest_experiment_audit (
+      owner_user_id, experiment_id, revision_id, stage_id, event_type, detail
+    ) VALUES (%s,%s,%s,%s,%s,%s)
+  """, (
+    stage["owner_user_id"], revision["experiment_id"], revision["id"], stage["id"],
+    "stage.materialization_resumed" if code is None else "stage.materialization_blocked",
+    Jsonb({"reasonCode": code}),
+  ))
 
 
 def _materialization_inputs(
@@ -650,15 +985,19 @@ def _insert_trial_execution(
   cur.execute("""
     UPDATE backtest_experiment_user_quota
     SET experiment_in_flight_count=experiment_in_flight_count+1,
-      row_version=row_version+1, updated_at=now()
+      materialization_sequence=materialization_sequence+1,
+      last_materialized_at=now(), row_version=row_version+1, updated_at=now()
     WHERE owner_user_id=%s
+    RETURNING materialization_sequence
   """, (owner_id,))
+  materialization_sequence = int(cur.fetchone()["materialization_sequence"])
   cur.execute("""
     UPDATE backtest_experiment_stage
-    SET in_flight_count=in_flight_count+1, updated_at=now(),
-      row_version=row_version+1
+    SET in_flight_count=in_flight_count+1,
+      last_materialized_sequence=%s, last_materialized_at=now(),
+      updated_at=now(), row_version=row_version+1
     WHERE id=%s
-  """, (stage["id"],))
+  """, (materialization_sequence, stage["id"]))
   cur.execute("""
     UPDATE backtest_experiment
     SET updated_at=now(), row_version=row_version+1
@@ -1251,7 +1590,10 @@ def _insert_revision(
     revision_id, experiment_id, owner_id, Jsonb(normalized_spec),
     preview["spec_hash"], preview["run_template_digest"],
     preview["dataset_snapshot_digest"], normalized_spec["canonicalizationVersion"],
-    preview["budget_version"], Jsonb(normalized_spec["resourceEstimate"]),
+    preview["budget_version"], Jsonb({
+      "estimate": normalized_spec["resourceEstimate"],
+      "capacityPolicy": normalized_spec["capacityPolicy"],
+    }),
     Jsonb(normalized_spec["determinism"]), preview["planned_trial_count"],
   ))
 

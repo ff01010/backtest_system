@@ -304,6 +304,7 @@ class ExperimentApplication:
       },
       "datasetSnapshots": list(datasets),
       "resourceEstimate": estimate,
+      "capacityPolicy": self._budget_summary(),
       "determinism": {
         "seedDerivation": "trial-seed-v1",
         "deterministicLevel": "input_deterministic_only",
@@ -370,10 +371,14 @@ class ExperimentApplication:
 
   def _budget_summary(self) -> dict[str, Any]:
     return with_version({
-      "budgetVersion": "experiment_budget_v1",
+      "budgetVersion": "experiment_budget_v2",
       "maxValuesPerDimension": settings.EXPERIMENT_MAX_VALUES_PER_DIMENSION,
       "maxTrials": settings.EXPERIMENT_MAX_TRIALS,
+      "maxUserPlannedTrials": settings.EXPERIMENT_MAX_USER_PLANNED_TRIALS,
       "maxEstimatedBars": settings.EXPERIMENT_BAR_MAX_ESTIMATED_BARS,
+      "maxInFlightPerExperiment": settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT,
+      "maxInFlightPerUser": settings.EXPERIMENT_MAX_IN_FLIGHT_PER_USER,
+      "schedulerCapacity": settings.BACKTEST_BASE_CONCURRENCY,
     })
 
 

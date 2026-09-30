@@ -11,6 +11,7 @@ import pytest
 
 from backend import settings
 from backend.experiments.application import ExperimentApplication
+from backend.experiments.compiler import LegacySingleBarTrialCompiler
 from backend.experiments.contracts import EvaluationSpecRequest, ExperimentCreateRequest
 from backend.experiments.coordinator import ExperimentCoordinator
 from backend.experiments.errors import ExperimentError
@@ -29,7 +30,11 @@ from backend.tests.test_experiment_preview import (
   _request,
   _template,
 )
-from backend.tests.test_experiment_execution import _dataset, _execution_template
+from backend.tests.test_experiment_execution import (
+  _assignment,
+  _dataset,
+  _execution_template,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -65,13 +70,22 @@ def users() -> None:
   with psycopg.connect(admin_url) as conn:
     with conn.cursor() as cur:
       cur.execute("""
+        DELETE FROM bar_backtest_job job USING backtest_run run
+        WHERE job.run_id=run.id AND run.origin_type='manual'
+          AND run.owner_user_id IN (%s,%s)
+      """, (OWNER.id, OTHER.id))
+      cur.execute("""
+        DELETE FROM backtest_run
+        WHERE origin_type='manual' AND owner_user_id IN (%s,%s)
+      """, (OWNER.id, OTHER.id))
+      cur.execute("""
         UPDATE backtest_run SET origin_trial_execution_id=NULL
         WHERE origin_type='experiment'
       """)
-      cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
       cur.execute("DELETE FROM backtest_experiment_audit")
       cur.execute("DELETE FROM backtest_experiment_evaluation_run")
       cur.execute("DELETE FROM backtest_experiment_evaluation_spec")
+      cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
       cur.execute("DELETE FROM backtest_experiment_trial_execution")
       cur.execute("DELETE FROM backtest_run WHERE origin_type='experiment'")
       cur.execute("DELETE FROM backtest_experiment_trial")
@@ -83,6 +97,11 @@ def users() -> None:
       cur.execute("DELETE FROM backtest_experiment")
       cur.execute("DELETE FROM backtest_experiment_user_quota")
       cur.execute("DELETE FROM backtest_experiment_preview")
+      cur.execute("""
+        UPDATE backtest_scheduler_capacity
+        SET override_limit=NULL, override_expires_at=NULL, update_reason=''
+        WHERE singleton
+      """)
       for user in (OWNER, OTHER):
         cur.execute("""
           INSERT INTO app_user (
@@ -111,6 +130,8 @@ def application(monkeypatch: pytest.MonkeyPatch) -> ExperimentApplication:
   monkeypatch.setattr(settings, "EXPERIMENT_COORDINATOR_LEASE_SECONDS", 30)
   monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 1)
   monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_USER", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_MANUAL_RESERVED_PERMITS", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_MANUAL_MAX_WAIT_SECONDS", 60)
   monkeypatch.setattr(settings, "EXPERIMENT_CURSOR_SIGNING_SECRET", "s" * 32)
   return ExperimentApplication(
     resolver=StaticResolver(_template()),
@@ -161,6 +182,8 @@ def execution_application(monkeypatch: pytest.MonkeyPatch) -> ExperimentApplicat
   monkeypatch.setattr(settings, "EXPERIMENT_COORDINATOR_LEASE_SECONDS", 30)
   monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 1)
   monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_USER", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_MANUAL_RESERVED_PERMITS", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_MANUAL_MAX_WAIT_SECONDS", 60)
   monkeypatch.setattr(settings, "EXPERIMENT_CURSOR_SIGNING_SECRET", "s" * 32)
   return ExperimentApplication(
     resolver=StaticResolver(_execution_template()),
@@ -173,13 +196,22 @@ def _clear_experiment_facts() -> None:
   with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
     with conn.cursor() as cur:
       cur.execute("""
+        DELETE FROM bar_backtest_job job USING backtest_run run
+        WHERE job.run_id=run.id AND run.origin_type='manual'
+          AND run.owner_user_id IN (%s,%s)
+      """, (OWNER.id, OTHER.id))
+      cur.execute("""
+        DELETE FROM backtest_run
+        WHERE origin_type='manual' AND owner_user_id IN (%s,%s)
+      """, (OWNER.id, OTHER.id))
+      cur.execute("""
         UPDATE backtest_run SET origin_trial_execution_id=NULL
         WHERE origin_type='experiment'
       """)
-      cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
       cur.execute("DELETE FROM backtest_experiment_audit")
       cur.execute("DELETE FROM backtest_experiment_evaluation_run")
       cur.execute("DELETE FROM backtest_experiment_evaluation_spec")
+      cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
       cur.execute("DELETE FROM backtest_experiment_trial_execution")
       cur.execute("DELETE FROM backtest_run WHERE origin_type='experiment'")
       cur.execute("DELETE FROM backtest_experiment_trial")
@@ -191,6 +223,11 @@ def _clear_experiment_facts() -> None:
       cur.execute("DELETE FROM backtest_experiment")
       cur.execute("DELETE FROM backtest_experiment_user_quota")
       cur.execute("DELETE FROM backtest_experiment_preview")
+      cur.execute("""
+        UPDATE backtest_scheduler_capacity
+        SET override_limit=NULL, override_expires_at=NULL, update_reason=''
+        WHERE singleton
+      """)
 
 
 def _preview_and_payload(
@@ -336,16 +373,235 @@ def _execution_request() -> Any:
 def _create_execution_experiment(
   application: ExperimentApplication,
   key: str,
+  request: Any | None = None,
+  user: CurrentUser = OWNER,
 ) -> str:
-  request = _execution_request()
-  preview = _as_user(OWNER, lambda: application.preview(request))
+  request = request or _execution_request()
+  preview = _as_user(user, lambda: application.preview(request))
   payload = ExperimentCreateRequest(
     previewToken=preview["previewToken"],
     specHash=preview["specHash"],
     experimentSpec=request,
   )
-  response, _status = _as_user(OWNER, lambda: application.create(payload, key))
+  response, _status = _as_user(user, lambda: application.create(payload, key))
   return str(response["experimentId"])
+
+
+def _generate_all(worker_id: str) -> None:
+  coordinator = ExperimentCoordinator(
+    repository=GenerationOnlyRepository(), worker_id=worker_id,
+  )
+  while coordinator.run_once():
+    pass
+
+
+def _two_trial_execution_request() -> Any:
+  return _request(
+    parameterGrid=[{"inputId": "strategyParameters.window", "values": [30, 40]}],
+    capitalScenarios=["100000"],
+    costScenarios=[{"scenarioId": "cost-1", "slippage": "0.01"}],
+  )
+
+
+def test_same_user_experiments_materialize_in_stable_round_robin(
+  execution_application: ExperimentApplication,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 2)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_USER", 2)
+  first = _create_execution_experiment(
+    execution_application, "round-robin-first", _two_trial_execution_request(),
+  )
+  second = _create_execution_experiment(
+    execution_application, "round-robin-second", _two_trial_execution_request(),
+  )
+  _generate_all("round-robin-generator")
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="round-robin-worker",
+  )
+
+  assert coordinator.run_once()
+  assert coordinator.run_once()
+
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT origin_experiment_id
+        FROM backtest_run
+        WHERE origin_type='experiment'
+        ORDER BY created_at, id
+      """)
+      materialized = [str(row[0]) for row in cur.fetchall()]
+  assert materialized == [first, second]
+
+
+def test_mixed_users_keep_cross_user_fairness_before_manual_priority(
+  execution_application: ExperimentApplication,
+) -> None:
+  owner_experiment = _create_execution_experiment(
+    execution_application, "mixed-owner-experiment",
+  )
+  other_experiment = _create_execution_experiment(
+    execution_application, "mixed-other-experiment", user=OTHER,
+  )
+  _generate_all("mixed-user-generator")
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="mixed-user-worker",
+  )
+
+  assert coordinator.run_once()
+  assert coordinator.run_once()
+  owner_run_id = _run_id_for_experiment(owner_experiment)
+  other_run_id = _run_id_for_experiment(other_experiment)
+  manual_payload = LegacySingleBarTrialCompiler().compile_request(
+    _execution_template(), _assignment(), _dataset(), {"baseSeed": 13},
+  )
+  manual_run_id, _display_no = _as_user(
+    OWNER, lambda: state_store.create_bar_backtest_job(manual_payload),
+  )
+  _occupy_scheduler_slot(owner_run_id)
+
+  with psycopg.connect(
+    os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], row_factory=dict_row,
+  ) as conn:
+    with conn.cursor() as cur:
+      candidate = state_store._next_backtest_candidate(cur, "bar")
+
+  assert candidate is not None
+  assert str(candidate["owner_user_id"]) == OTHER.id
+  assert str(candidate["run_id"]) == other_run_id
+  assert str(candidate["run_id"]) != manual_run_id
+  _delete_manual_run(manual_run_id)
+
+
+def test_concurrent_users_cannot_exceed_global_experiment_capacity(
+  execution_application: ExperimentApplication,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "BACKTEST_BASE_CONCURRENCY", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_MANUAL_RESERVED_PERMITS", 0)
+  owner_experiment = _create_execution_experiment(
+    execution_application, "global-capacity-owner",
+  )
+  other_experiment = _create_execution_experiment(
+    execution_application, "global-capacity-other", user=OTHER,
+  )
+  _generate_all("global-capacity-generator")
+
+  def materialize(worker_id: str) -> bool:
+    return ExperimentCoordinator(
+      repository=PostgresExperimentRepository(), worker_id=worker_id,
+    ).run_once()
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    list(executor.map(materialize, ("global-capacity-1", "global-capacity-2")))
+
+  facts = _global_execution_facts()
+  assert facts == {"runs": 1, "in_flight": 1}
+  assert materialize("global-capacity-block-reporter")
+  details = [
+    _as_user(OWNER, lambda: execution_application.detail(owner_experiment)),
+    _as_user(OTHER, lambda: execution_application.detail(other_experiment)),
+  ]
+  assert sum(
+    item["blockedReason"] is not None
+    and item["blockedReason"]["code"] == "experiment.capacity_blocked"
+    for item in details
+  ) == 1
+
+
+def test_manual_wait_gate_blocks_then_resumes_same_revision(
+  execution_application: ExperimentApplication,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 2)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_USER", 2)
+  experiment_id = _create_execution_experiment(
+    execution_application, "manual-wait-gate",
+  )
+  _generate_all("manual-wait-generator")
+  manual_payload = LegacySingleBarTrialCompiler().compile_request(
+    _execution_template(), _assignment(), _dataset(), {"baseSeed": 7},
+  )
+  manual_run_id, _display_no = _as_user(
+    OWNER, lambda: state_store.create_bar_backtest_job(manual_payload),
+  )
+  _age_manual_job(manual_run_id)
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="manual-wait-worker",
+  )
+
+  assert coordinator.run_once()
+  blocked = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert blocked["blockedReason"]["code"] == "experiment.manual_wait_blocked"
+  assert _execution_facts(experiment_id)["runs"] == 0
+
+  _delete_manual_run(manual_run_id)
+  assert coordinator.run_once()
+  resumed = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert resumed["blockedReason"] is None
+  assert _execution_facts(experiment_id)["runs"] == 1
+
+
+def test_capacity_override_blocks_without_losing_grid_and_resumes(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "capacity-block-resume",
+  )
+  _generate_all("capacity-generator")
+  before = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  _set_scheduler_capacity_override(8)
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="capacity-worker",
+  )
+
+  assert coordinator.run_once()
+  blocked = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert blocked["status"] == "queued"
+  assert blocked["blockedReason"]["code"] == "experiment.capacity_blocked"
+  assert blocked["snapshotVersion"] > before["snapshotVersion"]
+  assert blocked["stage"]["generatedTrialCount"] == blocked["stage"]["plannedTrialCount"]
+  assert _execution_facts(experiment_id)["runs"] == 0
+
+  _set_scheduler_capacity_override(None)
+  assert coordinator.run_once()
+  resumed = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert resumed["blockedReason"] is None
+  assert resumed["snapshotVersion"] > blocked["snapshotVersion"]
+  assert resumed["revision"]["revisionId"] == blocked["revision"]["revisionId"]
+  assert _execution_facts(experiment_id)["runs"] == 1
+
+
+def test_runner_prefers_manual_job_within_selected_user(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "runner-manual-priority",
+  )
+  _generate_all("runner-priority-generator")
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="runner-priority-worker",
+  )
+  assert coordinator.run_once()
+  experiment_run_id = _run_id_for_experiment(experiment_id)
+  manual_payload = LegacySingleBarTrialCompiler().compile_request(
+    _execution_template(), _assignment(), _dataset(), {"baseSeed": 11},
+  )
+  manual_run_id, _display_no = _as_user(
+    OWNER, lambda: state_store.create_bar_backtest_job(manual_payload),
+  )
+
+  with psycopg.connect(
+    os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], row_factory=dict_row,
+  ) as conn:
+    with conn.cursor() as cur:
+      candidate = state_store._next_backtest_candidate(cur, "bar")
+
+  assert candidate is not None
+  assert str(candidate["run_id"]) == manual_run_id
+  assert str(candidate["run_id"]) != experiment_run_id
+  _delete_manual_run(manual_run_id)
 
 
 def test_materialization_failure_rolls_back_run_execution_outbox_and_permit(
@@ -632,6 +888,78 @@ def _execution_facts(experiment_id: str) -> dict[str, Any]:
     "in_flight": int(row["in_flight"]),
     "materialization_status": str(row["materialization_status"]),
   }
+
+
+def _global_execution_facts() -> dict[str, int]:
+  with psycopg.connect(
+    os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], row_factory=dict_row,
+  ) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT count(DISTINCT run.id) AS runs,
+          count(execution.id) FILTER (
+            WHERE execution.permit_released_at IS NULL
+          ) AS in_flight
+        FROM backtest_run run
+        JOIN backtest_experiment_trial_execution execution
+          ON execution.run_id=run.id
+        WHERE run.origin_type='experiment'
+      """)
+      row = cur.fetchone()
+  return {"runs": int(row["runs"]), "in_flight": int(row["in_flight"])}
+
+
+def _age_manual_job(run_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE bar_backtest_job
+        SET created_at=now() - interval '120 seconds'
+        WHERE run_id=%s
+      """, (run_id,))
+
+
+def _occupy_scheduler_slot(run_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE bar_backtest_job
+        SET status='running', lease_expires_at=now() + interval '5 minutes'
+        WHERE run_id=%s
+      """, (run_id,))
+      cur.execute("UPDATE backtest_run SET status='running' WHERE id=%s", (run_id,))
+      cur.execute("""
+        INSERT INTO backtest_execution_slot (
+          run_id, owner_user_id, job_kind, attempt_token, worker_id,
+          is_burst, lease_expires_at
+        )
+        SELECT id, owner_user_id, 'bar', gen_random_uuid(), 'fairness-test',
+          false, now() + interval '5 minutes'
+        FROM backtest_run
+        WHERE id=%s
+      """, (run_id,))
+
+
+def _delete_manual_run(run_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("DELETE FROM bar_backtest_job WHERE run_id=%s", (run_id,))
+      cur.execute("DELETE FROM backtest_run WHERE id=%s", (run_id,))
+
+
+def _set_scheduler_capacity_override(limit: int | None) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_scheduler_capacity
+        SET override_limit=%s,
+          override_expires_at=CASE
+            WHEN %s::integer IS NULL THEN NULL
+            ELSE now() + interval '5 minutes'
+          END,
+          update_reason='test'
+        WHERE singleton
+      """, (limit, limit))
 
 
 def _run_id_for_experiment(experiment_id: str) -> str:

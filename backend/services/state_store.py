@@ -1945,26 +1945,41 @@ def _next_backtest_candidate(
   runtime_version: str = SCRIPT_RUNTIME_VERSION,
   capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
 ) -> dict[str, Any] | None:
-  """在全局锁内按用户当前占用数、提交时间选择下一条任务。"""
+  """先按用户公平选队首，再优先领取该用户的普通手工任务。"""
   cur.execute("""
-    SELECT candidate.*,
-      (SELECT count(*) FROM backtest_execution_slot slot
-       WHERE slot.owner_user_id=candidate.owner_user_id) AS owner_active_count
-    FROM (
-      SELECT 'bar' AS job_kind, run_id, owner_user_id, created_at
-      FROM bar_backtest_job
-      WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
-        AND NOT cancel_requested
-        AND runtime_version=%s AND capability_digest=%s
+    WITH candidates AS (
+      SELECT 'bar' AS job_kind, job.run_id, job.owner_user_id,
+        job.created_at, run.origin_type
+      FROM bar_backtest_job job
+      JOIN backtest_run run ON run.id=job.run_id
+      WHERE (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
+        AND NOT job.cancel_requested
+        AND job.runtime_version=%s AND job.capability_digest=%s
       UNION ALL
-      SELECT 'l2' AS job_kind, run_id, owner_user_id, created_at
-      FROM l2_backtest_job
-      WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
-        AND NOT cancel_requested
-        AND runtime_version=%s AND capability_digest=%s
-    ) AS candidate
-    WHERE (%s::text IS NULL OR candidate.job_kind=%s::text)
-    ORDER BY owner_active_count, candidate.created_at, candidate.run_id
+      SELECT 'l2' AS job_kind, job.run_id, job.owner_user_id,
+        job.created_at, run.origin_type
+      FROM l2_backtest_job job
+      JOIN backtest_run run ON run.id=job.run_id
+      WHERE (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
+        AND NOT job.cancel_requested
+        AND job.runtime_version=%s AND job.capability_digest=%s
+    ), eligible AS (
+      SELECT * FROM candidates
+      WHERE (%s::text IS NULL OR job_kind=%s::text)
+    ), ranked AS (
+      SELECT eligible.*,
+        (SELECT count(*) FROM backtest_execution_slot slot
+         WHERE slot.owner_user_id=eligible.owner_user_id) AS owner_active_count,
+        row_number() OVER (
+          PARTITION BY eligible.owner_user_id
+          ORDER BY CASE WHEN eligible.origin_type='manual' THEN 0 ELSE 1 END,
+            eligible.created_at, eligible.run_id
+        ) AS owner_queue_rank
+      FROM eligible
+    )
+    SELECT * FROM ranked
+    WHERE owner_queue_rank=1
+    ORDER BY owner_active_count, created_at, run_id
     LIMIT 1
   """, (
     runtime_version, capability_digest, runtime_version, capability_digest,

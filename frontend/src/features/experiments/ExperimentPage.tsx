@@ -46,6 +46,7 @@ import EvaluationBuilder from './EvaluationBuilder';
 
 type Props = {
   userId: string;
+  enabled?: boolean | null;
   subject: ExperimentSubjectRef | null;
   experimentId?: string | null;
   onExperimentChange?: (experimentId: string | null) => void;
@@ -58,6 +59,11 @@ type DraftChange = (draft: ExperimentDraft) => ExperimentDraft;
 
 const ACTIVE_EXPERIMENT_STATUSES = new Set(['preparing', 'queued', 'running', 'cancelling']);
 const CANCELLABLE_EXPERIMENT_STATUSES = new Set(['preparing', 'generation_blocked']);
+const RECOVERABLE_BLOCK_CODES = new Set([
+  'experiment.capacity_blocked',
+  'experiment.manual_queue_reserved',
+  'experiment.manual_wait_blocked',
+]);
 
 function shortDigest(value: unknown): string {
   return typeof value === 'string' && value ? `${value.slice(0, 12)}…` : '未提供';
@@ -455,8 +461,12 @@ function ExperimentDetailView({
       </section>
       {error && <div className="experiment-alert is-error" role="alert">{error}</div>}
       {detail.blockedReason && (
-        <div className="experiment-alert is-error" role="alert">
+        <div
+          className={`experiment-alert ${RECOVERABLE_BLOCK_CODES.has(detail.blockedReason.code) ? 'is-warning' : 'is-error'}`}
+          role="alert"
+        >
           {detail.blockedReason.message}（{detail.blockedReason.code}）
+          {RECOVERABLE_BLOCK_CODES.has(detail.blockedReason.code) && '。已生成的 Trial 和运行中任务保持不变，条件恢复后会从当前 Revision 继续。'}
         </div>
       )}
       <section className="experiment-preview-card">
@@ -710,6 +720,7 @@ function ExperimentCreator({
 
 export default function ExperimentPage({
   userId,
+  enabled = true,
   subject,
   experimentId,
   onExperimentChange,
@@ -717,6 +728,25 @@ export default function ExperimentPage({
   onBackToStrategy,
   onOpenRun,
 }: Props) {
+  if (enabled === null) {
+    return (
+      <main className="experiment-page">
+        <div className="experiment-empty"><RefreshCw className="is-spinning" size={20} /> 正在读取自动化回测能力…</div>
+      </main>
+    );
+  }
+  if (!enabled) {
+    return (
+      <main className="experiment-page">
+        <div className="experiment-alert is-warning" role="alert">
+          自动化回测能力尚未启用。完成统一调度和服务器容量门禁验证后，管理员才能开放普通用户入口。
+        </div>
+        <button className="app-button is-quiet" type="button" onClick={onBackToStrategy}>
+          <ArrowLeft size={15} /> 返回策略回测
+        </button>
+      </main>
+    );
+  }
   const selection = subject;
   const changeExperiment = onExperimentChange ?? (() => {});
   if (experimentId) {

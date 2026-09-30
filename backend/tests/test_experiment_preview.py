@@ -15,6 +15,7 @@ from backend.experiments.application import ExperimentApplication
 from backend.experiments.canonicalization import canonical_json, digest, with_version
 from backend.experiments.contracts import ExperimentPreviewRequest, SubjectRef
 from backend.experiments.errors import ExperimentError
+from backend.experiments.estimator import SingleBarResourceEstimator
 from backend.experiments.generators import FiniteGridGenerator
 from backend.experiments.generators import seed_bundle
 from backend.experiments import generators
@@ -140,6 +141,29 @@ def _template() -> ResolvedRunTemplate:
       "slippage": "0",
     },
   )
+
+
+@pytest.mark.parametrize(("timeframe", "dataset"), [
+  ("1h", {"formalDateCount": 2, "warmupDateCount": 1}),
+  ("5m", {"formalDateCount": 2}),
+])
+def test_resource_estimator_rejects_unreliable_metadata(
+  timeframe: str,
+  dataset: dict[str, Any],
+) -> None:
+  template = _template()
+  fixed = {**template.snapshot["fixedStructure"], "timeframe": timeframe}
+  unreliable = replace(
+    template,
+    snapshot={**template.snapshot, "fixedStructure": fixed},
+  )
+
+  with pytest.raises(ExperimentError) as rejected:
+    SingleBarResourceEstimator().estimate(unreliable, (dataset,), 1, 1)
+
+  assert rejected.value.code == "experiment.capacity_unavailable"
+  assert rejected.value.status_code == 503
+  assert rejected.value.retryable
 
 
 def _request(**stage_changes: Any) -> ExperimentPreviewRequest:
@@ -363,7 +387,7 @@ def test_preview_is_reproducible_but_issues_a_fresh_owner_bound_token(
   second = application.preview(_request())
 
   assert first["specHash"] == second["specHash"]
-  assert first["specHash"] == "58c35bc96a893a7e74ad8c25f2c6cc515b9e06a58438aae4170bd3dd4b394b11"
+  assert first["specHash"] == "16d5aa1ede7b1bcb9482b3f7f29afc1c4e4b9476c56bf9ef6e8d82077e851dcf"
   assert first["plannedTrialCount"] == 8
   assert first["examples"] == second["examples"]
   assert first["examples"][0]["trialFingerprint"] == (

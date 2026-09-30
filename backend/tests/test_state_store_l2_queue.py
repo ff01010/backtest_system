@@ -70,7 +70,10 @@ def test_claim_l2_job_uses_transaction_scoped_fair_scheduler_lock(monkeypatch: A
   assert "FROM backtest_execution_slot" in claim_query
   assert "UNION ALL" in claim_query
   assert "ORDER BY owner_active_count" in claim_query
+  assert "PARTITION BY eligible.owner_user_id" in claim_query
+  assert "eligible.origin_type='manual'" in claim_query
   assert "%s::text IS NULL" in claim_query
+  assert "benchmarkControl" not in claim_query
   assert claim_params == (
     state_store.SCRIPT_RUNTIME_VERSION,
     state_store.RUNTIME_CAPABILITY_DIGEST,

@@ -215,6 +215,21 @@ beforeEach(() => {
 });
 
 describe('ExperimentPage', () => {
+  it('shows a clear gate when automation is not enabled', () => {
+    render(
+      <ExperimentPage
+        userId="user-1"
+        enabled={false}
+        subject={null}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('alert').textContent).toContain('自动化回测能力尚未启用');
+    expect(fetchExperiments).not.toHaveBeenCalled();
+  });
+
   it('invalidates the preview immediately after any form change', async () => {
     render(
       <ExperimentPage
@@ -325,5 +340,29 @@ describe('ExperimentPage', () => {
     expect(onOpenRun).toHaveBeenCalledWith('run-1', '688981.SH', '5m', '20260701');
     expect(fetchExperimentDetail).toHaveBeenCalledTimes(1);
     expect(fetchExperimentTrials).toHaveBeenCalledWith('experiment-1');
+  });
+
+  it('explains that capacity blocks resume the same revision', async () => {
+    vi.mocked(fetchExperimentDetail).mockResolvedValueOnce({
+      ...DETAIL,
+      status: 'queued',
+      blockedReason: {
+        code: 'experiment.capacity_blocked',
+        message: '系统容量低于该 Revision 创建时预算',
+      },
+    });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('条件恢复后会从当前 Revision 继续');
   });
 });

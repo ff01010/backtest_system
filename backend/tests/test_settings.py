@@ -266,3 +266,36 @@ def test_experiment_configuration_requires_bounded_window_and_cursor_secret(
 
   monkeypatch.setattr(settings, "EXPERIMENT_CURSOR_SIGNING_SECRET", "s" * 32)
   settings.validate_experiment_configuration()
+
+
+def test_experiment_configuration_bounds_manual_reserved_permits(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENTS_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_BAR_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_TRIALS", 100)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_USER_PLANNED_TRIALS", 100)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_USER", 2)
+  monkeypatch.setattr(settings, "EXPERIMENT_MANUAL_RESERVED_PERMITS", 3)
+
+  with pytest.raises(ValueError, match="普通任务保留额度"):
+    settings.validate_experiment_configuration()
+
+
+def test_experiment_configuration_accepts_manual_wait_gate(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENTS_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_BAR_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_TRIALS", 100)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_USER_PLANNED_TRIALS", 100)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_USER", 2)
+  monkeypatch.setattr(settings, "EXPERIMENT_MANUAL_RESERVED_PERMITS", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_MANUAL_MAX_WAIT_SECONDS", 60)
+  monkeypatch.setattr(settings, "EXPERIMENT_COORDINATOR_LEASE_SECONDS", 30)
+  monkeypatch.setattr(settings, "EXPERIMENT_COORDINATOR_HEARTBEAT_SECONDS", 5)
+  monkeypatch.setattr(settings, "EXPERIMENT_CURSOR_SIGNING_SECRET", "s" * 32)
+
+  settings.validate_experiment_configuration()

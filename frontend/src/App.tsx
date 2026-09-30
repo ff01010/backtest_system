@@ -64,7 +64,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
     hasUnsavedStrategy: false,
     isStrategySavePending: false,
   });
-  const [experimentPreviewEnabled, setExperimentPreviewEnabled] = useState(false);
+  const [experimentPreviewEnabled, setExperimentPreviewEnabled] = useState<boolean | null>(null);
   const strategySaveActionRef = useRef<() => Promise<boolean>>(async () => false);
   const requestStrategySave = useCallback(
     () => strategySaveActionRef.current(),
@@ -214,7 +214,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
         </div>
         {[
           { key: 'backtest' as const, label: '策略回测' },
-          ...(experimentPreviewEnabled ? [{ key: 'experiments' as const, label: '自动化回测' }] : []),
+          ...(experimentPreviewEnabled === true ? [{ key: 'experiments' as const, label: '自动化回测' }] : []),
           { key: 'sharedBacktests' as const, label: '策略广场' },
           { key: 'signals' as const, label: '信号可视化' },
           { key: 'apiKeys' as const, label: 'API Key' },
@@ -353,7 +353,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
             });
             setActivePage('experiments');
           }}
-          experimentPreviewEnabled={experimentPreviewEnabled}
+          experimentPreviewEnabled={experimentPreviewEnabled === true}
           requestedConfigId={strategyConfigToOpen}
         />
       </div>
@@ -361,6 +361,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
       {activePage === 'experiments' && (
         <ExperimentPage
           userId={currentUser.id}
+          enabled={experimentPreviewEnabled}
           subject={experimentSubject}
           experimentId={urlParams.experimentId ?? null}
           onExperimentChange={(experimentId) => {
