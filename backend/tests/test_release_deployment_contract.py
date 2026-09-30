@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """发布脚本与 Compose 的关键不可变镜像契约。"""
 
+import re
 from pathlib import Path
 
 
@@ -188,3 +189,22 @@ def test_socket_proxy_uses_exact_read_only_endpoint_allowlist() -> None:
   assert "^(/v[0-9.]+)?/containers }" not in proxy
   assert "/archive" not in proxy
   assert "/export" not in proxy
+
+
+def test_socket_proxy_reserves_pid_capacity_for_healthcheck() -> None:
+  compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(
+    encoding="utf-8",
+  )
+  proxy = (
+    ROOT / "deploy" / "docker-socket-proxy" / "haproxy.cfg.template"
+  ).read_text(encoding="utf-8")
+  service = compose.split("  docker-socket-proxy:", 1)[1].split("\n  loki:", 1)[0]
+  thread_match = re.search(r"^\s*nbthread\s+(\d+)\s*$", proxy, re.MULTILINE)
+  pid_limit_match = re.search(r"^\s*pids_limit:\s*(\d+)\s*$", service, re.MULTILINE)
+
+  assert thread_match is not None
+  assert pid_limit_match is not None
+  thread_count = int(thread_match.group(1))
+  pid_limit = int(pid_limit_match.group(1))
+  assert thread_count <= 4
+  assert pid_limit >= thread_count + 4
