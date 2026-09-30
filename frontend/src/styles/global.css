@@ -4438,6 +4438,33 @@ button.experiment-trial-row:hover {
   gap: 7px;
 }
 
+.evaluation-rule-formula,
+.evaluation-rule-aggregate {
+  grid-template-columns: minmax(120px, 0.7fr) minmax(130px, 0.8fr) minmax(140px, 0.8fr) minmax(220px, 1.5fr) auto;
+}
+
+.evaluation-toggle {
+  display: flex !important;
+  align-items: center;
+  gap: 8px;
+}
+
+.evaluation-visualization-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.evaluation-axis-pair {
+  display: flex;
+  gap: 6px;
+}
+
+.evaluation-axis-pair select {
+  min-width: 0;
+  flex: 1;
+}
+
 .evaluation-priority {
   display: none;
 }
@@ -4493,9 +4520,87 @@ button.experiment-trial-row:hover {
 }
 
 .evaluation-result {
+  display: grid;
+  gap: 14px;
   margin-top: 20px;
   border-top: 1px solid var(--border);
   padding-top: 16px;
+}
+
+.evaluation-completeness {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(83, 182, 143, 0.35);
+  border-radius: 12px;
+  background: rgba(83, 182, 143, 0.08);
+}
+
+.evaluation-completeness.is-partial {
+  border-color: rgba(222, 163, 74, 0.5);
+  background: rgba(222, 163, 74, 0.1);
+}
+
+.evaluation-dataset-notice {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.evaluation-analysis-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.evaluation-analysis-card {
+  padding: 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.evaluation-analysis-card h4,
+.evaluation-analysis-card p {
+  margin: 0 0 10px;
+}
+
+.evaluation-point-list {
+  display: grid;
+  gap: 6px;
+}
+
+.evaluation-point-list span {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.evaluation-heatmap {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 6px;
+}
+
+.evaluation-heatmap span {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(102, 126, 234, 0.16);
+  font-size: 11px;
+}
+
+.evaluation-exceptions > div {
+  display: grid;
+  grid-template-columns: 100px 90px 1fr;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12px;
 }
 
 .evaluation-evidence {

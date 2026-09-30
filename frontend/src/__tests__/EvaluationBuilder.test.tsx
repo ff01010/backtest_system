@@ -12,6 +12,7 @@ import {
 } from '../features/experiments/api';
 import type {
   EvaluationCatalogs,
+  EvaluationCompletenessSnapshot,
   EvaluationRun,
   EvaluationRunDetail,
   SavedEvaluationSpec,
@@ -63,10 +64,22 @@ const CATALOGS: EvaluationCatalogs = {
   },
   dimensionCatalog: {
     version: 'dimension_catalog_v1',
-    dimensions: [{
-      dimensionId: 'dateScenarioId', displayName: '日期场景', dataType: 'string',
-      unit: null, nullSemantics: 'missing_is_null',
-    }],
+    dimensions: [
+      {
+        dimensionId: 'dateScenarioId', displayName: '日期场景', dataType: 'string',
+        unit: null, nullSemantics: 'missing_is_null', orderedValues: ['development'],
+      },
+      {
+        dimensionId: 'parameter.strategyParameters.lookback', displayName: 'lookback',
+        dataType: 'integer', unit: null, nullSemantics: 'missing_is_null',
+        orderedValues: [10, 20],
+      },
+      {
+        dimensionId: 'costScenarioId', displayName: '成本场景',
+        dataType: 'string', unit: null, nullSemantics: 'missing_is_null',
+        orderedValues: ['base', 'stress'],
+      },
+    ],
   },
   pipelineVersion: 'basic_evaluation_pipeline_v1',
   adapter: { type: 'legacy_single_bar_result', version: '1' },
@@ -114,6 +127,11 @@ const RUN: EvaluationRun = {
   adapterType: 'legacy_single_bar_result', adapterVersion: '1',
   metricCatalogVersion: 'metric_catalog_v1', dimensionCatalogVersion: 'dimension_catalog_v1',
   executionCount: 1, resultSetHash: 'b'.repeat(64), outputHash: null, error: null,
+  completeness: {
+    plannedTrialCount: 1, generatedTrialCount: 1, succeededCount: 1,
+    failedCount: 0, cancelledCount: 0, missingCount: 0,
+    completionRate: '1.0000', isPartial: false, dimensionCoverage: [], exceptions: [],
+  },
   attemptCount: 0, createdAt: '2026-09-30T00:00:00Z', finishedAt: null,
 };
 
@@ -133,8 +151,15 @@ const DETAIL: EvaluationRunDetail = {
     resultSetHash: 'b'.repeat(64),
     sourceRowCount: 1,
     matchedRowCount: 1,
+    isPartial: false,
+    reportStatus: 'complete',
+    candidateSelectionEligible: true,
+    finalTestEligible: false,
+    datasetNotice: 'reference 不是最终 test。',
+    completeness: RUN.completeness,
     columns: ['totalReturn', 'annualSharpe', 'maxDrawdownRate'],
     sort: [{ type: 'metric_sort_v1', metricId: 'annualSharpe', direction: 'desc' }],
+    groupBy: [],
     rows: [{
       trialId: 'trial-1', trialExecutionId: 'execution-1', runId: 'run-1',
       stageId: 'stage-1', stageIndex: 0, trialIndex: 0, resultHash: 'd'.repeat(64),
@@ -142,6 +167,7 @@ const DETAIL: EvaluationRunDetail = {
         totalReturn: '0.12', annualSharpe: null, maxDrawdownRate: '0.03',
       }, unsupportedReasons: { annualSharpe: 'metric_missing' },
     }],
+    visualizations: [],
   },
   spec: SAVED.spec,
 };
@@ -187,5 +213,124 @@ describe('EvaluationBuilder', () => {
 
     expect(screen.getByDisplayValue('基础评价 副本')).not.toBeNull();
     expect(createEvaluationRun).not.toHaveBeenCalled();
+  });
+
+  it('renders legacy basic evaluation output with run-level completeness fallback', async () => {
+    vi.mocked(fetchEvaluationRun).mockResolvedValue({
+      ...DETAIL,
+      output: {
+        schemaVersion: 'basic_evaluation_output_v1',
+        pipelineVersion: 'basic_evaluation_pipeline_v1',
+        resultSetHash: 'b'.repeat(64),
+        sourceRowCount: 1,
+        matchedRowCount: 1,
+        columns: ['totalReturn'],
+        sort: [],
+        rows: DETAIL.output!.rows,
+      },
+    });
+    vi.mocked(fetchEvaluationRuns).mockResolvedValue({
+      items: [{ ...RUN, status: 'succeeded' }], nextCursor: null,
+    });
+    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+
+    expect(await screen.findByText('完整评价')).not.toBeNull();
+    expect(screen.getByText(/历史基础评价按保存时/)).not.toBeNull();
+  });
+
+  it('saves partial policy, safe formula and an actual-point parameter curve', async () => {
+    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+
+    fireEvent.click(await screen.findByLabelText('允许 provisional 部分评价'));
+    fireEvent.change(screen.getByLabelText('最低完成率'), { target: { value: '0.7500' } });
+    fireEvent.click(screen.getByRole('button', { name: '添加维度覆盖' }));
+    fireEvent.change(screen.getByLabelText('最低覆盖率 dateScenarioId'), { target: { value: '0.5000' } });
+    fireEvent.click(screen.getByRole('button', { name: '添加安全公式' }));
+    fireEvent.click(screen.getByRole('button', { name: '参数曲线' }));
+    fireEvent.click(screen.getByRole('button', { name: '成本压力' }));
+    fireEvent.change(screen.getByLabelText('成本退化阈值'), { target: { value: '0.2500' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存版本并运行' }));
+
+    await waitFor(() => expect(saveEvaluationSpec).toHaveBeenCalledTimes(1));
+    const payload = vi.mocked(saveEvaluationSpec).mock.calls[0][1];
+    expect(payload.completeness).toMatchObject({
+      allowPartial: true,
+      minimumCompletionRate: '0.7500',
+      requiredDimensionCoverage: [{
+        dimensionId: 'dateScenarioId',
+        minimumCoverageRate: '0.5000',
+      }],
+    });
+    expect(payload.derivedMetrics[0]).toMatchObject({
+      type: 'row_formula_v1',
+      formula: 'coalesce(totalReturn, 0)',
+    });
+    expect(payload.visualizations[0]).toMatchObject({
+      type: 'parameter_curve_v1',
+      parameterDimensionId: 'parameter.strategyParameters.lookback',
+    });
+    expect(payload.visualizations[1]).toMatchObject({
+      type: 'cost_stress_v1',
+      baselineScenarioId: 'base',
+      degradationThreshold: '0.2500',
+    });
+  });
+
+  it('shows provisional coverage, exceptions and the final-test disclaimer', async () => {
+    const partialCompleteness: EvaluationCompletenessSnapshot = {
+      ...RUN.completeness,
+      plannedTrialCount: 3,
+      succeededCount: 1,
+      failedCount: 1,
+      missingCount: 1,
+      completionRate: '0.3333',
+      isPartial: true,
+      dimensionCoverage: [{
+        dimensionId: 'dateScenarioId', requiredRate: '0.5000',
+        minimumObservedRate: '0.5000',
+        values: [{
+          value: 'development', expectedCount: 2, succeededCount: 1,
+          coverageRate: '0.5000',
+        }],
+      }],
+      exceptions: [
+        {
+          stageId: 'stage-1', stageIndex: 0, trialId: 'trial-2', trialIndex: 1,
+          status: 'failed', materializationStatus: 'materialized', error: { message: '运行失败' },
+        },
+        {
+          stageId: 'stage-1', stageIndex: 0, trialId: null, trialIndex: 2,
+          status: 'missing', materializationStatus: 'not_generated', error: null,
+        },
+      ],
+    };
+    const partialDetail: EvaluationRunDetail = {
+      ...DETAIL,
+      completeness: partialCompleteness,
+      output: {
+        ...DETAIL.output!,
+        isPartial: true,
+        reportStatus: 'provisional',
+        candidateSelectionEligible: false,
+        completeness: partialCompleteness,
+      },
+    };
+    vi.mocked(fetchEvaluationRun).mockResolvedValue(partialDetail);
+    vi.mocked(fetchEvaluationRuns).mockResolvedValue({
+      items: [{ ...RUN, status: 'succeeded', completeness: partialDetail.completeness }],
+      nextCursor: null,
+    });
+    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+
+    expect(await screen.findByText('部分评价（provisional）')).not.toBeNull();
+    expect(screen.getByText('失败 1')).not.toBeNull();
+    expect(screen.getByText(/不是最终 test/)).not.toBeNull();
+    expect(screen.getByText('关键维度覆盖（1）')).not.toBeNull();
+    expect(screen.getByText(/development：1\/2/)).not.toBeNull();
+    expect(screen.getByText(/失败、取消与缺失项/)).not.toBeNull();
   });
 });

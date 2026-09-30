@@ -1065,6 +1065,54 @@ def test_evaluation_freezes_results_is_deterministic_and_detects_hash_drift(
   assert _experiment_run_count(experiment_id) == 1
 
 
+def test_provisional_evaluation_freezes_missing_trial_without_fake_result(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-provisional-evaluation",
+  )
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="provisional-source-worker",
+  )
+  assert coordinator.run_once()
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  payload = _evaluation_request(detail).model_dump(mode="json")
+  payload["name"] = "部分评价"
+  payload["completeness"] = {
+    "allowPartial": True,
+    "minimumCompletionRate": "0.0000",
+    "requiredDimensionCoverage": [],
+  }
+  request = EvaluationSpecRequest.model_validate(payload)
+  application = EvaluationApplication()
+  spec, _ = _as_user(
+    OWNER,
+    lambda: application.save_spec(experiment_id, request, "save-provisional"),
+  )
+
+  created, _ = _as_user(
+    OWNER,
+    lambda: application.create_run(
+      experiment_id, spec["evaluationSpecId"], "run-provisional",
+    ),
+  )
+
+  assert created["executionCount"] == 0
+  assert created["completeness"]["isPartial"] is True
+  assert created["completeness"]["missingCount"] == 1
+  assert EvaluationWorker(worker_id="provisional-worker-test").run_once()
+  result = _as_user(
+    OWNER,
+    lambda: application.run_detail(experiment_id, created["evaluationRunId"]),
+  )
+  assert result["status"] == "succeeded"
+  assert result["output"]["isPartial"] is True
+  assert result["output"]["candidateSelectionEligible"] is False
+  assert result["output"]["rows"] == []
+  assert result["output"]["completeness"]["exceptions"][0]["status"] == "missing"
+  assert _experiment_run_count(experiment_id) == 1
+
+
 def _execution_facts(experiment_id: str) -> dict[str, Any]:
   with psycopg.connect(
     os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], row_factory=dict_row,

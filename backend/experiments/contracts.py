@@ -140,10 +140,73 @@ class EvaluationCatalogs(StrictModel):
   normalizerVersion: None = None
 
 
+class EvaluationDimensionCoverage(StrictModel):
+  dimensionId: str = Field(min_length=1, max_length=160)
+  minimumCoverageRate: str = Field(pattern=r"^(0(\.\d{1,4})?|1(\.0{1,4})?)$")
+
+
 class EvaluationCompleteness(StrictModel):
-  allowPartial: Literal[False] = False
-  minimumCompletionRate: Literal["1.0000"] = "1.0000"
-  requiredDimensionCoverage: list[Any] = Field(default_factory=list, max_length=0)
+  allowPartial: bool = False
+  minimumCompletionRate: str = Field(
+    default="1.0000",
+    pattern=r"^(0(\.\d{1,4})?|1(\.0{1,4})?)$",
+  )
+  requiredDimensionCoverage: list[EvaluationDimensionCoverage] = Field(
+    default_factory=list,
+    max_length=16,
+  )
+
+  @model_validator(mode="after")
+  def validate_partial_policy(self) -> "EvaluationCompleteness":
+    if not self.allowPartial and (
+      self.minimumCompletionRate != "1.0000" or self.requiredDimensionCoverage
+    ):
+      raise ValueError("完整评价必须使用 100% 完成率且不能设置部分覆盖门槛")
+    dimensions = [item.dimensionId for item in self.requiredDimensionCoverage]
+    if len(set(dimensions)) != len(dimensions):
+      raise ValueError("部分评价的关键维度不能重复")
+    return self
+
+
+class EvaluationFormula(StrictModel):
+  type: Literal["row_formula_v1", "group_formula_v1"]
+  metricId: str = Field(
+    min_length=1,
+    max_length=160,
+    pattern=r"^[A-Za-z][A-Za-z0-9_]{0,159}$",
+  )
+  displayName: str = Field(min_length=1, max_length=80)
+  formula: str = Field(min_length=1, max_length=1000)
+  precision: int = Field(default=8, ge=0, le=18)
+  unit: str | None = Field(default=None, max_length=32)
+  direction: Literal["higher", "lower", "neutral"] = "neutral"
+
+
+class EvaluationAggregate(StrictModel):
+  type: Literal["metric_aggregate_v1"] = "metric_aggregate_v1"
+  aggregateId: str = Field(
+    min_length=1,
+    max_length=160,
+    pattern=r"^[A-Za-z][A-Za-z0-9_]{0,159}$",
+  )
+  metricId: str = Field(min_length=1, max_length=160)
+  function: Literal[
+    "count", "mean", "median", "min", "max", "sample_stddev",
+    "nearest_rank_percentile",
+  ]
+  percentile: str | None = Field(
+    default=None,
+    pattern=r"^(0(\.\d{1,6})?|1(\.0{1,6})?)$",
+  )
+
+  @model_validator(mode="after")
+  def validate_percentile(self) -> "EvaluationAggregate":
+    if self.function == "nearest_rank_percentile":
+      if self.percentile is None or self.percentile in {"0", "0.0", "0.00", "0.000", "0.0000", "0.00000", "0.000000"}:
+        raise ValueError("最近秩分位数必须提供大于 0 且不超过 1 的 percentile")
+    elif self.percentile is not None:
+      raise ValueError("仅最近秩分位数可以设置 percentile")
+    return self
 
 
 class EvaluationFilter(StrictModel):
@@ -161,10 +224,58 @@ class EvaluationFilter(StrictModel):
     return self
 
 
+class EvaluationGroupFilter(EvaluationFilter):
+  type: Literal["group_metric_comparison_v1"] = "group_metric_comparison_v1"
+
+
 class EvaluationSort(StrictModel):
   type: Literal["metric_sort_v1"] = "metric_sort_v1"
   metricId: str = Field(min_length=1, max_length=160)
   direction: Literal["asc", "desc"]
+
+
+class ParameterCurveVisualization(StrictModel):
+  type: Literal["parameter_curve_v1"] = "parameter_curve_v1"
+  parameterDimensionId: str = Field(min_length=1, max_length=160)
+  metricId: str = Field(min_length=1, max_length=160)
+  seriesBy: list[str] = Field(default_factory=list, max_length=8)
+
+
+class ParameterHeatmapVisualization(StrictModel):
+  type: Literal["parameter_heatmap_v1"] = "parameter_heatmap_v1"
+  xDimensionId: str = Field(min_length=1, max_length=160)
+  yDimensionId: str = Field(min_length=1, max_length=160)
+  metricId: str = Field(min_length=1, max_length=160)
+  facetBy: list[str] = Field(default_factory=list, max_length=8)
+
+  @model_validator(mode="after")
+  def validate_axes(self) -> "ParameterHeatmapVisualization":
+    if self.xDimensionId == self.yDimensionId:
+      raise ValueError("热力图横纵轴必须使用不同参数")
+    return self
+
+
+class CostStressVisualization(StrictModel):
+  type: Literal["cost_stress_v1"] = "cost_stress_v1"
+  metricId: str = Field(min_length=1, max_length=160)
+  baselineScenarioId: str = Field(min_length=1, max_length=64)
+  degradationThreshold: str | None = Field(
+    default=None,
+    pattern=r"^(0(\.\d{1,6})?|1(\.0{1,6})?)$",
+  )
+
+
+class TimeStabilityVisualization(StrictModel):
+  type: Literal["time_stability_v1"] = "time_stability_v1"
+  metricId: str = Field(min_length=1, max_length=160)
+
+
+EvaluationVisualization = (
+  ParameterCurveVisualization
+  | ParameterHeatmapVisualization
+  | CostStressVisualization
+  | TimeStabilityVisualization
+)
 
 
 class EvaluationSpecRequest(StrictModel):
@@ -174,14 +285,16 @@ class EvaluationSpecRequest(StrictModel):
   catalogs: EvaluationCatalogs
   completeness: EvaluationCompleteness = Field(default_factory=EvaluationCompleteness)
   columns: list[str] = Field(min_length=1, max_length=64)
-  derivedMetrics: list[Any] = Field(default_factory=list, max_length=0)
+  derivedMetrics: list[EvaluationFormula] = Field(default_factory=list, max_length=32)
   filters: list[EvaluationFilter] = Field(default_factory=list, max_length=32)
-  groupBy: list[Any] = Field(default_factory=list, max_length=0)
-  aggregates: list[Any] = Field(default_factory=list, max_length=0)
-  groupFilters: list[Any] = Field(default_factory=list, max_length=0)
+  groupBy: list[str] = Field(default_factory=list, max_length=8)
+  aggregates: list[EvaluationAggregate] = Field(default_factory=list, max_length=32)
+  groupFilters: list[EvaluationGroupFilter] = Field(default_factory=list, max_length=32)
   sort: list[EvaluationSort] = Field(default_factory=list, max_length=8)
-  visualizations: list[Any] = Field(default_factory=list, max_length=0)
-  reportSections: list[Any] = Field(default_factory=list, max_length=0)
+  visualizations: list[EvaluationVisualization] = Field(default_factory=list, max_length=16)
+  reportSections: list[
+    Literal["completeness", "ranking", "groups", "analysis", "exceptions", "dataset_notice"]
+  ] = Field(default_factory=list, max_length=6)
 
   @field_validator("name")
   @classmethod
@@ -206,6 +319,35 @@ class EvaluationSpecRequest(StrictModel):
     identities = [(item.metricId, item.operator) for item in value]
     if len(set(identities)) != len(identities):
       raise ValueError("相同指标与操作符的过滤条件不能重复")
+    return value
+
+  @field_validator("derivedMetrics")
+  @classmethod
+  def unique_formula_metrics(
+    cls,
+    value: list[EvaluationFormula],
+  ) -> list[EvaluationFormula]:
+    identities = [item.metricId for item in value]
+    if len(set(identities)) != len(identities):
+      raise ValueError("派生指标 ID 不能重复")
+    return value
+
+  @field_validator("groupBy")
+  @classmethod
+  def unique_group_dimensions(cls, value: list[str]) -> list[str]:
+    if len(set(value)) != len(value):
+      raise ValueError("分组维度不能重复")
+    return value
+
+  @field_validator("aggregates")
+  @classmethod
+  def unique_aggregate_ids(
+    cls,
+    value: list[EvaluationAggregate],
+  ) -> list[EvaluationAggregate]:
+    identities = [item.aggregateId for item in value]
+    if len(set(identities)) != len(identities):
+      raise ValueError("聚合指标 ID 不能重复")
     return value
 
   @field_validator("sort")

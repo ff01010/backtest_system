@@ -9,7 +9,7 @@ import time
 
 from backend import settings
 from backend.experiments.errors import ExperimentError
-from backend.experiments.evaluation import evaluate, output_hash
+from backend.experiments.evaluation import complete_snapshot, evaluate, output_hash
 from backend.experiments.evaluation_repository import PostgresEvaluationRepository
 
 
@@ -35,11 +35,17 @@ class EvaluationWorker:
     run_id = str(claimed.run["id"])
     try:
       sources = self._repository.load_run_sources(claimed.run)
+      completeness = (
+        dict(claimed.run.get("completeness_snapshot") or {})
+        or complete_snapshot(int(claimed.run["execution_count"]))
+      )
       output = evaluate(
         dict(claimed.run["evaluation_spec"]),
         dict(claimed.run["catalog_snapshot"]),
         sources,
         str(claimed.run["result_set_hash"]),
+        completeness,
+        str(claimed.run["pipeline_version"]),
       )
       self._repository.complete_run(
         run_id, claimed.attempt_token, output, output_hash(output),

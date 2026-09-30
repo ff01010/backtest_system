@@ -274,6 +274,7 @@ export type EvaluationDimensionDefinition = {
   dataType: string;
   unit: string | null;
   nullSemantics: string;
+  orderedValues?: unknown[] | null;
 };
 
 export type EvaluationCatalogs = {
@@ -311,6 +312,30 @@ export type EvaluationSort = {
   direction: 'asc' | 'desc';
 };
 
+export type EvaluationFormula = {
+  type: 'row_formula_v1' | 'group_formula_v1';
+  metricId: string;
+  displayName: string;
+  formula: string;
+  precision: number;
+  unit?: string | null;
+  direction?: 'higher' | 'lower' | 'neutral';
+};
+
+export type EvaluationAggregate = {
+  type: 'metric_aggregate_v1';
+  aggregateId: string;
+  metricId: string;
+  function: 'count' | 'mean' | 'median' | 'min' | 'max' | 'sample_stddev' | 'nearest_rank_percentile';
+  percentile?: string | null;
+};
+
+export type EvaluationVisualization =
+  | { type: 'parameter_curve_v1'; parameterDimensionId: string; metricId: string; seriesBy: string[] }
+  | { type: 'parameter_heatmap_v1'; xDimensionId: string; yDimensionId: string; metricId: string; facetBy: string[] }
+  | { type: 'cost_stress_v1'; metricId: string; baselineScenarioId: string; degradationThreshold?: string | null }
+  | { type: 'time_stability_v1'; metricId: string };
+
 export type EvaluationSpecPayload = {
   schemaVersion: 'evaluation_spec_v1';
   name: string;
@@ -325,19 +350,22 @@ export type EvaluationSpecPayload = {
     normalizerVersion: null;
   };
   completeness: {
-    allowPartial: false;
-    minimumCompletionRate: '1.0000';
-    requiredDimensionCoverage: [];
+    allowPartial: boolean;
+    minimumCompletionRate: string;
+    requiredDimensionCoverage: Array<{
+      dimensionId: string;
+      minimumCoverageRate: string;
+    }>;
   };
   columns: string[];
-  derivedMetrics: [];
+  derivedMetrics: EvaluationFormula[];
   filters: EvaluationFilter[];
-  groupBy: [];
-  aggregates: [];
-  groupFilters: [];
+  groupBy: string[];
+  aggregates: EvaluationAggregate[];
+  groupFilters: Array<Omit<EvaluationFilter, 'type'> & { type: 'group_metric_comparison_v1' }>;
   sort: EvaluationSort[];
-  visualizations: [];
-  reportSections: [];
+  visualizations: EvaluationVisualization[];
+  reportSections: Array<'completeness' | 'ranking' | 'groups' | 'analysis' | 'exceptions' | 'dataset_notice'>;
 };
 
 export type SavedEvaluationSpec = {
@@ -369,6 +397,7 @@ export type EvaluationRun = {
   metricCatalogVersion: string;
   dimensionCatalogVersion: string;
   executionCount: number;
+  completeness: EvaluationCompletenessSnapshot;
   resultSetHash: string;
   outputHash: string | null;
   error: { code: string; message: string } | null;
@@ -396,20 +425,61 @@ export type EvaluationRunDetail = EvaluationRun & {
     resultSetHash: string;
     sourceRowCount: number;
     matchedRowCount: number;
+    isPartial?: boolean;
+    reportStatus?: 'complete' | 'provisional';
+    candidateSelectionEligible?: boolean;
+    finalTestEligible?: false;
+    datasetNotice?: string;
+    completeness?: EvaluationCompletenessSnapshot;
     columns: string[];
     sort: EvaluationSort[];
+    groupBy?: string[];
     rows: Array<{
-      trialId: string;
-      trialExecutionId: string;
-      runId: string;
-      stageId: string;
+      trialId?: string;
+      trialExecutionId?: string;
+      runId?: string;
+      stageId?: string;
       stageIndex: number;
       trialIndex: number;
-      resultHash: string;
-      startDate: string | null;
+      resultHash?: string;
+      startDate?: string | null;
+      groupKey?: string;
+      memberCount?: number;
       values: Record<string, string | number | null>;
       unsupportedReasons: Record<string, string>;
     }>;
+    visualizations?: Array<Record<string, unknown>>;
   };
   spec: EvaluationSpecPayload;
+};
+
+export type EvaluationCompletenessSnapshot = {
+  plannedTrialCount: number;
+  generatedTrialCount: number;
+  succeededCount: number;
+  failedCount: number;
+  cancelledCount: number;
+  missingCount: number;
+  completionRate: string;
+  isPartial: boolean;
+  dimensionCoverage: Array<{
+    dimensionId: string;
+    requiredRate: string;
+    minimumObservedRate: string;
+    values: Array<{
+      value: unknown;
+      expectedCount: number;
+      succeededCount: number;
+      coverageRate: string;
+    }>;
+  }>;
+  exceptions: Array<{
+    stageId: string;
+    stageIndex: number;
+    trialId: string | null;
+    trialIndex: number;
+    status: 'failed' | 'cancelled' | 'missing';
+    materializationStatus: string;
+    error: Record<string, unknown> | null;
+  }>;
 };
