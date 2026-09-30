@@ -50,6 +50,23 @@ def test_quote_prefetch_size_has_safe_bounds(monkeypatch: pytest.MonkeyPatch) ->
     settings._read_bounded_int("TEST_L2_PREFETCH_SIZE", 16, 16, 512)
 
 
+def test_backtest_capacity_supports_explicit_capacity_search(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  assert settings.BACKTEST_CONFIGURABLE_MAX_CONCURRENCY == 64
+  assert settings.BACKTEST_BASE_CONCURRENCY <= settings.BACKTEST_BURST_MAX_CONCURRENCY
+  assert settings.BACKTEST_BURST_MAX_CONCURRENCY <= settings.BACKTEST_CONFIGURABLE_MAX_CONCURRENCY
+  monkeypatch.setenv("TEST_BACKTEST_CAPACITY", "64")
+  assert settings._read_bounded_int(
+    "TEST_BACKTEST_CAPACITY", 12, 1, settings.BACKTEST_CONFIGURABLE_MAX_CONCURRENCY,
+  ) == 64
+  monkeypatch.setenv("TEST_BACKTEST_CAPACITY", "65")
+  with pytest.raises(ValueError, match="1 至 64"):
+    settings._read_bounded_int(
+      "TEST_BACKTEST_CAPACITY", 12, 1, settings.BACKTEST_CONFIGURABLE_MAX_CONCURRENCY,
+    )
+
+
 def test_read_bool_rejects_ambiguous_value(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setenv("TEST_RESEARCH_REPORT_ENABLED", "yes")
 
