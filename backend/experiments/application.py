@@ -19,6 +19,9 @@ from backend.experiments.compiler import LegacySingleBarTrialCompiler, TrialComp
 from backend.experiments.contracts import (
   ExperimentCreateRequest,
   ExperimentPreviewRequest,
+  ExperimentRetryFailedRequest,
+  ExperimentRetryPreviewRequest,
+  ExperimentRevisionCreateRequest,
   SubjectRef,
 )
 from backend.experiments.errors import ExperimentError
@@ -123,6 +126,32 @@ class ExperimentApplication:
     result = self._experiment_repository().find_created_experiment(idempotency_key)
     return result.response, result.status_code
 
+  def create_revision(
+    self,
+    experiment_id: str,
+    request: ExperimentRevisionCreateRequest,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    response = self._calculate_preview(request.experimentSpec)
+    self._validate_create_preview(request, response)
+    result = self._experiment_repository().create_revision(
+      experiment_id=experiment_id,
+      expected_revision_id=str(request.expectedRevisionId),
+      expected_snapshot_version=request.expectedSnapshotVersion,
+      idempotency_key=idempotency_key,
+      request_hash=digest(with_version({
+        "operationType": "experiment.revision.create.v1",
+        "experimentId": experiment_id,
+        "request": request.model_dump(mode="json"),
+      })),
+      preview_token=request.previewToken,
+      expected_bindings=self._preview_bindings(response),
+      normalized_spec=response["normalizedSpec"],
+      request_id=request_id,
+    )
+    return result.response, result.status_code
+
   def detail(self, experiment_id: str) -> dict[str, Any]:
     return self._experiment_repository().get_experiment(experiment_id)
 
@@ -134,6 +163,17 @@ class ExperimentApplication:
   ) -> dict[str, Any]:
     return self._experiment_repository().list_experiments(limit=limit, cursor=cursor)
 
+  def list_revisions(
+    self,
+    experiment_id: str,
+    *,
+    limit: int,
+    cursor: str | None,
+  ) -> dict[str, Any]:
+    return self._experiment_repository().list_revisions(
+      experiment_id, limit=limit, cursor=cursor,
+    )
+
   def list_trials(
     self,
     experiment_id: str,
@@ -141,13 +181,52 @@ class ExperimentApplication:
     limit: int,
     cursor: str | None,
     status: str | None,
+    revision_id: str | None = None,
   ) -> dict[str, Any]:
     return self._experiment_repository().list_trials(
       experiment_id,
       limit=limit,
       cursor=cursor,
       status=status,
+      revision_id=revision_id,
     )
+
+  def preview_retry(
+    self,
+    experiment_id: str,
+    request: ExperimentRetryPreviewRequest,
+  ) -> dict[str, Any]:
+    return self._experiment_repository().preview_retry_selection(
+      experiment_id,
+      str(request.expectedRevisionId),
+      request.selection.model_dump(mode="json"),
+    )
+
+  def retry_failed(
+    self,
+    experiment_id: str,
+    request: ExperimentRetryFailedRequest,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    request_hash = digest(with_version({
+      "operationType": "experiment.retry_failed.v1",
+      "experimentId": experiment_id,
+      "request": request.model_dump(mode="json"),
+    }))
+    result = self._experiment_repository().retry_failed_trials(
+      experiment_id=experiment_id,
+      expected_revision_id=str(request.expectedRevisionId),
+      selection=request.selection.model_dump(mode="json"),
+      expected_count=request.expectedSelectedTrialCount,
+      expected_digest=request.expectedSelectionDigest,
+      reason=request.reason,
+      compiler=self._compiler,
+      idempotency_key=idempotency_key,
+      request_hash=request_hash,
+      request_id=request_id,
+    )
+    return result.response, result.status_code
 
   def cancel(
     self,
@@ -201,6 +280,23 @@ class ExperimentApplication:
     if not all(hasattr(self._repository, name) for name in required):
       raise RuntimeError("当前实验仓储不支持创建操作")
     return self._repository  # type: ignore[return-value]
+
+  @staticmethod
+  def _validate_create_preview(
+    request: ExperimentCreateRequest,
+    response: dict[str, Any],
+  ) -> None:
+    if not response["limitDecision"]["allowed"]:
+      raise ExperimentError(
+        "experiment.plan_limit_exceeded",
+        "实验计划超过当前硬上限，请重新调整后预览",
+        429,
+        details={"blockingReasons": response["limitDecision"]["blockingReasons"]},
+      )
+    if request.specHash != response["specHash"]:
+      raise ExperimentError(
+        "experiment.preview_stale", "实验定义已变化，请重新预览", 409,
+      )
 
   def _calculate_preview(self, request: ExperimentPreviewRequest) -> dict[str, Any]:
     self._require_capability()

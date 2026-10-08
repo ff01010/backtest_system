@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from fastapi import Request
 import pytest
@@ -10,7 +11,12 @@ import pytest
 from backend import app as app_module
 from backend import settings
 from backend.experiments.application import ExperimentApplication
-from backend.experiments.contracts import ExperimentCreateRequest
+from backend.experiments.contracts import (
+  ExperimentCreateRequest,
+  ExperimentRetryFailedRequest,
+  ExperimentRetryPreviewRequest,
+  ExperimentRevisionCreateRequest,
+)
 from backend.experiments.coordinator import ExperimentCoordinator
 from backend.experiments.errors import ExperimentError
 from backend.experiments.repository import (
@@ -30,6 +36,8 @@ class MemoryExperimentRepository:
   def __init__(self) -> None:
     self.preview: dict[str, Any] | None = None
     self.created: dict[str, Any] | None = None
+    self.created_revision: dict[str, Any] | None = None
+    self.retried: dict[str, Any] | None = None
 
   def save_preview(self, preview: dict[str, Any]) -> None:
     self.preview = preview
@@ -63,6 +71,41 @@ class MemoryExperimentRepository:
 
   def find_created_experiment(self, _key: str) -> CommandResult:
     return CommandResult({"experimentId": "experiment-1", "replayed": True}, 200)
+
+  def create_revision(self, **values: Any) -> CommandResult:
+    self.created_revision = values
+    return CommandResult({
+      "experimentId": values["experiment_id"],
+      "revisionId": "revision-2",
+      "stageId": "stage-2",
+      "status": "preparing",
+      "plannedTrialCount": self.preview["plannedTrialCount"] if self.preview else 0,
+      "generatedTrialCount": 0,
+      "specHash": self.preview["specHash"] if self.preview else "",
+      "replayed": False,
+      "createdAt": "2026-09-30T00:00:00+00:00",
+    }, 201)
+
+  def preview_retry_selection(self, *_args: Any) -> dict[str, Any]:
+    return {
+      "experimentId": "experiment-1",
+      "revisionId": "revision-1",
+      "selectedTrialCount": 1,
+      "selectionDigest": "b" * 64,
+      "trials": [],
+    }
+
+  def retry_failed_trials(self, **values: Any) -> CommandResult:
+    self.retried = values
+    return CommandResult({
+      "experimentId": values["experiment_id"],
+      "revisionId": values["expected_revision_id"],
+      "status": "running",
+      "selectedTrialCount": values["expected_count"],
+      "selectionDigest": values["expected_digest"],
+      "executions": [],
+      "replayed": False,
+    }, 202)
 
   def get_experiment(self, _experiment_id: str) -> dict[str, Any]:
     return {"experimentId": "experiment-1"}
@@ -204,6 +247,60 @@ def test_create_rejects_dataset_drift_against_the_saved_preview(
   assert repository.created is None
 
 
+def test_create_revision_repreviews_and_forwards_optimistic_identity(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _enable_experiments(monkeypatch)
+  repository = MemoryExperimentRepository()
+  application = _application(repository)
+  preview = application.preview(_request())
+  payload = ExperimentRevisionCreateRequest(
+    **_create_request(preview).model_dump(),
+    expectedRevisionId="10000000-0000-4000-8000-000000000010",
+    expectedSnapshotVersion=7,
+  )
+
+  response, status = application.create_revision(
+    "experiment-1", payload, "revision-key-1", "req-revision",
+  )
+
+  assert status == 201
+  assert response["revisionId"] == "revision-2"
+  assert repository.created_revision is not None
+  assert repository.created_revision["expected_snapshot_version"] == 7
+  assert repository.created_revision["preview_token"] == preview["previewToken"]
+
+
+def test_retry_application_forwards_frozen_selection_and_idempotency(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _enable_experiments(monkeypatch)
+  repository = MemoryExperimentRepository()
+  application = _application(repository)
+  trial_id = "10000000-0000-4000-8000-000000000020"
+  preview_request = ExperimentRetryPreviewRequest(
+    expectedRevisionId="10000000-0000-4000-8000-000000000010",
+    selection={"mode": "trial_ids", "trialIds": [trial_id]},
+  )
+  summary = application.preview_retry("experiment-1", preview_request)
+  retry_request = ExperimentRetryFailedRequest(
+    **preview_request.model_dump(),
+    expectedSelectedTrialCount=summary["selectedTrialCount"],
+    expectedSelectionDigest=summary["selectionDigest"],
+    reason="人工确认",
+  )
+
+  response, status = application.retry_failed(
+    "experiment-1", retry_request, "retry-key-1", "req-retry",
+  )
+
+  assert status == 202
+  assert response["selectionDigest"] == "b" * 64
+  assert repository.retried is not None
+  assert repository.retried["selection"]["trialIds"] == [trial_id]
+  assert repository.retried["reason"] == "人工确认"
+
+
 def test_coordinator_resumes_after_batch_failure_without_reordering(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -257,6 +354,114 @@ def test_create_route_requires_and_forwards_idempotency_key(
   response = app_module.create_experiment(payload, request)
 
   assert response.status_code == 201
+
+
+def test_revision_routes_forward_optimistic_identity_and_history_filter(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  experiment_id = UUID("10000000-0000-4000-8000-000000000001")
+  revision_id = UUID("10000000-0000-4000-8000-000000000010")
+  payload = ExperimentRevisionCreateRequest(
+    previewToken="10000000-0000-4000-8000-000000000011",
+    specHash="a" * 64,
+    experimentSpec=_request(),
+    expectedRevisionId=revision_id,
+    expectedSnapshotVersion=7,
+  )
+
+  class FakeApplication:
+    def create_revision(
+      self,
+      forwarded_experiment_id: str,
+      forwarded_payload: ExperimentRevisionCreateRequest,
+      key: str,
+      request_id: str,
+    ) -> tuple[dict[str, Any], int]:
+      assert forwarded_experiment_id == str(experiment_id)
+      assert forwarded_payload.expectedRevisionId == revision_id
+      assert forwarded_payload.expectedSnapshotVersion == 7
+      assert key == "revision-key-1"
+      assert request_id == "req-revision"
+      return {"experimentId": str(experiment_id), "revisionId": "revision-2"}, 201
+
+    def list_trials(self, forwarded_experiment_id: str, **values: Any) -> dict[str, Any]:
+      assert forwarded_experiment_id == str(experiment_id)
+      assert values["revision_id"] == str(revision_id)
+      return {"items": [], "nextCursor": None}
+
+  monkeypatch.setattr(app_module, "_experiment_application", FakeApplication())
+  request = Request({
+    "type": "http",
+    "method": "POST",
+    "path": f"/api/backtest/experiments/{experiment_id}/revisions",
+    "headers": [(b"idempotency-key", b"revision-key-1")],
+  })
+  request.state.request_id = "req-revision"
+
+  response = app_module.create_experiment_revision(experiment_id, payload, request)
+  trials = app_module.experiment_trials(
+    experiment_id, limit=50, cursor=None, revision_id=revision_id, status=None,
+  )
+
+  assert response.status_code == 201
+  assert trials == {"items": [], "nextCursor": None}
+
+
+def test_retry_routes_forward_frozen_selection_and_idempotency(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  experiment_id = UUID("10000000-0000-4000-8000-000000000001")
+  revision_id = UUID("10000000-0000-4000-8000-000000000010")
+  trial_id = UUID("10000000-0000-4000-8000-000000000020")
+  preview_payload = ExperimentRetryPreviewRequest(
+    expectedRevisionId=revision_id,
+    selection={"mode": "trial_ids", "trialIds": [trial_id]},
+  )
+  retry_payload = ExperimentRetryFailedRequest(
+    **preview_payload.model_dump(),
+    expectedSelectedTrialCount=1,
+    expectedSelectionDigest="b" * 64,
+    reason="人工确认",
+  )
+
+  class FakeApplication:
+    def preview_retry(
+      self,
+      forwarded_experiment_id: str,
+      forwarded_payload: ExperimentRetryPreviewRequest,
+    ) -> dict[str, Any]:
+      assert forwarded_experiment_id == str(experiment_id)
+      assert forwarded_payload.selection.trialIds == [trial_id]
+      return {"selectedTrialCount": 1, "selectionDigest": "b" * 64}
+
+    def retry_failed(
+      self,
+      forwarded_experiment_id: str,
+      forwarded_payload: ExperimentRetryFailedRequest,
+      key: str,
+      request_id: str,
+    ) -> tuple[dict[str, Any], int]:
+      assert forwarded_experiment_id == str(experiment_id)
+      assert forwarded_payload.expectedSelectedTrialCount == 1
+      assert forwarded_payload.expectedSelectionDigest == "b" * 64
+      assert key == "retry-key-1"
+      assert request_id == "req-retry"
+      return {"experimentId": str(experiment_id), "status": "running"}, 202
+
+  monkeypatch.setattr(app_module, "_experiment_application", FakeApplication())
+  request = Request({
+    "type": "http",
+    "method": "POST",
+    "path": f"/api/backtest/experiments/{experiment_id}/retry-failed",
+    "headers": [(b"idempotency-key", b"retry-key-1")],
+  })
+  request.state.request_id = "req-retry"
+
+  preview = app_module.preview_experiment_retry_failed(experiment_id, preview_payload)
+  response = app_module.retry_experiment_failed(experiment_id, retry_payload, request)
+
+  assert preview["selectionDigest"] == "b" * 64
+  assert response.status_code == 202
 
 
 def test_generation_migration_enforces_identity_and_rls_contracts() -> None:

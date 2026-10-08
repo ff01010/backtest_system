@@ -4,12 +4,16 @@ import ExperimentPage from '../features/experiments/ExperimentPage';
 import {
   cancelExperiment,
   createExperiment,
+  createExperimentRevision,
   fetchExperimentDetail,
+  fetchExperimentRevisions,
   fetchExperiments,
   fetchExperimentSubject,
   fetchExperimentTrials,
   findCreatedExperiment,
   previewExperiment,
+  previewRetryFailedTrials,
+  retryFailedTrials,
   resumeExperiment,
 } from '../features/experiments/api';
 import type {
@@ -24,12 +28,16 @@ import type {
 vi.mock('../features/experiments/api', () => ({
   cancelExperiment: vi.fn(),
   createExperiment: vi.fn(),
+  createExperimentRevision: vi.fn(),
   fetchExperimentDetail: vi.fn(),
+  fetchExperimentRevisions: vi.fn(),
   fetchExperiments: vi.fn(),
   fetchExperimentSubject: vi.fn(),
   fetchExperimentTrials: vi.fn(),
   findCreatedExperiment: vi.fn(),
   previewExperiment: vi.fn(),
+  previewRetryFailedTrials: vi.fn(),
+  retryFailedTrials: vi.fn(),
   resumeExperiment: vi.fn(),
 }));
 
@@ -198,6 +206,21 @@ const TRIAL: ExperimentTrial = {
     actualDataHash: 'b'.repeat(64),
   },
   errorSummary: null,
+  executionAttempts: [{
+    executionId: 'execution-1',
+    executionNo: 1,
+    runId: 'run-1',
+    status: 'succeeded',
+    terminalStatus: 'succeeded',
+    createdReason: 'initial',
+    selected: true,
+    active: false,
+    resultHash: 'a'.repeat(64),
+    errorSummary: null,
+    queuedAt: '2026-09-29T00:00:00Z',
+    startedAt: '2026-09-29T00:00:01Z',
+    finishedAt: '2026-09-29T00:00:02Z',
+  }],
   runId: 'run-1',
   runUrl: '/?workspace=backtest&runId=run-1',
   executionId: 'execution-1',
@@ -210,6 +233,30 @@ beforeEach(() => {
   vi.mocked(createExperiment).mockReset().mockResolvedValue(CREATED);
   vi.mocked(findCreatedExperiment).mockReset().mockResolvedValue({ ...CREATED, replayed: true });
   vi.mocked(fetchExperimentDetail).mockReset().mockResolvedValue(DETAIL);
+  vi.mocked(fetchExperimentRevisions).mockReset().mockResolvedValue({
+    items: [{
+      revisionId: 'revision-1',
+      revisionNo: 1,
+      current: true,
+      status: 'queued',
+      specHash: PREVIEW.specHash,
+      stage: {
+        stageId: 'stage-1',
+        status: 'queued',
+        plannedTrialCount: 2,
+        generatedTrialCount: 2,
+        inFlightTrialCount: 0,
+        terminalTrialCount: 0,
+        succeededTrialCount: 0,
+        failedTrialCount: 0,
+        cancelledTrialCount: 0,
+      },
+      createdAt: '2026-09-29T00:00:00Z',
+      updatedAt: '2026-09-29T00:00:01Z',
+      terminalAt: null,
+    }],
+    nextCursor: null,
+  });
   vi.mocked(fetchExperiments).mockReset().mockResolvedValue({ items: [], nextCursor: null });
   vi.mocked(fetchExperimentTrials).mockReset().mockResolvedValue({
     items: [TRIAL],
@@ -223,6 +270,40 @@ beforeEach(() => {
     experimentId: 'experiment-1',
     revisionId: 'revision-1',
     status: 'queued',
+  });
+  vi.mocked(createExperimentRevision).mockReset().mockResolvedValue({
+    ...CREATED,
+    revisionId: 'revision-2',
+  });
+  vi.mocked(previewRetryFailedTrials).mockReset().mockResolvedValue({
+    experimentId: 'experiment-1',
+    revisionId: 'revision-1',
+    selectedTrialCount: 1,
+    selectionDigest: '9'.repeat(64),
+    trials: [{
+      trialId: 'trial-1',
+      trialIndex: 0,
+      previousExecutionId: 'execution-1',
+      previousExecutionNo: 1,
+      errorSummary: { code: 'runtime.failed' },
+    }],
+  });
+  vi.mocked(retryFailedTrials).mockReset().mockResolvedValue({
+    experimentId: 'experiment-1',
+    revisionId: 'revision-1',
+    status: 'running',
+    operationId: 'operation-1',
+    selectedTrialCount: 1,
+    selectionDigest: '9'.repeat(64),
+    executions: [{
+      executionId: 'execution-2',
+      executionNo: 2,
+      runId: 'run-2',
+      dispatchKey: 'experiment:execution-2',
+      createdReason: 'manual_retry',
+    }],
+    replayed: false,
+    acceptedAt: '2026-09-30T00:00:00Z',
   });
 });
 
@@ -352,6 +433,106 @@ describe('ExperimentPage', () => {
     expect(onOpenRun).toHaveBeenCalledWith('run-1', '688981.SH', '5m', '20260701');
     expect(fetchExperimentDetail).toHaveBeenCalledTimes(1);
     expect(fetchExperimentTrials).toHaveBeenCalledWith('experiment-1');
+    expect(screen.getByText('执行 #1')).not.toBeNull();
+  });
+
+  it('freezes and confirms failed Trial selection before one manual retry', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const failedTrial: ExperimentTrial = {
+      ...TRIAL,
+      summaryStatus: 'failed',
+      selectedExecution: null,
+      errorSummary: { code: 'runtime.failed', message: '执行失败' },
+      executionAttempts: [{
+        ...TRIAL.executionAttempts[0],
+        status: 'failed',
+        terminalStatus: 'failed',
+        selected: false,
+        resultHash: null,
+        errorSummary: { code: 'runtime.failed', message: '执行失败' },
+      }],
+    };
+    vi.mocked(fetchExperimentDetail).mockResolvedValue({
+      ...DETAIL,
+      status: 'failed',
+      stage: {
+        ...DETAIL.stage,
+        terminalTrialCount: 2,
+        failedTrialCount: 1,
+        queuedTrialCount: 0,
+        status: 'failed',
+      },
+    });
+    vi.mocked(fetchExperimentTrials).mockResolvedValue({
+      items: [failedTrial],
+      nextCursor: null,
+    });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    const checkbox = await screen.findByRole('checkbox', { name: '选择 Trial #1' });
+    fireEvent.click(checkbox);
+    const retryButton = screen.getByRole('button', { name: '重试选中失败项（1）' });
+    fireEvent.click(retryButton);
+    fireEvent.click(retryButton);
+
+    await waitFor(() => expect(retryFailedTrials).toHaveBeenCalledTimes(1));
+    expect(previewRetryFailedTrials).toHaveBeenCalledWith(
+      'experiment-1', 'revision-1', ['trial-1'],
+    );
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('保留旧执行'));
+  });
+
+  it('re-previews and explicitly confirms a new Revision', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const onExperimentChange = vi.fn();
+    vi.mocked(fetchExperimentDetail).mockResolvedValue({
+      ...DETAIL,
+      status: 'completed',
+      stage: {
+        ...DETAIL.stage,
+        status: 'completed',
+        terminalTrialCount: 2,
+        succeededTrialCount: 2,
+        queuedTrialCount: 0,
+      },
+    });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={onExperimentChange}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '创建新 Revision' }));
+    await screen.findByRole('heading', { name: '均值回归' });
+    fireEvent.click(screen.getByRole('button', { name: '生成预览' }));
+    await screen.findByText('Trial 总数');
+    fireEvent.click(screen.getByRole('button', { name: '确认创建新 Revision' }));
+
+    await waitFor(() => expect(createExperimentRevision).toHaveBeenCalledTimes(1));
+    expect(createExperimentRevision).toHaveBeenCalledWith(
+      'experiment-1',
+      expect.objectContaining({
+        expectedRevisionId: 'revision-1',
+        expectedSnapshotVersion: 2,
+      }),
+      expect.any(String),
+    );
+    expect(createExperiment).not.toHaveBeenCalled();
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('旧 Revision 保持只读'));
   });
 
   it('explains that capacity blocks resume the same revision', async () => {

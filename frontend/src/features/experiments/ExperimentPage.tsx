@@ -16,12 +16,16 @@ import { createBrowserUuid } from '../../utils/browserUuid';
 import {
   cancelExperiment,
   createExperiment,
+  createExperimentRevision,
   fetchExperimentDetail,
+  fetchExperimentRevisions,
   fetchExperiments,
   fetchExperimentSubject,
   fetchExperimentTrials,
   findCreatedExperiment,
   previewExperiment,
+  previewRetryFailedTrials,
+  retryFailedTrials,
   resumeExperiment,
 } from './api';
 import type {
@@ -32,6 +36,7 @@ import type {
   ExperimentDraft,
   ExperimentListItem,
   ExperimentPreview,
+  ExperimentRevision,
   ExperimentSubject,
   ExperimentSubjectRef,
   ExperimentTrial,
@@ -67,6 +72,9 @@ const RECOVERABLE_BLOCK_CODES = new Set([
   'experiment.capacity_blocked',
   'experiment.manual_queue_reserved',
   'experiment.manual_wait_blocked',
+]);
+const TERMINAL_EXPERIMENT_STATUSES = new Set([
+  'completed', 'partially_completed', 'failed', 'cancelled',
 ]);
 
 function shortDigest(value: unknown): string {
@@ -376,19 +384,26 @@ function ExperimentDetailView({
   experimentId,
   onClose,
   onOpenRun,
+  onCreateRevision,
 }: {
   experimentId: string;
   onClose: () => void;
   onOpenRun?: (runId: string, symbol: string, timeframe: string, date: string) => void;
+  onCreateRevision: (detail: ExperimentDetail) => void;
 }) {
   const [detail, setDetail] = useState<ExperimentDetail | null>(null);
   const [trials, setTrials] = useState<ExperimentTrial[]>([]);
+  const [revisions, setRevisions] = useState<ExperimentRevision[]>([]);
+  const [viewRevisionId, setViewRevisionId] = useState<string | null>(null);
+  const [selectedFailedIds, setSelectedFailedIds] = useState<Set<string>>(new Set());
   const [nextTrialCursor, setNextTrialCursor] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const cancelInFlight = useRef(false);
   const resumeInFlight = useRef(false);
+  const retryInFlight = useRef(false);
   const unchangedPolls = useRef(0);
   const lastVersion = useRef<number | null>(null);
 
@@ -404,9 +419,21 @@ function ExperimentDetailView({
           : 0;
         lastVersion.current = result.snapshotVersion;
         setDetail(result);
-        const trialPage = await fetchExperimentTrials(experimentId);
+        const [trialPage, revisionPage] = await Promise.all([
+          viewRevisionId
+            ? fetchExperimentTrials(experimentId, undefined, viewRevisionId)
+            : fetchExperimentTrials(experimentId),
+          fetchExperimentRevisions(experimentId),
+        ]);
         if (stopped) return;
         setTrials(trialPage.items);
+        setRevisions(revisionPage.items);
+        setSelectedFailedIds((current) => {
+          const eligible = new Set(trialPage.items.filter((trial) => (
+            trial.summaryStatus === 'failed' && !trial.activeExecution
+          )).map((trial) => trial.trialId));
+          return new Set([...current].filter((trialId) => eligible.has(trialId)));
+        });
         setNextTrialCursor(trialPage.nextCursor);
         setError('');
         if (!ACTIVE_EXPERIMENT_STATUSES.has(result.status)) return;
@@ -423,7 +450,7 @@ function ExperimentDetailView({
       stopped = true;
       if (timer) clearTimeout(timer);
     };
-  }, [experimentId]);
+  }, [experimentId, viewRevisionId]);
 
   const handleCancel = async () => {
     if (cancelInFlight.current) return;
@@ -462,10 +489,54 @@ function ExperimentDetailView({
     }
   };
 
+  const handleRetryFailed = async () => {
+    if (!detail || retryInFlight.current || selectedFailedIds.size === 0) return;
+    retryInFlight.current = true;
+    setRetrying(true);
+    setError('');
+    const trialIds = [...selectedFailedIds].sort();
+    const idempotencyKey = createBrowserUuid();
+    try {
+      const summary = await previewRetryFailedTrials(
+        experimentId, detail.revision.revisionId, trialIds,
+      );
+      const confirmed = window.confirm(
+        `确认重试 ${summary.selectedTrialCount} 个失败 Trial？`
+          + '系统会保留旧执行，并为每项创建新的执行序号、回测任务和审计记录。',
+      );
+      if (!confirmed) return;
+      try {
+        await retryFailedTrials(
+          experimentId, detail.revision.revisionId, trialIds, summary, idempotencyKey,
+        );
+      } catch (reason) {
+        if (!(reason instanceof TypeError)) throw reason;
+        await retryFailedTrials(
+          experimentId, detail.revision.revisionId, trialIds, summary, idempotencyKey,
+        );
+      }
+      setSelectedFailedIds(new Set());
+      const [nextDetail, trialPage] = await Promise.all([
+        fetchExperimentDetail(experimentId),
+        fetchExperimentTrials(experimentId),
+      ]);
+      setDetail(nextDetail);
+      setTrials(trialPage.items);
+      setNextTrialCursor(trialPage.nextCursor);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      retryInFlight.current = false;
+      setRetrying(false);
+    }
+  };
+
   const loadMoreTrials = async () => {
     if (!nextTrialCursor) return;
     try {
-      const page = await fetchExperimentTrials(experimentId, nextTrialCursor);
+      const page = await fetchExperimentTrials(
+        experimentId, nextTrialCursor, viewRevisionId ?? undefined,
+      );
       setTrials((current) => [...current, ...page.items]);
       setNextTrialCursor(page.nextCursor);
     } catch (reason) {
@@ -480,6 +551,11 @@ function ExperimentDetailView({
     (detail.stage.generatedTrialCount / detail.stage.plannedTrialCount) * 100,
   );
   const fixed = detail.frozenDefinition.fixedStructure;
+  const viewingCurrentRevision = !viewRevisionId
+    || viewRevisionId === detail.revision.revisionId;
+  const failedTrials = trials.filter((trial) => (
+    trial.summaryStatus === 'failed' && !trial.activeExecution
+  ));
   return (
     <main className="experiment-page">
       <section className="experiment-hero">
@@ -548,7 +624,57 @@ function ExperimentDetailView({
         </div>
       </section>
       <section className="experiment-preview-card">
-        <h2>Trial 运行</h2>
+        <h2>修订历史</h2>
+        <div className="experiment-revision-list">
+          {revisions.map((revision) => (
+            <button
+              className={`experiment-revision-item ${(
+                viewRevisionId === revision.revisionId
+                || (!viewRevisionId && revision.current)
+              ) ? 'is-selected' : ''}`}
+              key={revision.revisionId}
+              type="button"
+              onClick={() => setViewRevisionId(revision.current ? null : revision.revisionId)}
+            >
+              <strong>Revision {revision.revisionNo}{revision.current ? ' · 当前' : ''}</strong>
+              <span>{revision.status}</span>
+              <small>
+                成功 {revision.stage.succeededTrialCount} / {revision.stage.plannedTrialCount}
+                {' · '}失败 {revision.stage.failedTrialCount}
+              </small>
+            </button>
+          ))}
+        </div>
+        {!viewingCurrentRevision && (
+          <div className="experiment-alert is-warning">
+            当前正在查看历史修订；其 Trial、执行和评价保持只读，不参与当前 Revision 聚合。
+          </div>
+        )}
+      </section>
+      <section className="experiment-preview-card">
+        <div className="experiment-card-heading-inline">
+          <h2>Trial 运行</h2>
+          {viewingCurrentRevision && failedTrials.length > 0 && (
+            <div className="experiment-retry-actions">
+              <button
+                className="app-button is-quiet"
+                type="button"
+                onClick={() => setSelectedFailedIds(new Set(failedTrials.map((trial) => trial.trialId)))}
+              >
+                选择全部失败项
+              </button>
+              <button
+                className="app-button is-primary"
+                type="button"
+                disabled={retrying || selectedFailedIds.size === 0}
+                onClick={() => { void handleRetryFailed(); }}
+              >
+                <RefreshCw size={15} />
+                {retrying ? '正在冻结选择并重试…' : `重试选中失败项（${selectedFailedIds.size}）`}
+              </button>
+            </div>
+          )}
+        </div>
         <div className="experiment-preview-heading">
           <div><span>排队</span><strong>{detail.stage.queuedTrialCount}</strong></div>
           <div><span>在途</span><strong>{detail.stage.inFlightTrialCount}</strong></div>
@@ -560,7 +686,20 @@ function ExperimentDetailView({
           {trials.map((trial) => {
             const dateScenario = trial.dimensionAssignment.dateScenario as Record<string, unknown> | undefined;
             return (
-              <div className="experiment-trial-row" key={trial.trialId}>
+              <div className="experiment-trial-row is-trial-detail" key={trial.trialId}>
+                {viewingCurrentRevision && trial.summaryStatus === 'failed' && !trial.activeExecution ? (
+                  <input
+                    aria-label={`选择 Trial #${trial.trialIndex + 1}`}
+                    type="checkbox"
+                    checked={selectedFailedIds.has(trial.trialId)}
+                    onChange={(event) => setSelectedFailedIds((current) => {
+                      const next = new Set(current);
+                      if (event.target.checked) next.add(trial.trialId);
+                      else next.delete(trial.trialId);
+                      return next;
+                    })}
+                  />
+                ) : <span />}
                 <strong>#{trial.trialIndex + 1}</strong>
                 <span>{trial.summaryStatus}</span>
                 <span>{String(dateScenario?.name ?? dateScenario?.scenarioId ?? '—')}</span>
@@ -578,6 +717,23 @@ function ExperimentDetailView({
                     查看单次结果
                   </button>
                 ) : <span>尚未物化</span>}
+                <div className="experiment-execution-attempts">
+                  {(trial.executionAttempts ?? []).map((execution) => (
+                    <div key={execution.executionId}>
+                      <strong>执行 #{execution.executionNo}</strong>
+                      <span>{execution.status}</span>
+                      <span>
+                        {execution.createdReason === 'manual_retry'
+                          ? '人工重试'
+                          : execution.createdReason === 'automatic_retry' ? '系统重试' : '首次执行'}
+                      </span>
+                      {execution.selected && <small>选定结果</small>}
+                      {execution.errorSummary && (
+                        <small>{String(execution.errorSummary.code ?? '执行失败')}</small>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
             );
           })}
@@ -610,6 +766,21 @@ function ExperimentDetailView({
           </button>
         </section>
       )}
+      {TERMINAL_EXPERIMENT_STATUSES.has(detail.status) && viewingCurrentRevision && (
+        <section className="experiment-command-bar is-confirm">
+          <div>
+            <strong>创建新修订</strong>
+            <span>新输入必须重新预览并冻结资产、数据、预算和能力；当前修订及其执行和评价保持不变。</span>
+          </div>
+          <button
+            className="app-button is-primary"
+            type="button"
+            onClick={() => onCreateRevision(detail)}
+          >
+            <Plus size={15} /> 创建新 Revision
+          </button>
+        </section>
+      )}
     </main>
   );
 }
@@ -619,11 +790,17 @@ function ExperimentCreator({
   subjectRef,
   onChangeSubject,
   onCreated,
+  revisionTarget,
 }: {
   userId: string;
   subjectRef: ExperimentSubjectRef;
   onChangeSubject: () => void;
   onCreated: (experimentId: string) => void;
+  revisionTarget?: {
+    experimentId: string;
+    expectedRevisionId: string;
+    expectedSnapshotVersion: number;
+  };
 }) {
   const [subject, setSubject] = useState<ExperimentSubject | null>(null);
   const [draft, setDraft] = useState<ExperimentDraft | null>(null);
@@ -685,7 +862,9 @@ function ExperimentCreator({
 
   const finishCreation = (result: ExperimentCreateResult) => {
     clearExperimentDraft(localStorage, userId, subjectRef);
-    setMessage('实验已创建，Trial 将由后台协调器继续生成。');
+    setMessage(revisionTarget
+      ? '新 Revision 已创建，Trial 将由后台协调器继续生成。'
+      : '实验已创建，Trial 将由后台协调器继续生成。');
     onCreated(result.experimentId);
   };
 
@@ -700,21 +879,40 @@ function ExperimentCreator({
 
   const handleCreate = async () => {
     if (!draft || !preview || !preview.limitDecision.allowed || submitting) return;
+    if (revisionTarget && !window.confirm(
+      '确认创建新 Revision？系统会重新冻结当前预览中的资产、数据、预算和能力，旧 Revision 保持只读。',
+    )) return;
     const idempotencyKey = createKeyRef.current ?? createBrowserUuid();
     createKeyRef.current = idempotencyKey;
     setSubmitting(true);
     setError('');
     try {
-      const result = await createExperiment({
+      const createRequest = {
         previewToken: preview.previewToken,
         specHash: preview.specHash,
         experimentSpec: buildPreviewRequest(subjectRef, draft),
-      }, idempotencyKey);
+      };
+      const result = revisionTarget
+        ? await createExperimentRevision(revisionTarget.experimentId, {
+          ...createRequest,
+          expectedRevisionId: revisionTarget.expectedRevisionId,
+          expectedSnapshotVersion: revisionTarget.expectedSnapshotVersion,
+        }, idempotencyKey)
+        : await createExperiment(createRequest, idempotencyKey);
       acceptCreationResult(result);
     } catch (reason) {
       if (reason instanceof TypeError) {
         try {
-          if (acceptCreationResult(await findCreatedExperiment(idempotencyKey))) return;
+          const recovered = revisionTarget
+            ? await createExperimentRevision(revisionTarget.experimentId, {
+              previewToken: preview.previewToken,
+              specHash: preview.specHash,
+              experimentSpec: buildPreviewRequest(subjectRef, draft),
+              expectedRevisionId: revisionTarget.expectedRevisionId,
+              expectedSnapshotVersion: revisionTarget.expectedSnapshotVersion,
+            }, idempotencyKey)
+            : await findCreatedExperiment(idempotencyKey);
+          if (acceptCreationResult(recovered)) return;
         } catch (lookupError) {
           setError(`创建结果暂不确定；再次提交将复用原请求键。${errorMessage(lookupError)}`);
         }
@@ -723,6 +921,8 @@ function ExperimentCreator({
         if (reason instanceof ApiResponseError && (
           reason.code === 'experiment.preview_stale'
           || reason.code === 'experiment.preview_expired'
+          || reason.code === 'experiment.state_changed'
+          || reason.code === 'experiment.active_revision_exists'
         )) {
           setPreview(null);
           createKeyRef.current = null;
@@ -741,7 +941,9 @@ function ExperimentCreator({
         <div>
           <span className="experiment-eyebrow">FINITE GRID / SERVER PREVIEW</span>
           <h1>{subject.displayName}</h1>
-          <p>定义有限候选空间，由服务端规范化、展开并冻结数据与运行契约。</p>
+          <p>{revisionTarget
+            ? '为同一 Experiment 定义新输入；服务端将重新预览并冻结完整运行契约。'
+            : '定义有限候选空间，由服务端规范化、展开并冻结数据与运行契约。'}</p>
         </div>
         <button className="app-button is-quiet" type="button" onClick={onChangeSubject}><ArrowLeft size={15} /> 更换策略</button>
       </section>
@@ -765,9 +967,14 @@ function ExperimentCreator({
       {preview && <PreviewResult preview={preview} />}
       {preview && preview.limitDecision.allowed && (
         <section className="experiment-command-bar is-confirm">
-          <div><strong>确认冻结并开始</strong><span>创建事务快速返回，关闭页面不会停止 Trial 生成。</span></div>
+          <div>
+            <strong>{revisionTarget ? '确认冻结新修订并开始' : '确认冻结并开始'}</strong>
+            <span>创建事务快速返回，关闭页面不会停止 Trial 生成。</span>
+          </div>
           <button className="app-button is-primary" type="button" disabled={submitting || previewing} onClick={() => { void handleCreate(); }}>
-            <FlaskConical size={15} /> {submitting ? '正在创建…' : '确认创建并开始'}
+            <FlaskConical size={15} /> {submitting
+              ? '正在创建…'
+              : revisionTarget ? '确认创建新 Revision' : '确认创建并开始'}
           </button>
         </section>
       )}
@@ -785,6 +992,12 @@ export default function ExperimentPage({
   onBackToStrategy,
   onOpenRun,
 }: Props) {
+  const [revisionTarget, setRevisionTarget] = useState<{
+    experimentId: string;
+    expectedRevisionId: string;
+    expectedSnapshotVersion: number;
+    subjectRef: ExperimentSubjectRef;
+  } | null>(null);
   if (enabled === null) {
     return (
       <main className="experiment-page">
@@ -806,12 +1019,33 @@ export default function ExperimentPage({
   }
   const selection = subject;
   const changeExperiment = onExperimentChange ?? (() => {});
+  if (revisionTarget) {
+    return (
+      <ExperimentCreator
+        key={`revision:${revisionTarget.expectedRevisionId}`}
+        userId={userId}
+        subjectRef={revisionTarget.subjectRef}
+        revisionTarget={revisionTarget}
+        onChangeSubject={() => setRevisionTarget(null)}
+        onCreated={(createdExperimentId) => {
+          setRevisionTarget(null);
+          changeExperiment(createdExperimentId);
+        }}
+      />
+    );
+  }
   if (experimentId) {
     return (
       <ExperimentDetailView
         experimentId={experimentId}
         onClose={() => changeExperiment(null)}
         onOpenRun={onOpenRun}
+        onCreateRevision={(detail) => setRevisionTarget({
+          experimentId: detail.experimentId,
+          expectedRevisionId: detail.revision.revisionId,
+          expectedSnapshotVersion: detail.snapshotVersion,
+          subjectRef: detail.frozenDefinition.subjectRef,
+        })}
       />
     );
   }

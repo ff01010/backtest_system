@@ -17,7 +17,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend import settings
-from backend.experiments.canonicalization import digest
+from backend.experiments.canonicalization import digest, with_version
 from backend.experiments.compiler import TrialCompiler
 from backend.experiments.errors import ExperimentError
 from backend.experiments.generators import (
@@ -38,8 +38,10 @@ from backend.strategies.runtime_contract import validate_runtime_capability
 
 
 CREATE_OPERATION = "experiment.create.v1"
+CREATE_REVISION_OPERATION = "experiment.revision.create.v1"
 CANCEL_OPERATION = "experiment.cancel.v1"
 RESUME_OPERATION = "experiment.resume.v1"
+RETRY_FAILED_OPERATION = "experiment.retry_failed.v1"
 _TRANSIENT_BLOCK_CODES = {
   "experiment.capacity_blocked",
   "experiment.manual_queue_reserved",
@@ -81,6 +83,45 @@ class ExperimentRepository(PreviewRepository, Protocol):
   ) -> CommandResult:
     """原子创建首个实验修订。"""
 
+  def create_revision(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_snapshot_version: int,
+    idempotency_key: str,
+    request_hash: str,
+    preview_token: str,
+    expected_bindings: dict[str, str],
+    normalized_spec: dict[str, Any],
+    request_id: str | None,
+  ) -> CommandResult:
+    """当前修订终结后原子创建新的不可变修订。"""
+
+  def preview_retry_selection(
+    self,
+    experiment_id: str,
+    expected_revision_id: str,
+    selection: dict[str, Any],
+  ) -> dict[str, Any]:
+    """计算当前失败 Trial 选择集的冻结摘要。"""
+
+  def retry_failed_trials(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    selection: dict[str, Any],
+    expected_count: int,
+    expected_digest: str,
+    reason: str,
+    compiler: TrialCompiler,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str | None,
+  ) -> CommandResult:
+    """为冻结失败选择集创建新的人工执行。"""
+
   def materialize_next_trial(self, compiler: TrialCompiler) -> bool:
     """在一个事务中物化一个待执行 Trial。"""
 
@@ -112,6 +153,15 @@ class ExperimentRepository(PreviewRepository, Protocol):
   ) -> dict[str, Any]:
     """游标分页读取当前用户实验。"""
 
+  def list_revisions(
+    self,
+    experiment_id: str,
+    *,
+    limit: int,
+    cursor: str | None,
+  ) -> dict[str, Any]:
+    """游标分页读取一个实验的历史修订。"""
+
   def list_trials(
     self,
     experiment_id: str,
@@ -119,6 +169,7 @@ class ExperimentRepository(PreviewRepository, Protocol):
     limit: int,
     cursor: str | None,
     status: str | None,
+    revision_id: str | None,
   ) -> dict[str, Any]:
     """游标分页读取当前实验 Trial。"""
 
@@ -193,6 +244,48 @@ class PostgresExperimentRepository:
         _save_idempotency(
           cur, owner_id, CREATE_OPERATION, idempotency_key, request_hash,
           "experiment", response["experimentId"], 201, response,
+        )
+        return CommandResult(response, 201)
+
+  def create_revision(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_snapshot_version: int,
+    idempotency_key: str,
+    request_hash: str,
+    preview_token: str,
+    expected_bindings: dict[str, str],
+    normalized_spec: dict[str, Any],
+    request_id: str | None,
+  ) -> CommandResult:
+    owner_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        _lock_command(cur, owner_id, CREATE_REVISION_OPERATION, idempotency_key)
+        replay = _load_idempotency(
+          cur, owner_id, CREATE_REVISION_OPERATION, idempotency_key,
+        )
+        if replay:
+          return _replay_result(replay, request_hash)
+        preview = _load_preview_for_update(cur, owner_id, preview_token)
+        if preview is None:
+          raise ExperimentError("experiment.not_found", "预览不存在", 404)
+        validate_preview_bindings(preview, expected_bindings, datetime.now(timezone.utc))
+        if digest(preview["normalized_spec"]) != digest(normalized_spec):
+          raise _preview_stale(["normalizedSpec"])
+        graph = _lock_revision_creation_graph(cur, experiment_id, owner_id)
+        _validate_revision_creation(
+          graph, expected_revision_id, expected_snapshot_version,
+        )
+        _reserve_user_plan(cur, owner_id, int(preview["planned_trial_count"]))
+        response = _insert_new_revision(
+          cur, graph, normalized_spec, preview, request_id,
+        )
+        _save_idempotency(
+          cur, owner_id, CREATE_REVISION_OPERATION, idempotency_key, request_hash,
+          "experiment_revision", response["revisionId"], 201, response,
         )
         return CommandResult(response, 201)
 
@@ -287,6 +380,49 @@ class PostgresExperimentRepository:
       })
     return {"items": [_experiment_list_item(row) for row in page], "nextCursor": next_cursor}
 
+  def list_revisions(
+    self,
+    experiment_id: str,
+    *,
+    limit: int,
+    cursor: str | None,
+  ) -> dict[str, Any]:
+    owner_id = state_store.current_user_id()
+    bindings = {"experimentId": experiment_id}
+    after = _decode_cursor(cursor, "revision-list", owner_id, bindings) if cursor else None
+    params: list[Any] = [experiment_id, owner_id]
+    after_sql = ""
+    if after:
+      after_sql = "AND r.revision_no < %s"
+      params.append(after["revisionNo"])
+    params.append(limit + 1)
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        _require_owned_experiment(cur, experiment_id, owner_id)
+        cur.execute(f"""
+          SELECT r.id AS revision_id, r.revision_no, r.status, r.spec_hash,
+            r.planned_trial_count, r.terminal_at, r.created_at, r.updated_at,
+            s.id AS stage_id, s.status AS stage_status,
+            s.generated_trial_count, s.in_flight_count, s.terminal_count,
+            s.succeeded_count, s.failed_count, s.cancelled_count,
+            e.current_revision_id
+          FROM backtest_experiment_revision r
+          JOIN backtest_experiment e ON e.id=r.experiment_id
+          JOIN backtest_experiment_stage s
+            ON s.revision_id=r.id AND s.stage_index=0
+          WHERE r.experiment_id=%s AND r.owner_user_id=%s {after_sql}
+          ORDER BY r.revision_no DESC
+          LIMIT %s
+        """, params)
+        rows = [dict(row) for row in cur.fetchall()]
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit:
+      next_cursor = _encode_cursor("revision-list", owner_id, bindings, {
+        "revisionNo": int(page[-1]["revision_no"]),
+      })
+    return {"items": [_revision_list_item(row) for row in page], "nextCursor": next_cursor}
+
   def list_trials(
     self,
     experiment_id: str,
@@ -294,21 +430,29 @@ class PostgresExperimentRepository:
     limit: int,
     cursor: str | None,
     status: str | None,
+    revision_id: str | None = None,
   ) -> dict[str, Any]:
     owner_id = state_store.current_user_id()
-    bindings = {"experimentId": experiment_id, "status": status or ""}
-    after = _decode_cursor(cursor, "trial-list", owner_id, bindings) if cursor else None
-    params: list[Any] = [experiment_id, owner_id]
-    filters = ["e.id=%s", "e.owner_user_id=%s"]
-    if status:
-      filters.append("t.summary_status=%s")
-      params.append(status)
-    if after:
-      filters.append("t.trial_index > %s")
-      params.append(after["trialIndex"])
-    params.append(limit + 1)
     with state_store.database_session() as conn:
       with conn.cursor() as cur:
+        selected_revision_id = _resolve_revision_id(
+          cur, experiment_id, owner_id, revision_id,
+        )
+        bindings = {
+          "experimentId": experiment_id,
+          "revisionId": selected_revision_id,
+          "status": status or "",
+        }
+        after = _decode_cursor(cursor, "trial-list", owner_id, bindings) if cursor else None
+        params: list[Any] = [experiment_id, owner_id, selected_revision_id]
+        filters = ["e.id=%s", "e.owner_user_id=%s", "r.id=%s"]
+        if status:
+          filters.append("t.summary_status=%s")
+          params.append(status)
+        if after:
+          filters.append("t.trial_index > %s")
+          params.append(after["trialIndex"])
+        params.append(limit + 1)
         cur.execute(f"""
           SELECT t.id AS trial_id, t.trial_index, t.trial_spec,
             t.dimension_projection, t.materialization_status, t.summary_status,
@@ -323,9 +467,10 @@ class PostgresExperimentRepository:
             latest.id AS latest_execution_id, latest.run_id AS latest_run_id,
             latest_run.status AS latest_run_status,
             COALESCE(latest.error_summary, selected.error_summary, active.error_summary)
-              AS error_summary
+              AS error_summary,
+            attempts.execution_attempts
           FROM backtest_experiment e
-          JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
+          JOIN backtest_experiment_revision r ON r.experiment_id=e.id
           JOIN backtest_experiment_stage s ON s.revision_id=r.id
           JOIN backtest_experiment_trial t ON t.stage_id=s.id
           LEFT JOIN backtest_experiment_trial_execution active
@@ -342,6 +487,26 @@ class PostgresExperimentRepository:
             LIMIT 1
           ) latest ON true
           LEFT JOIN backtest_run latest_run ON latest_run.id=latest.run_id
+          LEFT JOIN LATERAL (
+            SELECT jsonb_agg(jsonb_build_object(
+              'executionId', execution.id,
+              'executionNo', execution.execution_no,
+              'runId', execution.run_id,
+              'status', execution_run.status,
+              'terminalStatus', execution.terminal_status,
+              'createdReason', execution.created_reason,
+              'selected', execution.id=t.selected_execution_id,
+              'active', execution.id=t.active_execution_id,
+              'resultHash', execution.result_hash,
+              'errorSummary', execution.error_summary,
+              'queuedAt', execution.queued_at,
+              'startedAt', execution.started_at,
+              'finishedAt', execution.finished_at
+            ) ORDER BY execution.execution_no) AS execution_attempts
+            FROM backtest_experiment_trial_execution execution
+            JOIN backtest_run execution_run ON execution_run.id=execution.run_id
+            WHERE execution.trial_id=t.id
+          ) attempts ON true
           WHERE {' AND '.join(filters)}
           ORDER BY t.trial_index
           LIMIT %s
@@ -354,6 +519,58 @@ class PostgresExperimentRepository:
         "trialIndex": int(page[-1]["trial_index"]),
       })
     return {"items": [_trial_list_item(row) for row in page], "nextCursor": next_cursor}
+
+  def preview_retry_selection(
+    self,
+    experiment_id: str,
+    expected_revision_id: str,
+    selection: dict[str, Any],
+  ) -> dict[str, Any]:
+    owner_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        snapshot = _retry_selection_snapshot(
+          cur, experiment_id, owner_id, expected_revision_id, selection,
+        )
+    return _public_retry_selection(snapshot)
+
+  def retry_failed_trials(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    selection: dict[str, Any],
+    expected_count: int,
+    expected_digest: str,
+    reason: str,
+    compiler: TrialCompiler,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str | None,
+  ) -> CommandResult:
+    owner_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        _lock_command(cur, owner_id, RETRY_FAILED_OPERATION, idempotency_key)
+        replay = _load_idempotency(
+          cur, owner_id, RETRY_FAILED_OPERATION, idempotency_key,
+        )
+        if replay:
+          return _replay_result(replay, request_hash)
+        graph = _lock_retry_graph(
+          cur, experiment_id, owner_id, expected_revision_id, selection,
+        )
+        _validate_retry_selection(graph, expected_count, expected_digest)
+        _prepare_retry_revision(cur, graph)
+        _validate_retry_capacity(cur, graph, expected_count)
+        executions = _create_manual_retry_executions(cur, graph, compiler)
+        response = _retry_response(graph, executions, expected_digest)
+        _audit_manual_retry(cur, graph, reason, request_id, response)
+        _save_idempotency(
+          cur, owner_id, RETRY_FAILED_OPERATION, idempotency_key, request_hash,
+          "experiment", experiment_id, 202, response,
+        )
+        return CommandResult(response, 202)
 
   def materialize_next_trial(self, compiler: TrialCompiler) -> bool:
     with _coordinator_session() as conn:
@@ -797,7 +1014,7 @@ def _lock_capacity_block_graph(
 
 
 def _materialization_gate(cur: Any, locked: dict[str, Any]) -> MaterializationGate:
-  effective_capacity = _effective_scheduler_capacity(cur)
+  effective_capacity, global_in_flight = _capacity_snapshot(cur)
   budget_gate = _budget_capacity_gate(locked, effective_capacity)
   if not budget_gate.allowed:
     return budget_gate
@@ -807,22 +1024,13 @@ def _materialization_gate(cur: Any, locked: dict[str, Any]) -> MaterializationGa
   global_limit = max(
     0, effective_capacity - settings.EXPERIMENT_MANUAL_RESERVED_PERMITS,
   )
-  if _global_experiment_in_flight(cur) >= global_limit:
+  if global_in_flight >= global_limit:
     return MaterializationGate(
       False,
       "experiment.capacity_blocked",
       "当前统一调度容量已用尽，容量恢复后将继续运行",
     )
   return MaterializationGate(True)
-
-
-def _effective_scheduler_capacity(cur: Any) -> int:
-  cur.execute(
-    "SELECT app.effective_backtest_scheduler_capacity(%s) AS effective_limit",
-    (settings.BACKTEST_BASE_CONCURRENCY,),
-  )
-  row = cur.fetchone()
-  return int(row["effective_limit"]) if row and row["effective_limit"] else 0
 
 
 def _budget_capacity_gate(
@@ -912,15 +1120,6 @@ def _manual_queue_state(cur: Any, owner_id: str) -> tuple[int, float]:
   """, (owner_id, owner_id))
   row = cur.fetchone() or {}
   return int(row.get("pending_count") or 0), float(row.get("oldest_wait_seconds") or 0)
-
-
-def _global_experiment_in_flight(cur: Any) -> int:
-  cur.execute("""
-    SELECT count(*) AS value
-    FROM backtest_experiment_trial_execution
-    WHERE permit_released_at IS NULL
-  """)
-  return int(cur.fetchone()["value"])
 
 
 def _set_materialization_block(
@@ -1058,7 +1257,8 @@ def _insert_trial_execution(
   cur: Any,
   locked: dict[str, Any],
   payload: dict[str, Any],
-) -> None:
+  created_reason_override: str | None = None,
+) -> dict[str, Any]:
   trial = locked["trial"]
   stage = locked["stage"]
   revision = locked["revision"]
@@ -1072,7 +1272,9 @@ def _insert_trial_execution(
     WHERE trial_id=%s
   """, (trial["id"],))
   execution_no = int(cur.fetchone()["execution_no"])
-  created_reason = "automatic_retry" if is_retry else "initial"
+  created_reason = created_reason_override or (
+    "automatic_retry" if is_retry else "initial"
+  )
   run_id = _create_experiment_run(
     cur, payload, owner_id, dispatch_key, execution_id,
     str(revision["experiment_id"]), str(stage["id"]),
@@ -1103,7 +1305,9 @@ def _insert_trial_execution(
       automatic_retry_count=automatic_retry_count+%s, updated_at=now()
     WHERE id=%s AND active_execution_id IS NULL
       AND summary_status IN ('pending', 'failed')
-  """, (execution_id, 1 if is_retry else 0, trial["id"]))
+  """, (
+    execution_id, 1 if created_reason == "automatic_retry" else 0, trial["id"],
+  ))
   if cur.rowcount != 1:
     raise ExperimentError("experiment.state_changed", "Trial 状态已经变化", 409)
   cur.execute("""
@@ -1142,6 +1346,13 @@ def _insert_trial_execution(
       "executionNo": execution_no,
     }),
   ))
+  return {
+    "executionId": execution_id,
+    "executionNo": execution_no,
+    "runId": run_id,
+    "dispatchKey": dispatch_key,
+    "createdReason": created_reason,
+  }
 
 
 def _create_experiment_run(
@@ -1892,6 +2103,30 @@ def _experiment_list_item(row: dict[str, Any]) -> dict[str, Any]:
   }
 
 
+def _revision_list_item(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "revisionId": str(row["revision_id"]),
+    "revisionNo": int(row["revision_no"]),
+    "current": str(row["revision_id"]) == str(row["current_revision_id"]),
+    "status": row["status"],
+    "specHash": row["spec_hash"],
+    "stage": {
+      "stageId": str(row["stage_id"]),
+      "status": row["stage_status"],
+      "plannedTrialCount": int(row["planned_trial_count"]),
+      "generatedTrialCount": int(row["generated_trial_count"]),
+      "inFlightTrialCount": int(row.get("in_flight_count") or 0),
+      "terminalTrialCount": int(row.get("terminal_count") or 0),
+      "succeededTrialCount": int(row.get("succeeded_count") or 0),
+      "failedTrialCount": int(row.get("failed_count") or 0),
+      "cancelledTrialCount": int(row.get("cancelled_count") or 0),
+    },
+    "createdAt": row["created_at"].isoformat(),
+    "updatedAt": row["updated_at"].isoformat(),
+    "terminalAt": row["terminal_at"].isoformat() if row.get("terminal_at") else None,
+  }
+
+
 def _trial_list_item(row: dict[str, Any]) -> dict[str, Any]:
   trial_spec = dict(row["trial_spec"])
   run_id = row.get("selected_run_id") or row.get("active_run_id") or row.get("latest_run_id")
@@ -1925,10 +2160,40 @@ def _trial_list_item(row: dict[str, Any]) -> dict[str, Any]:
       if row.get("selected_execution_id") else None
     ),
     "errorSummary": row.get("error_summary"),
+    "executionAttempts": row.get("execution_attempts") or [],
     "runId": str(run_id) if run_id else None,
     "runUrl": f"/?workspace=backtest&runId={run_id}" if run_id else None,
     "executionId": str(execution_id) if execution_id else None,
   }
+
+
+def _require_owned_experiment(cur: Any, experiment_id: str, owner_id: str) -> None:
+  cur.execute(
+    "SELECT 1 FROM backtest_experiment WHERE id=%s AND owner_user_id=%s",
+    (experiment_id, owner_id),
+  )
+  if cur.fetchone() is None:
+    raise ExperimentError("experiment.not_found", "实验不存在", 404)
+
+
+def _resolve_revision_id(
+  cur: Any,
+  experiment_id: str,
+  owner_id: str,
+  revision_id: str | None,
+) -> str:
+  cur.execute("""
+    SELECT revision.id
+    FROM backtest_experiment experiment
+    JOIN backtest_experiment_revision revision
+      ON revision.experiment_id=experiment.id
+    WHERE experiment.id=%s AND experiment.owner_user_id=%s
+      AND revision.id=COALESCE(%s::uuid,experiment.current_revision_id)
+  """, (experiment_id, owner_id, revision_id))
+  row = cur.fetchone()
+  if row is None:
+    raise ExperimentError("experiment.not_found", "实验修订不存在", 404)
+  return str(row["id"])
 
 
 def _row_reason(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -2084,6 +2349,515 @@ def _reserve_user_plan(cur: Any, owner_id: str, planned_count: int) -> None:
   """, (planned_count, owner_id))
 
 
+def _retry_selection_snapshot(
+  cur: Any,
+  experiment_id: str,
+  owner_id: str,
+  expected_revision_id: str,
+  selection: dict[str, Any],
+) -> dict[str, Any]:
+  context = _load_retry_context(cur, experiment_id, owner_id, lock=False)
+  _validate_retry_revision(context, expected_revision_id)
+  trials = _load_retry_trials(cur, context["stage"]["id"], selection, lock=False)
+  _require_retryable_trials(trials, selection)
+  return {
+    **context,
+    "trials": trials,
+    "selection_digest": _retry_selection_digest(expected_revision_id, trials),
+  }
+
+
+def _load_retry_context(
+  cur: Any,
+  experiment_id: str,
+  owner_id: str,
+  *,
+  lock: bool,
+) -> dict[str, Any]:
+  lock_sql = "FOR UPDATE OF e, r, s" if lock else ""
+  cur.execute(f"""
+    SELECT e.id AS experiment_id, e.current_revision_id, e.status AS experiment_status,
+      e.row_version, r.*, s.id AS stage_id, s.status AS stage_status,
+      s.in_flight_count, s.blocked_reason_code AS stage_reason_code,
+      s.blocked_reason_message AS stage_reason_message
+    FROM backtest_experiment e
+    JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
+    JOIN backtest_experiment_stage s ON s.revision_id=r.id AND s.stage_index=0
+    WHERE e.id=%s AND e.owner_user_id=%s
+    {lock_sql}
+  """, (experiment_id, owner_id))
+  row = cur.fetchone()
+  if row is None:
+    raise ExperimentError("experiment.not_found", "实验不存在", 404)
+  value = dict(row)
+  return {
+    "experiment": {
+      "id": value["experiment_id"],
+      "current_revision_id": value["current_revision_id"],
+      "status": value["experiment_status"],
+      "row_version": value["row_version"],
+    },
+    "revision": {**value, "id": value["current_revision_id"]},
+    "stage": {
+      **value,
+      "id": value["stage_id"],
+      "status": value["stage_status"],
+      "blocked_reason_code": value["stage_reason_code"],
+      "blocked_reason_message": value["stage_reason_message"],
+    },
+  }
+
+
+def _validate_retry_revision(
+  context: dict[str, Any],
+  expected_revision_id: str,
+) -> None:
+  if str(context["revision"]["id"]) != expected_revision_id:
+    raise ExperimentError("experiment.state_changed", "实验修订已经变化", 409)
+
+
+def _load_retry_trials(
+  cur: Any,
+  stage_id: Any,
+  selection: dict[str, Any],
+  *,
+  lock: bool,
+) -> list[dict[str, Any]]:
+  trial_ids = [str(item) for item in selection.get("trialIds") or []]
+  lock_sql = "FOR UPDATE OF trial" if lock else ""
+  cur.execute(f"""
+    SELECT trial.*, latest.id AS latest_execution_id,
+      latest.execution_no AS latest_execution_no,
+      latest.terminal_status AS latest_terminal_status,
+      latest.error_fingerprint AS latest_error_fingerprint,
+      latest.error_summary AS latest_error_summary
+    FROM backtest_experiment_trial trial
+    LEFT JOIN LATERAL (
+      SELECT execution.* FROM backtest_experiment_trial_execution execution
+      WHERE execution.trial_id=trial.id
+      ORDER BY execution.execution_no DESC
+      LIMIT 1
+    ) latest ON true
+    WHERE trial.stage_id=%s AND trial.id=ANY(%s::uuid[])
+    ORDER BY trial.trial_index
+    {lock_sql}
+  """, (stage_id, trial_ids))
+  trials = [dict(row) for row in cur.fetchall()]
+  if lock and trials:
+    execution_ids = [
+      str(row["latest_execution_id"])
+      for row in trials
+      if row.get("latest_execution_id") is not None
+    ]
+    if execution_ids:
+      cur.execute("""
+        SELECT id FROM backtest_experiment_trial_execution
+        WHERE id=ANY(%s::uuid[]) ORDER BY id FOR UPDATE
+      """, (execution_ids,))
+  return trials
+
+
+def _require_retryable_trials(
+  trials: list[dict[str, Any]],
+  selection: dict[str, Any],
+) -> None:
+  selected_count = len(selection.get("trialIds") or [])
+  eligible = all(
+    row.get("summary_status") == "failed"
+    and row.get("active_execution_id") is None
+    and row.get("latest_execution_id") is not None
+    and row.get("latest_terminal_status") == "failed"
+    for row in trials
+  )
+  if len(trials) != selected_count or not eligible:
+    raise ExperimentError(
+      "experiment.selection_changed",
+      "失败 Trial 选择集已经变化，请刷新后重新确认",
+      409,
+    )
+
+
+def _retry_selection_digest(revision_id: str, trials: list[dict[str, Any]]) -> str:
+  return digest(with_version({
+    "operationType": "experiment.retry_selection.v1",
+    "revisionId": revision_id,
+    "trials": [{
+      "trialId": str(row["id"]),
+      "trialIndex": int(row["trial_index"]),
+      "executionId": str(row["latest_execution_id"]),
+      "executionNo": int(row["latest_execution_no"]),
+      "errorFingerprint": row.get("latest_error_fingerprint"),
+    } for row in trials],
+  }))
+
+
+def _public_retry_selection(snapshot: dict[str, Any]) -> dict[str, Any]:
+  trials = snapshot["trials"]
+  return {
+    "experimentId": str(snapshot["experiment"]["id"]),
+    "revisionId": str(snapshot["revision"]["id"]),
+    "selectedTrialCount": len(trials),
+    "selectionDigest": snapshot["selection_digest"],
+    "trials": [{
+      "trialId": str(row["id"]),
+      "trialIndex": int(row["trial_index"]),
+      "previousExecutionId": str(row["latest_execution_id"]),
+      "previousExecutionNo": int(row["latest_execution_no"]),
+      "errorSummary": row.get("latest_error_summary"),
+    } for row in trials],
+  }
+
+
+def _lock_retry_graph(
+  cur: Any,
+  experiment_id: str,
+  owner_id: str,
+  expected_revision_id: str,
+  selection: dict[str, Any],
+) -> dict[str, Any]:
+  cur.execute("""
+    SELECT quota.*, app_user.status AS user_status
+    FROM backtest_experiment_user_quota quota
+    JOIN app_user ON app_user.id=quota.owner_user_id
+    WHERE quota.owner_user_id=%s FOR UPDATE OF quota
+  """, (owner_id,))
+  quota = cur.fetchone()
+  if quota is None:
+    raise ExperimentError("experiment.not_found", "实验额度记录不存在", 404)
+  context = _load_retry_context(cur, experiment_id, owner_id, lock=True)
+  _validate_retry_revision(context, expected_revision_id)
+  trials = _load_retry_trials(cur, context["stage"]["id"], selection, lock=True)
+  _require_retryable_trials(trials, selection)
+  cur.execute("""
+    SELECT count(*) AS value FROM backtest_experiment_asset_hold
+    WHERE revision_id=%s AND hold_status <> 'held'
+  """, (context["revision"]["id"],))
+  unavailable_assets = int(cur.fetchone()["value"])
+  return {
+    **context,
+    "quota": _sync_manual_reserved_permits(cur, dict(quota)),
+    "trials": trials,
+    "unavailable_assets": unavailable_assets,
+    "selection_digest": _retry_selection_digest(expected_revision_id, trials),
+  }
+
+
+def _validate_retry_selection(
+  graph: dict[str, Any],
+  expected_count: int,
+  expected_digest: str,
+) -> None:
+  if (
+    len(graph["trials"]) != expected_count
+    or graph["selection_digest"] != expected_digest
+  ):
+    raise ExperimentError(
+      "experiment.selection_changed",
+      "失败 Trial 选择集已经变化，请刷新后重新确认",
+      409,
+    )
+
+
+def _prepare_retry_revision(cur: Any, graph: dict[str, Any]) -> None:
+  revision = graph["revision"]
+  stage = graph["stage"]
+  if revision.get("cancel_requested_at") is not None:
+    raise ExperimentError("experiment.command_invalid", "已取消修订不能重试", 409)
+  if stage.get("blocked_reason_code"):
+    raise ExperimentError(
+      "experiment.command_invalid", "请先解除当前执行阻塞再重试失败项", 409,
+    )
+  if graph["quota"].get("user_status") != "active" or graph["unavailable_assets"]:
+    raise ExperimentError("experiment.retry_validation_failed", "当前权限或冻结资产不可用", 409)
+  if revision.get("terminal_at") is not None:
+    planned = int(revision["planned_trial_count"])
+    _reserve_user_plan(cur, str(revision["owner_user_id"]), planned)
+    graph["quota"]["reserved_planned_trial_count"] += planned
+  _mark_revision_retrying(cur, graph)
+
+
+def _mark_revision_retrying(cur: Any, graph: dict[str, Any]) -> None:
+  revision = graph["revision"]
+  stage = graph["stage"]
+  cur.execute("""
+    UPDATE backtest_experiment_revision
+    SET status='running', terminal_at=NULL, plan_quota_released_at=NULL,
+      updated_at=now()
+    WHERE id=%s
+  """, (revision["id"],))
+  cur.execute("""
+    UPDATE backtest_experiment_stage
+    SET status='running', updated_at=now(), row_version=row_version+1
+    WHERE id=%s
+  """, (stage["id"],))
+  cur.execute("""
+    UPDATE backtest_experiment
+    SET status='running', updated_at=now(), row_version=row_version+1
+    WHERE id=%s
+  """, (graph["experiment"]["id"],))
+  revision["terminal_at"] = None
+  stage["status"] = "running"
+
+
+def _validate_retry_capacity(
+  cur: Any,
+  graph: dict[str, Any],
+  selected_count: int,
+) -> None:
+  quota = graph["quota"]
+  stage = graph["stage"]
+  effective_capacity, global_in_flight = _capacity_snapshot(cur)
+  budget_gate = _budget_capacity_gate(graph, effective_capacity)
+  if not budget_gate.allowed:
+    raise ExperimentError(
+      budget_gate.code or "experiment.capacity_blocked",
+      budget_gate.message or "当前容量不足",
+      409,
+      retryable=True,
+    )
+  manual_gate = _manual_capacity_gate(cur, graph)
+  if not manual_gate.allowed:
+    raise ExperimentError(
+      manual_gate.code or "experiment.capacity_blocked",
+      manual_gate.message or "当前容量不足",
+      409,
+      retryable=True,
+    )
+  global_limit = max(0, effective_capacity - settings.EXPERIMENT_MANUAL_RESERVED_PERMITS)
+  remaining = min(
+    settings.EXPERIMENT_MAX_IN_FLIGHT_PER_USER - int(quota["experiment_in_flight_count"]),
+    settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT - int(stage["in_flight_count"]),
+    global_limit - global_in_flight,
+  )
+  if selected_count > max(0, remaining):
+    raise ExperimentError(
+      "experiment.capacity_blocked",
+      "所选失败项超过当前可用在途容量，请减少选择或稍后重试",
+      409,
+      retryable=True,
+      details={"selectedTrialCount": selected_count, "availableTrialCount": max(0, remaining)},
+    )
+
+
+def _capacity_snapshot(cur: Any) -> tuple[int, int]:
+  cur.execute(
+    "SELECT * FROM app.experiment_capacity_snapshot(%s)",
+    (settings.BACKTEST_BASE_CONCURRENCY,),
+  )
+  row = cur.fetchone() or {}
+  return (
+    int(row.get("effective_limit") or 0),
+    int(row.get("experiment_in_flight_count") or 0),
+  )
+
+
+def _create_manual_retry_executions(
+  cur: Any,
+  graph: dict[str, Any],
+  compiler: TrialCompiler,
+) -> list[dict[str, Any]]:
+  executions: list[dict[str, Any]] = []
+  for trial in graph["trials"]:
+    locked = {**graph, "trial": trial}
+    template, assignment, dataset, seed = _materialization_inputs(locked)
+    payload = compiler.compile_request(template, assignment, dataset, seed)
+    _verify_compiled_request(compiler, template, assignment, locked)
+    executions.append(_insert_trial_execution(
+      cur, locked, payload, created_reason_override="manual_retry",
+    ))
+  _rebuild_aggregate_status(cur, str(graph["stage"]["id"]))
+  return executions
+
+
+def _retry_response(
+  graph: dict[str, Any],
+  executions: list[dict[str, Any]],
+  selection_digest: str,
+) -> dict[str, Any]:
+  return {
+    "experimentId": str(graph["experiment"]["id"]),
+    "revisionId": str(graph["revision"]["id"]),
+    "status": "running",
+    "operationId": str(uuid4()),
+    "selectedTrialCount": len(executions),
+    "selectionDigest": selection_digest,
+    "executions": executions,
+    "replayed": False,
+    "acceptedAt": datetime.now(timezone.utc).isoformat(),
+  }
+
+
+def _audit_manual_retry(
+  cur: Any,
+  graph: dict[str, Any],
+  reason: str,
+  request_id: str | None,
+  response: dict[str, Any],
+) -> None:
+  cur.execute("""
+    INSERT INTO backtest_experiment_audit (
+      owner_user_id, experiment_id, revision_id, stage_id,
+      event_type, request_id, detail
+    ) VALUES (%s,%s,%s,%s,'experiment.failed_trials_retried',%s,%s)
+  """, (
+    graph["revision"]["owner_user_id"], graph["experiment"]["id"],
+    graph["revision"]["id"], graph["stage"]["id"], request_id,
+    Jsonb({
+      "reason": reason,
+      "selectedTrialCount": response["selectedTrialCount"],
+      "selectionDigest": response["selectionDigest"],
+      "operationId": response["operationId"],
+    }),
+  ))
+
+
+def _lock_revision_creation_graph(
+  cur: Any,
+  experiment_id: str,
+  owner_id: str,
+) -> dict[str, Any]:
+  cur.execute("""
+    SELECT * FROM backtest_experiment
+    WHERE id=%s AND owner_user_id=%s
+    FOR UPDATE
+  """, (experiment_id, owner_id))
+  experiment = cur.fetchone()
+  if experiment is None:
+    raise ExperimentError("experiment.not_found", "实验不存在", 404)
+  cur.execute(
+    "SELECT * FROM backtest_experiment_revision WHERE id=%s FOR UPDATE",
+    (experiment["current_revision_id"],),
+  )
+  revision = cur.fetchone()
+  cur.execute("""
+    SELECT * FROM backtest_experiment_stage
+    WHERE revision_id=%s AND stage_index=0 FOR UPDATE
+  """, (experiment["current_revision_id"],))
+  stage = cur.fetchone()
+  if revision is None or stage is None:
+    raise ExperimentError("experiment.state_changed", "实验修订结构不完整", 409)
+  return {
+    "experiment": dict(experiment),
+    "revision": dict(revision),
+    "stage": dict(stage),
+  }
+
+
+def _validate_revision_creation(
+  graph: dict[str, Any],
+  expected_revision_id: str,
+  expected_snapshot_version: int,
+) -> None:
+  experiment = graph["experiment"]
+  revision = graph["revision"]
+  if (
+    str(revision["id"]) != expected_revision_id
+    or int(experiment["row_version"]) != expected_snapshot_version
+  ):
+    raise ExperimentError("experiment.state_changed", "实验状态已经变化，请刷新后重试", 409)
+  if revision.get("terminal_at") is None:
+    raise ExperimentError(
+      "experiment.active_revision_exists", "当前修订尚未终结，不能创建新修订", 409,
+    )
+
+
+def _insert_new_revision(
+  cur: Any,
+  graph: dict[str, Any],
+  normalized_spec: dict[str, Any],
+  preview: dict[str, Any],
+  request_id: str | None,
+) -> dict[str, Any]:
+  experiment = graph["experiment"]
+  revision_no = int(graph["revision"]["revision_no"]) + 1
+  revision_id = str(uuid4())
+  stage_id = str(uuid4())
+  stage_spec = dict(normalized_spec["plan"]["stages"][0])
+  _insert_revision(
+    cur, revision_id, str(experiment["id"]), str(experiment["owner_user_id"]),
+    revision_no, normalized_spec, preview,
+  )
+  _insert_stage(
+    cur, stage_id, revision_id, str(experiment["owner_user_id"]),
+    stage_spec, preview,
+  )
+  _insert_asset_holds(
+    cur, revision_id, str(experiment["owner_user_id"]), normalized_spec,
+  )
+  _activate_new_revision(cur, graph, revision_id, normalized_spec)
+  _audit_revision_created(cur, graph, revision_id, stage_id, preview, request_id)
+  return _revision_created_response(
+    cur, str(experiment["id"]), revision_id, stage_id, revision_no, preview,
+  )
+
+
+def _activate_new_revision(
+  cur: Any,
+  graph: dict[str, Any],
+  revision_id: str,
+  normalized_spec: dict[str, Any],
+) -> None:
+  cur.execute("""
+    UPDATE backtest_experiment
+    SET current_revision_id=%s, name=%s, description=%s, status='preparing',
+      blocked_reason_code=NULL, blocked_reason_message=NULL,
+      row_version=row_version+1, updated_at=now()
+    WHERE id=%s AND current_revision_id=%s
+  """, (
+    revision_id, normalized_spec["name"], normalized_spec["description"],
+    graph["experiment"]["id"], graph["revision"]["id"],
+  ))
+  if cur.rowcount != 1:
+    raise ExperimentError("experiment.state_changed", "实验状态已经变化", 409)
+
+
+def _audit_revision_created(
+  cur: Any,
+  graph: dict[str, Any],
+  revision_id: str,
+  stage_id: str,
+  preview: dict[str, Any],
+  request_id: str | None,
+) -> None:
+  cur.execute("""
+    INSERT INTO backtest_experiment_audit (
+      owner_user_id, experiment_id, revision_id, stage_id,
+      event_type, request_id, detail
+    ) VALUES (%s,%s,%s,%s,'experiment.revision_created',%s,%s)
+  """, (
+    graph["experiment"]["owner_user_id"], graph["experiment"]["id"],
+    revision_id, stage_id, request_id,
+    Jsonb({"plannedTrialCount": int(preview["planned_trial_count"])}),
+  ))
+
+
+def _revision_created_response(
+  cur: Any,
+  experiment_id: str,
+  revision_id: str,
+  stage_id: str,
+  revision_no: int,
+  preview: dict[str, Any],
+) -> dict[str, Any]:
+  cur.execute(
+    "SELECT created_at FROM backtest_experiment_revision WHERE id=%s",
+    (revision_id,),
+  )
+  created_at = cur.fetchone()["created_at"]
+  return {
+    "experimentId": experiment_id,
+    "revisionId": revision_id,
+    "revisionNo": revision_no,
+    "stageId": stage_id,
+    "status": "preparing",
+    "plannedTrialCount": int(preview["planned_trial_count"]),
+    "generatedTrialCount": 0,
+    "specHash": str(preview["spec_hash"]),
+    "replayed": False,
+    "createdAt": created_at.isoformat(),
+  }
+
+
 def _insert_experiment_graph(
   cur: Any,
   *,
@@ -2105,7 +2879,9 @@ def _insert_experiment_graph(
     experiment_id, owner_id, normalized_spec["name"], normalized_spec["description"],
   ))
   created_at = cur.fetchone()["created_at"]
-  _insert_revision(cur, revision_id, experiment_id, owner_id, normalized_spec, preview)
+  _insert_revision(
+    cur, revision_id, experiment_id, owner_id, 1, normalized_spec, preview,
+  )
   _insert_stage(cur, stage_id, revision_id, owner_id, stage_spec, preview)
   cur.execute(
     "UPDATE backtest_experiment SET current_revision_id=%s WHERE id=%s",
@@ -2139,6 +2915,7 @@ def _insert_revision(
   revision_id: str,
   experiment_id: str,
   owner_id: str,
+  revision_no: int,
   normalized_spec: dict[str, Any],
   preview: dict[str, Any],
 ) -> None:
@@ -2148,9 +2925,9 @@ def _insert_revision(
       spec_hash, run_template_digest, dataset_snapshot_digest,
       canonicalization_version, budget_version, resource_budget,
       determinism, planned_trial_count, failure_policy, status
-    ) VALUES (%s,%s,%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'preparing')
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'preparing')
   """, (
-    revision_id, experiment_id, owner_id, Jsonb(normalized_spec),
+    revision_id, experiment_id, owner_id, revision_no, Jsonb(normalized_spec),
     preview["spec_hash"], preview["run_template_digest"],
     preview["dataset_snapshot_digest"], normalized_spec["canonicalizationVersion"],
     preview["budget_version"], Jsonb({

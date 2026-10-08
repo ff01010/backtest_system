@@ -7,6 +7,10 @@ import type {
   ExperimentCreateResult,
   ExperimentDetail,
   ExperimentListItem,
+  ExperimentRetryResult,
+  ExperimentRetrySelection,
+  ExperimentRevision,
+  ExperimentRevisionCreateRequest,
   ExperimentSubject,
   ExperimentSubjectRef,
   ExperimentTrial,
@@ -45,6 +49,19 @@ export function findCreatedExperiment(idempotencyKey: string): Promise<Experimen
   );
 }
 
+export function createExperimentRevision(
+  experimentId: string,
+  request: ExperimentRevisionCreateRequest,
+  idempotencyKey: string,
+): Promise<ExperimentCreateResponse> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/revisions`,
+    'POST',
+    request,
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
 export function fetchExperimentDetail(experimentId: string): Promise<ExperimentDetail> {
   return fetchJson(`/api/backtest/experiments/${encodeURIComponent(experimentId)}`);
 }
@@ -56,13 +73,60 @@ export function fetchExperiments(
   return fetchJson(`/api/backtest/experiments${query}`);
 }
 
+export function fetchExperimentRevisions(
+  experimentId: string,
+  cursor?: string,
+): Promise<{ items: ExperimentRevision[]; nextCursor: string | null }> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/revisions${query}`,
+  );
+}
+
 export function fetchExperimentTrials(
   experimentId: string,
   cursor?: string,
+  revisionId?: string,
 ): Promise<{ items: ExperimentTrial[]; nextCursor: string | null }> {
-  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+  const query = new URLSearchParams();
+  if (cursor) query.set('cursor', cursor);
+  if (revisionId) query.set('revisionId', revisionId);
+  const suffix = query.size ? `?${query.toString()}` : '';
   return fetchJson(
-    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/trials${query}`,
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/trials${suffix}`,
+  );
+}
+
+export function previewRetryFailedTrials(
+  experimentId: string,
+  expectedRevisionId: string,
+  trialIds: string[],
+): Promise<ExperimentRetrySelection> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/retry-failed/preview`,
+    'POST',
+    { expectedRevisionId, selection: { mode: 'trial_ids', trialIds } },
+  );
+}
+
+export function retryFailedTrials(
+  experimentId: string,
+  expectedRevisionId: string,
+  trialIds: string[],
+  preview: ExperimentRetrySelection,
+  idempotencyKey: string,
+): Promise<ExperimentRetryResult> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/retry-failed`,
+    'POST',
+    {
+      expectedRevisionId,
+      selection: { mode: 'trial_ids', trialIds },
+      expectedSelectedTrialCount: preview.selectedTrialCount,
+      expectedSelectionDigest: preview.selectionDigest,
+      reason: '用户在实验详情页确认重试失败 Trial',
+    },
+    { 'Idempotency-Key': idempotencyKey },
   );
 }
 

@@ -116,6 +116,11 @@ export type ExperimentCreateRequest = {
   experimentSpec: ExperimentPreviewRequest;
 };
 
+export type ExperimentRevisionCreateRequest = ExperimentCreateRequest & {
+  expectedRevisionId: string;
+  expectedSnapshotVersion: number;
+};
+
 export type ExperimentCreateResult = {
   experimentId: string;
   revisionId: string;
@@ -190,9 +195,78 @@ export type ExperimentTrial = {
     actualDataHash: string;
   } | null;
   errorSummary: Record<string, unknown> | null;
+  executionAttempts: Array<{
+    executionId: string;
+    executionNo: number;
+    runId: string;
+    status: string;
+    terminalStatus: 'succeeded' | 'failed' | 'cancelled' | null;
+    createdReason: 'initial' | 'automatic_retry' | 'manual_retry';
+    selected: boolean;
+    active: boolean;
+    resultHash: string | null;
+    errorSummary: Record<string, unknown> | null;
+    queuedAt: string;
+    startedAt: string | null;
+    finishedAt: string | null;
+  }>;
   runId: string | null;
   runUrl: string | null;
   executionId: string | null;
+};
+
+export type ExperimentRevision = {
+  revisionId: string;
+  revisionNo: number;
+  current: boolean;
+  status: ExperimentStatus;
+  specHash: string;
+  stage: {
+    stageId: string;
+    status: string;
+    plannedTrialCount: number;
+    generatedTrialCount: number;
+    inFlightTrialCount: number;
+    terminalTrialCount: number;
+    succeededTrialCount: number;
+    failedTrialCount: number;
+    cancelledTrialCount: number;
+  };
+  createdAt: string;
+  updatedAt: string;
+  terminalAt: string | null;
+};
+
+export type ExperimentRetrySelection = {
+  experimentId: string;
+  revisionId: string;
+  selectedTrialCount: number;
+  selectionDigest: string;
+  trials: Array<{
+    trialId: string;
+    trialIndex: number;
+    previousExecutionId: string;
+    previousExecutionNo: number;
+    errorSummary: Record<string, unknown> | null;
+  }>;
+};
+
+export type ExperimentRetryResult = {
+  experimentId: string;
+  revisionId: string;
+  status: 'running';
+  operationId: string;
+  selectedTrialCount: number;
+  selectionDigest: string;
+  executions: Array<{
+    executionId: string;
+    executionNo: number;
+    runId: string;
+    dispatchKey: string;
+    createdReason: 'manual_retry';
+  }>;
+  replayed: boolean;
+  acceptedAt: string;
 };
 
 export type ExperimentDetail = {

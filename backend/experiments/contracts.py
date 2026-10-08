@@ -115,6 +115,39 @@ class ExperimentCreateRequest(StrictModel):
       raise ValueError("previewToken 必须是 UUID") from error
 
 
+class ExperimentRevisionCreateRequest(ExperimentCreateRequest):
+  expectedRevisionId: UUID
+  expectedSnapshotVersion: int = Field(ge=1)
+
+
+class TrialSelection(StrictModel):
+  mode: Literal["trial_ids"]
+  trialIds: list[UUID] = Field(min_length=1, max_length=200)
+
+  @field_validator("trialIds")
+  @classmethod
+  def unique_trial_ids(cls, value: list[UUID]) -> list[UUID]:
+    if len(set(value)) != len(value):
+      raise ValueError("trialIds 不能重复")
+    return value
+
+
+class ExperimentRetryPreviewRequest(StrictModel):
+  expectedRevisionId: UUID
+  selection: TrialSelection
+
+
+class ExperimentRetryFailedRequest(ExperimentRetryPreviewRequest):
+  expectedSelectedTrialCount: int = Field(ge=1, le=200)
+  expectedSelectionDigest: str = Field(pattern=r"^[0-9a-f]{64}$")
+  reason: str = Field(default="", max_length=500)
+
+  @field_validator("reason")
+  @classmethod
+  def normalize_reason(cls, value: str) -> str:
+    return value.strip()
+
+
 class ExperimentResumeRequest(StrictModel):
   expectedRevisionId: UUID
   reason: str = Field(min_length=1, max_length=500)

@@ -4305,8 +4305,75 @@ button.experiment-trial-row:hover {
   border-color: var(--accent);
 }
 
+.experiment-card-heading-inline,
+.experiment-retry-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.experiment-revision-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.experiment-revision-item {
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 10px 12px;
+  text-align: left;
+}
+
+.experiment-revision-item.is-selected {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.experiment-revision-item span,
+.experiment-revision-item small {
+  color: var(--text-muted);
+}
+
+.experiment-trial-row.is-trial-detail {
+  grid-template-columns: 24px 58px minmax(90px, 0.7fr) minmax(120px, 1fr) minmax(130px, auto);
+}
+
+.experiment-execution-attempts {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 5px;
+}
+
+.experiment-execution-attempts > div {
+  display: grid;
+  grid-template-columns: 90px 90px 100px minmax(90px, 1fr) minmax(120px, 1fr);
+  gap: 8px;
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 @media (max-width: 900px) {
   .experiment-trial-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .experiment-card-heading-inline,
+  .experiment-retry-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .experiment-trial-row.is-trial-detail,
+  .experiment-execution-attempts > div {
     grid-template-columns: 1fr 1fr;
   }
 }

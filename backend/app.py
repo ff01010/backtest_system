@@ -43,6 +43,9 @@ from backend.experiments import (
   ExperimentCreateRequest,
   ExperimentError,
   ExperimentPreviewRequest,
+  ExperimentRetryFailedRequest,
+  ExperimentRetryPreviewRequest,
+  ExperimentRevisionCreateRequest,
   ExperimentResumeRequest,
   SubjectRef,
 )
@@ -1838,11 +1841,44 @@ def experiment_detail(experiment_id: UUID, request: Request) -> Response:
     _raise_experiment_error(error)
 
 
+@app.get("/api/backtest/experiments/{experiment_id}/revisions")
+def experiment_revisions(
+  experiment_id: UUID,
+  limit: int = Query(50, ge=1, le=200),
+  cursor: str | None = Query(default=None, max_length=2048),
+) -> dict[str, Any]:
+  try:
+    return _experiment_application.list_revisions(
+      str(experiment_id), limit=limit, cursor=cursor,
+    )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/revisions")
+def create_experiment_revision(
+  experiment_id: UUID,
+  payload: ExperimentRevisionCreateRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _experiment_application.create_revision(
+      str(experiment_id),
+      payload,
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
 @app.get("/api/backtest/experiments/{experiment_id}/trials")
 def experiment_trials(
   experiment_id: UUID,
   limit: int = Query(50, ge=1, le=200),
   cursor: str | None = Query(default=None, max_length=2048),
+  revision_id: UUID | None = Query(default=None, alias="revisionId"),
   status: Literal[
     "pending", "queued", "running", "cancelling", "succeeded", "failed", "cancelled"
   ] | None = Query(default=None),
@@ -1853,6 +1889,7 @@ def experiment_trials(
       limit=limit,
       cursor=cursor,
       status=status,
+      revision_id=str(revision_id) if revision_id else None,
     )
   except ExperimentError as error:
     _raise_experiment_error(error)
@@ -2082,6 +2119,35 @@ def resume_experiment(
       str(experiment_id),
       str(payload.expectedRevisionId),
       payload.reason,
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/retry-failed/preview")
+def preview_experiment_retry_failed(
+  experiment_id: UUID,
+  payload: ExperimentRetryPreviewRequest,
+) -> dict[str, Any]:
+  try:
+    return _experiment_application.preview_retry(str(experiment_id), payload)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/retry-failed")
+def retry_experiment_failed(
+  experiment_id: UUID,
+  payload: ExperimentRetryFailedRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _experiment_application.retry_failed(
+      str(experiment_id),
+      payload,
       _experiment_idempotency_key(request),
       getattr(request.state, "request_id", None),
     )
