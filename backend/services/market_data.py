@@ -34,6 +34,9 @@ _HISTORY_PERIODS = {
   "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1h", "1d": "1d",
 }
 _HISTORY_DERIVED_PERIODS = {"3m": 3, "45m": 45}
+_HISTORY_MINUTE_BATCH_DATES = 10
+_HISTORY_OTHER_BATCH_DATES = 40
+_HISTORY_QUERY_RETRY_DELAY_SECONDS = 1.0
 _TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
@@ -284,18 +287,19 @@ def load_backtest_bars(
   resolution: BacktestDataResolution,
 ) -> tuple[pd.DataFrame, int]:
   """按已解析的来源读取 Bar，并返回预热 Bar 数量。"""
-  all_dates = resolution.all_dates
+  all_dates = tuple(sorted(set(resolution.all_dates)))
   if not all_dates:
     raise MarketDataError("回测数据范围为空", "no_complete_coverage")
   try:
-    rows = _query_kline_rows(symbol, resolution, all_dates[0], all_dates[-1])
+    rows = _query_kline_rows(symbol, resolution, all_dates)
     frame = _rows_to_frame(rows)
+    allowed_dates = set(all_dates)
+    frame = _validated_source_frame(frame, allowed_dates)
     frame = _transform_source_frame(frame, resolution)
     if frame.empty:
       raise MarketDataError(
         f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情", "empty_bar_data",
       )
-    allowed_dates = set(all_dates)
     frame_dates = frame["time"].str[:8].map(format_api_date)
     frame = frame[frame_dates.isin(allowed_dates)].reset_index(drop=True)
     if frame.empty:
@@ -635,16 +639,54 @@ def _history_coverage_range_query(symbol: str, period: str) -> str:
 def _query_kline_rows(
   symbol: str,
   resolution: BacktestDataResolution,
-  start_date: str,
-  end_date: str,
+  dates: Sequence[str],
 ) -> list[dict[str, Any]]:
   _validate_symbol(symbol)
   _require_history_source(resolution.source)
-  query = _history_kline_query(symbol, resolution.source_period, start_date, end_date)
-  try:
-    return clickhouse_client.query_rows_with_retry(query)
-  except clickhouse_client.ClickHouseError as error:
-    raise MarketDataError(str(error)) from error
+  rows: list[dict[str, Any]] = []
+  batch_size = (
+    _HISTORY_MINUTE_BATCH_DATES
+    if resolution.source_period == "1m"
+    else _HISTORY_OTHER_BATCH_DATES
+  )
+  for offset in range(0, len(dates), batch_size):
+    batch_dates = dates[offset:offset + batch_size]
+    query = _history_kline_dates_query(symbol, resolution.source_period, batch_dates)
+    try:
+      rows.extend(clickhouse_client.query_rows_with_retry(
+        query,
+        initial_delay_seconds=_HISTORY_QUERY_RETRY_DELAY_SECONDS,
+      ))
+    except clickhouse_client.ClickHouseError as error:
+      raise MarketDataError(str(error)) from error
+  return rows
+
+
+def _history_kline_dates_query(
+  symbol: str,
+  period: str,
+  dates: Sequence[str],
+) -> str:
+  table = _source_table(_HISTORY_SOURCE, period)
+  date_values = ", ".join(
+    f"toDate('{_date_sql(item)}')" for item in dates
+  )
+  return f"""
+    SELECT qmt_time_ms AS time, open, high, low, close, volume
+    FROM {_HISTORY_DATABASE}.{table}
+    WHERE symbol = '{symbol}' AND period = '{period}' AND adjustment = '{_HISTORY_ADJUSTMENT}'
+      AND is_final = 1
+      AND trade_date IN ({date_values})
+    ORDER BY bar_time ASC
+    SETTINGS max_execution_time = {_server_query_timeout_seconds()}
+  """
+
+
+def _server_query_timeout_seconds() -> int:
+  client_timeout = settings.CLICKHOUSE_TIMEOUT_SECONDS
+  if client_timeout <= 1:
+    raise MarketDataError("ClickHouse 客户端超时必须大于 1 秒", "source_config_invalid")
+  return max(1, min(25, client_timeout - 5))
 
 
 def _query_preview(
@@ -676,23 +718,13 @@ def _history_kline_query(
   order = "DESC" if descending else "ASC"
   limit_clause = f" LIMIT {limit}" if limit is not None else ""
   return f"""
-    SELECT qmt_index, time, open, high, low, close, volume
-    FROM (
-      SELECT bar_time,
-             argMax(qmt_index, tuple(revision, ingested_at)) AS qmt_index,
-             argMax(qmt_time_ms, tuple(revision, ingested_at)) AS time,
-             argMax(open, tuple(revision, ingested_at)) AS open,
-             argMax(high, tuple(revision, ingested_at)) AS high,
-             argMax(low, tuple(revision, ingested_at)) AS low,
-             argMax(close, tuple(revision, ingested_at)) AS close,
-             argMax(volume, tuple(revision, ingested_at)) AS volume
-      FROM {_HISTORY_DATABASE}.{table}
-      WHERE symbol = '{symbol}' AND period = '{period}' AND adjustment = '{_HISTORY_ADJUSTMENT}'
-        AND is_final = 1
-        AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
-      GROUP BY bar_time
-    )
+    SELECT qmt_time_ms AS time, open, high, low, close, volume
+    FROM {_HISTORY_DATABASE}.{table}
+    WHERE symbol = '{symbol}' AND period = '{period}' AND adjustment = '{_HISTORY_ADJUSTMENT}'
+      AND is_final = 1
+      AND trade_date BETWEEN toDate('{_date_sql(start_date)}') AND toDate('{_date_sql(end_date)}')
     ORDER BY bar_time {order}{limit_clause}
+    SETTINGS max_execution_time = {_server_query_timeout_seconds()}
   """
 
 
@@ -705,6 +737,30 @@ def _rows_to_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
     frame[column] = pd.to_numeric(frame[column])
   frame["time"] = frame["_timestamp"].dt.strftime("%Y%m%d%H%M")
   return frame
+
+
+def _validated_source_frame(
+  frame: pd.DataFrame,
+  allowed_dates: set[str],
+) -> pd.DataFrame:
+  if frame.empty:
+    return frame
+  if frame["time"].duplicated().any():
+    raise MarketDataError("QMT Bar 存在重复时间", "invalid_bar_data")
+  for column in ("open", "high", "low", "close", "volume"):
+    if not frame[column].map(math.isfinite).all():
+      raise MarketDataError(
+        f"QMT Bar 字段 {column} 包含非有限数值",
+        "invalid_bar_data",
+      )
+  frame_dates = frame["time"].str[:8].map(format_api_date)
+  unexpected_dates = sorted(set(frame_dates) - allowed_dates)
+  if unexpected_dates:
+    raise MarketDataError(
+      f"QMT Bar 返回了请求范围外的日期: {', '.join(unexpected_dates)}",
+      "invalid_bar_data",
+    )
+  return frame.sort_values("_timestamp", kind="stable").reset_index(drop=True)
 
 
 def _aggregate_minutes(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
