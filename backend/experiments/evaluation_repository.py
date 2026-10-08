@@ -22,6 +22,7 @@ from backend.experiments.repository import (
   CommandResult,
   _load_idempotency,
   _lock_command,
+  _lock_experiment_for_write,
   _replay_result,
   _save_idempotency,
 )
@@ -146,6 +147,7 @@ class PostgresEvaluationRepository:
         replay = _load_idempotency(cur, owner_id, CREATE_RUN_OPERATION, idempotency_key)
         if replay:
           return _replay_result(replay, request_hash)
+        _lock_experiment_for_write(cur, experiment_id, owner_id)
         spec = _load_spec_for_run(cur, experiment_id, evaluation_spec_id, owner_id)
         execution_set, completeness = _freeze_execution_set(cur, spec)
         result_set_hash = digest(with_version({
@@ -204,6 +206,7 @@ class PostgresEvaluationRepository:
         replay = _load_idempotency(cur, owner_id, RETRY_RUN_OPERATION, idempotency_key)
         if replay:
           return _replay_result(replay, request_hash)
+        _lock_experiment_for_write(cur, experiment_id, owner_id)
         row = _load_run(cur, experiment_id, run_id, owner_id, for_update=True)
         if row is None:
           raise ExperimentError("experiment.evaluation_run_not_found", "评价运行不存在", 404)
@@ -366,16 +369,22 @@ class PostgresEvaluationRepository:
 
 def _lock_evaluation_revision(cur: Any, experiment_id: str, owner_id: str) -> dict[str, Any]:
   cur.execute("""
-    SELECT revision.* FROM backtest_experiment experiment
+    SELECT revision.*, experiment.archived_at, experiment.purge_job_id
+    FROM backtest_experiment experiment
     JOIN backtest_experiment_revision revision
       ON revision.id=experiment.current_revision_id
     WHERE experiment.id=%s AND experiment.owner_user_id=%s
-    FOR UPDATE OF revision
+    FOR UPDATE OF experiment, revision
   """, (experiment_id, owner_id))
   row = cur.fetchone()
   if row is None:
     raise ExperimentError("experiment.not_found", "实验不存在", 404)
-  return dict(row)
+  revision = dict(row)
+  if revision.get("purge_job_id") is not None:
+    raise ExperimentError("experiment.purge_in_progress", "实验已经进入清理流程", 409)
+  if revision.get("archived_at") is not None:
+    raise ExperimentError("experiment.archived_read_only", "归档实验只允许读取或恢复", 409)
+  return revision
 
 
 def _validate_spec_scope(

@@ -361,6 +361,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
       {activePage === 'experiments' && (
         <ExperimentPage
           userId={currentUser.id}
+          isAdmin={currentUser.role === 'admin'}
           enabled={experimentPreviewEnabled}
           subject={experimentSubject}
           experimentId={urlParams.experimentId ?? null}

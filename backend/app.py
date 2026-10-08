@@ -41,6 +41,8 @@ from backend.experiments import (
   EvaluationSpecRequest,
   ExperimentApplication,
   ExperimentCreateRequest,
+  ExperimentLifecycleRequest,
+  ExperimentPurgeRequest,
   ExperimentError,
   ExperimentPreviewRequest,
   ExperimentRetryFailedRequest,
@@ -49,6 +51,7 @@ from backend.experiments import (
   ExperimentResumeRequest,
   SubjectRef,
 )
+from backend.experiments.purge_repository import PostgresExperimentPurgeRepository
 from backend.execution import execution_algorithm_snapshot, validate_execution_request
 from backend.date_codec import TradingDateError, format_legacy_date, normalize_date_range
 from backend import schemas
@@ -108,6 +111,7 @@ _verified_runtime_capabilities = declared_runtime_capabilities()
 _experiment_application = ExperimentApplication()
 _evaluation_application = EvaluationApplication()
 _evaluation_export_application = EvaluationExportApplication()
+_experiment_purge_repository = PostgresExperimentPurgeRepository()
 
 
 def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, Any]:
@@ -323,6 +327,7 @@ def _legacy_api_error(request: Request, status_code: int, detail: Any) -> JSONRe
 def _is_experiment_api_path(path: str) -> bool:
   return path.startswith((
     "/api/backtest/experiment",
+    "/api/backtest/admin/experiments",
     "/api/backtest/evaluation-runs",
     "/api/backtest/evaluation-exports",
   ))
@@ -1339,6 +1344,13 @@ def _require_admin(request: Request) -> CurrentUser:
   return user
 
 
+def _require_experiment_admin(request: Request) -> CurrentUser:
+  try:
+    return _require_admin(request)
+  except HTTPException as error:
+    raise _stable_error(403, "experiment.forbidden", "仅管理员可执行此操作") from error
+
+
 @app.get("/api/admin/users")
 def admin_users(
   request: Request,
@@ -1822,9 +1834,27 @@ def find_created_experiment(idempotency_key: str) -> Response:
 def list_experiments(
   limit: int = Query(50, ge=1, le=200),
   cursor: str | None = Query(default=None, max_length=2048),
+  archived: bool = Query(False),
 ) -> dict[str, Any]:
   try:
-    return _experiment_application.list_experiments(limit=limit, cursor=cursor)
+    return _experiment_application.list_experiments(
+      limit=limit, cursor=cursor, archived=archived,
+    )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/admin/experiments/archived")
+def list_admin_archived_experiments(
+  request: Request,
+  limit: int = Query(50, ge=1, le=200),
+  cursor: str | None = Query(default=None, max_length=2048),
+) -> dict[str, Any]:
+  _require_experiment_admin(request)
+  try:
+    return _experiment_application.list_admin_archived_experiments(
+      limit=limit, cursor=cursor,
+    )
   except ExperimentError as error:
     _raise_experiment_error(error)
 
@@ -2108,6 +2138,64 @@ def cancel_experiment(experiment_id: UUID, request: Request) -> Response:
     _raise_experiment_error(error)
 
 
+@app.post("/api/backtest/experiments/{experiment_id}/archive")
+def archive_experiment(
+  experiment_id: UUID,
+  payload: ExperimentLifecycleRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _experiment_application.archive(
+      str(experiment_id), payload, _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/restore-archive")
+def restore_archived_experiment(
+  experiment_id: UUID,
+  payload: ExperimentLifecycleRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _experiment_application.restore_archive(
+      str(experiment_id), payload, _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/purge")
+def purge_experiment(
+  experiment_id: UUID,
+  payload: ExperimentPurgeRequest,
+  request: Request,
+) -> Response:
+  _require_experiment_admin(request)
+  try:
+    body, status_code = _experiment_application.purge(
+      str(experiment_id), payload, _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/experiment-purges/{purge_id}")
+def experiment_purge_detail(purge_id: UUID, request: Request) -> dict[str, Any]:
+  _require_experiment_admin(request)
+  try:
+    return _experiment_purge_repository.get(str(purge_id))
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
 @app.post("/api/backtest/experiments/{experiment_id}/resume")
 def resume_experiment(
   experiment_id: UUID,
@@ -2223,6 +2311,8 @@ def create_signal_detail_export(
     raise _stable_error(503, "signal_export.runner_unavailable", str(error)) from error
   except state_store.ConflictError as error:
     raise _stable_error(409, "signal_export.idempotency_conflict", str(error)) from error
+  except state_store.ExperimentRunRetainedError as error:
+    raise _stable_error(409, "experiment.run_retained", str(error)) from error
   except ValueError as error:
     raise _stable_error(422, "signal_export.selection_invalid", str(error)) from error
   return JSONResponse(
@@ -2276,6 +2366,8 @@ def retry_signal_detail_export(export_id: str, request: Request) -> JSONResponse
     raise _stable_error(503, "signal_export.runner_unavailable", str(error)) from error
   except state_store.ConflictError as error:
     raise _stable_error(409, "signal_export.idempotency_conflict", str(error)) from error
+  except state_store.ExperimentRunRetainedError as error:
+    raise _stable_error(409, "experiment.run_retained", str(error)) from error
   except ValueError as error:
     raise _stable_error(409, "signal_export.state_conflict", str(error)) from error
   return JSONResponse(
@@ -2338,6 +2430,8 @@ def publish_backtest_run(
     return {"publication": publication, "created": created}
   except KeyError as error:
     raise HTTPException(404, "回测记录不存在或无权共享") from error
+  except state_store.ExperimentRunRetainedError as error:
+    raise _stable_error(409, "experiment.run_retained", str(error)) from error
   except ValueError as error:
     raise HTTPException(422, str(error)) from error
   except state_store.DatabaseError as error:

@@ -19,6 +19,7 @@ from backend.experiments.repository import (
   CommandResult,
   _load_idempotency,
   _lock_command,
+  _lock_experiment_for_write,
   _replay_result,
   _save_idempotency,
 )
@@ -60,6 +61,7 @@ class PostgresEvaluationExportRepository:
           return replay
         _assert_worker_available(cur)
         run = _load_succeeded_run(cur, evaluation_run_id, owner_id)
+        _lock_experiment_for_write(cur, str(run["experiment_id"]), owner_id)
         validate_columns(dict(run["output_snapshot"]), columns)
         response = _insert_export(
           cur, run, export_format, columns, locale, request_hash, request_id,
@@ -172,6 +174,7 @@ class PostgresEvaluationExportRepository:
           )
         _assert_worker_available(cur)
         run = _load_succeeded_run(cur, str(original["evaluation_run_id"]), owner_id)
+        _lock_experiment_for_write(cur, str(run["experiment_id"]), owner_id)
         if run["output_hash"] != original["output_hash"]:
           raise ExperimentError(
             "experiment.export_source_changed", "评价输出摘要已变化", 409,

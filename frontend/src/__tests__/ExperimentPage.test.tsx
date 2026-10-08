@@ -1,10 +1,13 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import ExperimentPage from '../features/experiments/ExperimentPage';
+import { fetchStrategyConfigs } from '../api/client';
 import {
+  archiveExperiment,
   cancelExperiment,
   createExperiment,
   createExperimentRevision,
+  fetchAdminArchivedExperiments,
   fetchExperimentDetail,
   fetchExperimentRevisions,
   fetchExperiments,
@@ -15,20 +18,30 @@ import {
   previewRetryFailedTrials,
   retryFailedTrials,
   resumeExperiment,
+  restoreArchivedExperiment,
+  requestExperimentPurge,
 } from '../features/experiments/api';
 import type {
   ExperimentCreateResult,
   ExperimentDetail,
+  ExperimentListItem,
   ExperimentPreview,
   ExperimentSubject,
   ExperimentSubjectRef,
   ExperimentTrial,
 } from '../features/experiments/contracts';
 
+vi.mock('../api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api/client')>();
+  return { ...actual, fetchStrategyConfigs: vi.fn() };
+});
+
 vi.mock('../features/experiments/api', () => ({
+  archiveExperiment: vi.fn(),
   cancelExperiment: vi.fn(),
   createExperiment: vi.fn(),
   createExperimentRevision: vi.fn(),
+  fetchAdminArchivedExperiments: vi.fn(),
   fetchExperimentDetail: vi.fn(),
   fetchExperimentRevisions: vi.fn(),
   fetchExperiments: vi.fn(),
@@ -39,6 +52,8 @@ vi.mock('../features/experiments/api', () => ({
   previewRetryFailedTrials: vi.fn(),
   retryFailedTrials: vi.fn(),
   resumeExperiment: vi.fn(),
+  restoreArchivedExperiment: vi.fn(),
+  requestExperimentPurge: vi.fn(),
 }));
 
 const SUBJECT_REF: ExperimentSubjectRef = {
@@ -176,9 +191,42 @@ const DETAIL: ExperimentDetail = {
     determinism: {},
   },
   blockedReason: null,
+  archivedAt: null,
+  retentionUntil: null,
+  purgeJobId: null,
   createdAt: '2026-09-29T00:00:00Z',
   updatedAt: '2026-09-29T00:00:01Z',
 };
+
+function experimentListItem(experimentId: string, name: string): ExperimentListItem {
+  return {
+    experimentId,
+    name,
+    subject: { ...SUBJECT_REF, name: '均值回归' },
+    currentRevisionId: `revision-${experimentId}`,
+    revisionNo: 1,
+    status: 'completed',
+    reason: null,
+    runPath: 'standard_bar',
+    scopeType: 'single_symbol',
+    symbol: '688981.SH',
+    timeframe: '5m',
+    fillModel: 'bar_next_open',
+    plannedTrialCount: 2,
+    generatedTrialCount: 2,
+    materializedTrialCount: 2,
+    queuedTrialCount: 0,
+    runningTrialCount: 0,
+    succeededTrialCount: 2,
+    failedTrialCount: 0,
+    cancelledTrialCount: 0,
+    createdAt: '2026-08-01T00:00:00Z',
+    updatedAt: '2026-10-01T00:00:00Z',
+    archivedAt: '2026-09-01T00:00:00Z',
+    retentionUntil: '2026-11-01T00:00:00Z',
+    purgeJobId: null,
+  };
+}
 
 const TRIAL: ExperimentTrial = {
   trialId: 'trial-1',
@@ -228,6 +276,7 @@ const TRIAL: ExperimentTrial = {
 
 beforeEach(() => {
   localStorage.clear();
+  vi.mocked(fetchStrategyConfigs).mockReset().mockResolvedValue([]);
   vi.mocked(fetchExperimentSubject).mockReset().mockResolvedValue(SUBJECT);
   vi.mocked(previewExperiment).mockReset().mockResolvedValue(PREVIEW);
   vi.mocked(createExperiment).mockReset().mockResolvedValue(CREATED);
@@ -258,10 +307,16 @@ beforeEach(() => {
     nextCursor: null,
   });
   vi.mocked(fetchExperiments).mockReset().mockResolvedValue({ items: [], nextCursor: null });
+  vi.mocked(fetchAdminArchivedExperiments).mockReset().mockResolvedValue({
+    items: [], nextCursor: null,
+  });
   vi.mocked(fetchExperimentTrials).mockReset().mockResolvedValue({
     items: [TRIAL],
     nextCursor: null,
   });
+  vi.mocked(archiveExperiment).mockReset();
+  vi.mocked(restoreArchivedExperiment).mockReset();
+  vi.mocked(requestExperimentPurge).mockReset();
   vi.mocked(cancelExperiment).mockReset().mockResolvedValue({
     experimentId: 'experiment-1',
     status: 'cancelled',
@@ -308,6 +363,168 @@ beforeEach(() => {
 });
 
 describe('ExperimentPage', () => {
+  it('keeps an admin owner archived experiment reachable for restore', async () => {
+    const onExperimentChange = vi.fn();
+    vi.mocked(fetchExperiments)
+      .mockResolvedValueOnce({ items: [], nextCursor: null })
+      .mockResolvedValueOnce({
+        items: [experimentListItem('owned-archive', '我的归档实验')],
+        nextCursor: null,
+      });
+    render(
+      <ExperimentPage
+        userId="admin-1"
+        isAdmin
+        subject={null}
+        onExperimentChange={onExperimentChange}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '查看已归档实验' }));
+    fireEvent.click(await screen.findByRole('button', { name: /我的归档实验/ }));
+
+    expect(onExperimentChange).toHaveBeenCalledWith('owned-archive');
+  });
+
+  it('uses the admin archive inventory to purge another user experiment', async () => {
+    vi.spyOn(window, 'prompt').mockReturnValue('管理员按保留策略清理');
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(fetchAdminArchivedExperiments).mockResolvedValue({
+      items: [{
+        experimentId: 'other-experiment',
+        name: '其他用户实验',
+        currentRevisionId: 'other-revision',
+        status: 'completed',
+        snapshotVersion: 7,
+        archivedAt: '2026-08-01T00:00:00Z',
+        retentionUntil: '2026-09-01T00:00:00Z',
+        purgeJobId: null,
+        updatedAt: '2026-10-01T00:00:00Z',
+      }],
+      nextCursor: null,
+    });
+    vi.mocked(requestExperimentPurge).mockResolvedValue({
+      purgeId: 'purge-other',
+      experimentId: 'other-experiment',
+      revisionId: 'other-revision',
+      status: 'queued',
+      phase: 'artifacts',
+      scopeDigest: 'a'.repeat(64),
+      scopeCounts: { experiment: 1 },
+      snapshotVersion: 8,
+      reason: '管理员按保留策略清理',
+      operationId: 'purge-other',
+      replayed: false,
+      acceptedAt: '2026-10-08T00:00:00Z',
+    });
+    render(
+      <ExperimentPage
+        userId="admin-1"
+        isAdmin
+        subject={null}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '查看已归档实验' }));
+    fireEvent.click(await screen.findByRole('button', { name: '物理清理 其他用户实验' }));
+
+    await waitFor(() => expect(requestExperimentPurge).toHaveBeenCalledWith(
+      'other-experiment', 'other-revision', 7,
+      '管理员按保留策略清理', expect.any(String),
+    ));
+    expect(fetchAdminArchivedExperiments).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads later pages for owner archives and the admin purge inventory', async () => {
+    vi.mocked(fetchExperiments)
+      .mockResolvedValueOnce({ items: [], nextCursor: null })
+      .mockResolvedValueOnce({
+        items: [experimentListItem('owned-first', '我的归档第一页')],
+        nextCursor: 'owner-next',
+      })
+      .mockResolvedValueOnce({
+        items: [experimentListItem('owned-second', '我的归档第二页')],
+        nextCursor: null,
+      });
+    vi.mocked(fetchAdminArchivedExperiments)
+      .mockResolvedValueOnce({
+        items: [{
+          experimentId: 'admin-first',
+          name: '待清理第一页',
+          currentRevisionId: 'admin-revision-1',
+          status: 'completed',
+          snapshotVersion: 3,
+          archivedAt: '2026-08-01T00:00:00Z',
+          retentionUntil: '2026-09-01T00:00:00Z',
+          purgeJobId: null,
+          updatedAt: '2026-10-02T00:00:00Z',
+        }],
+        nextCursor: 'admin-next',
+      })
+      .mockResolvedValueOnce({
+        items: [{
+          experimentId: 'admin-second',
+          name: '待清理第二页',
+          currentRevisionId: 'admin-revision-2',
+          status: 'completed',
+          snapshotVersion: 4,
+          archivedAt: '2026-08-02T00:00:00Z',
+          retentionUntil: '2026-09-02T00:00:00Z',
+          purgeJobId: null,
+          updatedAt: '2026-10-01T00:00:00Z',
+        }],
+        nextCursor: null,
+      });
+    render(
+      <ExperimentPage
+        userId="admin-1"
+        isAdmin
+        subject={null}
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '查看已归档实验' }));
+    fireEvent.click(await screen.findByRole('button', { name: '加载更多我的实验' }));
+    expect(await screen.findByText('我的归档第二页')).not.toBeNull();
+    expect(fetchExperiments).toHaveBeenLastCalledWith('owner-next', true);
+
+    fireEvent.click(screen.getByRole('button', { name: '加载更多待清理实验' }));
+    expect(await screen.findByText('待清理第二页')).not.toBeNull();
+    expect(fetchAdminArchivedExperiments).toHaveBeenLastCalledWith('admin-next');
+  });
+
+  it('ignores a stale experiment list response after switching archive views', async () => {
+    let rejectCurrent: (reason: Error) => void = () => {};
+    vi.mocked(fetchExperiments)
+      .mockReturnValueOnce(new Promise((_resolve, reject) => {
+        rejectCurrent = reject;
+      }))
+      .mockResolvedValueOnce({ items: [], nextCursor: null });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '查看已归档实验' }));
+    await waitFor(() => expect(fetchExperiments).toHaveBeenLastCalledWith(undefined, true));
+    expect(screen.getByText('暂无可用的已发布标准 Bar 策略。请先在策略回测中完成保存与发布。')).not.toBeNull();
+
+    await act(async () => rejectCurrent(new Error('stale list failed')));
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(fetchExperiments).toHaveBeenCalledTimes(2);
+  });
+
   it('shows a clear gate when automation is not enabled', () => {
     render(
       <ExperimentPage
@@ -607,5 +824,186 @@ describe('ExperimentPage', () => {
       '用户在实验详情页确认继续未完成 Trial',
       expect.any(String),
     );
+  });
+
+  it('archives a terminal experiment only after explicit confirmation', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const onExperimentChange = vi.fn();
+    vi.mocked(fetchExperimentDetail).mockResolvedValue({
+      ...DETAIL,
+      status: 'completed',
+      archivedAt: null,
+      retentionUntil: null,
+      purgeJobId: null,
+      stage: {
+        ...DETAIL.stage,
+        status: 'completed',
+        terminalTrialCount: 2,
+        succeededTrialCount: 2,
+        queuedTrialCount: 0,
+      },
+    });
+    vi.mocked(archiveExperiment).mockResolvedValue({
+      experimentId: 'experiment-1',
+      revisionId: 'revision-1',
+      status: 'completed',
+      snapshotVersion: 3,
+      archivedAt: '2026-10-08T00:00:00Z',
+      retentionUntil: '2026-11-07T00:00:00Z',
+      reason: '归档',
+      operationId: 'archive-operation-1',
+      replayed: false,
+      acceptedAt: '2026-10-08T00:00:00Z',
+    });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={onExperimentChange}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    const button = await screen.findByRole('button', { name: '归档实验' });
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(archiveExperiment).toHaveBeenCalledTimes(1));
+    expect(archiveExperiment).toHaveBeenCalledWith(
+      'experiment-1', 'revision-1', 2,
+      '用户在实验详情页确认归档终态实验', expect.any(String),
+    );
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('不会删除'));
+    expect(onExperimentChange).toHaveBeenCalledWith(null);
+  });
+
+  it('reuses the archive idempotency key after an uncertain network failure', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(fetchExperimentDetail).mockResolvedValue({
+      ...DETAIL,
+      status: 'completed',
+    });
+    vi.mocked(archiveExperiment)
+      .mockRejectedValueOnce(new TypeError('network failed'))
+      .mockResolvedValue({
+        experimentId: 'experiment-1',
+        revisionId: 'revision-1',
+        status: 'completed',
+        snapshotVersion: 3,
+        archivedAt: '2026-10-08T00:00:00Z',
+        retentionUntil: '2026-11-07T00:00:00Z',
+        reason: '归档',
+        operationId: 'archive-operation-1',
+        replayed: true,
+        acceptedAt: '2026-10-08T00:00:00Z',
+      });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '归档实验' }));
+
+    await waitFor(() => expect(archiveExperiment).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(archiveExperiment).mock.calls[0][4]).toBe(
+      vi.mocked(archiveExperiment).mock.calls[1][4],
+    );
+  });
+
+  it('restores an archived experiment without changing its revision identity', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const archived = {
+      ...DETAIL,
+      status: 'completed' as const,
+      archivedAt: '2026-10-08T00:00:00Z',
+      retentionUntil: '2026-11-07T00:00:00Z',
+      purgeJobId: null,
+    };
+    vi.mocked(fetchExperimentDetail).mockResolvedValueOnce(archived).mockResolvedValue(DETAIL);
+    vi.mocked(restoreArchivedExperiment).mockResolvedValue({
+      experimentId: 'experiment-1',
+      revisionId: 'revision-1',
+      status: 'completed',
+      snapshotVersion: 3,
+      archivedAt: null,
+      retentionUntil: null,
+      reason: '恢复归档',
+      operationId: 'restore-operation-1',
+      replayed: false,
+      acceptedAt: '2026-10-09T00:00:00Z',
+    });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '恢复归档实验' }));
+
+    await waitFor(() => expect(restoreArchivedExperiment).toHaveBeenCalledWith(
+      'experiment-1', 'revision-1', 2,
+      '用户在实验详情页确认恢复归档实验', expect.any(String),
+    ));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Revision 身份保持不变'));
+  });
+
+  it('requires an admin reason and confirmation before requesting purge', async () => {
+    vi.spyOn(window, 'prompt').mockReturnValue('用户申请数据清理');
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(fetchExperimentDetail).mockResolvedValueOnce({
+      ...DETAIL,
+      status: 'completed',
+      archivedAt: '2026-09-01T00:00:00Z',
+      retentionUntil: '2026-09-30T00:00:00Z',
+      purgeJobId: null,
+    }).mockResolvedValue(DETAIL);
+    vi.mocked(requestExperimentPurge).mockResolvedValue({
+      purgeId: 'purge-1',
+      experimentId: 'experiment-1',
+      revisionId: 'revision-1',
+      status: 'queued',
+      phase: 'artifacts',
+      scopeDigest: 'a'.repeat(64),
+      scopeCounts: { experiment: 1 },
+      snapshotVersion: 3,
+      reason: '用户申请数据清理',
+      operationId: 'purge-1',
+      replayed: false,
+      acceptedAt: '2026-10-08T00:00:00Z',
+    });
+    render(
+      <ExperimentPage
+        userId="admin-1"
+        isAdmin
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    const button = await screen.findByRole('button', { name: '物理清理实验' });
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(requestExperimentPurge).toHaveBeenCalledTimes(1));
+    expect(requestExperimentPurge).toHaveBeenCalledWith(
+      'experiment-1', 'revision-1', 2, '用户申请数据清理', expect.any(String),
+    );
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('不可逆'));
   });
 });

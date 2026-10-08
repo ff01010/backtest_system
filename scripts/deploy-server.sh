@@ -114,7 +114,7 @@ check_active_backtests() {
 stop_submission_and_wait_for_backtests() {
   local attempt
   echo "停止 backend，阻断新的页面和开放 API 回测提交"
-  "${compose[@]}" stop frontend backend experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner
+  "${compose[@]}" stop frontend backend experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner
   for attempt in $(seq 1 360); do
     if check_active_backtests; then
       echo "回测队列已排空，可以开始迁移和同批发布"
@@ -173,6 +173,7 @@ wait_for_application() {
       && runner_containers_ready "experiment-coordinator" "1" \
       && runner_containers_ready "evaluation-worker" "1" \
       && runner_containers_ready "evaluation-export-worker" "1" \
+      && runner_containers_ready "experiment-purge-worker" "1" \
       && runner_containers_ready "signal-export-runner" "1" \
       && [[ "$response" == *'"status":"ok"'* ]] \
       && [[ "$response" == *'"signalExportRunner":{"healthy":true}'* ]] \
@@ -358,7 +359,7 @@ fi
 "${compose[@]}" up -d --build --remove-orphans \
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \
-  backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner
+  backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner
 "${compose[@]}" --profile release-admin build release-admin
 verify_release_admin_image
 # Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。

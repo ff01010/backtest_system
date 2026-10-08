@@ -18,6 +18,8 @@ from backend.experiments.canonicalization import (
 from backend.experiments.compiler import LegacySingleBarTrialCompiler, TrialCompiler
 from backend.experiments.contracts import (
   ExperimentCreateRequest,
+  ExperimentLifecycleRequest,
+  ExperimentPurgeRequest,
   ExperimentPreviewRequest,
   ExperimentRetryFailedRequest,
   ExperimentRetryPreviewRequest,
@@ -160,8 +162,21 @@ class ExperimentApplication:
     *,
     limit: int,
     cursor: str | None,
+    archived: bool = False,
   ) -> dict[str, Any]:
-    return self._experiment_repository().list_experiments(limit=limit, cursor=cursor)
+    return self._experiment_repository().list_experiments(
+      limit=limit, cursor=cursor, archived=archived,
+    )
+
+  def list_admin_archived_experiments(
+    self,
+    *,
+    limit: int,
+    cursor: str | None,
+  ) -> dict[str, Any]:
+    return self._experiment_repository().list_admin_archived_experiments(
+      limit=limit, cursor=cursor,
+    )
 
   def list_revisions(
     self,
@@ -269,6 +284,75 @@ class ExperimentApplication:
       idempotency_key,
       request_hash,
       request_id,
+    )
+    return result.response, result.status_code
+
+  def archive(
+    self,
+    experiment_id: str,
+    request: ExperimentLifecycleRequest,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    request_hash = digest(with_version({
+      "operationType": "experiment.archive.v1",
+      "experimentId": experiment_id,
+      "request": request.model_dump(mode="json"),
+    }))
+    result = self._experiment_repository().archive_experiment(
+      experiment_id=experiment_id,
+      expected_revision_id=str(request.expectedRevisionId),
+      expected_snapshot_version=request.expectedSnapshotVersion,
+      reason=request.reason,
+      idempotency_key=idempotency_key,
+      request_hash=request_hash,
+      request_id=request_id,
+    )
+    return result.response, result.status_code
+
+  def restore_archive(
+    self,
+    experiment_id: str,
+    request: ExperimentLifecycleRequest,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    request_hash = digest(with_version({
+      "operationType": "experiment.archive.restore.v1",
+      "experimentId": experiment_id,
+      "request": request.model_dump(mode="json"),
+    }))
+    result = self._experiment_repository().restore_archived_experiment(
+      experiment_id=experiment_id,
+      expected_revision_id=str(request.expectedRevisionId),
+      expected_snapshot_version=request.expectedSnapshotVersion,
+      reason=request.reason,
+      idempotency_key=idempotency_key,
+      request_hash=request_hash,
+      request_id=request_id,
+    )
+    return result.response, result.status_code
+
+  def purge(
+    self,
+    experiment_id: str,
+    request: ExperimentPurgeRequest,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    request_hash = digest(with_version({
+      "operationType": "experiment.purge.create.v1",
+      "experimentId": experiment_id,
+      "request": request.model_dump(mode="json"),
+    }))
+    result = self._experiment_repository().request_purge(
+      experiment_id=experiment_id,
+      expected_revision_id=str(request.expectedRevisionId),
+      expected_snapshot_version=request.expectedSnapshotVersion,
+      reason=request.reason,
+      idempotency_key=idempotency_key,
+      request_hash=request_hash,
+      request_id=request_id,
     )
     return result.response, result.status_code
 

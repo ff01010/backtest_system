@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
+from pathlib import Path
 from typing import Any, Callable, Iterator
 
 import psycopg
@@ -16,6 +17,8 @@ from backend.experiments.contracts import (
   EvaluationExportCreateRequest,
   EvaluationSpecRequest,
   ExperimentCreateRequest,
+  ExperimentLifecycleRequest,
+  ExperimentPurgeRequest,
   ExperimentRetryFailedRequest,
   ExperimentRetryPreviewRequest,
   ExperimentRevisionCreateRequest,
@@ -27,7 +30,9 @@ from backend.experiments.evaluation_worker import EvaluationWorker
 from backend.experiments.export_application import EvaluationExportApplication
 from backend.experiments.export_repository import PostgresEvaluationExportRepository
 from backend.experiments.repository import PostgresExperimentRepository
-from backend.services import state_store
+from backend.experiments.purge_repository import PostgresExperimentPurgeRepository
+from backend.experiments.purge_worker import ExperimentPurgeWorker
+from backend.services import auth, state_store
 from backend.services.user_context import (
   CurrentUser,
   reset_current_user,
@@ -63,6 +68,12 @@ OTHER = CurrentUser(
   display_name="Experiment Other",
   role="user",
 )
+OWNER_ADMIN = CurrentUser(
+  id=OWNER.id,
+  username=OWNER.username,
+  display_name=OWNER.display_name,
+  role="admin",
+)
 
 
 def _as_user(user: CurrentUser, action: Callable[[], Any]) -> Any:
@@ -91,6 +102,9 @@ def users() -> None:
         UPDATE backtest_run SET origin_trial_execution_id=NULL
         WHERE origin_type='experiment'
       """)
+      cur.execute("UPDATE backtest_experiment SET purge_job_id=NULL")
+      cur.execute("DELETE FROM backtest_experiment_purge_item")
+      cur.execute("DELETE FROM backtest_experiment_purge")
       cur.execute("DELETE FROM backtest_experiment_audit")
       cur.execute("DELETE FROM backtest_experiment_evaluation_export")
       cur.execute("DELETE FROM backtest_experiment_evaluation_run")
@@ -218,6 +232,9 @@ def _clear_experiment_facts() -> None:
         UPDATE backtest_run SET origin_trial_execution_id=NULL
         WHERE origin_type='experiment'
       """)
+      cur.execute("UPDATE backtest_experiment SET purge_job_id=NULL")
+      cur.execute("DELETE FROM backtest_experiment_purge_item")
+      cur.execute("DELETE FROM backtest_experiment_purge")
       cur.execute("DELETE FROM backtest_experiment_audit")
       cur.execute("DELETE FROM backtest_experiment_evaluation_export")
       cur.execute("DELETE FROM backtest_experiment_evaluation_run")
@@ -431,6 +448,21 @@ def _generate_all(worker_id: str) -> None:
   )
   while coordinator.run_once():
     pass
+
+
+def _complete_execution_experiment(
+  application: ExperimentApplication,
+  key: str,
+) -> tuple[str, str]:
+  experiment_id = _create_execution_experiment(application, key)
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id=f"{key}-worker",
+  )
+  assert coordinator.run_once()
+  run_id = _run_id_for_experiment(experiment_id)
+  _finish_run_for_reconciliation(run_id)
+  assert coordinator.run_once()
+  return experiment_id, run_id
 
 
 def _two_trial_execution_request() -> Any:
@@ -790,6 +822,446 @@ def test_complete_standard_bar_execution_reconciles_once_and_keeps_window_bounde
   assert page["items"][0]["runId"] == run_id
   assert page["items"][0]["selectedExecution"]["resultHash"]
   assert page["items"][0]["selectedExecution"]["actualDataHash"] == "d" * 64
+
+
+def test_archive_hides_and_restore_preserves_the_complete_graph(
+  execution_application: ExperimentApplication,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  experiment_id, run_id = _complete_execution_experiment(
+    execution_application, "postgres-archive-restore",
+  )
+  before = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  request = ExperimentLifecycleRequest(
+    expectedRevisionId=before["revision"]["revisionId"],
+    expectedSnapshotVersion=before["snapshotVersion"],
+    reason="归档集成测试",
+  )
+
+  archived, status = _as_user(
+    OWNER,
+    lambda: execution_application.archive(
+      experiment_id, request, "postgres-archive-key", "archive-request",
+    ),
+  )
+  replayed, replay_status = _as_user(
+    OWNER,
+    lambda: execution_application.archive(
+      experiment_id, request, "postgres-archive-key", "archive-request",
+    ),
+  )
+
+  assert status == 200
+  assert replay_status == 200
+  assert replayed["replayed"] is True
+  assert archived["reason"] == "归档集成测试"
+  assert archived["operationId"]
+  assert archived["acceptedAt"] == archived["archivedAt"]
+  assert experiment_id not in {
+    item["experimentId"] for item in _as_user(
+      OWNER,
+      lambda: execution_application.list_experiments(
+        limit=50, cursor=None, archived=False,
+      ),
+    )["items"]
+  }
+  archived_page = _as_user(
+    OWNER,
+    lambda: execution_application.list_experiments(
+      limit=50, cursor=None, archived=True,
+    ),
+  )
+  assert [item["experimentId"] for item in archived_page["items"]] == [experiment_id]
+  with pytest.raises(ExperimentError) as ordinary_inventory:
+    _as_user(
+      OWNER,
+      lambda: execution_application.list_admin_archived_experiments(
+        limit=50, cursor=None,
+      ),
+    )
+  assert ordinary_inventory.value.code == "experiment.forbidden"
+  cross_owner_admin = CurrentUser(
+    id=OTHER.id,
+    username=OTHER.username,
+    display_name=OTHER.display_name,
+    role="admin",
+  )
+  admin_page = _as_user(
+    cross_owner_admin,
+    lambda: execution_application.list_admin_archived_experiments(
+      limit=50, cursor=None,
+    ),
+  )
+  admin_item = next(
+    item for item in admin_page["items"] if item["experimentId"] == experiment_id
+  )
+  assert admin_item["currentRevisionId"] == archived["revisionId"]
+  assert admin_item["snapshotVersion"] == archived["snapshotVersion"]
+
+  monkeypatch.setattr(settings, "SIGNAL_EXPORT_RUNNER_AVAILABILITY_REQUIRED", False)
+  with pytest.raises(state_store.ExperimentRunRetainedError):
+    _as_user(
+      OWNER,
+      lambda: state_store.create_shared_backtest_publication(
+        run_id, "归档后共享", "不应创建", [],
+      ),
+    )
+  with pytest.raises(state_store.ExperimentRunRetainedError):
+    _as_user(
+      OWNER,
+      lambda: state_store.create_signal_detail_export(
+        {"mode": "ids", "runIds": [run_id]},
+        "10000000-0000-4000-8000-000000000099",
+      ),
+    )
+  with pytest.raises(ExperimentError) as hidden:
+    _as_user(OTHER, lambda: execution_application.detail(experiment_id))
+  assert hidden.value.code == "experiment.not_found"
+
+  restore_request = ExperimentLifecycleRequest(
+    expectedRevisionId=archived["revisionId"],
+    expectedSnapshotVersion=archived["snapshotVersion"],
+    reason="撤销归档集成测试",
+  )
+  restored, restore_status = _as_user(
+    OWNER,
+    lambda: execution_application.restore_archive(
+      experiment_id, restore_request, "postgres-restore-key", "restore-request",
+    ),
+  )
+  after = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert restore_status == 200
+  assert restored["revisionId"] == before["revision"]["revisionId"]
+  assert after["revision"] == before["revision"]
+  assert after["stage"] == before["stage"]
+  assert _run_id_for_experiment(experiment_id) == run_id
+  assert restored["reason"] == "撤销归档集成测试"
+  assert restored["operationId"]
+  assert restored["acceptedAt"]
+
+
+def test_all_ordinary_deletion_paths_reject_experiment_retained_runs(
+  execution_application: ExperimentApplication,
+) -> None:
+  _experiment_id, run_id = _complete_execution_experiment(
+    execution_application, "postgres-retained-delete",
+  )
+  selection = {"mode": "ids", "runIds": [run_id]}
+  summary = _as_user(
+    OWNER, lambda: state_store.summarize_backtest_run_selection(selection),
+  )
+
+  with pytest.raises(state_store.ExperimentRunRetainedError):
+    _as_user(OWNER, lambda: state_store.delete_backtest_run(run_id))
+  with pytest.raises(state_store.ExperimentRunRetainedError):
+    _as_user(OWNER, lambda: state_store.delete_backtest_runs([run_id]))
+  with pytest.raises(state_store.ExperimentRunRetainedError):
+    _as_user(
+      OWNER,
+      lambda: state_store.delete_backtest_run_selection(
+        selection,
+        summary["selectedRunCount"],
+        summary["selectionDigest"],
+      ),
+    )
+  assert _run_id_for_experiment(_experiment_id) == run_id
+
+
+def test_purge_preserves_shared_run_and_resumes_after_frozen_scope_failure(
+  execution_application: ExperimentApplication,
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENT_PURGE_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_PURGE_BATCH_SIZE", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_PURGE_RETRY_DELAY_SECONDS", 1)
+  monkeypatch.setattr(settings, "EXPERIMENT_PURGE_MAX_ATTEMPTS", 5)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 2)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_IN_FLIGHT_PER_USER", 2)
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-purge-graph", _two_trial_execution_request(),
+  )
+  _generate_all("purge-generation-worker")
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="purge-execution-worker",
+  )
+  assert coordinator.run_once()
+  assert coordinator.run_once()
+  run_ids = _run_ids_for_experiment(experiment_id)
+  for run_id in run_ids:
+    _finish_run_for_reconciliation(run_id)
+  assert coordinator.run_once()
+  assert coordinator.run_once()
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert detail["status"] == "completed"
+  _insert_asset_hold(detail["revision"]["revisionId"])
+  _publish_run(run_ids[0])
+  shared_artifact = _insert_run_artifact(run_ids[0], tmp_path, "shared-signal.ndjson")
+  exclusive_artifact = _insert_run_artifact(
+    run_ids[1], tmp_path, "exclusive-signal.ndjson",
+  )
+  next_preview = _as_user(
+    OWNER, lambda: execution_application.preview(_execution_request()),
+  )
+
+  archive_request = ExperimentLifecycleRequest(
+    expectedRevisionId=detail["revision"]["revisionId"],
+    expectedSnapshotVersion=detail["snapshotVersion"],
+    reason="物理清理前归档",
+  )
+  archived, _status = _as_user(
+    OWNER,
+    lambda: execution_application.archive(
+      experiment_id, archive_request, "purge-archive-key", "purge-archive-request",
+    ),
+  )
+  _expire_archive_retention(experiment_id)
+  request = ExperimentPurgeRequest(
+    expectedRevisionId=archived["revisionId"],
+    expectedSnapshotVersion=archived["snapshotVersion"],
+    reason="管理员确认测试数据达到保留期限",
+  )
+  admin = OWNER_ADMIN
+  purge, status = _as_user(
+    admin,
+    lambda: execution_application.purge(
+      experiment_id, request, "postgres-purge-key", "purge-request-id",
+    ),
+  )
+  replayed, replay_status = _as_user(
+    admin,
+    lambda: execution_application.purge(
+      experiment_id, request, "postgres-purge-key", "purge-request-id",
+    ),
+  )
+  assert status == 202
+  assert replay_status == 200
+  assert replayed["purgeId"] == purge["purgeId"]
+  assert replayed["replayed"] is True
+  assert purge["reason"] == "管理员确认测试数据达到保留期限"
+  assert purge["operationId"] == purge["purgeId"]
+  assert purge["acceptedAt"]
+  assert purge["scopeCounts"]["run_artifact"] == 2
+  assert _as_user(OTHER, _purge_rls_counts) == (0, 0)
+  with pytest.raises(ExperimentError) as forbidden:
+    _as_user(
+      OTHER, lambda: PostgresExperimentPurgeRepository().get(purge["purgeId"]),
+    )
+  assert forbidden.value.code == "experiment.purge_forbidden"
+
+  blocked_revision = ExperimentRevisionCreateRequest(
+    previewToken=next_preview["previewToken"],
+    specHash=next_preview["specHash"],
+    experimentSpec=_execution_request(),
+    expectedRevisionId=archived["revisionId"],
+    expectedSnapshotVersion=purge["snapshotVersion"],
+  )
+  with pytest.raises(ExperimentError) as revision_conflict:
+    _as_user(
+      OWNER,
+      lambda: execution_application.create_revision(
+        experiment_id, blocked_revision, "purge-blocked-revision",
+      ),
+    )
+  assert revision_conflict.value.code == "experiment.purge_in_progress"
+  with pytest.raises(ExperimentError) as evaluation_conflict:
+    _as_user(
+      OWNER,
+      lambda: EvaluationApplication().save_spec(
+        experiment_id, _evaluation_request(detail), "purge-blocked-evaluation",
+      ),
+    )
+  assert evaluation_conflict.value.code == "experiment.purge_in_progress"
+
+  injected_audit_id = _insert_unfrozen_purge_dependency(
+    experiment_id, archived["revisionId"],
+  )
+  worker = ExperimentPurgeWorker(
+    repository=PostgresExperimentPurgeRepository(),
+    artifact_root=tmp_path,
+    worker_id="purge-worker-first",
+  )
+  assert worker.run_once()
+  failed = _as_user(
+    admin, lambda: PostgresExperimentPurgeRepository().get(purge["purgeId"]),
+  )
+  assert failed["status"] == "failed"
+  assert failed["failurePhase"] == "experiment"
+  assert _experiment_asset_hold_count(experiment_id) > 0
+  assert shared_artifact.exists()
+  assert not exclusive_artifact.exists()
+
+  _remove_unfrozen_purge_dependency(injected_audit_id, purge["purgeId"])
+  resumed_worker = ExperimentPurgeWorker(
+    repository=PostgresExperimentPurgeRepository(),
+    artifact_root=tmp_path,
+    worker_id="purge-worker-resumed",
+  )
+  assert resumed_worker.run_once()
+  completed = _as_user(
+    admin, lambda: PostgresExperimentPurgeRepository().get(purge["purgeId"]),
+  )
+  assert completed["status"] == "succeeded"
+  assert completed["attemptCount"] == 2
+  assert completed["requestId"] == "purge-request-id"
+  assert completed["reason"] == "管理员确认测试数据达到保留期限"
+  assert completed["oldValue"]["experimentStatus"] == "completed"
+  assert completed["newValue"]["purgeStatus"] == "succeeded"
+  _assert_purged_graph(experiment_id, run_ids)
+  assert _experiment_asset_hold_count(experiment_id) == 0
+  assert shared_artifact.exists()
+  assert _artifact_exists_for_run(run_ids[0])
+  assert not _artifact_exists_for_run(run_ids[1])
+
+
+def test_purge_preserves_run_referenced_by_signal_detail_export(
+  execution_application: ExperimentApplication,
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENT_PURGE_ENABLED", True)
+  monkeypatch.setattr(settings, "SIGNAL_EXPORT_RUNNER_AVAILABILITY_REQUIRED", False)
+  experiment_id, run_id = _complete_execution_experiment(
+    execution_application, "postgres-purge-signal-export-reference",
+  )
+  artifact_path = _insert_run_artifact(
+    run_id, tmp_path, "signal-export-retained.ndjson",
+  )
+  exported = _as_user(
+    OWNER,
+    lambda: state_store.create_signal_detail_export(
+      {"mode": "ids", "runIds": [run_id]},
+      "10000000-0000-4000-8000-000000000098",
+    ),
+  )
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  archived, _status = _as_user(
+    OWNER,
+    lambda: execution_application.archive(
+      experiment_id,
+      ExperimentLifecycleRequest(
+        expectedRevisionId=detail["revision"]["revisionId"],
+        expectedSnapshotVersion=detail["snapshotVersion"],
+        reason="验证信号导出引用保留",
+      ),
+      "purge-signal-reference-archive",
+    ),
+  )
+  _expire_archive_retention(experiment_id)
+  purge, _purge_status = _as_user(
+    OWNER_ADMIN,
+    lambda: execution_application.purge(
+      experiment_id,
+      ExperimentPurgeRequest(
+        expectedRevisionId=archived["revisionId"],
+        expectedSnapshotVersion=archived["snapshotVersion"],
+        reason="管理员清理信号导出引用实验",
+      ),
+      "purge-signal-reference-request",
+    ),
+  )
+
+  worker = ExperimentPurgeWorker(
+    repository=PostgresExperimentPurgeRepository(),
+    artifact_root=tmp_path,
+    worker_id="purge-signal-reference-worker",
+  )
+  assert worker.run_once()
+  completed = _as_user(
+    OWNER_ADMIN,
+    lambda: PostgresExperimentPurgeRepository().get(purge["purgeId"]),
+  )
+  assert completed["status"] == "succeeded"
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "SELECT origin_experiment_id FROM backtest_run WHERE id=%s",
+        (run_id,),
+      )
+      assert cur.fetchone()[0] is None
+      cur.execute("""
+        SELECT count(*) FROM backtest_signal_detail_export_item
+        WHERE export_id=%s AND source_run_id=%s
+      """, (exported["id"], run_id))
+      assert int(cur.fetchone()[0]) == 1
+  assert artifact_path.exists()
+  assert _artifact_exists_for_run(run_id)
+
+
+def test_account_delete_disables_user_with_pending_experiment_without_run(
+  application: ExperimentApplication,
+) -> None:
+  _clear_experiment_facts()
+  pending_user = CurrentUser(
+    id="10000000-0000-4000-8000-000000000003",
+    username="pending-experiment-user",
+    display_name="Pending Experiment User",
+    role="user",
+  )
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        INSERT INTO app_user (
+          id, username, display_name, password_hash, role, status
+        ) VALUES (%s,%s,%s,'test-only','user','active')
+        ON CONFLICT (id) DO UPDATE SET status='active'
+      """, (pending_user.id, pending_user.username, pending_user.display_name))
+  try:
+    experiment_id = _create_execution_experiment(
+      application, "pending-account-delete", user=pending_user,
+    )
+    assert _experiment_run_count(experiment_id) == 0
+
+    result = auth.delete_user(pending_user.id, OWNER.id)
+
+    assert result["action"] == "disabled"
+    with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT status FROM app_user WHERE id=%s", (pending_user.id,))
+        assert cur.fetchone()[0] == "disabled"
+  finally:
+    _clear_experiment_facts()
+    with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+      with conn.cursor() as cur:
+        cur.execute("DELETE FROM app_user WHERE id=%s", (pending_user.id,))
+
+
+def test_account_delete_preserves_purge_requester_audit() -> None:
+  requester = CurrentUser(
+    id="10000000-0000-4000-8000-000000000004",
+    username="purge-requester-admin",
+    display_name="Purge Requester Admin",
+    role="admin",
+  )
+  purge_id = "20000000-0000-4000-8000-000000000004"
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        INSERT INTO app_user (
+          id, username, display_name, password_hash, role, status
+        ) VALUES (%s,%s,%s,'test-only','admin','active')
+      """, (requester.id, requester.username, requester.display_name))
+      cur.execute("""
+        INSERT INTO backtest_experiment_purge (
+          id, experiment_id, revision_id, owner_user_id, requested_by_user_id,
+          reason, scope_digest, scope_counts
+        ) VALUES (%s,gen_random_uuid(),gen_random_uuid(),%s,%s,%s,%s,'{}'::jsonb)
+      """, (
+        purge_id, OWNER.id, requester.id, "保留清理申请人审计", "a" * 64,
+      ))
+  try:
+    result = auth.delete_user(requester.id, OWNER.id)
+
+    assert result["action"] == "disabled"
+    with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT status FROM app_user WHERE id=%s", (requester.id,))
+        assert cur.fetchone()[0] == "disabled"
+  finally:
+    with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+      with conn.cursor() as cur:
+        cur.execute("DELETE FROM backtest_experiment_purge WHERE id=%s", (purge_id,))
+        cur.execute("DELETE FROM app_user WHERE id=%s", (requester.id,))
 
 
 def test_running_experiment_cancel_stops_new_runs_and_releases_permit_after_reconcile(
@@ -1644,6 +2116,156 @@ def _run_id_for_experiment(experiment_id: str) -> str:
         WHERE origin_experiment_id=%s
       """, (experiment_id,))
       return str(cur.fetchone()[0])
+
+
+def _run_ids_for_experiment(experiment_id: str) -> list[str]:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT id FROM backtest_run
+        WHERE origin_experiment_id=%s ORDER BY created_at, id
+      """, (experiment_id,))
+      return [str(row[0]) for row in cur.fetchall()]
+
+
+def _publish_run(run_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT set_config('app.current_user_id', %s, true)", (OWNER.id,))
+      cur.execute("SELECT set_config('app.current_is_admin', 'true', true)")
+      cur.execute("""
+        INSERT INTO backtest_publication (
+          owner_user_id, author_name_snapshot, source_run_id, title, description,
+          snapshot_schema_version, snapshot_json, snapshot_digest, symbol,
+          timeframe, strategy_category, start_date, end_date
+        ) VALUES (%s,'实验用户',%s,'共享实验运行','清理测试共享引用',1,%s,%s,
+          '688981','5m','grid','2026-07-01','2026-07-02')
+      """, (
+        OWNER.id, run_id, psycopg.types.json.Jsonb({"runId": run_id}), "a" * 64,
+      ))
+
+
+def _insert_run_artifact(run_id: str, root: Path, filename: str) -> Path:
+  storage_key = f"experiment-purge-tests/{run_id}/{filename}"
+  artifact_path = root / storage_key
+  artifact_path.parent.mkdir(parents=True, exist_ok=True)
+  artifact_path.write_text('{"signal":1}\n', encoding="utf-8")
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        INSERT INTO artifact_file (
+          id, owner_user_id, run_id, artifact_type, storage_key,
+          original_filename, content_type, byte_size, content_sha256
+        ) VALUES (
+          gen_random_uuid(), %s, %s, 'research_signal', %s, %s,
+          'application/x-ndjson', %s, %s
+        ) RETURNING id
+      """, (
+        OWNER.id, run_id, storage_key, filename, artifact_path.stat().st_size, "f" * 64,
+      ))
+      artifact_id = cur.fetchone()[0]
+      cur.execute("""
+        INSERT INTO research_signal_snapshot (
+          run_id, dataset_id, dataset_version, snapshot_hash,
+          artifact_file_id, manifest, source_partitions
+        ) VALUES (%s,gen_random_uuid(),1,%s,%s,'{}'::jsonb,'[]'::jsonb)
+      """, (run_id, "e" * 64, artifact_id))
+  return artifact_path
+
+
+def _artifact_exists_for_run(run_id: str) -> bool:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT EXISTS(SELECT 1 FROM artifact_file WHERE run_id=%s)", (run_id,))
+      return bool(cur.fetchone()[0])
+
+
+def _experiment_asset_hold_count(experiment_id: str) -> int:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT count(*) FROM backtest_experiment_asset_hold hold
+        JOIN backtest_experiment_revision revision ON revision.id=hold.revision_id
+        WHERE revision.experiment_id=%s
+      """, (experiment_id,))
+      return int(cur.fetchone()[0])
+
+
+def _insert_asset_hold(revision_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        INSERT INTO backtest_experiment_asset_hold (
+          revision_id, owner_user_id, asset_type, asset_id,
+          exact_version, content_digest
+        ) VALUES (%s,%s,'test_asset','asset-1','version-1',%s)
+      """, (revision_id, OWNER.id, "d" * 64))
+
+
+def _expire_archive_retention(experiment_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_experiment
+        SET archive_retention_until=now() - interval '1 second'
+        WHERE id=%s
+      """, (experiment_id,))
+
+
+def _insert_unfrozen_purge_dependency(experiment_id: str, revision_id: str) -> str:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        INSERT INTO backtest_experiment_audit (
+          owner_user_id, experiment_id, revision_id, event_type, detail
+        ) VALUES (%s,%s,%s,'test.unfrozen_dependency','{}'::jsonb)
+        RETURNING id
+      """, (OWNER.id, experiment_id, revision_id))
+      return str(cur.fetchone()[0])
+
+
+def _remove_unfrozen_purge_dependency(audit_id: str, purge_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("DELETE FROM backtest_experiment_audit WHERE id=%s", (audit_id,))
+      cur.execute("""
+        UPDATE backtest_experiment_purge
+        SET next_attempt_at=now() - interval '1 second' WHERE id=%s
+      """, (purge_id,))
+
+
+def _assert_purged_graph(experiment_id: str, run_ids: list[str]) -> None:
+  with psycopg.connect(
+    os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], row_factory=dict_row,
+  ) as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT count(*) AS value FROM backtest_experiment WHERE id=%s", (
+        experiment_id,
+      ))
+      assert int(cur.fetchone()["value"]) == 0
+      cur.execute("""
+        SELECT id, origin_experiment_id, origin_trial_execution_id
+        FROM backtest_run WHERE id=ANY(%s) ORDER BY id
+      """, (run_ids,))
+      remaining = cur.fetchall()
+      assert [str(row["id"]) for row in remaining] == [run_ids[0]]
+      assert remaining[0]["origin_experiment_id"] is None
+      assert remaining[0]["origin_trial_execution_id"] is None
+      cur.execute(
+        "SELECT count(*) AS value FROM backtest_publication WHERE source_run_id=%s",
+        (run_ids[0],),
+      )
+      assert int(cur.fetchone()["value"]) == 1
+
+
+def _purge_rls_counts() -> tuple[int, int]:
+  with state_store.database_session() as conn:
+    with conn.cursor() as cur:
+      cur.execute("SELECT count(*) AS value FROM backtest_experiment_purge")
+      jobs = int(cur.fetchone()["value"])
+      cur.execute("SELECT count(*) AS value FROM backtest_experiment_purge_item")
+      items = int(cur.fetchone()["value"])
+  return jobs, items
 
 
 def _latest_run_id_for_experiment(experiment_id: str) -> str:

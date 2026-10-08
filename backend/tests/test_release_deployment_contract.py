@@ -75,7 +75,7 @@ def test_signal_export_runner_is_deployed_and_health_checked_with_backend() -> N
   assert "quant-backtest-artifacts:/runtime/artifacts" in compose
   assert "backend.signal_export_runner', '--healthcheck" in compose
   assert (
-    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner"
+    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner"
     in script
   )
   assert "strategy-worker" not in script
@@ -95,7 +95,7 @@ def test_experiment_coordinator_is_deployed_and_health_checked_with_backend() ->
   assert "python', '-m', 'backend.experiment_coordinator" in compose
   assert 'runner_containers_ready "experiment-coordinator" "1"' in script
   assert (
-    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner"
+    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner"
     in script
   )
 
@@ -187,7 +187,7 @@ def test_observability_services_are_pinned_isolated_and_started_before_applicati
     "up -d --build container-event-observer",
   )
   assert script.index(
-    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner",
+    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner",
   ) < (
     script.index("if ! wait_for_observability; then")
   )
@@ -204,7 +204,7 @@ def test_observability_failure_cannot_stop_core_release_after_cutover() -> None:
   migration = script.index("run --rm migrate")
   observer = script.index("up -d --build container-event-observer")
   core_start = script.index(
-    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner",
+    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner",
   )
 
   assert core_stop < migration < observer < core_start

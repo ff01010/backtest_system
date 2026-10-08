@@ -356,3 +356,58 @@ def test_delete_user_preserves_backtest_history(monkeypatch: pytest.MonkeyPatch,
   statements = "\n".join(connection.cursor_instance.calls)
   assert ("DELETE FROM app_user" in statements) is (not has_history)
   assert ("status='disabled'" in statements) is has_history
+
+
+def test_delete_user_preserves_pending_experiment_without_run(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class Cursor:
+    def __init__(self) -> None:
+      self.last_sql = ""
+      self.calls: list[str] = []
+
+    def __enter__(self) -> "Cursor":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def execute(self, sql: str, _params: object = None) -> None:
+      self.last_sql = sql
+      self.calls.append(sql)
+
+    def fetchone(self) -> dict[str, object]:
+      if "SELECT id, role, status" in self.last_sql:
+        return {"id": "user-1", "role": "user", "status": "active"}
+      if "backtest_experiment" in self.last_sql:
+        return {"value": True}
+      return {"value": False}
+
+  class Connection:
+    def __init__(self) -> None:
+      self.cursor_instance = Cursor()
+
+    def __enter__(self) -> "Connection":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def cursor(self) -> Cursor:
+      return self.cursor_instance
+
+  connection = Connection()
+
+  @contextmanager
+  def system_db():
+    yield connection
+
+  monkeypatch.setattr(auth, "_system_db", system_db)
+
+  result = auth.delete_user("user-1", "admin-1")
+
+  assert result["action"] == "disabled"
+  statements = "\n".join(connection.cursor_instance.calls)
+  assert "DELETE FROM app_user" not in statements
+  assert "FROM backtest_experiment" in statements
+  assert "requested_by_user_id" in statements

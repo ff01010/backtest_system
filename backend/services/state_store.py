@@ -3417,6 +3417,7 @@ def create_shared_backtest_publication(
         if existing:
           artifacts = _publication_artifact_rows(cur, str(existing["id"]))
           return _publication_detail(existing, artifacts), False
+        _lock_runs_for_external_reference(cur, [run_id], user_id)
         cur.execute(_run_query("AND r.id=%s FOR UPDATE OF r"), (user_id, run_id))
         row = cur.fetchone()
         if not row:
@@ -4130,6 +4131,33 @@ def _assert_signal_export_runner_available(cur: Any) -> None:
     raise RunnerUnavailableError("信号明细导出服务暂不可用")
 
 
+def _lock_runs_for_external_reference(
+  cur: Any,
+  run_ids: list[str],
+  owner_user_id: str,
+) -> None:
+  """先锁实验、再锁运行，阻止归档/清理与新外部引用交错提交。"""
+  unique_run_ids = _unique_selection_ids(run_ids)
+  cur.execute("""
+    SELECT e.id, e.archived_at, e.purge_job_id
+    FROM backtest_run run
+    JOIN backtest_experiment e ON e.id=run.origin_experiment_id
+    WHERE run.id=ANY(%s) AND run.owner_user_id=%s
+    ORDER BY e.id
+    FOR SHARE OF e
+  """, (unique_run_ids, owner_user_id))
+  experiments = cur.fetchall()
+  if any(row["archived_at"] is not None or row["purge_job_id"] is not None for row in experiments):
+    raise ExperimentRunRetainedError("实验已归档或正在清理，不能创建新的运行引用")
+  cur.execute("""
+    SELECT id FROM backtest_run
+    WHERE id=ANY(%s) AND owner_user_id=%s
+    ORDER BY id FOR UPDATE
+  """, (unique_run_ids, owner_user_id))
+  if len(cur.fetchall()) != len(unique_run_ids):
+    raise KeyError("部分回测记录不存在或无操作权限")
+
+
 def create_signal_detail_export(
   selection: dict[str, Any],
   idempotency_key: str,
@@ -4155,14 +4183,15 @@ def create_signal_detail_export(
         _validate_explicit_backtest_selection(
           cur, canonical_selection["runIds"], owner_user_id,
         )
-      count_query, count_params = _backtest_selection_query(
-        canonical_selection, owner_user_id, columns="count(*) AS value", order_by="r.id",
+      selected_query, selected_params = _backtest_selection_query(
+        canonical_selection, owner_user_id, columns="r.id", order_by="r.id",
       )
-      count_query = count_query.rsplit("ORDER BY", 1)[0]
-      cur.execute(count_query, count_params)
-      selected_count = int(cur.fetchone()["value"])
+      cur.execute(selected_query, selected_params)
+      selected_run_ids = [str(row["id"]) for row in cur.fetchall()]
+      selected_count = len(selected_run_ids)
       if selected_count == 0:
         raise ValueError("当前选择中没有可处理的终态回测")
+      _lock_runs_for_external_reference(cur, selected_run_ids, owner_user_id)
       cur.execute("""
         INSERT INTO backtest_signal_detail_export (
           id, owner_user_id, selection_mode, selection_snapshot,
@@ -4326,6 +4355,13 @@ def retry_signal_detail_export(
       if not retryable:
         raise ValueError("当前导出任务不能重新导出")
       _assert_signal_export_runner_available(cur)
+      cur.execute("""
+        SELECT source_run_id AS id
+        FROM backtest_signal_detail_export_item
+        WHERE export_id=%s ORDER BY source_run_id
+      """, (export_id,))
+      selected_run_ids = [str(row["id"]) for row in cur.fetchall()]
+      _lock_runs_for_external_reference(cur, selected_run_ids, owner_user_id)
       snapshot = _json(source["selection_snapshot"], {})
       snapshot["retrySourceExportId"] = export_id
       cur.execute("""

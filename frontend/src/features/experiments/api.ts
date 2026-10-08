@@ -1,5 +1,6 @@
 import { fetchJson, sendJson } from '../../api/client';
 import type {
+  AdminArchivedExperimentItem,
   ExperimentPreview,
   ExperimentPreviewRequest,
   ExperimentCreateRequest,
@@ -7,6 +8,8 @@ import type {
   ExperimentCreateResult,
   ExperimentDetail,
   ExperimentListItem,
+  ExperimentLifecycleResult,
+  ExperimentPurge,
   ExperimentRetryResult,
   ExperimentRetrySelection,
   ExperimentRevision,
@@ -68,9 +71,65 @@ export function fetchExperimentDetail(experimentId: string): Promise<ExperimentD
 
 export function fetchExperiments(
   cursor?: string,
+  archived = false,
 ): Promise<{ items: ExperimentListItem[]; nextCursor: string | null }> {
+  const query = new URLSearchParams();
+  if (cursor) query.set('cursor', cursor);
+  if (archived) query.set('archived', 'true');
+  const suffix = query.size ? `?${query.toString()}` : '';
+  return fetchJson(`/api/backtest/experiments${suffix}`);
+}
+
+export function fetchAdminArchivedExperiments(
+  cursor?: string,
+): Promise<{ items: AdminArchivedExperimentItem[]; nextCursor: string | null }> {
   const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
-  return fetchJson(`/api/backtest/experiments${query}`);
+  return fetchJson(`/api/backtest/admin/experiments/archived${query}`);
+}
+
+export function archiveExperiment(
+  experimentId: string,
+  expectedRevisionId: string,
+  expectedSnapshotVersion: number,
+  reason: string,
+  idempotencyKey: string,
+): Promise<ExperimentLifecycleResult> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/archive`,
+    'POST',
+    { expectedRevisionId, expectedSnapshotVersion, reason },
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function restoreArchivedExperiment(
+  experimentId: string,
+  expectedRevisionId: string,
+  expectedSnapshotVersion: number,
+  reason: string,
+  idempotencyKey: string,
+): Promise<ExperimentLifecycleResult> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/restore-archive`,
+    'POST',
+    { expectedRevisionId, expectedSnapshotVersion, reason },
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function requestExperimentPurge(
+  experimentId: string,
+  expectedRevisionId: string,
+  expectedSnapshotVersion: number,
+  reason: string,
+  idempotencyKey: string,
+): Promise<ExperimentPurge> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/purge`,
+    'POST',
+    { expectedRevisionId, expectedSnapshotVersion, reason },
+    { 'Idempotency-Key': idempotencyKey },
+  );
 }
 
 export function fetchExperimentRevisions(

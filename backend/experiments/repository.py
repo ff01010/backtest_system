@@ -42,6 +42,9 @@ CREATE_REVISION_OPERATION = "experiment.revision.create.v1"
 CANCEL_OPERATION = "experiment.cancel.v1"
 RESUME_OPERATION = "experiment.resume.v1"
 RETRY_FAILED_OPERATION = "experiment.retry_failed.v1"
+ARCHIVE_OPERATION = "experiment.archive.v1"
+RESTORE_ARCHIVE_OPERATION = "experiment.archive.restore.v1"
+PURGE_OPERATION = "experiment.purge.create.v1"
 _TRANSIENT_BLOCK_CODES = {
   "experiment.capacity_blocked",
   "experiment.manual_queue_reserved",
@@ -145,13 +148,61 @@ class ExperimentRepository(PreviewRepository, Protocol):
   ) -> CommandResult:
     """校验后解除当前 Revision 的可恢复执行阻塞。"""
 
+  def archive_experiment(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_snapshot_version: int,
+    reason: str,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str | None,
+  ) -> CommandResult:
+    """归档终态实验但保留完整研究证据。"""
+
+  def restore_archived_experiment(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_snapshot_version: int,
+    reason: str,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str | None,
+  ) -> CommandResult:
+    """在保留期内撤销归档。"""
+
+  def request_purge(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_snapshot_version: int,
+    reason: str,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str | None,
+  ) -> CommandResult:
+    """创建受审计且可恢复的物理清理作业。"""
+
   def list_experiments(
     self,
     *,
     limit: int,
     cursor: str | None,
+    archived: bool,
   ) -> dict[str, Any]:
     """游标分页读取当前用户实验。"""
+
+  def list_admin_archived_experiments(
+    self,
+    *,
+    limit: int,
+    cursor: str | None,
+  ) -> dict[str, Any]:
+    """分页读取管理员可执行物理清理的归档实验。"""
 
   def list_revisions(
     self,
@@ -309,6 +360,7 @@ class PostgresExperimentRepository:
         cur.execute("""
           SELECT e.id AS experiment_id, e.name, e.description,
             e.status, e.blocked_reason_code, e.blocked_reason_message,
+            e.archived_at, e.archive_retention_until, e.purge_job_id,
             e.row_version, e.created_at, e.updated_at,
             r.id AS revision_id, r.revision_no, r.experiment_spec,
             r.spec_hash, r.planned_trial_count, r.resource_budget,
@@ -342,9 +394,14 @@ class PostgresExperimentRepository:
     *,
     limit: int,
     cursor: str | None,
+    archived: bool,
   ) -> dict[str, Any]:
     owner_id = state_store.current_user_id()
-    after = _decode_cursor(cursor, "experiment-list", owner_id, {}) if cursor else None
+    filters = {"archived": archived}
+    after = (
+      _decode_cursor(cursor, "experiment-list", owner_id, filters)
+      if cursor else None
+    )
     params: list[Any] = [owner_id]
     after_sql = ""
     if after:
@@ -356,7 +413,8 @@ class PostgresExperimentRepository:
         cur.execute(f"""
           SELECT e.id AS experiment_id, e.name, e.status,
             e.blocked_reason_code, e.blocked_reason_message,
-            e.archived_at, e.created_at, e.updated_at,
+            e.archived_at, e.archive_retention_until, e.purge_job_id,
+            e.created_at, e.updated_at,
             r.id AS revision_id, r.revision_no, r.experiment_spec,
             r.planned_trial_count,
             s.id AS stage_id, s.status AS stage_status,
@@ -365,7 +423,8 @@ class PostgresExperimentRepository:
           FROM backtest_experiment e
           JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
           JOIN backtest_experiment_stage s ON s.revision_id=r.id AND s.stage_index=0
-          WHERE e.owner_user_id=%s AND e.archived_at IS NULL {after_sql}
+          WHERE e.owner_user_id=%s
+            AND e.archived_at IS {'NOT NULL' if archived else 'NULL'} {after_sql}
           ORDER BY e.updated_at DESC, e.id DESC
           LIMIT %s
         """, params)
@@ -374,11 +433,60 @@ class PostgresExperimentRepository:
     next_cursor = None
     if len(rows) > limit:
       last = page[-1]
-      next_cursor = _encode_cursor("experiment-list", owner_id, {}, {
+      next_cursor = _encode_cursor("experiment-list", owner_id, filters, {
         "updatedAt": last["updated_at"].isoformat(),
         "experimentId": str(last["experiment_id"]),
       })
     return {"items": [_experiment_list_item(row) for row in page], "nextCursor": next_cursor}
+
+  def list_admin_archived_experiments(
+    self,
+    *,
+    limit: int,
+    cursor: str | None,
+  ) -> dict[str, Any]:
+    if not state_store.current_user_is_admin():
+      raise ExperimentError("experiment.forbidden", "仅管理员可以查看待清理实验", 403)
+    actor_id = state_store.current_user_id()
+    bindings = {"scope": "admin-archived"}
+    after = (
+      _decode_cursor(cursor, "admin-archived-experiment-list", actor_id, bindings)
+      if cursor else None
+    )
+    params: list[Any] = []
+    after_sql = ""
+    if after:
+      after_sql = "AND (e.updated_at, e.id) < (%s::timestamptz, %s::uuid)"
+      params.extend([after["updatedAt"], after["experimentId"]])
+    params.append(limit + 1)
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        cur.execute(f"""
+          SELECT e.id AS experiment_id, e.name, e.status, e.row_version,
+            e.archived_at, e.archive_retention_until, e.purge_job_id,
+            e.updated_at,
+            COALESCE(e.current_revision_id, purge.revision_id) AS revision_id
+          FROM backtest_experiment e
+          LEFT JOIN backtest_experiment_purge purge ON purge.id=e.purge_job_id
+          WHERE e.archived_at IS NOT NULL {after_sql}
+          ORDER BY e.updated_at DESC, e.id DESC
+          LIMIT %s
+        """, params)
+        rows = [dict(row) for row in cur.fetchall()]
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit:
+      last = page[-1]
+      next_cursor = _encode_cursor(
+        "admin-archived-experiment-list", actor_id, bindings, {
+          "updatedAt": last["updated_at"].isoformat(),
+          "experimentId": str(last["experiment_id"]),
+        },
+      )
+    return {
+      "items": [_admin_archived_experiment_list_item(row) for row in page],
+      "nextCursor": next_cursor,
+    }
 
   def list_revisions(
     self,
@@ -653,6 +761,101 @@ class PostgresExperimentRepository:
         response = _cancel_stage(cur, graph, request_id)
         _save_idempotency(
           cur, owner_id, CANCEL_OPERATION, idempotency_key, request_hash,
+          "experiment", experiment_id, 200, response,
+        )
+        return CommandResult(response, 200)
+
+  def request_purge(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_snapshot_version: int,
+    reason: str,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str | None,
+  ) -> CommandResult:
+    if not settings.EXPERIMENT_PURGE_ENABLED:
+      raise ExperimentError(
+        "experiment.purge_disabled", "实验物理清理能力未启用", 503,
+      )
+    if not state_store.current_user_is_admin():
+      raise ExperimentError("experiment.purge_forbidden", "仅管理员可以清理实验", 403)
+    actor_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        _lock_command(cur, actor_id, PURGE_OPERATION, idempotency_key)
+        replay = _load_idempotency(cur, actor_id, PURGE_OPERATION, idempotency_key)
+        if replay:
+          return _replay_result(replay, request_hash)
+        graph = _lock_admin_purge_experiment(cur, experiment_id)
+        _validate_purge_request(
+          cur, graph, expected_revision_id, expected_snapshot_version,
+        )
+        response = _create_purge_job(cur, graph, actor_id, reason, request_id)
+        _save_idempotency(
+          cur, actor_id, PURGE_OPERATION, idempotency_key, request_hash,
+          "experiment_purge", response["purgeId"], 202, response,
+        )
+        return CommandResult(response, 202)
+
+  def archive_experiment(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_snapshot_version: int,
+    reason: str,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str | None,
+  ) -> CommandResult:
+    owner_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        _lock_command(cur, owner_id, ARCHIVE_OPERATION, idempotency_key)
+        replay = _load_idempotency(cur, owner_id, ARCHIVE_OPERATION, idempotency_key)
+        if replay:
+          return _replay_result(replay, request_hash)
+        graph = _lock_lifecycle_experiment(cur, experiment_id, owner_id)
+        response = _archive_experiment(
+          cur, graph, expected_revision_id, expected_snapshot_version,
+          reason, request_id,
+        )
+        _save_idempotency(
+          cur, owner_id, ARCHIVE_OPERATION, idempotency_key, request_hash,
+          "experiment", experiment_id, 200, response,
+        )
+        return CommandResult(response, 200)
+
+  def restore_archived_experiment(
+    self,
+    *,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_snapshot_version: int,
+    reason: str,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str | None,
+  ) -> CommandResult:
+    owner_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        _lock_command(cur, owner_id, RESTORE_ARCHIVE_OPERATION, idempotency_key)
+        replay = _load_idempotency(
+          cur, owner_id, RESTORE_ARCHIVE_OPERATION, idempotency_key,
+        )
+        if replay:
+          return _replay_result(replay, request_hash)
+        graph = _lock_lifecycle_experiment(cur, experiment_id, owner_id)
+        response = _restore_archived_experiment(
+          cur, graph, expected_revision_id, expected_snapshot_version,
+          reason, request_id,
+        )
+        _save_idempotency(
+          cur, owner_id, RESTORE_ARCHIVE_OPERATION, idempotency_key, request_hash,
           "experiment", experiment_id, 200, response,
         )
         return CommandResult(response, 200)
@@ -2100,6 +2303,28 @@ def _experiment_list_item(row: dict[str, Any]) -> dict[str, Any]:
     "createdAt": row["created_at"].isoformat(),
     "updatedAt": row["updated_at"].isoformat(),
     "archivedAt": row["archived_at"].isoformat() if row["archived_at"] else None,
+    "retentionUntil": (
+      row["archive_retention_until"].isoformat()
+      if row.get("archive_retention_until") else None
+    ),
+    "purgeJobId": str(row["purge_job_id"]) if row.get("purge_job_id") else None,
+  }
+
+
+def _admin_archived_experiment_list_item(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "experimentId": str(row["experiment_id"]),
+    "name": row["name"],
+    "currentRevisionId": str(row["revision_id"]),
+    "status": row["status"],
+    "snapshotVersion": int(row["row_version"]),
+    "archivedAt": row["archived_at"].isoformat(),
+    "retentionUntil": (
+      row["archive_retention_until"].isoformat()
+      if row.get("archive_retention_until") else None
+    ),
+    "purgeJobId": str(row["purge_job_id"]) if row.get("purge_job_id") else None,
+    "updatedAt": row["updated_at"].isoformat(),
   }
 
 
@@ -2377,7 +2602,8 @@ def _load_retry_context(
   lock_sql = "FOR UPDATE OF e, r, s" if lock else ""
   cur.execute(f"""
     SELECT e.id AS experiment_id, e.current_revision_id, e.status AS experiment_status,
-      e.row_version, r.*, s.id AS stage_id, s.status AS stage_status,
+      e.row_version, e.archived_at, e.purge_job_id,
+      r.*, s.id AS stage_id, s.status AS stage_status,
       s.in_flight_count, s.blocked_reason_code AS stage_reason_code,
       s.blocked_reason_message AS stage_reason_message
     FROM backtest_experiment e
@@ -2396,6 +2622,8 @@ def _load_retry_context(
       "current_revision_id": value["current_revision_id"],
       "status": value["experiment_status"],
       "row_version": value["row_version"],
+      "archived_at": value["archived_at"],
+      "purge_job_id": value["purge_job_id"],
     },
     "revision": {**value, "id": value["current_revision_id"]},
     "stage": {
@@ -2412,6 +2640,7 @@ def _validate_retry_revision(
   context: dict[str, Any],
   expected_revision_id: str,
 ) -> None:
+  _require_experiment_write_allowed(context["experiment"])
   if str(context["revision"]["id"]) != expected_revision_id:
     raise ExperimentError("experiment.state_changed", "实验修订已经变化", 409)
 
@@ -2750,6 +2979,7 @@ def _validate_revision_creation(
 ) -> None:
   experiment = graph["experiment"]
   revision = graph["revision"]
+  _require_experiment_write_allowed(experiment)
   if (
     str(revision["id"]) != expected_revision_id
     or int(experiment["row_version"]) != expected_snapshot_version
@@ -3020,6 +3250,12 @@ def _detail_response(row: dict[str, Any]) -> dict[str, Any]:
     "description": row["description"],
     "status": row["status"],
     "snapshotVersion": int(row["row_version"]),
+    "archivedAt": row["archived_at"].isoformat() if row.get("archived_at") else None,
+    "retentionUntil": (
+      row["archive_retention_until"].isoformat()
+      if row.get("archive_retention_until") else None
+    ),
+    "purgeJobId": str(row["purge_job_id"]) if row.get("purge_job_id") else None,
     "revision": {
       "revisionId": str(row["revision_id"]),
       "revisionNo": int(row["revision_no"]),
@@ -3075,6 +3311,508 @@ def _public_dataset_snapshot(value: Any) -> dict[str, Any]:
   return snapshot
 
 
+def _lock_experiment_for_write(
+  cur: Any,
+  experiment_id: str,
+  owner_id: str,
+) -> dict[str, Any]:
+  cur.execute("""
+    SELECT id, archived_at, purge_job_id
+    FROM backtest_experiment
+    WHERE id=%s AND owner_user_id=%s
+    FOR UPDATE
+  """, (experiment_id, owner_id))
+  row = cur.fetchone()
+  if row is None:
+    raise ExperimentError("experiment.not_found", "实验不存在", 404)
+  experiment = dict(row)
+  _require_experiment_write_allowed(experiment)
+  return experiment
+
+
+def _require_experiment_write_allowed(experiment: dict[str, Any]) -> None:
+  if experiment.get("purge_job_id") is not None:
+    raise ExperimentError("experiment.purge_in_progress", "实验已经进入清理流程", 409)
+  if experiment.get("archived_at") is not None:
+    raise ExperimentError("experiment.archived_read_only", "归档实验只允许读取或恢复", 409)
+
+
+def _lock_lifecycle_experiment(
+  cur: Any,
+  experiment_id: str,
+  owner_id: str,
+) -> dict[str, Any]:
+  cur.execute("""
+    SELECT e.id, e.owner_user_id, e.status, e.current_revision_id,
+      e.archived_at, e.archive_retention_until, e.purge_job_id,
+      e.row_version, r.terminal_at
+    FROM backtest_experiment e
+    JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
+    WHERE e.id=%s AND e.owner_user_id=%s
+    FOR UPDATE OF e, r
+  """, (experiment_id, owner_id))
+  row = cur.fetchone()
+  if row is None:
+    raise ExperimentError("experiment.not_found", "实验不存在", 404)
+  return dict(row)
+
+
+def _archive_experiment(
+  cur: Any,
+  graph: dict[str, Any],
+  expected_revision_id: str,
+  expected_snapshot_version: int,
+  reason: str,
+  request_id: str | None,
+) -> dict[str, Any]:
+  if str(graph["current_revision_id"]) != expected_revision_id:
+    raise ExperimentError("experiment.state_changed", "实验当前修订已变化", 409)
+  if int(graph["row_version"]) != expected_snapshot_version:
+    raise ExperimentError("experiment.state_changed", "实验状态已变化", 409)
+  if graph["terminal_at"] is None or graph["status"] not in {
+    "completed", "partially_completed", "failed", "cancelled",
+  }:
+    raise ExperimentError(
+      "experiment.archive_requires_terminal", "只有终态实验可以归档", 409,
+    )
+  if graph["archived_at"] is not None:
+    raise ExperimentError("experiment.already_archived", "实验已经归档", 409)
+  if graph["purge_job_id"] is not None:
+    raise ExperimentError("experiment.purge_in_progress", "实验正在清理", 409)
+  cur.execute("""
+    UPDATE backtest_experiment
+    SET archived_at=now(),
+      archive_retention_until=now() + (%s * interval '1 day'),
+      row_version=row_version + 1, updated_at=now()
+    WHERE id=%s
+    RETURNING archived_at, archive_retention_until, row_version
+  """, (settings.EXPERIMENT_PURGE_RETENTION_DAYS, graph["id"]))
+  updated = cur.fetchone()
+  operation_id = str(uuid4())
+  cur.execute("""
+    INSERT INTO backtest_experiment_audit (
+      owner_user_id, experiment_id, revision_id, event_type, request_id, detail
+    ) VALUES (%s,%s,%s,'experiment.archived',%s,%s)
+  """, (
+    graph["owner_user_id"], graph["id"], graph["current_revision_id"], request_id,
+    Jsonb({
+      "reason": reason,
+      "operationId": operation_id,
+      "retentionUntil": updated["archive_retention_until"].isoformat(),
+    }),
+  ))
+  return {
+    "experimentId": str(graph["id"]),
+    "revisionId": str(graph["current_revision_id"]),
+    "status": graph["status"],
+    "snapshotVersion": int(updated["row_version"]),
+    "archivedAt": updated["archived_at"].isoformat(),
+    "retentionUntil": updated["archive_retention_until"].isoformat(),
+    "reason": reason,
+    "operationId": operation_id,
+    "replayed": False,
+    "acceptedAt": updated["archived_at"].isoformat(),
+  }
+
+
+def _restore_archived_experiment(
+  cur: Any,
+  graph: dict[str, Any],
+  expected_revision_id: str,
+  expected_snapshot_version: int,
+  reason: str,
+  request_id: str | None,
+) -> dict[str, Any]:
+  if str(graph["current_revision_id"]) != expected_revision_id:
+    raise ExperimentError("experiment.state_changed", "实验当前修订已变化", 409)
+  if int(graph["row_version"]) != expected_snapshot_version:
+    raise ExperimentError("experiment.state_changed", "实验状态已变化", 409)
+  if graph["archived_at"] is None:
+    raise ExperimentError("experiment.not_archived", "实验尚未归档", 409)
+  if graph["purge_job_id"] is not None:
+    raise ExperimentError("experiment.purge_in_progress", "实验正在清理", 409)
+  retention_until = graph["archive_retention_until"]
+  if retention_until is None or retention_until <= datetime.now(timezone.utc):
+    raise ExperimentError(
+      "experiment.archive_retention_expired", "实验归档保留期已结束", 409,
+    )
+  cur.execute("""
+    UPDATE backtest_experiment
+    SET archived_at=NULL, archive_retention_until=NULL,
+      row_version=row_version + 1, updated_at=now()
+    WHERE id=%s
+    RETURNING row_version, updated_at AS accepted_at
+  """, (graph["id"],))
+  updated = cur.fetchone()
+  operation_id = str(uuid4())
+  cur.execute("""
+    INSERT INTO backtest_experiment_audit (
+      owner_user_id, experiment_id, revision_id, event_type, request_id, detail
+    ) VALUES (%s,%s,%s,'experiment.archive_restored',%s,%s)
+  """, (
+    graph["owner_user_id"], graph["id"], graph["current_revision_id"], request_id,
+    Jsonb({"reason": reason, "operationId": operation_id}),
+  ))
+  return {
+    "experimentId": str(graph["id"]),
+    "revisionId": str(graph["current_revision_id"]),
+    "status": graph["status"],
+    "snapshotVersion": int(updated["row_version"]),
+    "archivedAt": None,
+    "retentionUntil": None,
+    "reason": reason,
+    "operationId": operation_id,
+    "replayed": False,
+    "acceptedAt": updated["accepted_at"].isoformat(),
+  }
+
+
+def _lock_admin_purge_experiment(cur: Any, experiment_id: str) -> dict[str, Any]:
+  cur.execute("""
+    SELECT e.id, e.owner_user_id, e.status, e.current_revision_id,
+      e.archived_at, e.archive_retention_until, e.purge_job_id,
+      e.row_version, r.terminal_at
+    FROM backtest_experiment e
+    JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
+    WHERE e.id=%s
+    FOR UPDATE OF e, r
+  """, (experiment_id,))
+  row = cur.fetchone()
+  if row is None:
+    raise ExperimentError("experiment.not_found", "实验不存在", 404)
+  return dict(row)
+
+
+def _validate_purge_request(
+  cur: Any,
+  graph: dict[str, Any],
+  expected_revision_id: str,
+  expected_snapshot_version: int,
+) -> None:
+  if str(graph["current_revision_id"]) != expected_revision_id:
+    raise ExperimentError("experiment.state_changed", "实验当前修订已变化", 409)
+  if int(graph["row_version"]) != expected_snapshot_version:
+    raise ExperimentError("experiment.state_changed", "实验状态已变化", 409)
+  if graph["terminal_at"] is None or graph["status"] not in {
+    "completed", "partially_completed", "failed", "cancelled",
+  }:
+    raise ExperimentError("experiment.purge_requires_terminal", "只有终态实验可以清理", 409)
+  if graph["archived_at"] is None:
+    raise ExperimentError("experiment.purge_requires_archive", "请先归档实验", 409)
+  if graph["purge_job_id"] is not None:
+    raise ExperimentError("experiment.purge_in_progress", "实验已经进入清理流程", 409)
+  retention_until = graph["archive_retention_until"]
+  if retention_until is None or retention_until > datetime.now(timezone.utc):
+    raise ExperimentError("experiment.purge_retention_active", "实验仍在归档保留期内", 409)
+  _ensure_purge_dependencies_terminal(cur, str(graph["id"]))
+
+
+def _ensure_purge_dependencies_terminal(cur: Any, experiment_id: str) -> None:
+  cur.execute("""
+    SELECT EXISTS (
+      SELECT 1 FROM backtest_experiment_evaluation_run
+      WHERE experiment_id=%s AND status IN ('queued','running')
+      UNION ALL
+      SELECT 1 FROM backtest_experiment_evaluation_export
+      WHERE experiment_id=%s AND status IN ('queued','running','cancel_requested')
+    ) AS active
+  """, (experiment_id, experiment_id))
+  if bool(cur.fetchone()["active"]):
+    raise ExperimentError(
+      "experiment.purge_dependency_active", "实验仍有未终结的评价或导出作业", 409,
+    )
+
+
+def _create_purge_job(
+  cur: Any,
+  graph: dict[str, Any],
+  actor_id: str,
+  reason: str,
+  request_id: str | None,
+) -> dict[str, Any]:
+  purge_id = str(uuid4())
+  cur.execute("""
+    INSERT INTO backtest_experiment_purge (
+      id, experiment_id, revision_id, owner_user_id, requested_by_user_id,
+      request_id, reason, scope_digest, scope_counts, old_value, new_value
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    RETURNING created_at
+  """, (
+    purge_id, graph["id"], graph["current_revision_id"], graph["owner_user_id"],
+    actor_id, request_id, reason, "0" * 64, Jsonb({}),
+    Jsonb(_purge_old_value(graph)),
+    Jsonb({"purgeStatus": "queued", "phase": "artifacts"}),
+  ))
+  accepted_at = cur.fetchone()["created_at"]
+  _audit_purge_requested(cur, graph, actor_id, reason, request_id, purge_id)
+  scope_counts, scope_digest = _freeze_purge_scope(
+    cur, purge_id, str(graph["id"]), str(graph["owner_user_id"]),
+  )
+  cur.execute("""
+    UPDATE backtest_experiment_purge
+    SET scope_counts=%s, scope_digest=%s, updated_at=now() WHERE id=%s
+  """, (Jsonb(scope_counts), scope_digest, purge_id))
+  snapshot_version = _bind_purge_job(cur, purge_id, str(graph["id"]))
+  return {
+    "purgeId": purge_id, "experimentId": str(graph["id"]),
+    "revisionId": str(graph["current_revision_id"]), "status": "queued",
+    "phase": "artifacts", "scopeDigest": scope_digest,
+    "scopeCounts": scope_counts, "snapshotVersion": snapshot_version,
+    "reason": reason, "operationId": purge_id,
+    "replayed": False,
+    "acceptedAt": accepted_at.isoformat(),
+  }
+
+
+def _purge_old_value(graph: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "experimentStatus": graph["status"],
+    "archivedAt": graph["archived_at"].isoformat(),
+    "retentionUntil": graph["archive_retention_until"].isoformat(),
+    "snapshotVersion": int(graph["row_version"]),
+    "purgeJobId": None,
+  }
+
+
+def _bind_purge_job(cur: Any, purge_id: str, experiment_id: str) -> int:
+  cur.execute("""
+    UPDATE backtest_experiment
+    SET purge_job_id=%s, row_version=row_version + 1, updated_at=now()
+    WHERE id=%s RETURNING row_version
+  """, (purge_id, experiment_id))
+  snapshot_version = int(cur.fetchone()["row_version"])
+  cur.execute("""
+    UPDATE backtest_experiment_purge
+    SET new_value=%s, updated_at=now() WHERE id=%s
+  """, (
+    Jsonb({
+      "purgeStatus": "queued", "phase": "artifacts",
+      "snapshotVersion": snapshot_version,
+    }),
+    purge_id,
+  ))
+  return snapshot_version
+
+
+def _audit_purge_requested(
+  cur: Any,
+  graph: dict[str, Any],
+  actor_id: str,
+  reason: str,
+  request_id: str | None,
+  purge_id: str,
+) -> None:
+  cur.execute("""
+    INSERT INTO backtest_experiment_audit (
+      owner_user_id, experiment_id, revision_id, event_type, request_id, detail
+    ) VALUES (%s,%s,%s,'experiment.purge_requested',%s,%s)
+  """, (
+    graph["owner_user_id"], graph["id"], graph["current_revision_id"], request_id,
+    Jsonb({"purgeId": purge_id, "requestedBy": actor_id, "reason": reason}),
+  ))
+
+
+def _freeze_purge_scope(
+  cur: Any,
+  purge_id: str,
+  experiment_id: str,
+  owner_id: str,
+) -> tuple[dict[str, int], str]:
+  _insert_purge_graph_items(cur, purge_id, experiment_id, owner_id)
+  cur.execute("""
+    SELECT resource_type, resource_id
+    FROM backtest_experiment_purge_item
+    WHERE purge_id=%s ORDER BY resource_type, resource_id
+  """, (purge_id,))
+  items = [(str(row["resource_type"]), str(row["resource_id"])) for row in cur]
+  counts: dict[str, int] = {}
+  for resource_type, _resource_id in items:
+    counts[resource_type] = counts.get(resource_type, 0) + 1
+  return counts, digest(with_version({"resources": items}))
+
+
+def _insert_purge_graph_items(
+  cur: Any,
+  purge_id: str,
+  experiment_id: str,
+  owner_id: str,
+) -> None:
+  queries = _purge_scope_queries()
+  for resource_type, query in queries:
+    _insert_purge_items(
+      cur, purge_id, owner_id, resource_type, query, (experiment_id,),
+    )
+  _insert_purge_items(
+    cur, purge_id, owner_id, "idempotency", """
+      SELECT id AS resource_id,
+        jsonb_build_object('operationType', operation_type) AS resource_snapshot
+      FROM backtest_internal_idempotency
+      WHERE resource_id IN (
+        SELECT resource_id FROM backtest_experiment_purge_item
+        WHERE purge_id=%s
+      )
+    """, (purge_id,),
+  )
+
+
+def _purge_scope_queries() -> tuple[tuple[str, str], ...]:
+  revision_scope = """
+    SELECT id FROM backtest_experiment_revision WHERE experiment_id=%s
+  """
+  stage_scope = f"""
+    SELECT id FROM backtest_experiment_stage
+    WHERE revision_id IN ({revision_scope})
+  """
+  trial_scope = f"""
+    SELECT id FROM backtest_experiment_trial WHERE stage_id IN ({stage_scope})
+  """
+  execution_scope = f"""
+    SELECT id FROM backtest_experiment_trial_execution
+    WHERE trial_id IN ({trial_scope})
+  """
+  return (
+    *_purge_evaluation_scope_queries(),
+    _purge_audit_scope_query(),
+    *_purge_execution_scope_queries(
+      revision_scope, stage_scope, trial_scope, execution_scope,
+    ),
+  )
+
+
+def _purge_evaluation_scope_queries() -> tuple[tuple[str, str], ...]:
+  return (
+    ("export_artifact", """
+      SELECT id AS resource_id,
+        jsonb_build_object('storageKey', storage_key) AS resource_snapshot
+      FROM backtest_experiment_evaluation_export
+      WHERE experiment_id=%s AND storage_key IS NOT NULL
+    """),
+    ("export", """
+      SELECT id AS resource_id, '{}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_evaluation_export WHERE experiment_id=%s
+    """),
+    ("evaluation_run", """
+      SELECT id AS resource_id, '{}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_evaluation_run WHERE experiment_id=%s
+    """),
+    ("evaluation_spec", """
+      SELECT id AS resource_id, '{}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_evaluation_spec WHERE experiment_id=%s
+    """),
+  )
+
+
+def _purge_audit_scope_query() -> tuple[str, str]:
+  return ("audit", """
+    WITH target AS (SELECT %s::uuid AS experiment_id)
+    SELECT audit.id AS resource_id, '{}'::jsonb AS resource_snapshot
+    FROM backtest_experiment_audit audit CROSS JOIN target
+    WHERE audit.experiment_id=target.experiment_id
+      OR audit.revision_id IN (
+        SELECT id FROM backtest_experiment_revision
+        WHERE experiment_id=target.experiment_id
+      )
+      OR audit.stage_id IN (
+        SELECT stage.id FROM backtest_experiment_stage stage
+        JOIN backtest_experiment_revision revision ON revision.id=stage.revision_id
+        WHERE revision.experiment_id=target.experiment_id
+      )
+      OR audit.trial_id IN (
+        SELECT trial.id FROM backtest_experiment_trial trial
+        JOIN backtest_experiment_stage stage ON stage.id=trial.stage_id
+        JOIN backtest_experiment_revision revision ON revision.id=stage.revision_id
+        WHERE revision.experiment_id=target.experiment_id
+      )
+      OR audit.execution_id IN (
+        SELECT execution.id FROM backtest_experiment_trial_execution execution
+        JOIN backtest_experiment_trial trial ON trial.id=execution.trial_id
+        JOIN backtest_experiment_stage stage ON stage.id=trial.stage_id
+        JOIN backtest_experiment_revision revision ON revision.id=stage.revision_id
+        WHERE revision.experiment_id=target.experiment_id
+      )
+  """)
+
+
+def _purge_execution_scope_queries(
+  revision_scope: str,
+  stage_scope: str,
+  trial_scope: str,
+  execution_scope: str,
+) -> tuple[tuple[str, str], ...]:
+  run_scope = f"""
+    SELECT run_id FROM backtest_experiment_trial_execution
+    WHERE id IN ({execution_scope})
+  """
+  return (
+    ("outbox", f"""
+      SELECT id AS resource_id, '{{}}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_dispatch_outbox
+      WHERE execution_id IN ({execution_scope})
+    """),
+    ("execution", f"""
+      SELECT id AS resource_id, '{{}}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_trial_execution WHERE id IN ({execution_scope})
+    """),
+    ("run", f"""
+      SELECT run_id AS resource_id, '{{}}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_trial_execution WHERE id IN ({execution_scope})
+    """),
+    ("run_artifact", f"""
+      WITH target_runs AS ({run_scope})
+      SELECT DISTINCT artifact.id AS resource_id,
+        jsonb_build_object('storageKey', artifact.storage_key) AS resource_snapshot
+      FROM artifact_file artifact
+      WHERE artifact.run_id IN (SELECT run_id FROM target_runs)
+        OR artifact.id IN (
+          SELECT snapshot.artifact_file_id
+          FROM research_signal_snapshot snapshot
+          WHERE snapshot.run_id IN (SELECT run_id FROM target_runs)
+        )
+    """),
+    ("asset_hold", f"""
+      SELECT id AS resource_id, '{{}}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_asset_hold
+      WHERE revision_id IN ({revision_scope})
+    """),
+    ("trial", f"""
+      SELECT id AS resource_id, '{{}}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_trial WHERE id IN ({trial_scope})
+    """),
+    ("stage", f"""
+      SELECT id AS resource_id, '{{}}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_stage WHERE id IN ({stage_scope})
+    """),
+    ("revision", """
+      SELECT id AS resource_id, '{}'::jsonb AS resource_snapshot
+      FROM backtest_experiment_revision WHERE experiment_id=%s
+    """),
+    ("experiment", """
+      SELECT id AS resource_id, '{}'::jsonb AS resource_snapshot
+      FROM backtest_experiment WHERE id=%s
+    """),
+  )
+
+
+def _insert_purge_items(
+  cur: Any,
+  purge_id: str,
+  owner_id: str,
+  resource_type: str,
+  query: str,
+  params: tuple[Any, ...],
+) -> None:
+  cur.execute(f"""
+    INSERT INTO backtest_experiment_purge_item (
+      purge_id, owner_user_id, resource_type, resource_id,
+      ordinal, resource_snapshot
+    )
+    SELECT %s, %s, %s, resource_id,
+      row_number() OVER (ORDER BY resource_id) - 1, resource_snapshot
+    FROM ({query}) scope
+    ON CONFLICT DO NOTHING
+  """, (purge_id, owner_id, resource_type, *params))
+
+
 def _load_current_stage_for_update(
   cur: Any,
   experiment_id: str,
@@ -3094,6 +3832,7 @@ def _load_current_stage_for_update(
     SELECT e.id AS experiment_id, e.status AS experiment_status,
       e.current_revision_id, e.blocked_reason_code AS experiment_reason_code,
       e.blocked_reason_message AS experiment_reason_message,
+      e.archived_at, e.purge_job_id,
       r.*, s.id AS stage_id, s.status AS stage_status,
       s.generated_trial_count, s.planned_trial_count AS stage_planned_trial_count,
       s.cancelled_before_generation, s.in_flight_count,
@@ -3110,6 +3849,7 @@ def _load_current_stage_for_update(
   if row is None:
     return None
   value = dict(row)
+  _require_experiment_write_allowed(value)
   cur.execute("""
     SELECT count(*) AS value
     FROM backtest_experiment_asset_hold
@@ -3122,6 +3862,8 @@ def _load_current_stage_for_update(
       "status": value["experiment_status"],
       "blocked_reason_code": value["experiment_reason_code"],
       "blocked_reason_message": value["experiment_reason_message"],
+      "archived_at": value["archived_at"],
+      "purge_job_id": value["purge_job_id"],
     },
     "revision": {
       **value,

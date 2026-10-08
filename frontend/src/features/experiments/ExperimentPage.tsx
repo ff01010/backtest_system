@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  Archive,
   Ban,
   FlaskConical,
   LockKeyhole,
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   ShieldCheck,
   Trash2,
 } from 'lucide-react';
@@ -14,9 +16,11 @@ import { ApiResponseError, fetchStrategyConfigs } from '../../api/client';
 import type { StrategyConfig } from '../../types';
 import { createBrowserUuid } from '../../utils/browserUuid';
 import {
+  archiveExperiment,
   cancelExperiment,
   createExperiment,
   createExperimentRevision,
+  fetchAdminArchivedExperiments,
   fetchExperimentDetail,
   fetchExperimentRevisions,
   fetchExperiments,
@@ -26,9 +30,12 @@ import {
   previewExperiment,
   previewRetryFailedTrials,
   retryFailedTrials,
+  requestExperimentPurge,
   resumeExperiment,
+  restoreArchivedExperiment,
 } from './api';
 import type {
+  AdminArchivedExperimentItem,
   DateScenarioDraft,
   ExperimentCreateResponse,
   ExperimentCreateResult,
@@ -53,6 +60,7 @@ import EvaluationBuilder from './EvaluationBuilder';
 
 type Props = {
   userId: string;
+  isAdmin?: boolean;
   enabled?: boolean | null;
   subject: ExperimentSubjectRef | null;
   experimentId?: string | null;
@@ -88,6 +96,15 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '请求未完成';
 }
 
+async function retryUncertain<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    return operation();
+  }
+}
+
 function isStandardBarConfig(config: StrategyConfig): boolean {
   const params = config.paramsJson.params;
   const fillModel = params && typeof params === 'object'
@@ -101,28 +118,115 @@ function isStandardBarConfig(config: StrategyConfig): boolean {
 }
 
 function ExperimentLanding({
+  isAdmin,
   onSelect,
   onOpenExperiment,
   onBack,
 }: {
+  isAdmin: boolean;
   onSelect: (subject: ExperimentSubjectRef) => void;
   onOpenExperiment: (experimentId: string) => void;
   onBack: () => void;
 }) {
   const [configs, setConfigs] = useState<StrategyConfig[]>([]);
   const [experiments, setExperiments] = useState<ExperimentListItem[]>([]);
+  const [adminArchived, setAdminArchived] = useState<AdminArchivedExperimentItem[]>([]);
+  const [nextExperimentCursor, setNextExperimentCursor] = useState<string | null>(null);
+  const [nextAdminCursor, setNextAdminCursor] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
+  const [purgingExperimentId, setPurgingExperimentId] = useState('');
 
   useEffect(() => {
-    Promise.all([fetchStrategyConfigs(), fetchExperiments()])
-      .then(([items, page]) => {
+    let active = true;
+    setLoading(true);
+    setError('');
+    const adminRequest = showArchived && isAdmin
+      ? fetchAdminArchivedExperiments()
+      : Promise.resolve({ items: [], nextCursor: null });
+    Promise.all([
+      fetchStrategyConfigs(),
+      fetchExperiments(undefined, showArchived),
+      adminRequest,
+    ])
+      .then(([items, page, adminPage]) => {
+        if (!active) return;
         setConfigs(items.filter(isStandardBarConfig));
         setExperiments(page.items);
+        setNextExperimentCursor(page.nextCursor);
+        setAdminArchived(adminPage.items);
+        setNextAdminCursor(adminPage.nextCursor);
       })
-      .catch((reason: unknown) => setError(errorMessage(reason)))
-      .finally(() => setLoading(false));
-  }, []);
+      .catch((reason: unknown) => {
+        if (active) setError(errorMessage(reason));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isAdmin, showArchived]);
+
+  const loadMoreExperiments = async () => {
+    if (!nextExperimentCursor || loadingMore) return;
+    setLoadingMore(true);
+    setError('');
+    try {
+      const page = await fetchExperiments(nextExperimentCursor, showArchived);
+      setExperiments((current) => [...current, ...page.items]);
+      setNextExperimentCursor(page.nextCursor);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const loadMoreAdminArchived = async () => {
+    if (!nextAdminCursor || loadingMore) return;
+    setLoadingMore(true);
+    setError('');
+    try {
+      const page = await fetchAdminArchivedExperiments(nextAdminCursor);
+      setAdminArchived((current) => [...current, ...page.items]);
+      setNextAdminCursor(page.nextCursor);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const handleAdminPurge = async (experiment: AdminArchivedExperimentItem) => {
+    if (purgingExperimentId) return;
+    const reason = window.prompt('请输入物理清理原因（将写入管理员审计）：')?.trim();
+    if (!reason) return;
+    if (!window.confirm('高风险操作：确认提交不可逆的实验物理清理任务？共享回测会保留。')) return;
+    setPurgingExperimentId(experiment.experimentId);
+    setError('');
+    try {
+      const idempotencyKey = createBrowserUuid();
+      const purge = await retryUncertain(() => requestExperimentPurge(
+        experiment.experimentId,
+        experiment.currentRevisionId,
+        experiment.snapshotVersion,
+        reason,
+        idempotencyKey,
+      ));
+      setAdminArchived((current) => current.map((item) => (
+        item.experimentId === experiment.experimentId
+          ? { ...item, purgeJobId: purge.purgeId, snapshotVersion: purge.snapshotVersion }
+          : item
+      )));
+    } catch (reasonValue) {
+      setError(errorMessage(reasonValue));
+    } finally {
+      setPurgingExperimentId('');
+    }
+  };
 
   return (
     <main className="experiment-page experiment-landing">
@@ -137,6 +241,20 @@ function ExperimentLanding({
         </button>
       </section>
       {error && <div className="experiment-alert is-error" role="alert">{error}</div>}
+      <section className="experiment-command-bar">
+        <div>
+          <strong>{showArchived ? '已归档实验' : '当前实验'}</strong>
+          <span>归档只从默认列表隐藏实验，不会删除 Trial、回测结果或评价。</span>
+        </div>
+        <button
+          className="app-button is-quiet"
+          type="button"
+          onClick={() => setShowArchived((current) => !current)}
+        >
+          {showArchived ? <RotateCcw size={15} /> : <Archive size={15} />}
+          {showArchived ? '返回当前实验' : '查看已归档实验'}
+        </button>
+      </section>
       {!loading && experiments.length > 0 && (
         <section className="experiment-preview-card">
           <h2>最近实验</h2>
@@ -157,6 +275,58 @@ function ExperimentLanding({
               </button>
             ))}
           </div>
+          {nextExperimentCursor && (
+            <button
+              className="app-button is-quiet"
+              type="button"
+              disabled={loadingMore}
+              onClick={() => { void loadMoreExperiments(); }}
+            >
+              {loadingMore ? '正在加载…' : '加载更多我的实验'}
+            </button>
+          )}
+        </section>
+      )}
+      {showArchived && isAdmin && (
+        <section className="experiment-preview-card">
+          <h2>管理员待清理实验</h2>
+          {adminArchived.length === 0 && !loading && (
+            <div className="experiment-empty">暂无可执行物理清理的归档实验。</div>
+          )}
+          <div className="experiment-trial-table">
+            {adminArchived.map((experiment) => {
+              const retentionActive = Boolean(
+                experiment.retentionUntil
+                && Date.parse(experiment.retentionUntil) > Date.now(),
+              );
+              return (
+                <div className="experiment-trial-row" key={experiment.experimentId}>
+                  <strong>{experiment.name}</strong>
+                  <span>{experiment.status}</span>
+                  <span>{retentionActive ? '保留期内' : '已到清理期限'}</span>
+                  <button
+                    className="app-button is-danger"
+                    type="button"
+                    disabled={Boolean(experiment.purgeJobId) || retentionActive || Boolean(purgingExperimentId)}
+                    onClick={() => { void handleAdminPurge(experiment); }}
+                  >
+                    <Trash2 size={14} />
+                    {experiment.purgeJobId ? '清理已提交' : `物理清理 ${experiment.name}`}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          {nextAdminCursor && (
+            <button
+              className="app-button is-quiet"
+              type="button"
+              disabled={loadingMore}
+              onClick={() => { void loadMoreAdminArchived(); }}
+            >
+              {loadingMore ? '正在加载…' : '加载更多待清理实验'}
+            </button>
+          )}
         </section>
       )}
       <section className="experiment-subject-grid" aria-busy={loading}>
@@ -382,11 +552,13 @@ function PreviewResult({ preview }: { preview: ExperimentPreview }) {
 
 function ExperimentDetailView({
   experimentId,
+  isAdmin,
   onClose,
   onOpenRun,
   onCreateRevision,
 }: {
   experimentId: string;
+  isAdmin: boolean;
   onClose: () => void;
   onOpenRun?: (runId: string, symbol: string, timeframe: string, date: string) => void;
   onCreateRevision: (detail: ExperimentDetail) => void;
@@ -401,9 +573,12 @@ function ExperimentDetailView({
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [lifecycleAction, setLifecycleAction] = useState<'' | 'archive' | 'restore' | 'purge'>('');
+  const [lifecycleMessage, setLifecycleMessage] = useState('');
   const cancelInFlight = useRef(false);
   const resumeInFlight = useRef(false);
   const retryInFlight = useRef(false);
+  const lifecycleInFlight = useRef(false);
   const unchangedPolls = useRef(0);
   const lastVersion = useRef<number | null>(null);
 
@@ -531,6 +706,75 @@ function ExperimentDetailView({
     }
   };
 
+  const handleArchive = async () => {
+    if (!detail || lifecycleInFlight.current) return;
+    if (!window.confirm('确认归档该实验？归档只会从默认列表隐藏，不会删除任何实验数据。')) return;
+    lifecycleInFlight.current = true;
+    setLifecycleAction('archive');
+    setError('');
+    const idempotencyKey = createBrowserUuid();
+    try {
+      await retryUncertain(() => archiveExperiment(
+        experimentId,
+        detail.revision.revisionId,
+        detail.snapshotVersion,
+        '用户在实验详情页确认归档终态实验',
+        idempotencyKey,
+      ));
+      onClose();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      lifecycleInFlight.current = false;
+      setLifecycleAction('');
+    }
+  };
+
+  const handleRestoreArchive = async () => {
+    if (!detail || lifecycleInFlight.current) return;
+    if (!window.confirm('确认恢复该实验到默认列表？实验数据和 Revision 身份保持不变。')) return;
+    lifecycleInFlight.current = true;
+    setLifecycleAction('restore');
+    setError('');
+    try {
+      const idempotencyKey = createBrowserUuid();
+      await retryUncertain(() => restoreArchivedExperiment(
+        experimentId, detail.revision.revisionId, detail.snapshotVersion,
+        '用户在实验详情页确认恢复归档实验', idempotencyKey,
+      ));
+      setDetail(await fetchExperimentDetail(experimentId));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      lifecycleInFlight.current = false;
+      setLifecycleAction('');
+    }
+  };
+
+  const handlePurge = async () => {
+    if (!detail || lifecycleInFlight.current) return;
+    const reason = window.prompt('请输入物理清理原因（将写入管理员审计）：')?.trim();
+    if (!reason) return;
+    if (!window.confirm('高风险操作：确认提交不可逆的实验物理清理任务？共享回测会保留。')) return;
+    lifecycleInFlight.current = true;
+    setLifecycleAction('purge');
+    setError('');
+    try {
+      const idempotencyKey = createBrowserUuid();
+      const purge = await retryUncertain(() => requestExperimentPurge(
+        experimentId, detail.revision.revisionId, detail.snapshotVersion,
+        reason, idempotencyKey,
+      ));
+      setLifecycleMessage(`物理清理任务已进入队列：${purge.purgeId}`);
+      setDetail(await fetchExperimentDetail(experimentId));
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      lifecycleInFlight.current = false;
+      setLifecycleAction('');
+    }
+  };
+
   const loadMoreTrials = async () => {
     if (!nextTrialCursor) return;
     try {
@@ -556,6 +800,9 @@ function ExperimentDetailView({
   const failedTrials = trials.filter((trial) => (
     trial.summaryStatus === 'failed' && !trial.activeExecution
   ));
+  const retentionActive = Boolean(
+    detail.retentionUntil && Date.parse(detail.retentionUntil) > Date.now(),
+  );
   return (
     <main className="experiment-page">
       <section className="experiment-hero">
@@ -567,6 +814,14 @@ function ExperimentDetailView({
         <button className="app-button is-quiet" type="button" onClick={onClose}><ArrowLeft size={15} /> 返回实验入口</button>
       </section>
       {error && <div className="experiment-alert is-error" role="alert">{error}</div>}
+      {lifecycleMessage && <div className="experiment-alert" role="status">{lifecycleMessage}</div>}
+      {detail.archivedAt && (
+        <div className="experiment-alert is-warning" role="status">
+          此实验已归档，当前内容保持只读。
+          {detail.retentionUntil && ` 最早可清理时间：${new Date(detail.retentionUntil).toLocaleString()}。`}
+          {detail.purgeJobId && ` 物理清理任务：${detail.purgeJobId}。`}
+        </div>
+      )}
       {detail.blockedReason && (
         <div
           className={`experiment-alert ${RECOVERABLE_BLOCK_CODES.has(detail.blockedReason.code) ? 'is-warning' : 'is-error'}`}
@@ -654,7 +909,7 @@ function ExperimentDetailView({
       <section className="experiment-preview-card">
         <div className="experiment-card-heading-inline">
           <h2>Trial 运行</h2>
-          {viewingCurrentRevision && failedTrials.length > 0 && (
+          {viewingCurrentRevision && !detail.archivedAt && failedTrials.length > 0 && (
             <div className="experiment-retry-actions">
               <button
                 className="app-button is-quiet"
@@ -687,7 +942,8 @@ function ExperimentDetailView({
             const dateScenario = trial.dimensionAssignment.dateScenario as Record<string, unknown> | undefined;
             return (
               <div className="experiment-trial-row is-trial-detail" key={trial.trialId}>
-                {viewingCurrentRevision && trial.summaryStatus === 'failed' && !trial.activeExecution ? (
+                {viewingCurrentRevision && !detail.archivedAt
+                  && trial.summaryStatus === 'failed' && !trial.activeExecution ? (
                   <input
                     aria-label={`选择 Trial #${trial.trialIndex + 1}`}
                     type="checkbox"
@@ -745,13 +1001,18 @@ function ExperimentDetailView({
           </button>
         )}
       </section>
-      {detail.status === 'completed' ? (
+      {detail.status === 'completed' && !detail.archivedAt ? (
         <EvaluationBuilder
           experimentId={experimentId}
           symbol={String(fixed.symbol ?? '')}
           timeframe={String(fixed.timeframe ?? '5m')}
           onOpenRun={onOpenRun}
         />
+      ) : detail.archivedAt ? (
+        <section className="experiment-preview-card evaluation-locked">
+          <h2>结果评价</h2>
+          <p>归档实验保持只读；恢复归档后可继续创建评价与导出。</p>
+        </section>
       ) : (
         <section className="experiment-preview-card evaluation-locked">
           <h2>结果评价</h2>
@@ -766,7 +1027,7 @@ function ExperimentDetailView({
           </button>
         </section>
       )}
-      {TERMINAL_EXPERIMENT_STATUSES.has(detail.status) && viewingCurrentRevision && (
+      {TERMINAL_EXPERIMENT_STATUSES.has(detail.status) && viewingCurrentRevision && !detail.archivedAt && (
         <section className="experiment-command-bar is-confirm">
           <div>
             <strong>创建新修订</strong>
@@ -778,6 +1039,54 @@ function ExperimentDetailView({
             onClick={() => onCreateRevision(detail)}
           >
             <Plus size={15} /> 创建新 Revision
+          </button>
+        </section>
+      )}
+      {TERMINAL_EXPERIMENT_STATUSES.has(detail.status) && viewingCurrentRevision && !detail.archivedAt && (
+        <section className="experiment-command-bar">
+          <div>
+            <strong>归档实验</strong>
+            <span>仅从默认列表隐藏；Revision、Trial、回测结果和评价均继续保留。</span>
+          </div>
+          <button
+            className="app-button is-quiet"
+            type="button"
+            disabled={lifecycleAction !== ''}
+            onClick={() => { void handleArchive(); }}
+          >
+            <Archive size={15} /> {lifecycleAction === 'archive' ? '正在归档…' : '归档实验'}
+          </button>
+        </section>
+      )}
+      {detail.archivedAt && !detail.purgeJobId && retentionActive && (
+        <section className="experiment-command-bar">
+          <div>
+            <strong>恢复归档</strong>
+            <span>恢复到默认实验列表，不改变现有 Revision 和结果身份。</span>
+          </div>
+          <button
+            className="app-button is-quiet"
+            type="button"
+            disabled={lifecycleAction !== ''}
+            onClick={() => { void handleRestoreArchive(); }}
+          >
+            <RotateCcw size={15} /> {lifecycleAction === 'restore' ? '正在恢复…' : '恢复归档实验'}
+          </button>
+        </section>
+      )}
+      {isAdmin && detail.archivedAt && !detail.purgeJobId && !retentionActive && (
+        <section className="experiment-command-bar">
+          <div>
+            <strong>管理员物理清理</strong>
+            <span>保留期届满后才可提交；操作不可逆，清理范围和原因会被冻结并审计。</span>
+          </div>
+          <button
+            className="app-button is-quiet"
+            type="button"
+            disabled={lifecycleAction !== ''}
+            onClick={() => { void handlePurge(); }}
+          >
+            <Trash2 size={15} /> {lifecycleAction === 'purge' ? '正在提交…' : '物理清理实验'}
           </button>
         </section>
       )}
@@ -984,6 +1293,7 @@ function ExperimentCreator({
 
 export default function ExperimentPage({
   userId,
+  isAdmin = false,
   enabled = true,
   subject,
   experimentId,
@@ -1038,6 +1348,7 @@ export default function ExperimentPage({
     return (
       <ExperimentDetailView
         experimentId={experimentId}
+        isAdmin={isAdmin}
         onClose={() => changeExperiment(null)}
         onOpenRun={onOpenRun}
         onCreateRevision={(detail) => setRevisionTarget({
@@ -1052,6 +1363,7 @@ export default function ExperimentPage({
   if (!selection) {
     return (
       <ExperimentLanding
+        isAdmin={isAdmin}
         onSelect={onSubjectChange}
         onOpenExperiment={changeExperiment}
         onBack={onBackToStrategy}

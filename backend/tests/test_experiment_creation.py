@@ -13,6 +13,8 @@ from backend import settings
 from backend.experiments.application import ExperimentApplication
 from backend.experiments.contracts import (
   ExperimentCreateRequest,
+  ExperimentLifecycleRequest,
+  ExperimentPurgeRequest,
   ExperimentRetryFailedRequest,
   ExperimentRetryPreviewRequest,
   ExperimentRevisionCreateRequest,
@@ -38,6 +40,10 @@ class MemoryExperimentRepository:
     self.created: dict[str, Any] | None = None
     self.created_revision: dict[str, Any] | None = None
     self.retried: dict[str, Any] | None = None
+    self.archived: dict[str, Any] | None = None
+    self.restored_archive: dict[str, Any] | None = None
+    self.list_archived: bool | None = None
+    self.purge_requested: dict[str, Any] | None = None
 
   def save_preview(self, preview: dict[str, Any]) -> None:
     self.preview = preview
@@ -112,6 +118,43 @@ class MemoryExperimentRepository:
 
   def cancel_experiment(self, *_args: Any) -> CommandResult:
     return CommandResult({"experimentId": "experiment-1", "status": "cancelled"}, 200)
+
+  def archive_experiment(self, **values: Any) -> CommandResult:
+    self.archived = values
+    return CommandResult({
+      "experimentId": values["experiment_id"],
+      "revisionId": values["expected_revision_id"],
+      "status": "completed",
+      "snapshotVersion": values["expected_snapshot_version"] + 1,
+      "archivedAt": "2026-10-08T00:00:00+00:00",
+      "replayed": False,
+    }, 200)
+
+  def restore_archived_experiment(self, **values: Any) -> CommandResult:
+    self.restored_archive = values
+    return CommandResult({
+      "experimentId": values["experiment_id"],
+      "revisionId": values["expected_revision_id"],
+      "status": "completed",
+      "snapshotVersion": values["expected_snapshot_version"] + 1,
+      "archivedAt": None,
+      "retentionUntil": None,
+      "replayed": False,
+    }, 200)
+
+  def list_experiments(self, **values: Any) -> dict[str, Any]:
+    self.list_archived = values["archived"]
+    return {"items": [], "nextCursor": None}
+
+  def request_purge(self, **values: Any) -> CommandResult:
+    self.purge_requested = values
+    return CommandResult({
+      "purgeId": "20000000-0000-4000-8000-000000000001",
+      "experimentId": values["experiment_id"],
+      "status": "queued",
+      "phase": "artifacts",
+      "replayed": False,
+    }, 202)
 
 
 class MemoryGenerationRepository:
@@ -299,6 +342,80 @@ def test_retry_application_forwards_frozen_selection_and_idempotency(
   assert repository.retried is not None
   assert repository.retried["selection"]["trialIds"] == [trial_id]
   assert repository.retried["reason"] == "人工确认"
+
+
+def test_archive_application_forwards_optimistic_identity_and_idempotency() -> None:
+  repository = MemoryExperimentRepository()
+  application = _application(repository)
+  payload = ExperimentLifecycleRequest(
+    expectedRevisionId=UUID("10000000-0000-4000-8000-000000000010"),
+    expectedSnapshotVersion=7,
+    reason="研究已结束，保留证据后归档",
+  )
+
+  response, status = application.archive(
+    "experiment-1", payload, "archive-key-1", "req-archive",
+  )
+
+  assert status == 200
+  assert response["archivedAt"] == "2026-10-08T00:00:00+00:00"
+  assert repository.archived is not None
+  assert repository.archived["expected_revision_id"] == str(payload.expectedRevisionId)
+  assert repository.archived["expected_snapshot_version"] == 7
+  assert repository.archived["reason"] == "研究已结束，保留证据后归档"
+  assert repository.archived["idempotency_key"] == "archive-key-1"
+  assert repository.archived["request_id"] == "req-archive"
+
+
+def test_restore_archive_application_preserves_revision_identity() -> None:
+  repository = MemoryExperimentRepository()
+  application = _application(repository)
+  payload = ExperimentLifecycleRequest(
+    expectedRevisionId=UUID("10000000-0000-4000-8000-000000000010"),
+    expectedSnapshotVersion=8,
+    reason="继续保留并查看历史研究",
+  )
+
+  response, status = application.restore_archive(
+    "experiment-1", payload, "restore-archive-key-1", "req-restore-archive",
+  )
+
+  assert status == 200
+  assert response["revisionId"] == str(payload.expectedRevisionId)
+  assert response["archivedAt"] is None
+  assert repository.restored_archive is not None
+  assert repository.restored_archive["expected_snapshot_version"] == 8
+  assert repository.restored_archive["idempotency_key"] == "restore-archive-key-1"
+
+
+def test_list_archived_experiments_uses_a_distinct_query_scope() -> None:
+  repository = MemoryExperimentRepository()
+  application = _application(repository)
+
+  assert application.list_experiments(
+    limit=50, cursor=None, archived=True,
+  ) == {"items": [], "nextCursor": None}
+  assert repository.list_archived is True
+
+
+def test_purge_application_creates_an_audited_async_job() -> None:
+  repository = MemoryExperimentRepository()
+  application = _application(repository)
+  payload = ExperimentPurgeRequest(
+    expectedRevisionId=UUID("10000000-0000-4000-8000-000000000010"),
+    expectedSnapshotVersion=9,
+    reason="超过保留期且已完成合规审批",
+  )
+
+  response, status = application.purge(
+    "experiment-1", payload, "purge-key-1", "req-purge",
+  )
+
+  assert status == 202
+  assert response["status"] == "queued"
+  assert repository.purge_requested is not None
+  assert repository.purge_requested["reason"] == "超过保留期且已完成合规审批"
+  assert repository.purge_requested["request_id"] == "req-purge"
 
 
 def test_coordinator_resumes_after_batch_failure_without_reordering(

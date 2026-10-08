@@ -70,6 +70,7 @@ def _invoke_app(
   method: str,
   body: bytes,
   headers: list[tuple[bytes, bytes]] | None = None,
+  query_string: bytes = b"",
 ) -> tuple[int, dict[str, str], dict[str, object]]:
   messages: list[dict[str, object]] = []
 
@@ -94,7 +95,7 @@ def _invoke_app(
       "scheme": "http",
       "path": path,
       "raw_path": path.encode("ascii"),
-      "query_string": b"",
+      "query_string": query_string,
       "headers": [(b"content-type", b"application/json"), *(headers or [])],
       "client": ("127.0.0.1", 12345),
       "server": ("testserver", 80),
@@ -180,6 +181,41 @@ def test_experiment_authentication_and_csrf_errors_use_stable_contract(
     "requestId": "req_experiment",
     "details": {},
   }}
+
+
+def test_admin_experiment_inventory_uses_stable_forbidden_and_validation_errors(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(auth, "get_user_by_token", lambda _token: USER)
+  forbidden_status, forbidden_headers, forbidden_body = _invoke_app(
+    "/api/backtest/admin/experiments/archived",
+    "GET",
+    b"",
+    _security_headers(),
+  )
+
+  assert forbidden_status == 403
+  assert forbidden_body["error"]["code"] == "experiment.forbidden"
+  assert forbidden_body["error"]["requestId"] == forbidden_headers["x-request-id"]
+
+  admin = CurrentUser(
+    id=USER.id,
+    username=USER.username,
+    display_name=USER.display_name,
+    role="admin",
+  )
+  monkeypatch.setattr(auth, "get_user_by_token", lambda _token: admin)
+  invalid_status, invalid_headers, invalid_body = _invoke_app(
+    "/api/backtest/admin/experiments/archived",
+    "GET",
+    b"",
+    _security_headers(),
+    b"limit=0",
+  )
+
+  assert invalid_status == 422
+  assert invalid_body["error"]["code"] == "experiment.validation_failed"
+  assert invalid_body["error"]["requestId"] == invalid_headers["x-request-id"]
 
 
 def test_validation_error_through_asgi_has_matching_request_id_header_and_body() -> None:

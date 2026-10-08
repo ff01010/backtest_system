@@ -161,6 +161,29 @@ class ExperimentResumeRequest(StrictModel):
     return normalized
 
 
+class ExperimentLifecycleRequest(StrictModel):
+  expectedRevisionId: UUID
+  expectedSnapshotVersion: int = Field(ge=1)
+  reason: str = Field(default="", max_length=500)
+
+  @field_validator("reason")
+  @classmethod
+  def normalize_lifecycle_reason(cls, value: str) -> str:
+    return value.strip()
+
+
+class ExperimentPurgeRequest(ExperimentLifecycleRequest):
+  reason: str = Field(min_length=1, max_length=500)
+
+  @field_validator("reason")
+  @classmethod
+  def require_purge_reason(cls, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+      raise ValueError("清理原因不能为空")
+    return normalized
+
+
 class EvaluationSource(StrictModel):
   experimentRevisionId: UUID
   stageIds: list[UUID] = Field(min_length=1, max_length=1)

@@ -173,6 +173,48 @@ export type ExperimentListItem = {
   createdAt: string;
   updatedAt: string;
   archivedAt: string | null;
+  retentionUntil: string | null;
+  purgeJobId: string | null;
+};
+
+export type AdminArchivedExperimentItem = {
+  experimentId: string;
+  name: string;
+  currentRevisionId: string;
+  status: ExperimentStatus;
+  snapshotVersion: number;
+  archivedAt: string;
+  retentionUntil: string | null;
+  purgeJobId: string | null;
+  updatedAt: string;
+};
+
+export type ExperimentLifecycleResult = {
+  experimentId: string;
+  revisionId: string;
+  status: ExperimentStatus;
+  snapshotVersion: number;
+  archivedAt: string | null;
+  retentionUntil: string | null;
+  reason: string;
+  operationId: string;
+  replayed: boolean;
+  acceptedAt: string;
+};
+
+export type ExperimentPurge = {
+  purgeId: string;
+  experimentId: string;
+  revisionId: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed';
+  phase: string;
+  scopeDigest: string;
+  scopeCounts: Record<string, number>;
+  snapshotVersion: number;
+  reason: string;
+  operationId: string;
+  replayed: boolean;
+  acceptedAt: string;
 };
 
 export type ExperimentTrial = {
@@ -323,6 +365,9 @@ export type ExperimentDetail = {
     scope: 'stage' | 'experiment' | null;
     blockedAt: string | null;
   } | null;
+  archivedAt: string | null;
+  retentionUntil: string | null;
+  purgeJobId: string | null;
   createdAt: string;
   updatedAt: string;
 };
