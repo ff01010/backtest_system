@@ -244,6 +244,26 @@ def test_experiment_configuration_requires_safe_lease_relationship(
     settings.validate_experiment_configuration()
 
 
+def test_experiment_configuration_requires_safe_export_heartbeat_windows(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "EXPERIMENTS_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_BAR_ENABLED", True)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_TRIALS", 100)
+  monkeypatch.setattr(settings, "EXPERIMENT_MAX_USER_PLANNED_TRIALS", 100)
+  monkeypatch.setattr(settings, "EXPERIMENT_CURSOR_SIGNING_SECRET", "s" * 32)
+  monkeypatch.setattr(settings, "EXPERIMENT_EXPORT_HEARTBEAT_SECONDS", 10)
+  monkeypatch.setattr(settings, "EXPERIMENT_EXPORT_LEASE_SECONDS", 30)
+
+  with pytest.raises(ValueError, match="评价导出 Worker 租约"):
+    settings.validate_experiment_configuration()
+
+  monkeypatch.setattr(settings, "EXPERIMENT_EXPORT_LEASE_SECONDS", 90)
+  monkeypatch.setattr(settings, "EXPERIMENT_EXPORT_WORKER_TTL_SECONDS", 20)
+  with pytest.raises(ValueError, match="评价导出 Worker 健康 TTL"):
+    settings.validate_experiment_configuration()
+
+
 def test_experiment_configuration_requires_bounded_window_and_cursor_secret(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:

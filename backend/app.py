@@ -35,6 +35,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from backend import settings
 from backend.experiments import (
   EvaluationApplication,
+  EvaluationExportApplication,
+  EvaluationExportCreateRequest,
   EvaluationRunCreateRequest,
   EvaluationSpecRequest,
   ExperimentApplication,
@@ -102,6 +104,7 @@ logger = logging.getLogger(__name__)
 _verified_runtime_capabilities = declared_runtime_capabilities()
 _experiment_application = ExperimentApplication()
 _evaluation_application = EvaluationApplication()
+_evaluation_export_application = EvaluationExportApplication()
 
 
 def _backtest_error_summary(error: Exception, run_id: str | None) -> dict[str, Any]:
@@ -315,7 +318,11 @@ def _legacy_api_error(request: Request, status_code: int, detail: Any) -> JSONRe
 
 
 def _is_experiment_api_path(path: str) -> bool:
-  return path.startswith("/api/backtest/experiment")
+  return path.startswith((
+    "/api/backtest/experiment",
+    "/api/backtest/evaluation-runs",
+    "/api/backtest/evaluation-exports",
+  ))
 
 
 def _experiment_api_error(
@@ -1045,6 +1052,7 @@ def startup():
 def health():
   runner_health = state_store.get_backtest_runner_health()
   signal_export_healthy = state_store.signal_export_runner_available()
+  evaluation_export_healthy = _evaluation_export_application.worker_available()
   return {
     "status": runner_health["status"],
     "backtest": "ok" if runner_health["status"] == "ok" else "unavailable",
@@ -1054,6 +1062,7 @@ def health():
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
     "runtimeCapabilities": _verified_runtime_capabilities,
     "signalExportRunner": {"healthy": signal_export_healthy},
+    "evaluationExportWorker": {"healthy": evaluation_export_healthy},
     "observability": loki_client.health_status(),
     "experiments": {
       "enabled": settings.EXPERIMENTS_ENABLED,
@@ -1942,6 +1951,111 @@ def retry_experiment_evaluation_run(
     return JSONResponse(status_code=status_code, content=body)
   except ExperimentError as error:
     _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/evaluation-runs/{evaluation_run_id}/exports")
+def create_evaluation_export(
+  evaluation_run_id: UUID,
+  payload: EvaluationExportCreateRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _evaluation_export_application.create(
+      str(evaluation_run_id), payload, _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/evaluation-runs/{evaluation_run_id}/exports")
+def evaluation_exports(evaluation_run_id: UUID) -> dict[str, Any]:
+  try:
+    return _evaluation_export_application.list_exports(str(evaluation_run_id))
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/evaluation-exports/{export_id}")
+def evaluation_export_detail(export_id: UUID) -> dict[str, Any]:
+  try:
+    return _evaluation_export_application.detail(str(export_id))
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/evaluation-exports/{export_id}/cancel")
+def cancel_evaluation_export(export_id: UUID, request: Request) -> Response:
+  try:
+    body, status_code = _evaluation_export_application.cancel(
+      str(export_id), _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/evaluation-exports/{export_id}/retry")
+def retry_evaluation_export(export_id: UUID, request: Request) -> Response:
+  try:
+    body, status_code = _evaluation_export_application.retry(
+      str(export_id), _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/evaluation-exports/{export_id}/download")
+def download_evaluation_export(export_id: UUID) -> FileResponse:
+  try:
+    export = _evaluation_export_application.download_source(str(export_id))
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+  if export["status"] == "expired":
+    raise _stable_error(410, "experiment.export_expired", "评价导出制品已过期")
+  if export["status"] != "succeeded":
+    raise _stable_error(409, "experiment.export_state_conflict", "评价导出尚未完成")
+  root = Path(settings.OUTPUT_ROOT).resolve()
+  path = (root / str(export.get("storage_key") or "")).resolve()
+  try:
+    path.relative_to(root)
+  except ValueError as error:
+    logger.error("评价导出路径越界: export_id=%s", export_id)
+    _evaluation_export_application.expire_artifact(str(export_id), "artifact_missing")
+    raise _stable_error(410, "experiment.export_unavailable", "评价导出制品不可用") from error
+  expected_size = int(export.get("byte_size") or -1)
+  expected_hash = str(export.get("content_sha256") or "")
+  if (
+    not path.is_file()
+    or path.stat().st_size != expected_size
+    or _file_content_sha256(path) != expected_hash
+  ):
+    logger.error("评价导出文件缺失或校验失败: export_id=%s", export_id)
+    _evaluation_export_application.expire_artifact(str(export_id), "artifact_missing")
+    raise _stable_error(410, "experiment.export_unavailable", "评价导出制品不可用")
+  _evaluation_export_application.mark_downloaded(str(export_id))
+  return FileResponse(
+    path,
+    media_type=str(export.get("media_type") or "application/octet-stream"),
+    filename=str(export.get("download_filename") or "evaluation-export"),
+    headers={
+      "Cache-Control": "private, no-store",
+      "ETag": f'"{expected_hash}"',
+      "Accept-Ranges": "bytes",
+    },
+  )
+
+
+def _file_content_sha256(path: Path) -> str:
+  content_hash = hashlib.sha256()
+  with path.open("rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+      content_hash.update(chunk)
+  return content_hash.hexdigest()
 
 
 @app.post("/api/backtest/experiments/{experiment_id}/cancel")

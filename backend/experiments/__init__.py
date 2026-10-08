@@ -2,7 +2,9 @@
 
 from backend.experiments.application import ExperimentApplication
 from backend.experiments.evaluation_application import EvaluationApplication
+from backend.experiments.export_application import EvaluationExportApplication
 from backend.experiments.contracts import (
+  EvaluationExportCreateRequest,
   EvaluationRunCreateRequest,
   EvaluationSpecRequest,
   ExperimentCreateRequest,
@@ -15,6 +17,8 @@ from backend.experiments.errors import ExperimentError
 __all__ = [
   "ExperimentApplication",
   "EvaluationApplication",
+  "EvaluationExportApplication",
+  "EvaluationExportCreateRequest",
   "ExperimentCreateRequest",
   "ExperimentError",
   "ExperimentPreviewRequest",

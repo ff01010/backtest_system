@@ -219,6 +219,9 @@ def test_health_reports_runner_degradation_without_internal_counts(
   monkeypatch.setattr(
     api_app.state_store, "signal_export_runner_available", lambda: True,
   )
+  monkeypatch.setattr(
+    api_app._evaluation_export_application, "worker_available", lambda: True,
+  )
 
   assert api_app.health() == {
     "status": "degraded",
@@ -229,6 +232,7 @@ def test_health_reports_runner_degradation_without_internal_counts(
     "capabilityDigest": api_app.RUNTIME_CAPABILITY_DIGEST,
     "runtimeCapabilities": api_app._verified_runtime_capabilities,
     "signalExportRunner": {"healthy": True},
+    "evaluationExportWorker": {"healthy": True},
     "observability": {"status": "disabled"},
     "experiments": {
       "enabled": api_app.settings.EXPERIMENTS_ENABLED,

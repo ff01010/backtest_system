@@ -361,3 +361,18 @@ class EvaluationSpecRequest(StrictModel):
 
 class EvaluationRunCreateRequest(StrictModel):
   evaluationSpecId: UUID
+
+
+class EvaluationExportCreateRequest(StrictModel):
+  format: Literal["csv", "xlsx", "report"]
+  columns: list[str] = Field(min_length=1, max_length=64)
+  locale: Literal["zh-CN", "en-US"] = "zh-CN"
+
+  @field_validator("columns")
+  @classmethod
+  def validate_export_columns(cls, value: list[str]) -> list[str]:
+    if any(not item or len(item) > 160 for item in value):
+      raise ValueError("导出字段 ID 无效")
+    if len(set(value)) != len(value):
+      raise ValueError("导出字段不能重复")
+    return value

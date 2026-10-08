@@ -197,6 +197,20 @@ def ensure_schema() -> None:
         "export_table", "item_table", "health_table",
       )):
         raise DatabaseError("数据库缺少信号明细批量导出迁移 040，请先运行 migrate 服务")
+      cur.execute("""
+        SELECT
+          to_regclass(
+            'public.backtest_experiment_evaluation_export'
+          ) AS evaluation_export_table,
+          to_regclass(
+            'public.backtest_experiment_export_worker_health'
+          ) AS evaluation_export_health_table
+      """)
+      evaluation_export_tables = cur.fetchone()
+      if any(evaluation_export_tables[key] is None for key in (
+        "evaluation_export_table", "evaluation_export_health_table",
+      )):
+        raise DatabaseError("数据库缺少评价异步导出迁移 051，请先运行 migrate 服务")
 def get_release_status_record() -> dict[str, Any] | None:
   """返回当前部署、有效公告和当前用户回执。"""
   with _db() as conn:

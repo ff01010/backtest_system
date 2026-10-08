@@ -4651,6 +4651,118 @@ button.experiment-trial-row:hover {
   padding: 6px 0;
 }
 
+.evaluation-export-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface-accent) 72%, var(--surface));
+  padding: 16px;
+}
+
+.evaluation-export-heading,
+.evaluation-export-item,
+.evaluation-export-item > div:last-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.evaluation-export-heading h3,
+.evaluation-export-heading p {
+  margin: 0;
+}
+
+.evaluation-export-heading p,
+.evaluation-export-item span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-export-heading code,
+.evaluation-export-item code {
+  overflow: hidden;
+  max-width: 360px;
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evaluation-export-form {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.45fr) minmax(150px, 0.45fr) minmax(260px, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.evaluation-export-form > label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-export-form select {
+  height: 32px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 8px;
+}
+
+.evaluation-export-columns {
+  display: flex;
+  overflow: auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: 6px 9px;
+  white-space: nowrap;
+}
+
+.evaluation-export-columns label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text);
+  font-size: 10px;
+}
+
+.evaluation-export-history {
+  display: grid;
+  gap: 8px;
+}
+
+.evaluation-export-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: 10px;
+}
+
+.evaluation-export-item > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.evaluation-export-item.is-failed,
+.evaluation-export-item.is-expired {
+  border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
+}
+
+.evaluation-export-item .is-error {
+  color: var(--danger);
+}
+
 .evaluation-locked {
   color: var(--text-muted);
 }
@@ -4658,7 +4770,14 @@ button.experiment-trial-row:hover {
 @media (max-width: 900px) {
   .evaluation-layout,
   .evaluation-rule,
-  .evaluation-execution-set > div {
+  .evaluation-execution-set > div,
+  .evaluation-export-form {
     grid-template-columns: 1fr;
+  }
+
+  .evaluation-export-heading,
+  .evaluation-export-item {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

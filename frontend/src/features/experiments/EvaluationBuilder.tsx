@@ -1,12 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Copy, Play, Plus, RefreshCw, RotateCcw, Save, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Copy, Download, Play, Plus, RefreshCw, RotateCcw, Save, Trash2, X } from 'lucide-react';
 import { createBrowserUuid } from '../../utils/browserUuid';
 import {
+  cancelEvaluationExport,
+  createEvaluationExport,
   createEvaluationRun,
+  evaluationExportDownloadUrl,
   fetchEvaluationCatalogs,
+  fetchEvaluationExports,
   fetchEvaluationRun,
   fetchEvaluationRuns,
   fetchEvaluationSpecs,
+  retryEvaluationExport,
   retryEvaluationRun,
   saveEvaluationSpec,
 } from './api';
@@ -14,6 +19,8 @@ import type {
   EvaluationCatalogs,
   EvaluationAggregate,
   EvaluationDimensionDefinition,
+  EvaluationExport,
+  EvaluationExportFormat,
   EvaluationFilter,
   EvaluationFormula,
   EvaluationMetricDefinition,
@@ -411,6 +418,157 @@ function VisualizationResult({ item }: { item: Record<string, unknown> }) {
   return <div className="evaluation-analysis-card"><h4>时间稳定性 · {String(item.metricId)}</h4><p>reference 仅是冻结用途标签，不代表最终 test。</p>{candidates.map((candidate) => <div className="evaluation-point-list" key={candidate.candidateKey}>{candidate.values.map((value) => <span key={String(value.dateScenarioId)}>{String(value.dateScenarioId)}（{String(value.role)}）：{String(value.value ?? '—')}</span>)}</div>)}</div>;
 }
 
+const EXPORT_STATUS_LABELS: Record<EvaluationExport['status'], string> = {
+  queued: '排队中',
+  running: '生成中',
+  succeeded: '已完成',
+  failed: '失败',
+  cancel_requested: '取消中',
+  cancelled: '已取消',
+  expired: '已过期',
+};
+
+function EvaluationExports({
+  detail,
+  labels,
+}: {
+  detail: EvaluationRunDetail;
+  labels: Map<string, string>;
+}) {
+  const outputColumns = detail.output?.columns ?? [];
+  const [items, setItems] = useState<EvaluationExport[]>([]);
+  const [format, setFormat] = useState<EvaluationExportFormat>('xlsx');
+  const [columns, setColumns] = useState<string[]>(outputColumns);
+  const [locale, setLocale] = useState<'zh-CN' | 'en-US'>('zh-CN');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const createIntentRef = useRef<{ signature: string; key: string } | null>(null);
+  const commandKeysRef = useRef(new Map<string, string>());
+
+  const refresh = useCallback(async () => {
+    const result = await fetchEvaluationExports(detail.evaluationRunId);
+    setItems(result.items);
+    return result.items;
+  }, [detail.evaluationRunId]);
+
+  useEffect(() => {
+    setColumns(outputColumns);
+  }, [detail.evaluationRunId, outputColumns.join('|')]);
+
+  useEffect(() => {
+    let stopped = false;
+    const load = async () => {
+      try {
+        await refresh();
+        if (stopped) return;
+        setError('');
+      } catch (reason) {
+        if (!stopped) setError(messageOf(reason));
+      }
+    };
+    void load();
+    return () => { stopped = true; };
+  }, [refresh]);
+
+  const hasActiveExport = items.some((item) => (
+    ['queued', 'running', 'cancel_requested'].includes(item.status)
+  ));
+
+  useEffect(() => {
+    if (!hasActiveExport) return undefined;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      try {
+        await refresh();
+        if (!stopped) setError('');
+      } catch (reason) {
+        if (!stopped) setError(messageOf(reason));
+      } finally {
+        if (!stopped) timer = setTimeout(() => { void poll(); }, 1500);
+      }
+    };
+    timer = setTimeout(() => { void poll(); }, 1500);
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [hasActiveExport, refresh]);
+
+  const create = async () => {
+    if (busy || columns.length === 0) return;
+    setBusy(true); setError('');
+    const signature = JSON.stringify({ format, columns, locale });
+    const previous = createIntentRef.current;
+    const key = previous?.signature === signature ? previous.key : createBrowserUuid();
+    createIntentRef.current = { signature, key };
+    try {
+      await createEvaluationExport(
+        detail.evaluationRunId, format, columns, locale, key,
+      );
+      createIntentRef.current = null;
+      await refresh();
+    } catch (reason) {
+      setError(messageOf(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cancel = async (exportId: string) => {
+    setBusy(true); setError('');
+    const command = `cancel:${exportId}`;
+    const key = commandKeysRef.current.get(command) ?? createBrowserUuid();
+    commandKeysRef.current.set(command, key);
+    try {
+      await cancelEvaluationExport(exportId, key);
+      commandKeysRef.current.delete(command);
+      await refresh();
+    } catch (reason) {
+      setError(messageOf(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const retry = async (exportId: string) => {
+    setBusy(true); setError('');
+    const command = `retry:${exportId}`;
+    const key = commandKeysRef.current.get(command) ?? createBrowserUuid();
+    commandKeysRef.current.set(command, key);
+    try {
+      await retryEvaluationExport(exportId, key);
+      commandKeysRef.current.delete(command);
+      await refresh();
+    } catch (reason) {
+      setError(messageOf(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="evaluation-export-panel" aria-label="评价导出">
+      <div className="evaluation-export-heading"><div><h3>异步导出</h3><p>制品冻结当前输出摘要；过期后会创建新的导出作业。</p></div><code>{detail.outputHash}</code></div>
+      {error && <div className="experiment-alert is-error" role="alert">{error}</div>}
+      <div className="evaluation-export-form">
+        <label>格式<select aria-label="导出格式" value={format} onChange={(event) => setFormat(event.target.value as EvaluationExportFormat)}><option value="csv">CSV 结果表</option><option value="xlsx">XLSX 结果表</option><option value="report">HTML 研究报告</option></select></label>
+        <label>语言<select aria-label="导出语言" value={locale} onChange={(event) => setLocale(event.target.value as 'zh-CN' | 'en-US')}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label>
+        <div className="evaluation-export-columns" aria-label="导出字段">{outputColumns.map((column) => <label key={column}><input type="checkbox" checked={columns.includes(column)} onChange={(event) => setColumns(event.target.checked ? [...columns, column] : columns.filter((item) => item !== column))} /> {labels.get(column) ?? column}</label>)}</div>
+        <button className="app-button is-primary" type="button" disabled={busy || columns.length === 0} onClick={() => { void create(); }}><Download size={15} /> {busy ? '正在提交…' : '创建导出'}</button>
+      </div>
+      <div className="evaluation-export-history">
+        {items.map((item) => {
+          const active = ['queued', 'running', 'cancel_requested'].includes(item.status);
+          const retryable = ['failed', 'cancelled', 'expired'].includes(item.status);
+          return <article key={item.exportId} className={`evaluation-export-item is-${item.status}`}><div><strong>{item.format.toUpperCase()} · {EXPORT_STATUS_LABELS[item.status]}</strong><span>{item.progress.completed}/{item.progress.total} · 尝试 {item.attemptCount}</span>{item.error && <span className="is-error">{item.error.message}（{item.error.code}）</span>}{item.artifact && <><span>{item.artifact.filename} · {item.artifact.byteSize} bytes</span><code>SHA-256 {item.artifact.sha256}</code></>}</div><div>{item.status === 'succeeded' && <a className="app-button is-primary" href={evaluationExportDownloadUrl(item.exportId)}><Download size={14} /> 下载</a>}{active && item.status !== 'cancel_requested' && <button className="app-icon-button" type="button" aria-label="取消评价导出" disabled={busy} onClick={() => { void cancel(item.exportId); }}><X size={14} /></button>}{retryable && <button className="app-icon-button" type="button" aria-label="重新创建评价导出" disabled={busy} onClick={() => { void retry(item.exportId); }}><RotateCcw size={14} /></button>}</div></article>;
+        })}
+        {items.length === 0 && <div className="experiment-empty">尚未创建评价导出。</div>}
+      </div>
+    </section>
+  );
+}
+
 function EvaluationResult({
   detail,
   catalogs,
@@ -476,6 +634,7 @@ function EvaluationResult({
           </div>
         ))}
       </details>
+      <EvaluationExports detail={detail} labels={labels} />
     </div>
   );
 }

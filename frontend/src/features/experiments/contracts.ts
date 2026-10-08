@@ -483,3 +483,33 @@ export type EvaluationCompletenessSnapshot = {
     error: Record<string, unknown> | null;
   }>;
 };
+
+export type EvaluationExportFormat = 'csv' | 'xlsx' | 'report';
+
+export type EvaluationExport = {
+  exportId: string;
+  evaluationRunId: string;
+  evaluationSpecId: string;
+  experimentId: string;
+  evaluationName: string | null;
+  format: EvaluationExportFormat;
+  columns: string[];
+  locale: 'zh-CN' | 'en-US';
+  outputHash: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancel_requested' | 'cancelled' | 'expired';
+  progress: { completed: number; total: number };
+  attemptCount: number;
+  artifact: null | {
+    filename: string;
+    mediaType: string;
+    byteSize: number;
+    sha256: string;
+  };
+  error: null | { code: string; message: string };
+  retryOfExportId: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  expiresAt: string | null;
+  replayed?: boolean;
+};

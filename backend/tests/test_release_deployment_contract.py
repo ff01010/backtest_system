@@ -75,7 +75,7 @@ def test_signal_export_runner_is_deployed_and_health_checked_with_backend() -> N
   assert "quant-backtest-artifacts:/runtime/artifacts" in compose
   assert "backend.signal_export_runner', '--healthcheck" in compose
   assert (
-    "backend bar-runner l2-runner experiment-coordinator evaluation-worker signal-export-runner"
+    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner"
     in script
   )
   assert "strategy-worker" not in script
@@ -95,7 +95,7 @@ def test_experiment_coordinator_is_deployed_and_health_checked_with_backend() ->
   assert "python', '-m', 'backend.experiment_coordinator" in compose
   assert 'runner_containers_ready "experiment-coordinator" "1"' in script
   assert (
-    "backend bar-runner l2-runner experiment-coordinator evaluation-worker signal-export-runner"
+    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner"
     in script
   )
 
@@ -110,6 +110,20 @@ def test_evaluation_worker_is_deployed_and_health_checked_with_backend() -> None
   assert "python', '-m', 'backend.evaluation_worker" in compose
   assert "backend.evaluation_worker', '--healthcheck" in compose
   assert 'runner_containers_ready "evaluation-worker" "1"' in script
+
+
+def test_evaluation_export_worker_is_deployed_and_health_checked_with_backend() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(
+    encoding="utf-8",
+  )
+
+  assert "evaluation-export-worker:" in compose
+  assert "python', '-m', 'backend.evaluation_export_worker" in compose
+  assert "backend.evaluation_export_worker', '--healthcheck" in compose
+  assert "quant-backtest-artifacts:/runtime/artifacts" in compose
+  assert 'runner_containers_ready "evaluation-export-worker" "1"' in script
+  assert '"evaluationExportWorker":{"healthy":true}' in script
 
 
 def test_retired_strategy_worker_is_absent_from_runtime_and_deployment() -> None:
@@ -173,7 +187,7 @@ def test_observability_services_are_pinned_isolated_and_started_before_applicati
     "up -d --build container-event-observer",
   )
   assert script.index(
-    "backend bar-runner l2-runner experiment-coordinator evaluation-worker signal-export-runner",
+    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner",
   ) < (
     script.index("if ! wait_for_observability; then")
   )
@@ -190,7 +204,7 @@ def test_observability_failure_cannot_stop_core_release_after_cutover() -> None:
   migration = script.index("run --rm migrate")
   observer = script.index("up -d --build container-event-observer")
   core_start = script.index(
-    "backend bar-runner l2-runner experiment-coordinator evaluation-worker signal-export-runner",
+    "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker signal-export-runner",
   )
 
   assert core_stop < migration < observer < core_start

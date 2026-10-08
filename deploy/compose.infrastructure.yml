@@ -456,6 +456,51 @@ services:
     networks:
       - quant-backtest-net
 
+  evaluation-export-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    container_name: quant-backtest-evaluation-export-worker
+    restart: unless-stopped
+    logging: *bounded-logging
+    labels: *log-on-main
+    env_file:
+      - .env
+    environment:
+      TREND_GRID_DATABASE_URL: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${APP_DB_NAME}
+      TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
+      TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+      TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+      TREND_GRID_OUTPUT_ROOT: /runtime/artifacts
+      TREND_GRID_EXPERIMENT_EXPORT_TTL_DAYS: ${TREND_GRID_EXPERIMENT_EXPORT_TTL_DAYS:-7}
+      TREND_GRID_EXPERIMENT_EXPORT_CLEANUP_SECONDS: ${TREND_GRID_EXPERIMENT_EXPORT_CLEANUP_SECONDS:-300}
+      TREND_GRID_EXPERIMENT_EXPORT_STALE_PART_HOURS: ${TREND_GRID_EXPERIMENT_EXPORT_STALE_PART_HOURS:-24}
+      TREND_GRID_EXPERIMENT_EXPORT_LEASE_SECONDS: ${TREND_GRID_EXPERIMENT_EXPORT_LEASE_SECONDS:-90}
+      TREND_GRID_EXPERIMENT_EXPORT_HEARTBEAT_SECONDS: ${TREND_GRID_EXPERIMENT_EXPORT_HEARTBEAT_SECONDS:-10}
+      TREND_GRID_EXPERIMENT_EXPORT_WORKER_TTL_SECONDS: ${TREND_GRID_EXPERIMENT_EXPORT_WORKER_TTL_SECONDS:-30}
+      TREND_GRID_EXPERIMENT_EXPORT_MAX_ATTEMPTS: ${TREND_GRID_EXPERIMENT_EXPORT_MAX_ATTEMPTS:-3}
+      TREND_GRID_EXPERIMENT_EXPORT_MIN_FREE_BYTES: ${TREND_GRID_EXPERIMENT_EXPORT_MIN_FREE_BYTES:-536870912}
+    command: ['python', '-m', 'backend.evaluation_export_worker']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - quant-backtest-artifacts:/runtime/artifacts
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 128
+    healthcheck:
+      test: ['CMD', 'python', '-m', 'backend.evaluation_export_worker', '--healthcheck']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - quant-backtest-net
+
   signal-export-runner:
     build:
       context: ..

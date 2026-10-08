@@ -11,6 +11,8 @@ import type {
   ExperimentSubjectRef,
   ExperimentTrial,
   EvaluationCatalogs,
+  EvaluationExport,
+  EvaluationExportFormat,
   EvaluationRun,
   EvaluationRunDetail,
   EvaluationSpecPayload,
@@ -160,4 +162,59 @@ export function retryEvaluationRun(
     {},
     { 'Idempotency-Key': idempotencyKey },
   );
+}
+
+export function createEvaluationExport(
+  evaluationRunId: string,
+  format: EvaluationExportFormat,
+  columns: string[],
+  locale: 'zh-CN' | 'en-US',
+  idempotencyKey: string,
+): Promise<EvaluationExport> {
+  return sendJson(
+    `/api/backtest/evaluation-runs/${encodeURIComponent(evaluationRunId)}/exports`,
+    'POST',
+    { format, columns, locale },
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function fetchEvaluationExports(
+  evaluationRunId: string,
+): Promise<{ items: EvaluationExport[]; nextCursor: null }> {
+  return fetchJson(
+    `/api/backtest/evaluation-runs/${encodeURIComponent(evaluationRunId)}/exports`,
+  );
+}
+
+export function fetchEvaluationExport(exportId: string): Promise<EvaluationExport> {
+  return fetchJson(`/api/backtest/evaluation-exports/${encodeURIComponent(exportId)}`);
+}
+
+export function cancelEvaluationExport(
+  exportId: string,
+  idempotencyKey: string,
+): Promise<{ exportId: string; status: string; replayed: boolean }> {
+  return sendJson(
+    `/api/backtest/evaluation-exports/${encodeURIComponent(exportId)}/cancel`,
+    'POST',
+    {},
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function retryEvaluationExport(
+  exportId: string,
+  idempotencyKey: string,
+): Promise<EvaluationExport> {
+  return sendJson(
+    `/api/backtest/evaluation-exports/${encodeURIComponent(exportId)}/retry`,
+    'POST',
+    {},
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function evaluationExportDownloadUrl(exportId: string): string {
+  return `/api/backtest/evaluation-exports/${encodeURIComponent(exportId)}/download`;
 }

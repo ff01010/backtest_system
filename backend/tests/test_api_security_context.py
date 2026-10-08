@@ -408,7 +408,7 @@ def test_all_cookie_write_routes_are_rejected_before_dispatch_without_csrf(
     response = _run_middleware(request, call_next)
     assert response.status_code == 403, f"{method} {path}"
     body = json.loads(response.body)
-    if path.startswith("/api/backtest/experiment"):
+    if app_module._is_experiment_api_path(path):
       assert body["error"]["code"] == "auth.csrf_invalid"
     else:
       assert body["detail"]["code"] == "auth.csrf_invalid"

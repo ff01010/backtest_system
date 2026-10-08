@@ -2,17 +2,22 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import EvaluationBuilder from '../features/experiments/EvaluationBuilder';
 import {
+  cancelEvaluationExport,
+  createEvaluationExport,
   createEvaluationRun,
   fetchEvaluationCatalogs,
+  fetchEvaluationExports,
   fetchEvaluationRun,
   fetchEvaluationRuns,
   fetchEvaluationSpecs,
+  retryEvaluationExport,
   retryEvaluationRun,
   saveEvaluationSpec,
 } from '../features/experiments/api';
 import type {
   EvaluationCatalogs,
   EvaluationCompletenessSnapshot,
+  EvaluationExport,
   EvaluationRun,
   EvaluationRunDetail,
   SavedEvaluationSpec,
@@ -20,11 +25,16 @@ import type {
 
 
 vi.mock('../features/experiments/api', () => ({
+  cancelEvaluationExport: vi.fn(),
+  createEvaluationExport: vi.fn(),
   createEvaluationRun: vi.fn(),
+  evaluationExportDownloadUrl: vi.fn((exportId: string) => `/download/${exportId}`),
   fetchEvaluationCatalogs: vi.fn(),
+  fetchEvaluationExports: vi.fn(),
   fetchEvaluationRun: vi.fn(),
   fetchEvaluationRuns: vi.fn(),
   fetchEvaluationSpecs: vi.fn(),
+  retryEvaluationExport: vi.fn(),
   retryEvaluationRun: vi.fn(),
   saveEvaluationSpec: vi.fn(),
 }));
@@ -172,6 +182,18 @@ const DETAIL: EvaluationRunDetail = {
   spec: SAVED.spec,
 };
 
+const EXPORT: EvaluationExport = {
+  exportId: 'export-1', evaluationRunId: 'evaluation-run-1',
+  evaluationSpecId: 'spec-1', experimentId: 'experiment-1',
+  evaluationName: '基础评价', format: 'xlsx',
+  columns: ['totalReturn', 'annualSharpe', 'maxDrawdownRate'], locale: 'zh-CN',
+  outputHash: 'c'.repeat(64), status: 'queued',
+  progress: { completed: 0, total: 1 }, attemptCount: 0,
+  artifact: null, error: null, retryOfExportId: null,
+  createdAt: '2026-09-30T00:00:02Z', startedAt: null,
+  finishedAt: null, expiresAt: null,
+};
+
 beforeEach(() => {
   vi.mocked(fetchEvaluationCatalogs).mockReset().mockResolvedValue(CATALOGS);
   vi.mocked(fetchEvaluationSpecs).mockReset().mockResolvedValue({ items: [], nextCursor: null });
@@ -179,6 +201,14 @@ beforeEach(() => {
   vi.mocked(saveEvaluationSpec).mockReset().mockResolvedValue(SAVED);
   vi.mocked(createEvaluationRun).mockReset().mockResolvedValue(RUN);
   vi.mocked(fetchEvaluationRun).mockReset().mockResolvedValue(DETAIL);
+  vi.mocked(fetchEvaluationExports).mockReset().mockResolvedValue({ items: [], nextCursor: null });
+  vi.mocked(createEvaluationExport).mockReset().mockResolvedValue(EXPORT);
+  vi.mocked(cancelEvaluationExport).mockReset().mockResolvedValue({
+    exportId: EXPORT.exportId, status: 'cancel_requested', replayed: false,
+  });
+  vi.mocked(retryEvaluationExport).mockReset().mockResolvedValue({
+    ...EXPORT, exportId: 'export-2', retryOfExportId: EXPORT.exportId,
+  });
   vi.mocked(retryEvaluationRun).mockReset().mockResolvedValue({
     evaluationRunId: RUN.evaluationRunId,
     status: 'queued',
@@ -213,6 +243,100 @@ describe('EvaluationBuilder', () => {
 
     expect(screen.getByDisplayValue('基础评价 副本')).not.toBeNull();
     expect(createEvaluationRun).not.toHaveBeenCalled();
+  });
+
+  it('creates an asynchronous export with the frozen visible columns', async () => {
+    vi.mocked(fetchEvaluationRuns).mockResolvedValue({ items: [DETAIL], nextCursor: null });
+    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+    fireEvent.click(await screen.findByRole('button', { name: '创建导出' }));
+
+    await waitFor(() => expect(createEvaluationExport).toHaveBeenCalledTimes(1));
+    expect(createEvaluationExport).toHaveBeenCalledWith(
+      'evaluation-run-1',
+      'xlsx',
+      ['totalReturn', 'annualSharpe', 'maxDrawdownRate'],
+      'zh-CN',
+      expect.stringMatching(/^[0-9a-f-]{36}$/),
+    );
+  });
+
+  it('starts polling when a newly created export enters the queue', async () => {
+    vi.mocked(fetchEvaluationRuns).mockResolvedValue({ items: [DETAIL], nextCursor: null });
+    vi.mocked(fetchEvaluationExports)
+      .mockResolvedValueOnce({ items: [], nextCursor: null })
+      .mockResolvedValueOnce({ items: [EXPORT], nextCursor: null })
+      .mockResolvedValueOnce({
+        items: [{
+          ...EXPORT,
+          status: 'succeeded',
+          artifact: {
+            filename: 'result.xlsx', mediaType: 'application/xlsx',
+            byteSize: 128, sha256: 'f'.repeat(64),
+          },
+        }],
+        nextCursor: null,
+      });
+    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+    const createButton = await screen.findByRole('button', { name: '创建导出' });
+    await waitFor(() => expect(fetchEvaluationExports).toHaveBeenCalledTimes(1));
+    fireEvent.click(createButton);
+
+    await waitFor(
+      () => expect(fetchEvaluationExports).toHaveBeenCalledTimes(3),
+      { timeout: 2500 },
+    );
+    expect(await screen.findByText('XLSX · 已完成')).not.toBeNull();
+  });
+
+  it('reuses the export idempotency key after an uncertain network result', async () => {
+    vi.mocked(fetchEvaluationRuns).mockResolvedValue({ items: [DETAIL], nextCursor: null });
+    vi.mocked(createEvaluationExport)
+      .mockRejectedValueOnce(new Error('network failed'))
+      .mockResolvedValueOnce(EXPORT);
+    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+    const createButton = await screen.findByRole('button', { name: '创建导出' });
+    fireEvent.click(createButton);
+    expect(await screen.findByText('network failed')).not.toBeNull();
+    fireEvent.click(createButton);
+
+    await waitFor(() => expect(createEvaluationExport).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(createEvaluationExport).mock.calls[0][4]).toBe(
+      vi.mocked(createEvaluationExport).mock.calls[1][4],
+    );
+  });
+
+  it('shows completed, failed, cancelled and expired export actions', async () => {
+    vi.mocked(fetchEvaluationRuns).mockResolvedValue({ items: [DETAIL], nextCursor: null });
+    vi.mocked(fetchEvaluationExports).mockResolvedValue({
+      items: [
+        {
+          ...EXPORT,
+          status: 'succeeded',
+          artifact: {
+            filename: 'report.xlsx', mediaType: 'application/xlsx',
+            byteSize: 1024, sha256: 'f'.repeat(64),
+          },
+          expiresAt: '2026-10-07T00:00:00Z',
+        },
+        { ...EXPORT, exportId: 'export-failed', status: 'failed', error: { code: 'artifact_failed', message: '生成失败' } },
+        { ...EXPORT, exportId: 'export-cancelled', status: 'cancelled' },
+        { ...EXPORT, exportId: 'export-expired', status: 'expired' },
+      ],
+      nextCursor: null,
+    });
+    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+
+    expect(await screen.findByRole('link', { name: '下载' })).not.toBeNull();
+    expect(screen.getAllByRole('button', { name: '重新创建评价导出' })).toHaveLength(3);
+    expect(screen.getByText(/SHA-256/)).not.toBeNull();
   });
 
   it('renders legacy basic evaluation output with run-level completeness fallback', async () => {

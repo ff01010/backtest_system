@@ -12,11 +12,20 @@ import pytest
 from backend import settings
 from backend.experiments.application import ExperimentApplication
 from backend.experiments.compiler import LegacySingleBarTrialCompiler
-from backend.experiments.contracts import EvaluationSpecRequest, ExperimentCreateRequest
+from backend.experiments.contracts import (
+  EvaluationExportCreateRequest,
+  EvaluationSpecRequest,
+  ExperimentCreateRequest,
+  ExperimentRetryFailedRequest,
+  ExperimentRetryPreviewRequest,
+  ExperimentRevisionCreateRequest,
+)
 from backend.experiments.coordinator import ExperimentCoordinator
 from backend.experiments.errors import ExperimentError
 from backend.experiments.evaluation_application import EvaluationApplication
 from backend.experiments.evaluation_worker import EvaluationWorker
+from backend.experiments.export_application import EvaluationExportApplication
+from backend.experiments.export_repository import PostgresEvaluationExportRepository
 from backend.experiments.repository import PostgresExperimentRepository
 from backend.services import state_store
 from backend.services.user_context import (
@@ -83,6 +92,7 @@ def users() -> None:
         WHERE origin_type='experiment'
       """)
       cur.execute("DELETE FROM backtest_experiment_audit")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_export")
       cur.execute("DELETE FROM backtest_experiment_evaluation_run")
       cur.execute("DELETE FROM backtest_experiment_evaluation_spec")
       cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
@@ -209,6 +219,7 @@ def _clear_experiment_facts() -> None:
         WHERE origin_type='experiment'
       """)
       cur.execute("DELETE FROM backtest_experiment_audit")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_export")
       cur.execute("DELETE FROM backtest_experiment_evaluation_run")
       cur.execute("DELETE FROM backtest_experiment_evaluation_spec")
       cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
@@ -385,6 +396,33 @@ def _create_execution_experiment(
   )
   response, _status = _as_user(user, lambda: application.create(payload, key))
   return str(response["experimentId"])
+
+
+def _manual_retry_request(
+  application: ExperimentApplication,
+  user: CurrentUser,
+  experiment_id: str,
+) -> ExperimentRetryFailedRequest:
+  detail = _as_user(user, lambda: application.detail(experiment_id))
+  page = _as_user(
+    user,
+    lambda: application.list_trials(
+      experiment_id, limit=10, cursor=None, status=None,
+    ),
+  )
+  preview_request = ExperimentRetryPreviewRequest(
+    expectedRevisionId=detail["revision"]["revisionId"],
+    selection={"mode": "trial_ids", "trialIds": [page["items"][0]["trialId"]]},
+  )
+  summary = _as_user(
+    user, lambda: application.preview_retry(experiment_id, preview_request),
+  )
+  return ExperimentRetryFailedRequest(
+    **preview_request.model_dump(),
+    expectedSelectedTrialCount=summary["selectedTrialCount"],
+    expectedSelectionDigest=summary["selectionDigest"],
+    reason="全局容量并发测试",
+  )
 
 
 def _generate_all(worker_id: str) -> None:
@@ -893,6 +931,230 @@ def test_retryable_failure_retries_once_then_becomes_terminal(
   assert page["items"][0]["automaticRetryCount"] == 1
 
 
+def test_manual_retry_freezes_selection_and_competing_requests_create_one_execution(
+  execution_application: ExperimentApplication,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "BACKTEST_BASE_CONCURRENCY", 8)
+  _set_scheduler_capacity_override(8)
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-manual-retry",
+  )
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="manual-retry-worker",
+  )
+  assert coordinator.run_once()
+  first_run_id = _latest_run_id_for_experiment(experiment_id)
+  _fail_run_for_reconciliation(first_run_id, retryable=False)
+  assert coordinator.run_once()
+  page = _as_user(
+    OWNER,
+    lambda: execution_application.list_trials(
+      experiment_id, limit=10, cursor=None, status=None,
+    ),
+  )
+  trial_id = page["items"][0]["trialId"]
+  preview_request = ExperimentRetryPreviewRequest(
+    expectedRevisionId=_as_user(
+      OWNER, lambda: execution_application.detail(experiment_id),
+    )["revision"]["revisionId"],
+    selection={"mode": "trial_ids", "trialIds": [trial_id]},
+  )
+  summary = _as_user(
+    OWNER, lambda: execution_application.preview_retry(experiment_id, preview_request),
+  )
+  retry_request = ExperimentRetryFailedRequest(
+    **preview_request.model_dump(),
+    expectedSelectedTrialCount=summary["selectedTrialCount"],
+    expectedSelectionDigest=summary["selectionDigest"],
+    reason="并发人工重试测试",
+  )
+
+  def retry(key: str) -> tuple[str, str]:
+    try:
+      _response, status = _as_user(
+        OWNER,
+        lambda: execution_application.retry_failed(
+          experiment_id, retry_request, key, f"request-{key}",
+        ),
+      )
+      return key, f"created:{status}"
+    except ExperimentError as error:
+      return key, error.code
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    outcomes = list(executor.map(retry, ("manual-retry-1", "manual-retry-2")))
+
+  assert sorted(value for _key, value in outcomes) == [
+    "created:202", "experiment.selection_changed",
+  ]
+  success_key = next(key for key, value in outcomes if value == "created:202")
+  replay, replay_status = _as_user(
+    OWNER,
+    lambda: execution_application.retry_failed(
+      experiment_id, retry_request, success_key, "request-replay",
+    ),
+  )
+  assert replay_status == 200
+  assert replay["replayed"] is True
+  assert _experiment_run_count(experiment_id) == 2
+  attempts = _as_user(
+    OWNER,
+    lambda: execution_application.list_trials(
+      experiment_id, limit=10, cursor=None, status=None,
+    ),
+  )["items"][0]["executionAttempts"]
+  assert [item["executionNo"] for item in attempts] == [1, 2]
+  assert [item["createdReason"] for item in attempts] == ["initial", "manual_retry"]
+  assert _experiment_run_seeds(experiment_id)[0] == _experiment_run_seeds(experiment_id)[1]
+
+
+def test_new_revision_requires_terminal_current_and_preserves_history(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-revision-history",
+  )
+  active = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  preview = _as_user(OWNER, lambda: execution_application.preview(_execution_request()))
+  active_request = ExperimentRevisionCreateRequest(
+    previewToken=preview["previewToken"],
+    specHash=preview["specHash"],
+    experimentSpec=_execution_request(),
+    expectedRevisionId=active["revision"]["revisionId"],
+    expectedSnapshotVersion=active["snapshotVersion"],
+  )
+  with pytest.raises(ExperimentError) as conflict:
+    _as_user(
+      OWNER,
+      lambda: execution_application.create_revision(
+        experiment_id, active_request, "active-revision-conflict",
+      ),
+    )
+  assert conflict.value.code == "experiment.active_revision_exists"
+
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="revision-history-worker",
+  )
+  assert coordinator.run_once()
+  first_run_id = _latest_run_id_for_experiment(experiment_id)
+  _finish_run_for_reconciliation(first_run_id)
+  assert coordinator.run_once()
+  terminal = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  old_revision_id = terminal["revision"]["revisionId"]
+  next_preview = _as_user(OWNER, lambda: execution_application.preview(_execution_request()))
+  next_request = ExperimentRevisionCreateRequest(
+    previewToken=next_preview["previewToken"],
+    specHash=next_preview["specHash"],
+    experimentSpec=_execution_request(),
+    expectedRevisionId=old_revision_id,
+    expectedSnapshotVersion=terminal["snapshotVersion"],
+  )
+  created, status = _as_user(
+    OWNER,
+    lambda: execution_application.create_revision(
+      experiment_id, next_request, "create-revision-2",
+    ),
+  )
+
+  assert status == 201
+  assert created["revisionId"] != old_revision_id
+  history = _as_user(
+    OWNER,
+    lambda: execution_application.list_revisions(
+      experiment_id, limit=10, cursor=None,
+    ),
+  )
+  assert [item["revisionNo"] for item in history["items"]] == [2, 1]
+  assert history["items"][0]["current"] is True
+  assert history["items"][1]["status"] == "completed"
+  old_trials = _as_user(
+    OWNER,
+    lambda: execution_application.list_trials(
+      experiment_id,
+      limit=10,
+      cursor=None,
+      status=None,
+      revision_id=old_revision_id,
+    ),
+  )
+  assert old_trials["items"][0]["runId"] == first_run_id
+  assert old_trials["items"][0]["executionAttempts"][0]["selected"] is True
+
+
+def test_manual_retries_across_users_respect_global_capacity_atomically(
+  execution_application: ExperimentApplication,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "BACKTEST_BASE_CONCURRENCY", 8)
+  monkeypatch.setattr(settings, "EXPERIMENT_MANUAL_RESERVED_PERMITS", 7)
+  _set_scheduler_capacity_override(8)
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="global-retry-capacity",
+  )
+  experiments: list[tuple[CurrentUser, str, ExperimentRetryFailedRequest]] = []
+  for index, user in enumerate((OWNER, OTHER), start=1):
+    experiment_id = _create_execution_experiment(
+      execution_application, f"global-retry-{index}", user=user,
+    )
+    assert coordinator.run_once()
+    run_id = _latest_run_id_for_experiment(experiment_id)
+    _fail_run_for_reconciliation(run_id, retryable=False)
+    assert coordinator.run_once()
+    experiments.append((
+      user,
+      experiment_id,
+      _manual_retry_request(execution_application, user, experiment_id),
+    ))
+
+  def retry(values: tuple[CurrentUser, str, ExperimentRetryFailedRequest]) -> str:
+    user, experiment_id, request = values
+    try:
+      _response, status = _as_user(
+        user,
+        lambda: execution_application.retry_failed(
+          experiment_id, request, f"global-retry-key-{user.id}",
+        ),
+      )
+      return f"created:{status}"
+    except ExperimentError as error:
+      return error.code
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    outcomes = list(executor.map(retry, experiments))
+
+  assert sorted(outcomes) == ["created:202", "experiment.capacity_blocked"]
+  assert sum(_experiment_run_count(item[1]) for item in experiments) == 3
+
+
+def test_capacity_snapshot_restores_regular_user_rls_context() -> None:
+  def read_snapshot() -> tuple[bool, int, int, bool]:
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT app.current_is_admin() AS value")
+        before = bool(cur.fetchone()["value"])
+        cur.execute(
+          "SELECT * FROM app.experiment_capacity_snapshot(%s)",
+          (settings.BACKTEST_BASE_CONCURRENCY,),
+        )
+        snapshot = cur.fetchone()
+        cur.execute("SELECT app.current_is_admin() AS value")
+        after = bool(cur.fetchone()["value"])
+    return (
+      before,
+      int(snapshot["effective_limit"]),
+      int(snapshot["experiment_in_flight_count"]),
+      after,
+    )
+
+  before, effective_limit, in_flight, after = _as_user(OWNER, read_snapshot)
+
+  assert before is False
+  assert effective_limit >= 0
+  assert in_flight >= 0
+  assert after is False
+
+
 def test_three_terminal_sequence_failures_open_circuit_and_resume_same_revision(
   execution_application: ExperimentApplication,
 ) -> None:
@@ -1113,6 +1375,149 @@ def test_provisional_evaluation_freezes_missing_trial_without_fake_result(
   assert _experiment_run_count(experiment_id) == 1
 
 
+def test_evaluation_export_idempotency_rls_lease_reclaim_and_failure_recovery(
+  execution_application: ExperimentApplication,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  experiment_id = _create_execution_experiment(
+    execution_application, "postgres-evaluation-export",
+  )
+  coordinator = ExperimentCoordinator(
+    repository=PostgresExperimentRepository(), worker_id="export-source-worker",
+  )
+  assert coordinator.run_once()
+  run_id = _run_id_for_experiment(experiment_id)
+  _finish_run_for_reconciliation(run_id)
+  assert coordinator.run_once()
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  evaluation = EvaluationApplication()
+  spec, _ = _as_user(
+    OWNER,
+    lambda: evaluation.save_spec(
+      experiment_id, _evaluation_request(detail), "save-export-evaluation",
+    ),
+  )
+  evaluation_run, _ = _as_user(
+    OWNER,
+    lambda: evaluation.create_run(
+      experiment_id, spec["evaluationSpecId"], "run-export-evaluation",
+    ),
+  )
+  assert EvaluationWorker(worker_id="export-evaluation-worker").run_once()
+  run_detail = _as_user(
+    OWNER,
+    lambda: evaluation.run_detail(
+      experiment_id, evaluation_run["evaluationRunId"],
+    ),
+  )
+  columns = list(run_detail["output"]["columns"])
+  request = EvaluationExportCreateRequest(
+    format="csv", columns=columns, locale="zh-CN",
+  )
+  monkeypatch.setattr(
+    settings, "EXPERIMENT_EXPORT_WORKER_AVAILABILITY_REQUIRED", False,
+  )
+  application = EvaluationExportApplication()
+
+  def create_same_export() -> tuple[str, int]:
+    response, status = _as_user(
+      OWNER,
+      lambda: application.create(
+        evaluation_run["evaluationRunId"], request,
+        "concurrent-export-key", "request-export",
+      ),
+    )
+    return response["exportId"], status
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    created = list(executor.map(lambda _index: create_same_export(), range(2)))
+
+  assert len({item[0] for item in created}) == 1
+  assert sorted(item[1] for item in created) == [200, 202]
+  export_id = created[0][0]
+
+  with pytest.raises(ExperimentError) as conflict:
+    _as_user(
+      OWNER,
+      lambda: application.create(
+        evaluation_run["evaluationRunId"],
+        EvaluationExportCreateRequest(
+          format="xlsx", columns=columns, locale="zh-CN",
+        ),
+        "concurrent-export-key",
+      ),
+    )
+  assert conflict.value.code == "idempotency.conflict"
+
+  with pytest.raises(ExperimentError) as hidden:
+    _as_user(
+      OTHER,
+      lambda: application.list_exports(evaluation_run["evaluationRunId"]),
+    )
+  assert hidden.value.code == "experiment.evaluation_run_not_found"
+
+  with pytest.raises(ExperimentError) as hidden_download:
+    _as_user(OTHER, lambda: application.download_source(export_id))
+  assert hidden_download.value.code == "experiment.export_not_found"
+
+  cancelled, cancel_status = _as_user(
+    OWNER,
+    lambda: application.create(
+      evaluation_run["evaluationRunId"],
+      EvaluationExportCreateRequest(
+        format="xlsx", columns=columns, locale="zh-CN",
+      ),
+      "cancelled-export-key",
+    ),
+  )
+  cancelled_id = cancelled["exportId"]
+  cancel_response, cancel_response_status = _as_user(
+    OWNER,
+    lambda: application.cancel(cancelled_id, "cancel-export-key"),
+  )
+  replayed_cancel, replayed_cancel_status = _as_user(
+    OWNER,
+    lambda: application.cancel(cancelled_id, "cancel-export-key"),
+  )
+  assert cancel_status == 202
+  assert cancel_response_status == 202
+  assert replayed_cancel_status == 200
+  assert cancel_response["status"] == "cancelled"
+  assert replayed_cancel["replayed"] is True
+
+  repository = PostgresEvaluationExportRepository()
+  first = repository.claim_next_export("export-worker-1")
+  assert first is not None
+  _expire_evaluation_export_lease(export_id)
+  second = repository.claim_next_export("export-worker-2")
+  assert second is not None
+  assert second.export["id"] == export_id
+  assert second.attempt_token != first.attempt_token
+  assert not repository.heartbeat(export_id, first.attempt_token)
+  assert repository.fail_export(
+    export_id, second.attempt_token, "storage_unavailable",
+    "暂时不可用", retryable=True,
+  )
+  third = repository.claim_next_export("export-worker-3")
+  assert third is not None
+  assert repository.fail_export(
+    export_id, third.attempt_token, "artifact_failed",
+    "生成失败", retryable=False,
+  )
+  failed = _as_user(OWNER, lambda: application.detail(export_id))
+  assert failed["status"] == "failed"
+  assert failed["attemptCount"] == 3
+  assert failed["error"]["code"] == "artifact_failed"
+
+  retried, retry_status = _as_user(
+    OWNER,
+    lambda: application.retry(export_id, "retry-export-key"),
+  )
+  assert retry_status == 202
+  assert retried["exportId"] != export_id
+  assert retried["retryOfExportId"] == export_id
+
+
 def _execution_facts(experiment_id: str) -> dict[str, Any]:
   with psycopg.connect(
     os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], row_factory=dict_row,
@@ -1221,6 +1626,16 @@ def _set_scheduler_capacity_override(limit: int | None) -> None:
       """, (limit, limit))
 
 
+def _expire_evaluation_export_lease(export_id: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE backtest_experiment_evaluation_export
+        SET lease_expires_at=now() - interval '1 second'
+        WHERE id=%s
+      """, (export_id,))
+
+
 def _run_id_for_experiment(experiment_id: str) -> str:
   with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
     with conn.cursor() as cur:
@@ -1241,6 +1656,20 @@ def _latest_run_id_for_experiment(experiment_id: str) -> str:
         LIMIT 1
       """, (experiment_id,))
       return str(cur.fetchone()[0])
+
+
+def _experiment_run_seeds(experiment_id: str) -> list[dict[str, Any]]:
+  with psycopg.connect(
+    os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], row_factory=dict_row,
+  ) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT requested_params->'seedBundle' AS seed_bundle
+        FROM backtest_run
+        WHERE origin_experiment_id=%s
+        ORDER BY created_at, id
+      """, (experiment_id,))
+      return [dict(row["seed_bundle"]) for row in cur.fetchall()]
 
 
 def _mark_experiment_run_running(run_id: str) -> None:
