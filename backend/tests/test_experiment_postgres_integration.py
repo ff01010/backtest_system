@@ -313,6 +313,62 @@ def test_concurrent_same_key_replays_one_experiment_and_generates_exact_trials(
   _assert_trial_collection(experiment_id, preview["plannedTrialCount"])
 
 
+def test_copied_experiment_preserves_owned_source_lineage(
+  application: ExperimentApplication,
+) -> None:
+  _preview, source_payload = _preview_and_payload(application)
+  source, _status = _as_user(
+    OWNER,
+    lambda: application.create(source_payload, "postgres-copy-source"),
+  )
+  copy_preview, base_copy_payload = _preview_and_payload(application)
+  copy_payload = ExperimentCreateRequest(
+    **base_copy_payload.model_dump(exclude={"source"}),
+    source={
+      "experimentId": source["experimentId"],
+      "revisionId": source["revisionId"],
+    },
+  )
+
+  copied, copied_status = _as_user(
+    OWNER,
+    lambda: application.create(copy_payload, "postgres-copy-derived"),
+  )
+  detail = _as_user(OWNER, lambda: application.detail(copied["experimentId"]))
+  page = _as_user(
+    OWNER,
+    lambda: application.list_experiments(limit=100, cursor=None),
+  )
+  listed = next(
+    item for item in page["items"] if item["experimentId"] == copied["experimentId"]
+  )
+
+  assert copied_status == 201
+  assert detail["source"] == {
+    "experimentId": source["experimentId"],
+    "experimentName": source_payload.experimentSpec.name,
+    "revisionId": source["revisionId"],
+    "revisionNo": 1,
+  }
+  assert listed["source"] == detail["source"]
+  assert detail["revision"]["revisionNo"] == 1
+  assert copy_preview["specHash"] == detail["revision"]["specHash"]
+
+  other_preview = _as_user(OTHER, lambda: application.preview(_request()))
+  unauthorized = ExperimentCreateRequest(
+    previewToken=other_preview["previewToken"],
+    specHash=other_preview["specHash"],
+    experimentSpec=_request(),
+    source=copy_payload.source,
+  )
+  with pytest.raises(ExperimentError) as hidden:
+    _as_user(
+      OTHER,
+      lambda: application.create(unauthorized, "postgres-copy-cross-owner"),
+    )
+  assert hidden.value.code == "experiment.source_not_found"
+
+
 def test_cross_user_ids_tokens_and_idempotency_keys_are_not_discoverable(
   application: ExperimentApplication,
 ) -> None:
@@ -1736,23 +1792,25 @@ def test_evaluation_freezes_results_is_deterministic_and_detects_hash_drift(
       experiment_id, spec["evaluationSpecId"], "run-evaluation-1",
     ),
   )
-  second_run, _ = _as_user(
-    OWNER,
-    lambda: application.create_run(
-      experiment_id, spec["evaluationSpecId"], "run-evaluation-2",
-    ),
-  )
   worker = EvaluationWorker(worker_id="evaluation-worker-test")
-  assert worker.run_once()
   assert worker.run_once()
   first = _as_user(
     OWNER,
     lambda: application.run_detail(experiment_id, first_run["evaluationRunId"]),
   )
+  second_run, second_status = _as_user(
+    OWNER,
+    lambda: application.create_run(
+      experiment_id, spec["evaluationSpecId"], "run-evaluation-2",
+    ),
+  )
   second = _as_user(
     OWNER,
     lambda: application.run_detail(experiment_id, second_run["evaluationRunId"]),
   )
+  assert second_status == 200
+  assert second_run["evaluationRunId"] == first_run["evaluationRunId"]
+  assert second_run["replayed"] is True
   assert first["status"] == second["status"] == "succeeded"
   assert first["resultSetHash"] == second["resultSetHash"]
   assert first["outputHash"] == second["outputHash"]
@@ -1762,6 +1820,7 @@ def test_evaluation_freezes_results_is_deterministic_and_detects_hash_drift(
     OWNER,
     lambda: application.create_run(
       experiment_id, spec["evaluationSpecId"], "run-evaluation-data-drift",
+      force_recompute=True,
     ),
   )
   _set_execution_actual_data_hash(run_id, "f" * 64)
@@ -1780,6 +1839,7 @@ def test_evaluation_freezes_results_is_deterministic_and_detects_hash_drift(
     OWNER,
     lambda: application.create_run(
       experiment_id, spec["evaluationSpecId"], "run-evaluation-drift",
+      force_recompute=True,
     ),
   )
   _mutate_result_after_evaluation_freeze(run_id)

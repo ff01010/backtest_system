@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Archive,
   Ban,
+  Copy,
   FlaskConical,
   LockKeyhole,
   Play,
@@ -19,7 +20,6 @@ import {
   archiveExperiment,
   cancelExperiment,
   createExperiment,
-  createExperimentRevision,
   fetchAdminArchivedExperiments,
   fetchExperimentDetail,
   fetchExperimentRevisions,
@@ -52,11 +52,14 @@ import type {
 import {
   buildPreviewRequest,
   clearExperimentDraft,
+  createCopiedExperimentDraft,
   createExperimentDraft,
   loadExperimentDraft,
   saveExperimentDraft,
 } from './draftStore';
 import EvaluationBuilder from './EvaluationBuilder';
+import { frozenScenarioNames } from './comparisonData';
+import { dateRoleLabel, fillModelLabel, statusLabel } from './displayLabels';
 
 type Props = {
   userId: string;
@@ -71,6 +74,15 @@ type Props = {
 };
 
 type DraftChange = (draft: ExperimentDraft) => ExperimentDraft;
+
+type ExperimentCopyTarget = {
+  experimentId: string;
+  revisionId: string;
+  revisionNo: number;
+  experimentName: string;
+  subjectRef: ExperimentSubjectRef;
+  initialDraft: ExperimentDraft;
+};
 
 const ACTIVE_EXPERIMENT_STATUSES = new Set(['preparing', 'queued', 'running', 'cancelling']);
 const CANCELLABLE_EXPERIMENT_STATUSES = new Set([
@@ -89,6 +101,47 @@ function shortDigest(value: unknown): string {
   return typeof value === 'string' && value ? `${value.slice(0, 12)}…` : '未提供';
 }
 
+function trialParameterValue(value: unknown): string {
+  if (value == null) return '未记录';
+  if (typeof value === 'boolean') return value ? '启用' : '停用';
+  if (typeof value === 'string') return value || '空文本';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function trialParameterEntries(assignment: Record<string, unknown>): Array<{
+  label: string;
+  value: string;
+}> {
+  const strategyParameters = assignment.strategyParameters as Record<string, unknown> | undefined;
+  const costScenario = assignment.costScenario as Record<string, unknown> | undefined;
+  const executionScenario = assignment.executionScenario as Record<string, unknown> | undefined;
+  const entries = Object.entries(strategyParameters ?? {}).map(([label, value]) => ({
+    label,
+    value: trialParameterValue(value),
+  }));
+  if ('initialCapital' in assignment) {
+    entries.push({ label: '初始资金', value: trialParameterValue(assignment.initialCapital) });
+  }
+  if (costScenario) {
+    entries.push({
+      label: '成本场景',
+      value: trialParameterValue(costScenario.name ?? costScenario.scenarioId),
+    });
+    entries.push({ label: '滑点', value: trialParameterValue(costScenario.slippage) });
+  }
+  if (executionScenario) {
+    const algorithm = executionScenario.algorithm === 'immediate'
+      ? '立即成交'
+      : executionScenario.algorithm;
+    entries.push({
+      label: '执行场景',
+      value: trialParameterValue(executionScenario.name ?? algorithm ?? executionScenario.scenarioId),
+    });
+  }
+  return entries;
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof ApiResponseError) {
     return `${error.message}${error.requestId ? `（请求 ${error.requestId}）` : ''}`;
@@ -105,7 +158,7 @@ async function retryUncertain<T>(operation: () => Promise<T>): Promise<T> {
   }
 }
 
-function isStandardBarConfig(config: StrategyConfig): boolean {
+export function isStandardBarConfig(config: StrategyConfig): boolean {
   const params = config.paramsJson.params;
   const fillModel = params && typeof params === 'object'
     ? (params as Record<string, unknown>).fillModel
@@ -114,7 +167,7 @@ function isStandardBarConfig(config: StrategyConfig): boolean {
     && config.published
     && Boolean(config.publishedVersionId)
     && config.mode === 'backtest'
-    && fillModel !== 'l2_quote';
+    && fillModel === 'bar_next_open';
 }
 
 function ExperimentLanding({
@@ -232,7 +285,7 @@ function ExperimentLanding({
     <main className="experiment-page experiment-landing">
       <section className="experiment-hero">
         <div>
-          <span className="experiment-eyebrow">AUTOMATION / FINITE GRID</span>
+          <span className="experiment-eyebrow">自动化回测 / 有限网格</span>
           <h1>选择一个发布版本</h1>
           <p>自动化预览仅使用当前用户可运行的标准 Bar 单标的策略，结构字段在整个实验中保持冻结。</p>
         </div>
@@ -268,7 +321,7 @@ function ExperimentLanding({
               >
                 <strong>{experiment.name}</strong>
                 <span>{experiment.symbol} · {experiment.timeframe}</span>
-                <span>{experiment.status}</span>
+                <span>{statusLabel(experiment.status)}</span>
                 <span>
                   成功 {experiment.succeededTrialCount} / {experiment.plannedTrialCount}
                 </span>
@@ -302,7 +355,7 @@ function ExperimentLanding({
               return (
                 <div className="experiment-trial-row" key={experiment.experimentId}>
                   <strong>{experiment.name}</strong>
-                  <span>{experiment.status}</span>
+                  <span>{statusLabel(experiment.status)}</span>
                   <span>{retentionActive ? '保留期内' : '已到清理期限'}</span>
                   <button
                     className="app-button is-danger"
@@ -363,7 +416,7 @@ function FixedStructure({ subject }: { subject: ExperimentSubject }) {
   const rows = [
     ['标的', fixed.symbol],
     ['周期', fixed.timeframe],
-    ['成交模型', fixed.fillModel],
+    ['成交模型', fillModelLabel(fixed.fillModel)],
     ['策略代码', shortDigest(fixed.scriptCodeDigest)],
     ['运行能力', shortDigest(fixed.runtimeCapabilityDigest)],
     ['费用档案', `${String(feeProfile?.profileId ?? '—')} · ${String(feeProfile?.version ?? '—')}`],
@@ -555,13 +608,13 @@ function ExperimentDetailView({
   isAdmin,
   onClose,
   onOpenRun,
-  onCreateRevision,
+  onCopyExperiment,
 }: {
   experimentId: string;
   isAdmin: boolean;
   onClose: () => void;
   onOpenRun?: (runId: string, symbol: string, timeframe: string, date: string) => void;
-  onCreateRevision: (detail: ExperimentDetail) => void;
+  onCopyExperiment: (detail: ExperimentDetail) => void;
 }) {
   const [detail, setDetail] = useState<ExperimentDetail | null>(null);
   const [trials, setTrials] = useState<ExperimentTrial[]>([]);
@@ -791,9 +844,9 @@ function ExperimentDetailView({
   if (!detail) {
     return <main className="experiment-page"><div className="experiment-empty"><RefreshCw className="is-spinning" size={20} /> {error || '正在读取实验进度…'}</div></main>;
   }
-  const progress = Math.round(
-    (detail.stage.generatedTrialCount / detail.stage.plannedTrialCount) * 100,
-  );
+  const progress = detail.stage.plannedTrialCount > 0
+    ? Math.round((detail.stage.generatedTrialCount / detail.stage.plannedTrialCount) * 100)
+    : 0;
   const fixed = detail.frozenDefinition.fixedStructure;
   const viewingCurrentRevision = !viewRevisionId
     || viewRevisionId === detail.revision.revisionId;
@@ -803,18 +856,66 @@ function ExperimentDetailView({
   const retentionActive = Boolean(
     detail.retentionUntil && Date.parse(detail.retentionUntil) > Date.now(),
   );
+  const focusFailedTrials = () => {
+    setSelectedFailedIds(new Set(failedTrials.map((trial) => trial.trialId)));
+    document.getElementById('experiment-trial-runs')?.scrollIntoView({
+      behavior: 'smooth', block: 'start',
+    });
+  };
   return (
-    <main className="experiment-page">
-      <section className="experiment-hero">
+    <main className="experiment-page experiment-detail-page">
+      <section className="experiment-hero experiment-detail-hero">
         <div>
-          <span className="experiment-eyebrow">EXPERIMENT / {detail.status.toUpperCase()}</span>
+          <span className="experiment-eyebrow">自动化实验 / {statusLabel(detail.status)}</span>
           <h1>{detail.name}</h1>
-          <p>{detail.description || '冻结定义已创建；后续生成不依赖当前浏览器。'}</p>
+          <p>{detail.description || `Revision ${detail.revision.revisionNo}`}</p>
         </div>
-        <button className="app-button is-quiet" type="button" onClick={onClose}><ArrowLeft size={15} /> 返回实验入口</button>
+        <div className="experiment-detail-actions">
+          <button className="app-button is-quiet" type="button" onClick={onClose}>
+            <ArrowLeft size={15} /> 返回实验入口
+          </button>
+          {TERMINAL_EXPERIMENT_STATUSES.has(detail.status)
+            && viewingCurrentRevision && !detail.archivedAt && (
+            <button
+              className="app-button is-primary"
+              type="button"
+              onClick={() => onCopyExperiment(detail)}
+            >
+              <Copy size={15} /> 复制实验并调整
+            </button>
+          )}
+          {TERMINAL_EXPERIMENT_STATUSES.has(detail.status)
+            && viewingCurrentRevision && !detail.archivedAt && (
+            <button
+              className="app-button is-quiet experiment-lifecycle-button"
+              type="button"
+              disabled={lifecycleAction !== ''}
+              onClick={() => { void handleArchive(); }}
+            >
+              <Archive size={14} /> {lifecycleAction === 'archive' ? '正在归档…' : '归档实验'}
+            </button>
+          )}
+          {detail.archivedAt && !detail.purgeJobId && retentionActive && (
+            <button
+              className="app-button is-quiet"
+              type="button"
+              disabled={lifecycleAction !== ''}
+              onClick={() => { void handleRestoreArchive(); }}
+            >
+              <RotateCcw size={15} /> {lifecycleAction === 'restore' ? '正在恢复…' : '恢复归档实验'}
+            </button>
+          )}
+        </div>
       </section>
       {error && <div className="experiment-alert is-error" role="alert">{error}</div>}
       {lifecycleMessage && <div className="experiment-alert" role="status">{lifecycleMessage}</div>}
+      {detail.source && (
+        <div className="experiment-source-banner">
+          <span>复制来源</span>
+          <strong>{detail.source.experimentName}</strong>
+          <small>来源实验的 Revision {detail.source.revisionNo}</small>
+        </div>
+      )}
       {detail.archivedAt && (
         <div className="experiment-alert is-warning" role="status">
           此实验已归档，当前内容保持只读。
@@ -857,56 +958,25 @@ function ExperimentDetailView({
           </div>
         </section>
       )}
-      <section className="experiment-preview-card">
-        <div className="experiment-preview-heading">
-          <div><span>当前阶段</span><strong>{detail.stage.status}</strong></div>
-          <div><span>Trial 生成</span><strong>{detail.stage.generatedTrialCount} / {detail.stage.plannedTrialCount}</strong></div>
-          <div><span>终态</span><strong>{detail.stage.terminalTrialCount} / {detail.stage.plannedTrialCount}</strong></div>
+      <section className="experiment-detail-kpis" aria-label="实验运行概览">
+        <div>
+          <span>当前阶段</span>
+          <strong>{statusLabel(detail.stage.status)}</strong>
         </div>
-        <div className="experiment-progress" aria-label="Trial 生成进度">
-          <span style={{ width: `${progress}%` }} />
-        </div>
-        <div className="experiment-digest">Spec Hash <code>{detail.revision.specHash}</code></div>
-        <div className="experiment-digest">Trial 集合 <code>{shortDigest(detail.stage.trialCollectionDigest)}</code></div>
-      </section>
-      <section className="experiment-structure-card">
-        <h2>冻结定义</h2>
-        <div className="experiment-structure-grid">
-          <div><span>标的</span><strong>{String(fixed.symbol ?? '—')}</strong></div>
-          <div><span>周期</span><strong>{String(fixed.timeframe ?? '—')}</strong></div>
-          <div><span>成交模型</span><strong>{String(fixed.fillModel ?? '—')}</strong></div>
-          <div><span>数据场景</span><strong>{detail.frozenDefinition.datasetSnapshots.length}</strong></div>
-        </div>
-      </section>
-      <section className="experiment-preview-card">
-        <h2>修订历史</h2>
-        <div className="experiment-revision-list">
-          {revisions.map((revision) => (
-            <button
-              className={`experiment-revision-item ${(
-                viewRevisionId === revision.revisionId
-                || (!viewRevisionId && revision.current)
-              ) ? 'is-selected' : ''}`}
-              key={revision.revisionId}
-              type="button"
-              onClick={() => setViewRevisionId(revision.current ? null : revision.revisionId)}
-            >
-              <strong>Revision {revision.revisionNo}{revision.current ? ' · 当前' : ''}</strong>
-              <span>{revision.status}</span>
-              <small>
-                成功 {revision.stage.succeededTrialCount} / {revision.stage.plannedTrialCount}
-                {' · '}失败 {revision.stage.failedTrialCount}
-              </small>
-            </button>
-          ))}
-        </div>
-        {!viewingCurrentRevision && (
-          <div className="experiment-alert is-warning">
-            当前正在查看历史修订；其 Trial、执行和评价保持只读，不参与当前 Revision 聚合。
+        <div className="experiment-detail-progress-kpi">
+          <span>Trial 生成</span>
+          <strong>{detail.stage.generatedTrialCount} / {detail.stage.plannedTrialCount}</strong>
+          <div className="experiment-progress" aria-label="Trial 生成进度">
+            <span style={{ width: `${progress}%` }} />
           </div>
-        )}
+        </div>
+        <div><span>成功</span><strong>{detail.stage.succeededTrialCount}</strong></div>
+        <div><span>失败</span><strong>{detail.stage.failedTrialCount}</strong></div>
+        <div><span>日期场景</span><strong>{detail.frozenDefinition.datasetSnapshots.length}</strong></div>
       </section>
-      <section className="experiment-preview-card">
+      <div className="experiment-detail-workspace">
+        <div className="experiment-detail-main">
+          <section className="experiment-preview-card" id="experiment-trial-runs">
         <div className="experiment-card-heading-inline">
           <h2>Trial 运行</h2>
           {viewingCurrentRevision && !detail.archivedAt && failedTrials.length > 0 && (
@@ -940,6 +1010,7 @@ function ExperimentDetailView({
         <div className="experiment-trial-table">
           {trials.map((trial) => {
             const dateScenario = trial.dimensionAssignment.dateScenario as Record<string, unknown> | undefined;
+            const parameterEntries = trialParameterEntries(trial.dimensionAssignment);
             return (
               <div className="experiment-trial-row is-trial-detail" key={trial.trialId}>
                 {viewingCurrentRevision && !detail.archivedAt
@@ -957,8 +1028,13 @@ function ExperimentDetailView({
                   />
                 ) : <span />}
                 <strong>#{trial.trialIndex + 1}</strong>
-                <span>{trial.summaryStatus}</span>
-                <span>{String(dateScenario?.name ?? dateScenario?.scenarioId ?? '—')}</span>
+                <span>{statusLabel(trial.summaryStatus)}</span>
+                <span className="experiment-date-scenario">
+                  <strong>{String(dateScenario?.name ?? dateScenario?.scenarioId ?? '—')}</strong>
+                  <small>
+                    {dateRoleLabel(dateScenario?.role)} · {String(dateScenario?.startDate ?? '—')} 至 {String(dateScenario?.endDate ?? '—')}
+                  </small>
+                </span>
                 {trial.runId ? (
                   <button
                     className="app-button is-quiet"
@@ -973,23 +1049,39 @@ function ExperimentDetailView({
                     查看单次结果
                   </button>
                 ) : <span>尚未物化</span>}
-                <div className="experiment-execution-attempts">
-                  {(trial.executionAttempts ?? []).map((execution) => (
-                    <div key={execution.executionId}>
-                      <strong>执行 #{execution.executionNo}</strong>
-                      <span>{execution.status}</span>
-                      <span>
-                        {execution.createdReason === 'manual_retry'
-                          ? '人工重试'
-                          : execution.createdReason === 'automatic_retry' ? '系统重试' : '首次执行'}
-                      </span>
-                      {execution.selected && <small>选定结果</small>}
-                      {execution.errorSummary && (
-                        <small>{String(execution.errorSummary.code ?? '执行失败')}</small>
-                      )}
+                {parameterEntries.length > 0 && (
+                  <details className="experiment-trial-parameters">
+                    <summary>查看参数</summary>
+                    <div>
+                      {parameterEntries.map((entry) => (
+                        <div key={entry.label}>
+                          <span>{entry.label}</span>
+                          <strong>{entry.value}</strong>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
+                  </details>
+                )}
+                {(trial.executionAttempts ?? []).length > 0 && (
+                  <details className="experiment-execution-attempts">
+                    <summary>执行记录（{trial.executionAttempts.length}）</summary>
+                    {(trial.executionAttempts ?? []).map((execution) => (
+                      <div key={execution.executionId}>
+                        <strong>执行 #{execution.executionNo}</strong>
+                        <span>{statusLabel(execution.status)}</span>
+                        <span>
+                          {execution.createdReason === 'manual_retry'
+                            ? '人工重试'
+                            : execution.createdReason === 'automatic_retry' ? '系统重试' : '首次执行'}
+                        </span>
+                        {execution.selected && <small>选定结果</small>}
+                        {execution.errorSummary && (
+                          <small>{String(execution.errorSummary.code ?? '执行失败')}</small>
+                        )}
+                      </div>
+                    ))}
+                  </details>
+                )}
               </div>
             );
           })}
@@ -1001,11 +1093,21 @@ function ExperimentDetailView({
           </button>
         )}
       </section>
-      {detail.status === 'completed' && !detail.archivedAt ? (
+      {TERMINAL_EXPERIMENT_STATUSES.has(detail.status)
+        && viewingCurrentRevision && !detail.archivedAt ? (
         <EvaluationBuilder
           experimentId={experimentId}
+          scenarioNames={frozenScenarioNames(detail.frozenDefinition.plan)}
           symbol={String(fixed.symbol ?? '')}
           timeframe={String(fixed.timeframe ?? '5m')}
+          trialSummary={{
+            planned: detail.stage.plannedTrialCount,
+            generated: detail.stage.generatedTrialCount,
+            succeeded: detail.stage.succeededTrialCount,
+            failed: detail.stage.failedTrialCount,
+            cancelled: detail.stage.cancelledTrialCount,
+          }}
+          onRetryFailed={failedTrials.length > 0 ? focusFailedTrials : undefined}
           onOpenRun={onOpenRun}
         />
       ) : detail.archivedAt ? (
@@ -1016,61 +1118,70 @@ function ExperimentDetailView({
       ) : (
         <section className="experiment-preview-card evaluation-locked">
           <h2>结果评价</h2>
-          <p>基础评价将在全部 Trial 成功并冻结选定执行后开放。</p>
+          <p>{viewingCurrentRevision
+            ? '评价将在当前阶段进入终态后开放；失败项可重试，已有成功结果可生成明确标记的临时评价。'
+            : '历史修订评价保持只读，请返回当前 Revision 查看评价报告。'}</p>
         </section>
       )}
+        </div>
+        <aside className="experiment-detail-sidebar">
+          <section className="experiment-structure-card">
+            <div className="experiment-sidebar-heading">
+              <h2>冻结定义</h2>
+              <span>创建时快照</span>
+            </div>
+            <div className="experiment-structure-grid">
+              <div><span>标的</span><strong>{String(fixed.symbol ?? '—')}</strong></div>
+              <div><span>周期</span><strong>{String(fixed.timeframe ?? '—')}</strong></div>
+              <div><span>成交模型</span><strong>{fillModelLabel(fixed.fillModel)}</strong></div>
+              <div><span>数据场景</span><strong>{detail.frozenDefinition.datasetSnapshots.length}</strong></div>
+            </div>
+          </section>
+          <section className="experiment-preview-card experiment-revision-card">
+            <div className="experiment-sidebar-heading">
+              <h2>修订历史</h2>
+              <span>{revisions.length} 个版本</span>
+            </div>
+            <div className="experiment-revision-list">
+              {revisions.map((revision) => (
+                <button
+                  className={`experiment-revision-item ${(
+                    viewRevisionId === revision.revisionId
+                    || (!viewRevisionId && revision.current)
+                  ) ? 'is-selected' : ''}`}
+                  key={revision.revisionId}
+                  type="button"
+                  onClick={() => setViewRevisionId(revision.current ? null : revision.revisionId)}
+                >
+                  <strong>Revision {revision.revisionNo}{revision.current ? ' · 当前' : ''}</strong>
+                  <span>{statusLabel(revision.status)}</span>
+                  <small>
+                    成功 {revision.stage.succeededTrialCount} / {revision.stage.plannedTrialCount}
+                    {' · '}失败 {revision.stage.failedTrialCount}
+                  </small>
+                </button>
+              ))}
+            </div>
+            {!viewingCurrentRevision && (
+              <div className="experiment-alert is-warning">
+                当前正在查看历史修订；其 Trial、执行和评价保持只读，不参与当前 Revision 聚合。
+              </div>
+            )}
+          </section>
+          <section className="experiment-preview-card experiment-technical-card">
+            <details className="experiment-technical-details">
+              <summary>技术信息与编号</summary>
+              <div className="experiment-digest">Spec Hash <code>{detail.revision.specHash}</code></div>
+              <div className="experiment-digest">Trial 集合 <code>{shortDigest(detail.stage.trialCollectionDigest)}</code></div>
+            </details>
+          </section>
+        </aside>
+      </div>
       {CANCELLABLE_EXPERIMENT_STATUSES.has(detail.status) && (
         <section className="experiment-command-bar">
           <div><strong>取消实验</strong><span>系统将停止生成和物化新 Trial；已提交任务按普通回测取消语义收敛，已有结果继续保留。</span></div>
           <button className="app-button is-quiet" type="button" disabled={cancelling} onClick={() => { void handleCancel(); }}>
             <Ban size={15} /> {cancelling ? '正在取消…' : '取消实验'}
-          </button>
-        </section>
-      )}
-      {TERMINAL_EXPERIMENT_STATUSES.has(detail.status) && viewingCurrentRevision && !detail.archivedAt && (
-        <section className="experiment-command-bar is-confirm">
-          <div>
-            <strong>创建新修订</strong>
-            <span>新输入必须重新预览并冻结资产、数据、预算和能力；当前修订及其执行和评价保持不变。</span>
-          </div>
-          <button
-            className="app-button is-primary"
-            type="button"
-            onClick={() => onCreateRevision(detail)}
-          >
-            <Plus size={15} /> 创建新 Revision
-          </button>
-        </section>
-      )}
-      {TERMINAL_EXPERIMENT_STATUSES.has(detail.status) && viewingCurrentRevision && !detail.archivedAt && (
-        <section className="experiment-command-bar">
-          <div>
-            <strong>归档实验</strong>
-            <span>仅从默认列表隐藏；Revision、Trial、回测结果和评价均继续保留。</span>
-          </div>
-          <button
-            className="app-button is-quiet"
-            type="button"
-            disabled={lifecycleAction !== ''}
-            onClick={() => { void handleArchive(); }}
-          >
-            <Archive size={15} /> {lifecycleAction === 'archive' ? '正在归档…' : '归档实验'}
-          </button>
-        </section>
-      )}
-      {detail.archivedAt && !detail.purgeJobId && retentionActive && (
-        <section className="experiment-command-bar">
-          <div>
-            <strong>恢复归档</strong>
-            <span>恢复到默认实验列表，不改变现有 Revision 和结果身份。</span>
-          </div>
-          <button
-            className="app-button is-quiet"
-            type="button"
-            disabled={lifecycleAction !== ''}
-            onClick={() => { void handleRestoreArchive(); }}
-          >
-            <RotateCcw size={15} /> {lifecycleAction === 'restore' ? '正在恢复…' : '恢复归档实验'}
           </button>
         </section>
       )}
@@ -1094,22 +1205,86 @@ function ExperimentDetailView({
   );
 }
 
+function draftDateSummary(draft: ExperimentDraft): string {
+  return draft.dateScenarios.map((scenario) => (
+    `${scenario.name} ${scenario.startDate}～${scenario.endDate}`
+  )).join('；');
+}
+
+function ExperimentCopySummary({
+  source,
+  current,
+  subject,
+}: {
+  source: ExperimentCopyTarget;
+  current: ExperimentDraft;
+  subject: ExperimentSubject;
+}) {
+  const baseline = source.initialDraft;
+  const labels = new Map(subject.tunableInputCatalog.inputs.map((input) => (
+    [input.inputId, input.sourceName]
+  )));
+  const changes: Array<{ label: string; before: string; after: string }> = [];
+  const parameterIds = new Set([
+    ...Object.keys(baseline.parameterValues),
+    ...Object.keys(current.parameterValues),
+  ]);
+  parameterIds.forEach((inputId) => {
+    const before = baseline.parameterValues[inputId] ?? '';
+    const after = current.parameterValues[inputId] ?? '';
+    if (before !== after) changes.push({
+      label: labels.get(inputId) ?? inputId,
+      before: before || '沿用发布值',
+      after: after || '沿用发布值',
+    });
+  });
+  if (baseline.capitalValues !== current.capitalValues) changes.push({
+    label: '初始资金', before: baseline.capitalValues, after: current.capitalValues,
+  });
+  if (baseline.slippageValues !== current.slippageValues) changes.push({
+    label: '滑点', before: baseline.slippageValues, after: current.slippageValues,
+  });
+  const baselineDates = draftDateSummary(baseline);
+  const currentDates = draftDateSummary(current);
+  if (baselineDates !== currentDates) changes.push({
+    label: '日期场景', before: baselineDates, after: currentDates,
+  });
+  return (
+    <section className="experiment-copy-summary">
+      <header>
+        <div><span>复制来源</span><strong>{source.experimentName}</strong></div>
+        <small>Revision {source.revisionNo} · 创建后成为独立实验</small>
+      </header>
+      {changes.length === 0 ? (
+        <p>运行配置尚未变化。修改参数候选、日期、资金或滑点后，差异会显示在这里。</p>
+      ) : (
+        <div className="experiment-copy-diff-list">
+          {changes.map((change) => (
+            <div key={change.label}>
+              <strong>{change.label}</strong>
+              <span>{change.before}</span>
+              <i>→</i>
+              <span>{change.after}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ExperimentCreator({
   userId,
   subjectRef,
   onChangeSubject,
   onCreated,
-  revisionTarget,
+  copyTarget,
 }: {
   userId: string;
   subjectRef: ExperimentSubjectRef;
   onChangeSubject: () => void;
   onCreated: (experimentId: string) => void;
-  revisionTarget?: {
-    experimentId: string;
-    expectedRevisionId: string;
-    expectedSnapshotVersion: number;
-  };
+  copyTarget?: ExperimentCopyTarget;
 }) {
   const [subject, setSubject] = useState<ExperimentSubject | null>(null);
   const [draft, setDraft] = useState<ExperimentDraft | null>(null);
@@ -1122,23 +1297,30 @@ function ExperimentCreator({
   const [hydrated, setHydrated] = useState(false);
   const draftRevisionRef = useRef(0);
   const createKeyRef = useRef<string | null>(null);
+  const draftScope = copyTarget ? `copy:${copyTarget.revisionId}` : undefined;
 
   useEffect(() => {
     setLoading(true);
     setHydrated(false);
     fetchExperimentSubject(subjectRef).then((resolved) => {
-      const restored = loadExperimentDraft(localStorage, userId, subjectRef);
+      const restored = loadExperimentDraft(localStorage, userId, subjectRef, draftScope);
       setSubject(resolved);
-      setDraft(restored ?? createExperimentDraft(resolved));
-      setMessage(restored ? '已恢复本机草稿；为防止数据漂移，提交前必须重新预览。' : '配置就绪，尚未生成预览。');
+      setDraft(restored ?? copyTarget?.initialDraft ?? createExperimentDraft(resolved));
+      setMessage(restored
+        ? '已恢复本机草稿；为防止数据漂移，提交前必须重新预览。'
+        : copyTarget
+          ? '已继承来源实验的冻结配置；修改后请重新生成预览。'
+          : '配置就绪，尚未生成预览。');
       setPreview(null);
       setHydrated(true);
     }).catch((reason: unknown) => setError(errorMessage(reason))).finally(() => setLoading(false));
-  }, [subjectRef, userId]);
+  }, [copyTarget, draftScope, subjectRef, userId]);
 
   useEffect(() => {
-    if (hydrated && draft) saveExperimentDraft(localStorage, userId, subjectRef, draft);
-  }, [draft, hydrated, subjectRef, userId]);
+    if (hydrated && draft) {
+      saveExperimentDraft(localStorage, userId, subjectRef, draft, draftScope);
+    }
+  }, [draft, draftScope, hydrated, subjectRef, userId]);
 
   const changeDraft = useCallback((change: DraftChange) => {
     draftRevisionRef.current += 1;
@@ -1170,10 +1352,8 @@ function ExperimentCreator({
   };
 
   const finishCreation = (result: ExperimentCreateResult) => {
-    clearExperimentDraft(localStorage, userId, subjectRef);
-    setMessage(revisionTarget
-      ? '新 Revision 已创建，Trial 将由后台协调器继续生成。'
-      : '实验已创建，Trial 将由后台协调器继续生成。');
+    clearExperimentDraft(localStorage, userId, subjectRef, draftScope);
+    setMessage('实验已创建，Trial 将由后台协调器继续生成。');
     onCreated(result.experimentId);
   };
 
@@ -1188,9 +1368,6 @@ function ExperimentCreator({
 
   const handleCreate = async () => {
     if (!draft || !preview || !preview.limitDecision.allowed || submitting) return;
-    if (revisionTarget && !window.confirm(
-      '确认创建新 Revision？系统会重新冻结当前预览中的资产、数据、预算和能力，旧 Revision 保持只读。',
-    )) return;
     const idempotencyKey = createKeyRef.current ?? createBrowserUuid();
     createKeyRef.current = idempotencyKey;
     setSubmitting(true);
@@ -1200,27 +1377,17 @@ function ExperimentCreator({
         previewToken: preview.previewToken,
         specHash: preview.specHash,
         experimentSpec: buildPreviewRequest(subjectRef, draft),
+        source: copyTarget ? {
+          experimentId: copyTarget.experimentId,
+          revisionId: copyTarget.revisionId,
+        } : undefined,
       };
-      const result = revisionTarget
-        ? await createExperimentRevision(revisionTarget.experimentId, {
-          ...createRequest,
-          expectedRevisionId: revisionTarget.expectedRevisionId,
-          expectedSnapshotVersion: revisionTarget.expectedSnapshotVersion,
-        }, idempotencyKey)
-        : await createExperiment(createRequest, idempotencyKey);
+      const result = await createExperiment(createRequest, idempotencyKey);
       acceptCreationResult(result);
     } catch (reason) {
       if (reason instanceof TypeError) {
         try {
-          const recovered = revisionTarget
-            ? await createExperimentRevision(revisionTarget.experimentId, {
-              previewToken: preview.previewToken,
-              specHash: preview.specHash,
-              experimentSpec: buildPreviewRequest(subjectRef, draft),
-              expectedRevisionId: revisionTarget.expectedRevisionId,
-              expectedSnapshotVersion: revisionTarget.expectedSnapshotVersion,
-            }, idempotencyKey)
-            : await findCreatedExperiment(idempotencyKey);
+          const recovered = await findCreatedExperiment(idempotencyKey);
           if (acceptCreationResult(recovered)) return;
         } catch (lookupError) {
           setError(`创建结果暂不确定；再次提交将复用原请求键。${errorMessage(lookupError)}`);
@@ -1230,8 +1397,7 @@ function ExperimentCreator({
         if (reason instanceof ApiResponseError && (
           reason.code === 'experiment.preview_stale'
           || reason.code === 'experiment.preview_expired'
-          || reason.code === 'experiment.state_changed'
-          || reason.code === 'experiment.active_revision_exists'
+          || reason.code === 'experiment.source_not_found'
         )) {
           setPreview(null);
           createKeyRef.current = null;
@@ -1248,15 +1414,16 @@ function ExperimentCreator({
     <main className="experiment-page">
       <section className="experiment-hero">
         <div>
-          <span className="experiment-eyebrow">FINITE GRID / SERVER PREVIEW</span>
+          <span className="experiment-eyebrow">有限网格 / 服务端预览</span>
           <h1>{subject.displayName}</h1>
-          <p>{revisionTarget
-            ? '为同一 Experiment 定义新输入；服务端将重新预览并冻结完整运行契约。'
+          <p>{copyTarget
+            ? '已复制来源实验的冻结配置；确认后将创建独立实验，不改写来源结果。'
             : '定义有限候选空间，由服务端规范化、展开并冻结数据与运行契约。'}</p>
         </div>
-        <button className="app-button is-quiet" type="button" onClick={onChangeSubject}><ArrowLeft size={15} /> 更换策略</button>
+        <button className="app-button is-quiet" type="button" onClick={onChangeSubject}><ArrowLeft size={15} /> {copyTarget ? '返回来源实验' : '更换策略'}</button>
       </section>
       {(error || message) && <div className={`experiment-alert ${error ? 'is-error' : ''}`} role={error ? 'alert' : 'status'}>{error || message}</div>}
+      {copyTarget && <ExperimentCopySummary source={copyTarget} current={draft} subject={subject} />}
       <section className="experiment-name-row">
         <label className="experiment-field"><span>实验名称</span><input value={draft.name} onChange={(event) => changeDraft((current) => ({ ...current, name: event.target.value }))} /></label>
         <label className="experiment-field"><span>说明</span><input value={draft.description} placeholder="可选" onChange={(event) => changeDraft((current) => ({ ...current, description: event.target.value }))} /></label>
@@ -1277,13 +1444,13 @@ function ExperimentCreator({
       {preview && preview.limitDecision.allowed && (
         <section className="experiment-command-bar is-confirm">
           <div>
-            <strong>{revisionTarget ? '确认冻结新修订并开始' : '确认冻结并开始'}</strong>
+            <strong>{copyTarget ? '确认创建独立实验并开始' : '确认冻结并开始'}</strong>
             <span>创建事务快速返回，关闭页面不会停止 Trial 生成。</span>
           </div>
           <button className="app-button is-primary" type="button" disabled={submitting || previewing} onClick={() => { void handleCreate(); }}>
             <FlaskConical size={15} /> {submitting
               ? '正在创建…'
-              : revisionTarget ? '确认创建新 Revision' : '确认创建并开始'}
+              : copyTarget ? '创建新实验并开始' : '确认创建并开始'}
           </button>
         </section>
       )}
@@ -1302,12 +1469,7 @@ export default function ExperimentPage({
   onBackToStrategy,
   onOpenRun,
 }: Props) {
-  const [revisionTarget, setRevisionTarget] = useState<{
-    experimentId: string;
-    expectedRevisionId: string;
-    expectedSnapshotVersion: number;
-    subjectRef: ExperimentSubjectRef;
-  } | null>(null);
+  const [copyTarget, setCopyTarget] = useState<ExperimentCopyTarget | null>(null);
   if (enabled === null) {
     return (
       <main className="experiment-page">
@@ -1329,16 +1491,16 @@ export default function ExperimentPage({
   }
   const selection = subject;
   const changeExperiment = onExperimentChange ?? (() => {});
-  if (revisionTarget) {
+  if (copyTarget) {
     return (
       <ExperimentCreator
-        key={`revision:${revisionTarget.expectedRevisionId}`}
+        key={`copy:${copyTarget.revisionId}`}
         userId={userId}
-        subjectRef={revisionTarget.subjectRef}
-        revisionTarget={revisionTarget}
-        onChangeSubject={() => setRevisionTarget(null)}
+        subjectRef={copyTarget.subjectRef}
+        copyTarget={copyTarget}
+        onChangeSubject={() => setCopyTarget(null)}
         onCreated={(createdExperimentId) => {
-          setRevisionTarget(null);
+          setCopyTarget(null);
           changeExperiment(createdExperimentId);
         }}
       />
@@ -1351,11 +1513,13 @@ export default function ExperimentPage({
         isAdmin={isAdmin}
         onClose={() => changeExperiment(null)}
         onOpenRun={onOpenRun}
-        onCreateRevision={(detail) => setRevisionTarget({
+        onCopyExperiment={(detail) => setCopyTarget({
           experimentId: detail.experimentId,
-          expectedRevisionId: detail.revision.revisionId,
-          expectedSnapshotVersion: detail.snapshotVersion,
+          revisionId: detail.revision.revisionId,
+          revisionNo: detail.revision.revisionNo,
+          experimentName: detail.name,
           subjectRef: detail.frozenDefinition.subjectRef,
+          initialDraft: createCopiedExperimentDraft(detail),
         })}
       />
     );

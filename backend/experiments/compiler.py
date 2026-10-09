@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 import hashlib
+import math
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -36,10 +37,18 @@ class LegacySingleBarTrialCompiler:
   def compile(self, template: ResolvedRunTemplate, assignment: dict[str, Any]) -> dict[str, Any]:
     request = self._request_model(template, assignment)
     try:
+      identity_request = request.model_dump()
+      identity_request.update({
+        "strategyParams": {
+          **template.defaults["strategyParameters"],
+          **assignment["strategyParameters"],
+        },
+        "strategyParamOverrides": assignment["strategyParameters"],
+      })
       summary = with_version({
         "contractVersion": self.contract_version,
         "runTemplateDigest": template.digest,
-        "request": _identity_safe_value(request.model_dump()),
+        "request": _identity_safe_value(identity_request),
       })
       request_digest = digest(summary)
     except (TypeError, ValueError) as error:
@@ -69,13 +78,12 @@ class LegacySingleBarTrialCompiler:
         "experiment.execution_snapshot_invalid", "冻结策略代码摘要不一致", 409,
       )
     published = dict(execution.get("publishedConfig") or {})
-    effective_parameters = {
-      **template.defaults["strategyParameters"],
-      **assignment["strategyParameters"],
-    }
+    saved_parameters, parameter_overrides, effective_parameters = (
+      _runtime_parameter_sets(template, assignment)
+    )
     request.update({
       "strategyVersionId": fixed["strategyVersionId"],
-      "savedStrategyParams": template.defaults["strategyParameters"],
+      "savedStrategyParams": saved_parameters,
       "effectiveStrategyParams": effective_parameters,
       "feeProfile": _numeric_mapping(fixed["feeProfile"]["rates"]),
       "versionScriptSnapshot": script,
@@ -83,8 +91,8 @@ class LegacySingleBarTrialCompiler:
       "savedConfigSnapshot": {
         **published,
         "runParams": effective_parameters,
-        "savedStrategyParams": template.defaults["strategyParameters"],
-        "strategyParamOverrides": assignment["strategyParameters"],
+        "savedStrategyParams": saved_parameters,
+        "strategyParamOverrides": parameter_overrides,
         "effectiveStrategyParams": effective_parameters,
         "warmupTradingDays": fixed["warmupTradingDays"],
         "signalRequired": bool(fixed.get("signalRequired", False)),
@@ -108,10 +116,9 @@ class LegacySingleBarTrialCompiler:
     date_scenario = assignment["dateScenario"]
     cost_scenario = assignment["costScenario"]
     execution = assignment["executionScenario"]
-    effective_parameters = {
-      **template.defaults["strategyParameters"],
-      **assignment["strategyParameters"],
-    }
+    _, parameter_overrides, effective_parameters = _runtime_parameter_sets(
+      template, assignment,
+    )
     try:
       return schemas.BacktestRunRequest(
         configId=fixed["configId"],
@@ -146,7 +153,7 @@ class LegacySingleBarTrialCompiler:
         t0Enabled=fixed["t0Enabled"],
         warmupTradingDays=fixed["warmupTradingDays"],
         strategyParams=effective_parameters,
-        strategyParamOverrides=assignment["strategyParameters"],
+        strategyParamOverrides=parameter_overrides,
       )
     except (ValidationError, ValueError) as error:
       raise ExperimentError(
@@ -157,6 +164,54 @@ class LegacySingleBarTrialCompiler:
 
 def _numeric_mapping(value: dict[str, Any]) -> dict[str, float]:
   return {key: float(Decimal(str(item))) for key, item in value.items()}
+
+
+def _runtime_parameter_sets(
+  template: ResolvedRunTemplate,
+  assignment: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+  saved = _runtime_strategy_parameters(
+    template, template.defaults["strategyParameters"],
+  )
+  overrides = _runtime_strategy_parameters(
+    template, assignment["strategyParameters"],
+  )
+  return saved, overrides, {**saved, **overrides}
+
+
+def _runtime_strategy_parameters(
+  template: ResolvedRunTemplate,
+  parameters: dict[str, Any],
+) -> dict[str, Any]:
+  parameter_types = {
+    str(item["sourceName"]): str(item["type"])
+    for item in template.tunable_inputs
+    if item.get("group") == "strategyParameters"
+  }
+  return {
+    name: _runtime_number(name, value)
+    if parameter_types.get(name) == "number" else value
+    for name, value in parameters.items()
+  }
+
+
+def _runtime_number(name: str, value: Any) -> float:
+  try:
+    parsed = Decimal(str(value))
+    runtime_value = float(parsed)
+  except (ArithmeticError, ValueError) as error:
+    raise _invalid_runtime_parameter(name) from error
+  if not parsed.is_finite() or not math.isfinite(runtime_value):
+    raise _invalid_runtime_parameter(name)
+  return runtime_value
+
+
+def _invalid_runtime_parameter(name: str) -> ExperimentError:
+  return ExperimentError(
+    "experiment.validation_failed",
+    "网格组合不符合单次回测契约",
+    details={"reason": f"策略参数 {name} 的值与声明类型不匹配"},
+  )
 
 
 def _bar_snapshot(dataset: dict[str, Any]) -> dict[str, Any]:

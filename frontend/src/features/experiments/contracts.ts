@@ -114,11 +114,10 @@ export type ExperimentCreateRequest = {
   previewToken: string;
   specHash: string;
   experimentSpec: ExperimentPreviewRequest;
-};
-
-export type ExperimentRevisionCreateRequest = ExperimentCreateRequest & {
-  expectedRevisionId: string;
-  expectedSnapshotVersion: number;
+  source?: {
+    experimentId: string;
+    revisionId: string;
+  };
 };
 
 export type ExperimentCreateResult = {
@@ -152,6 +151,7 @@ export type ExperimentStatus =
 export type ExperimentListItem = {
   experimentId: string;
   name: string;
+  source: ExperimentSourceSummary | null;
   subject: ExperimentSubjectRef & { name: string };
   currentRevisionId: string;
   revisionNo: number;
@@ -315,6 +315,7 @@ export type ExperimentDetail = {
   experimentId: string;
   name: string;
   description: string;
+  source: ExperimentSourceSummary | null;
   status: ExperimentStatus;
   snapshotVersion: number;
   revision: {
@@ -372,6 +373,13 @@ export type ExperimentDetail = {
   updatedAt: string;
 };
 
+export type ExperimentSourceSummary = {
+  experimentId: string;
+  experimentName: string;
+  revisionId: string;
+  revisionNo: number;
+};
+
 export type EvaluationMetricDefinition = {
   metricId: string;
   displayName: string;
@@ -416,6 +424,11 @@ export type EvaluationCatalogs = {
   };
   pipelineVersion: string;
   adapter: { type: string; version: string };
+  normalizers?: Array<{
+    version: 'candidate_rate_distribution_v1';
+    name: string;
+    supportedUnits: string[];
+  }>;
 };
 
 export type EvaluationFilter = {
@@ -466,7 +479,7 @@ export type EvaluationSpecPayload = {
   catalogs: {
     metricCatalogVersion: 'metric_catalog_v1';
     dimensionCatalogVersion: 'dimension_catalog_v1';
-    normalizerVersion: null;
+    normalizerVersion: 'candidate_rate_distribution_v1' | null;
   };
   completeness: {
     allowPartial: boolean;
@@ -509,6 +522,7 @@ export type EvaluationRun = {
   revisionId: string;
   specVersionNo: number | null;
   specName: string | null;
+  specHash?: string | null;
   status: 'queued' | 'running' | 'succeeded' | 'failed';
   pipelineVersion: string;
   adapterType: string;
@@ -523,6 +537,7 @@ export type EvaluationRun = {
   attemptCount: number;
   createdAt: string;
   finishedAt: string | null;
+  replayed?: boolean;
 };
 
 export type EvaluationRunDetail = EvaluationRun & {
@@ -564,6 +579,16 @@ export type EvaluationRunDetail = EvaluationRun & {
       startDate?: string | null;
       groupKey?: string;
       memberCount?: number;
+      members?: Array<{
+        trialId: string;
+        trialExecutionId: string;
+        runId: string;
+        stageId: string;
+        stageIndex: number;
+        trialIndex: number;
+        resultHash: string;
+        startDate?: string | null;
+      }>;
       values: Record<string, string | number | null>;
       unsupportedReasons: Record<string, string>;
     }>;

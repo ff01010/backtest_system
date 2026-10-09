@@ -126,6 +126,23 @@ def test_evaluation_export_worker_is_deployed_and_health_checked_with_backend() 
   assert '"evaluationExportWorker":{"healthy":true}' in script
 
 
+def test_local_start_waits_for_all_experiment_workers() -> None:
+  script = (ROOT / "scripts" / "start-local.ps1").read_text(encoding="utf-8")
+
+  assert "$requiredWorkerServices = @(" in script
+  for service in (
+    "experiment-coordinator",
+    "evaluation-worker",
+    "evaluation-export-worker",
+    "experiment-purge-worker",
+    "signal-export-runner",
+  ):
+    assert f"'{service}'" in script
+  assert "$upArguments += $requiredWorkerServices" in script
+  assert "Test-ServiceContainersReady -Service $_ -ExpectedCount 1" in script
+  assert "$response.evaluationExportWorker.healthy -eq $true" in script
+
+
 def test_retired_strategy_worker_is_absent_from_runtime_and_deployment() -> None:
   paths = (
     ROOT / "backend" / "worker_app.py",

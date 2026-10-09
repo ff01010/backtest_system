@@ -269,6 +269,49 @@ def test_create_revalidates_preview_and_freezes_only_the_plan(
   assert "trials" not in repository.created["normalized_spec"]
 
 
+def test_create_forwards_copy_source_without_changing_the_preview_spec(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _enable_experiments(monkeypatch)
+  repository = MemoryExperimentRepository()
+  application = _application(repository)
+  preview = application.preview(_request())
+  payload = ExperimentCreateRequest(
+    **_create_request(preview).model_dump(exclude={"source"}),
+    source={
+      "experimentId": "10000000-0000-4000-8000-000000000001",
+      "revisionId": "10000000-0000-4000-8000-000000000002",
+    },
+  )
+
+  application.create(payload, "copy-key-1")
+
+  assert repository.created is not None
+  assert repository.created["source"] == {
+    "experimentId": "10000000-0000-4000-8000-000000000001",
+    "revisionId": "10000000-0000-4000-8000-000000000002",
+  }
+  assert "source" not in repository.created["normalized_spec"]
+
+
+def test_revision_request_rejects_copy_source() -> None:
+  payload = {
+    **_create_request({
+      "previewToken": "10000000-0000-4000-8000-000000000010",
+      "specHash": "a" * 64,
+    }).model_dump(mode="json"),
+    "source": {
+      "experimentId": "10000000-0000-4000-8000-000000000001",
+      "revisionId": "10000000-0000-4000-8000-000000000002",
+    },
+    "expectedRevisionId": "10000000-0000-4000-8000-000000000003",
+    "expectedSnapshotVersion": 1,
+  }
+
+  with pytest.raises(ValueError):
+    ExperimentRevisionCreateRequest.model_validate(payload)
+
+
 def test_create_rejects_dataset_drift_against_the_saved_preview(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -298,7 +341,7 @@ def test_create_revision_repreviews_and_forwards_optimistic_identity(
   application = _application(repository)
   preview = application.preview(_request())
   payload = ExperimentRevisionCreateRequest(
-    **_create_request(preview).model_dump(),
+    **_create_request(preview).model_dump(exclude={"source"}),
     expectedRevisionId="10000000-0000-4000-8000-000000000010",
     expectedSnapshotVersion=7,
   )
@@ -593,3 +636,14 @@ def test_generation_migration_enforces_identity_and_rls_contracts() -> None:
   assert "backtest_experiment_current_revision_fk" in sql
   assert "backtest_experiment_trial_stage_owner_fk" in sql
   assert "reserved_planned_trial_count" in sql
+
+
+def test_copy_lineage_migration_preserves_independent_experiment_lifecycle() -> None:
+  sql = Path("db/migrations/054_experiment_copy_lineage.sql").read_text(
+    encoding="utf-8",
+  )
+
+  assert "ADD COLUMN IF NOT EXISTS source_revision_id uuid" in sql
+  assert "backtest_experiment_source_revision_fk" in sql
+  assert "ON DELETE SET NULL" in sql
+  assert "WHERE source_revision_id IS NOT NULL" in sql

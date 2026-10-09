@@ -3784,6 +3784,14 @@ button, input, select, textarea {
     linear-gradient(180deg, #f6f8f4 0%, var(--canvas) 100%);
 }
 
+.experiment-detail-page {
+  padding-top: 20px;
+}
+
+.experiment-detail-page .experiment-hero {
+  margin-bottom: 14px;
+}
+
 .experiment-hero {
   display: flex;
   align-items: flex-start;
@@ -3819,10 +3827,94 @@ button, input, select, textarea {
 .experiment-command-bar,
 .experiment-preview,
 .experiment-alert,
+.experiment-copy-summary,
+.experiment-source-banner,
 .experiment-subject-grid {
   max-width: 1280px;
   margin-right: auto;
   margin-left: auto;
+}
+
+.experiment-source-banner {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+}
+
+.experiment-source-banner span,
+.experiment-source-banner small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.experiment-copy-summary {
+  margin-bottom: 14px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--radius-md);
+  background: rgba(239, 248, 244, 0.86);
+  box-shadow: var(--shadow-sm);
+}
+
+.experiment-copy-summary > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.experiment-copy-summary > header div {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+
+.experiment-copy-summary > header span,
+.experiment-copy-summary > header small,
+.experiment-copy-summary > p {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.experiment-copy-summary > p {
+  margin: 0;
+  padding: 14px 16px;
+}
+
+.experiment-copy-diff-list {
+  display: grid;
+}
+
+.experiment-copy-diff-list > div {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr) 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.experiment-copy-diff-list > div:first-child {
+  border-top: 0;
+}
+
+.experiment-copy-diff-list span {
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.experiment-copy-diff-list i {
+  color: var(--accent);
+  font-style: normal;
+  text-align: center;
 }
 
 .experiment-layout {
@@ -4261,6 +4353,22 @@ button, input, select, textarea {
     align-items: stretch;
     flex-direction: column;
   }
+
+  .experiment-copy-summary > header,
+  .experiment-source-banner {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .experiment-copy-diff-list > div {
+    grid-template-columns: 1fr;
+  }
+
+  .experiment-copy-diff-list i {
+    text-align: left;
+    transform: rotate(90deg);
+    transform-origin: left center;
+  }
 }
 .experiment-progress {
   height: 8px;
@@ -4277,10 +4385,208 @@ button, input, select, textarea {
   transition: width 240ms ease;
 }
 
+.experiment-overview-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+  gap: 12px;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.experiment-overview-grid > .experiment-preview-card,
+.experiment-overview-grid > .experiment-structure-card {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 14px;
+}
+
+.experiment-status-card h2,
+.experiment-structure-card h2 {
+  margin-bottom: 10px;
+  font-size: 16px;
+}
+
+.experiment-detail-hero {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 14px;
+}
+
+.experiment-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.experiment-lifecycle-button {
+  border-color: transparent;
+  color: var(--text-muted);
+  padding-right: 6px;
+  padding-left: 6px;
+}
+
+.experiment-detail-kpis {
+  display: grid;
+  grid-template-columns: 1.15fr 1.35fr repeat(3, minmax(110px, 1fr));
+  max-width: 1280px;
+  margin: 0 auto 14px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--border);
+  gap: 1px;
+  box-shadow: var(--shadow-sm);
+}
+
+.experiment-detail-kpis > div {
+  display: grid;
+  min-height: 68px;
+  align-content: center;
+  gap: 4px;
+  background: rgba(255, 254, 250, 0.96);
+  padding: 11px 14px;
+}
+
+.experiment-detail-kpis span,
+.experiment-sidebar-heading span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.experiment-detail-kpis strong {
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+}
+
+.experiment-detail-progress-kpi .experiment-progress {
+  height: 5px;
+  margin-top: 3px;
+}
+
+.experiment-detail-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 2.15fr) minmax(280px, 0.85fr);
+  align-items: start;
+  gap: 14px;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.experiment-detail-main {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 14px;
+}
+
+.experiment-detail-main > .experiment-preview-card,
+.experiment-detail-sidebar > .experiment-preview-card,
+.experiment-detail-sidebar > .experiment-structure-card {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 14px;
+}
+
+.experiment-detail-sidebar {
+  display: grid;
+  position: sticky;
+  top: 14px;
+  min-width: 0;
+  align-content: start;
+  gap: 12px;
+}
+
+.experiment-sidebar-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.experiment-sidebar-heading h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.experiment-detail-sidebar .experiment-structure-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 0;
+}
+
+.experiment-detail-sidebar .experiment-revision-list {
+  grid-template-columns: 1fr;
+  margin-top: 0;
+}
+
+.experiment-detail-sidebar .experiment-revision-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.experiment-detail-sidebar .experiment-revision-item small {
+  grid-column: 1 / -1;
+}
+
+.experiment-detail-sidebar .experiment-alert {
+  margin-top: 10px;
+}
+
+.experiment-technical-card {
+  box-shadow: none;
+}
+
+.experiment-technical-card .experiment-technical-details {
+  margin: 0;
+  border-top: 0;
+  padding-top: 0;
+}
+
+.experiment-technical-card .experiment-technical-details summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 28px;
+  list-style: none;
+  font-size: 11px;
+}
+
+.experiment-technical-card .experiment-technical-details summary::after {
+  content: "›";
+  color: var(--text-muted);
+}
+
+.experiment-technical-card .experiment-technical-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.experiment-technical-details {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 7px;
+}
+
+.experiment-technical-details summary,
+.experiment-trial-parameters summary,
+.experiment-execution-attempts summary {
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.experiment-technical-details .experiment-digest {
+  margin-top: 7px;
+}
+
 .experiment-trial-table {
   display: grid;
-  gap: 8px;
-  margin: 14px 0;
+  gap: 5px;
+  margin: 10px 0;
 }
 
 .experiment-trial-row {
@@ -4293,7 +4599,7 @@ button, input, select, textarea {
   border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
-  padding: 10px 12px;
+  padding: 8px 10px;
   text-align: left;
 }
 
@@ -4342,12 +4648,71 @@ button.experiment-trial-row:hover {
 }
 
 .experiment-trial-row.is-trial-detail {
-  grid-template-columns: 24px 58px minmax(90px, 0.7fr) minmax(120px, 1fr) minmax(130px, auto);
+  grid-template-columns: 24px 48px minmax(76px, 0.55fr) minmax(280px, 1.8fr) minmax(124px, auto);
+  gap: 8px;
+}
+
+.experiment-date-scenario {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 7px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.experiment-date-scenario strong,
+.experiment-date-scenario small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.experiment-date-scenario strong {
+  flex: 0 0 auto;
+  font-size: 11px;
+}
+
+.experiment-date-scenario small {
+  color: var(--text-muted);
+  font-size: 9px;
 }
 
 .experiment-execution-attempts {
-  display: grid;
   grid-column: 1 / -1;
+  border-top: 1px dashed var(--border);
+  padding-top: 5px;
+}
+
+.experiment-trial-parameters {
+  grid-column: 1 / -1;
+  border-top: 1px dashed var(--border);
+  padding-top: 5px;
+}
+
+.experiment-trial-parameters > div {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+  padding: 7px 0 2px 12px;
+}
+
+.experiment-trial-parameters > div > div {
+  display: grid;
+  gap: 2px;
+}
+
+.experiment-trial-parameters span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.experiment-trial-parameters strong {
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
+
+.experiment-execution-attempts[open] {
+  display: grid;
   gap: 5px;
 }
 
@@ -4355,8 +4720,7 @@ button.experiment-trial-row:hover {
   display: grid;
   grid-template-columns: 90px 90px 100px minmax(90px, 1fr) minmax(120px, 1fr);
   gap: 8px;
-  border-top: 1px dashed var(--border);
-  padding-top: 6px;
+  padding: 4px 0 0 12px;
   color: var(--text-muted);
   font-size: 11px;
 }
@@ -4389,12 +4753,17 @@ button.experiment-trial-row:hover {
   box-shadow: var(--shadow-sm);
 }
 
+.experiment-detail-page > .experiment-preview-card,
+.experiment-detail-page > .experiment-structure-card {
+  padding: 14px;
+}
+
 .experiment-preview-heading,
 .experiment-structure-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
-  margin-bottom: 14px;
+  margin-bottom: 10px;
 }
 
 .experiment-preview-heading > div,
@@ -4413,22 +4782,14 @@ button.experiment-trial-row:hover {
 }
 
 .evaluation-heading,
-.evaluation-history-item,
-.evaluation-evidence {
+.evaluation-history-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
 }
 
-.evaluation-heading p {
-  margin-top: 3px;
-  color: var(--text-muted);
-  font-size: 11px;
-}
-
 .evaluation-heading code,
-.evaluation-evidence code,
 .evaluation-history-item code,
 .evaluation-execution-set code {
   overflow: hidden;
@@ -4441,9 +4802,190 @@ button.experiment-trial-row:hover {
 
 .evaluation-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(280px, 0.7fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
   margin-top: 18px;
+}
+
+.evaluation-layout.is-advanced-open {
+  grid-template-columns: minmax(0, 1.5fr) minmax(280px, 0.7fr);
+}
+
+.evaluation-report-browser {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.7fr) minmax(360px, 1.3fr) auto;
+  align-items: end;
+  gap: 14px;
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+  padding: 13px 14px;
+}
+
+.evaluation-report-browser > div,
+.evaluation-report-browser label {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.evaluation-report-browser span,
+.evaluation-report-browser small {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-report-browser select {
+  width: 100%;
+  height: 36px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 9px;
+}
+
+.evaluation-basic-card {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.2fr) minmax(240px, 0.9fr) auto;
+  align-items: center;
+  gap: 18px;
+  margin-top: 16px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: var(--radius-md);
+  background: linear-gradient(120deg, color-mix(in srgb, var(--surface-accent) 74%, var(--surface)), var(--surface));
+  padding: 18px;
+}
+
+.evaluation-basic-card h3 {
+  margin: 0;
+}
+
+.evaluation-basic-card h3 {
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 16px;
+}
+
+.evaluation-basic-kicker {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+}
+
+.evaluation-basic-rules {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+
+.evaluation-basic-rules span {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  color: var(--text-secondary);
+  padding: 7px 8px;
+  font-size: 10px;
+}
+
+.evaluation-failure-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+  border: 1px solid color-mix(in srgb, var(--warning) 42%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+  padding: 16px;
+}
+
+.evaluation-failure-summary,
+.evaluation-failure-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.evaluation-failure-summary > div {
+  display: grid;
+  min-width: 76px;
+  gap: 2px;
+  border-right: 1px solid var(--border);
+}
+
+.evaluation-failure-summary span,
+.evaluation-temporary-policy p {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-temporary-policy {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.evaluation-temporary-policy > label {
+  display: grid;
+  max-width: 260px;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-temporary-policy input {
+  height: 32px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 8px;
+}
+
+.evaluation-advanced {
+  align-self: start;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+}
+
+.evaluation-spec-library {
+  align-self: start;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+}
+
+.evaluation-advanced > summary,
+.evaluation-spec-library > summary {
+  display: flex;
+  cursor: pointer;
+  list-style: none;
+  padding: 14px;
+}
+
+.evaluation-advanced > summary::-webkit-details-marker,
+.evaluation-spec-library > summary::-webkit-details-marker {
+  display: none;
+}
+
+.evaluation-advanced > summary span,
+.evaluation-spec-library > summary span {
+  display: grid;
+  gap: 3px;
+}
+
+.evaluation-advanced > .evaluation-form {
+  border-top: 1px solid var(--border);
+  padding: 14px;
+}
+
+.evaluation-spec-library > .evaluation-history {
+  border-top: 1px solid var(--border);
+  padding: 12px;
 }
 
 .evaluation-form,
@@ -4451,6 +4993,15 @@ button.experiment-trial-row:hover {
   display: grid;
   align-content: start;
   gap: 12px;
+}
+
+.evaluation-layout:not(.is-advanced-open) .evaluation-history {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.evaluation-layout:not(.is-advanced-open) .evaluation-history > h3,
+.evaluation-layout:not(.is-advanced-open) .evaluation-history > .experiment-empty {
+  grid-column: 1 / -1;
 }
 
 .evaluation-form > label,
@@ -4508,6 +5059,45 @@ button.experiment-trial-row:hover {
 .evaluation-rule-formula,
 .evaluation-rule-aggregate {
   grid-template-columns: minmax(120px, 0.7fr) minmax(130px, 0.8fr) minmax(140px, 0.8fr) minmax(220px, 1.5fr) auto;
+}
+
+.evaluation-formula-block {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+}
+
+.evaluation-formula-catalog {
+  display: flex;
+  overflow-x: auto;
+  gap: 6px;
+  padding-bottom: 3px;
+}
+
+.evaluation-formula-catalog button {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  color: var(--text);
+  padding: 6px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.evaluation-formula-catalog code,
+.evaluation-formula-catalog span {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.evaluation-inline-error {
+  color: var(--danger);
+  font-size: 10px;
 }
 
 .evaluation-toggle {
@@ -4572,6 +5162,25 @@ button.experiment-trial-row:hover {
   gap: 2px;
 }
 
+.evaluation-report-item {
+  flex-wrap: wrap;
+}
+
+.evaluation-report-item > .evaluation-card-technical {
+  display: grid;
+  flex: 0 0 100%;
+  gap: 3px;
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+}
+
+.evaluation-card-technical code,
+.evaluation-card-technical span {
+  display: block;
+  max-width: 100%;
+  margin-top: 3px;
+}
+
 .evaluation-run-link {
   flex: 1;
   border: 0;
@@ -4594,6 +5203,50 @@ button.experiment-trial-row:hover {
   padding-top: 16px;
 }
 
+.evaluation-report-identity {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.7fr) minmax(320px, 1.3fr);
+  gap: 12px;
+}
+
+.evaluation-report-identity > div {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  padding: 12px;
+}
+
+.evaluation-report-identity span,
+.evaluation-report-identity small {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-member-results {
+  min-width: 150px;
+}
+
+.evaluation-member-results summary {
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.evaluation-member-results button,
+.evaluation-member-results span {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 6px 0;
+  cursor: pointer;
+  font-size: 10px;
+  text-align: left;
+}
+
 .evaluation-completeness {
   display: flex;
   flex-wrap: wrap;
@@ -4610,28 +5263,172 @@ button.experiment-trial-row:hover {
   background: rgba(222, 163, 74, 0.1);
 }
 
-.evaluation-dataset-notice {
+.evaluation-analysis-section {
+  display: grid;
+  gap: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+}
+
+.evaluation-analysis-section > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.evaluation-analysis-section > div:first-child > span,
+.evaluation-analysis-card header > span {
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.evaluation-analysis-section h3,
+.evaluation-analysis-section p {
   margin: 0;
-  color: var(--text-secondary);
-  font-size: 13px;
+}
+
+.evaluation-analysis-section > div:first-child > p {
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .evaluation-analysis-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
 .evaluation-analysis-card {
   padding: 14px;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border);
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.025);
+  background: var(--surface-muted);
+}
+
+.evaluation-analysis-card.is-wide {
+  grid-column: 1 / -1;
+}
+
+.evaluation-analysis-card header {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
 }
 
 .evaluation-analysis-card h4,
 .evaluation-analysis-card p {
-  margin: 0 0 10px;
+  margin: 0;
+}
+
+.evaluation-analysis-card header p {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.evaluation-insight {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--surface-accent) 52%, var(--surface));
+  padding: 8px 10px;
+}
+
+.evaluation-insight span,
+.evaluation-insight small {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.evaluation-insight strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evaluation-analysis-rows {
+  display: grid;
+  gap: 5px;
+}
+
+.evaluation-analysis-rows > div {
+  display: grid;
+  grid-template-columns: minmax(52px, 0.35fr) minmax(60px, 0.6fr) minmax(96px, 0.7fr) minmax(180px, 1.5fr);
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.evaluation-analysis-rows small {
+  color: var(--text-muted);
+}
+
+.evaluation-range-track {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border) 72%, transparent);
+}
+
+.evaluation-range-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), #4fb49f);
+}
+
+.evaluation-stability-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 8px;
+}
+
+.evaluation-stability-list > div {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: 10px;
+}
+
+.evaluation-stability-list > div > strong {
+  font-size: 10px;
+}
+
+.evaluation-stability-list > div > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.evaluation-stability-list span {
+  display: grid;
+  min-width: 112px;
+  gap: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  padding: 6px 7px;
+}
+
+.evaluation-stability-list small,
+.evaluation-stability-list em {
+  color: var(--text-muted);
+  font-size: 9px;
+  font-style: normal;
+}
+
+.evaluation-stability-list b {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .evaluation-point-list {
@@ -4695,6 +5492,7 @@ button.experiment-trial-row:hover {
 .evaluation-table td {
   border-bottom: 1px solid var(--border);
   padding: 8px;
+  font-variant-numeric: tabular-nums;
   text-align: left;
   white-space: nowrap;
 }
@@ -4737,24 +5535,55 @@ button.experiment-trial-row:hover {
   gap: 10px;
 }
 
-.evaluation-export-heading h3,
-.evaluation-export-heading p {
+.evaluation-export-heading h3 {
   margin: 0;
 }
 
-.evaluation-export-heading p,
 .evaluation-export-item span {
   color: var(--text-muted);
   font-size: 10px;
 }
 
-.evaluation-export-heading code,
 .evaluation-export-item code {
   overflow: hidden;
   max-width: 360px;
   color: var(--text-muted);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evaluation-evidence,
+.evaluation-card-technical {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.evaluation-evidence {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  padding: 8px 10px;
+}
+
+.evaluation-evidence summary,
+.evaluation-card-technical summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.evaluation-evidence > div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 5px 10px;
+  margin-top: 8px;
+}
+
+.evaluation-evidence code,
+.evaluation-card-technical code {
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -4812,7 +5641,7 @@ button.experiment-trial-row:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface);
-  padding: 10px;
+  padding: 8px 9px;
 }
 
 .evaluation-export-item > div:first-child {
@@ -4834,11 +5663,51 @@ button.experiment-trial-row:hover {
   color: var(--text-muted);
 }
 
+@media (max-width: 1100px) {
+  .experiment-detail-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .experiment-detail-sidebar {
+    position: static;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 900px) {
+  .experiment-detail-actions {
+    justify-content: flex-start;
+  }
+
+  .experiment-detail-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .experiment-detail-sidebar {
+    grid-template-columns: 1fr;
+  }
+
+  .experiment-overview-grid,
+  .evaluation-layout:not(.is-advanced-open) .evaluation-history,
+  .evaluation-basic-card,
+  .evaluation-report-browser,
+  .evaluation-report-identity,
   .evaluation-layout,
   .evaluation-rule,
   .evaluation-execution-set > div,
   .evaluation-export-form {
+    grid-template-columns: 1fr;
+  }
+
+  .evaluation-analysis-rows > div {
+    grid-template-columns: minmax(60px, 0.5fr) minmax(80px, 1fr) minmax(100px, 1fr);
+  }
+
+  .evaluation-analysis-rows > div > small {
+    grid-column: 1 / -1;
+  }
+
+  .evaluation-analysis-grid {
     grid-template-columns: 1fr;
   }
 

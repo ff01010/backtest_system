@@ -1,5 +1,6 @@
 import type {
   ExperimentDraft,
+  ExperimentDetail,
   ExperimentPreviewRequest,
   ExperimentSubject,
   ExperimentSubjectRef,
@@ -7,14 +8,54 @@ import type {
 
 const DRAFT_SCHEMA_VERSION = 'experiment_draft_v1' as const;
 
-export function experimentDraftKey(userId: string, subject: ExperimentSubjectRef): string {
-  return [
+export function experimentDraftKey(
+  userId: string,
+  subject: ExperimentSubjectRef,
+  scope?: string,
+): string {
+  const parts = [
     'trend_grid_experiment_draft_v1',
     userId,
     subject.subjectType,
     subject.subjectId,
     subject.subjectVersion,
-  ].join(':');
+  ];
+  if (scope) parts.push(scope);
+  return parts.join(':');
+}
+
+function joinValues(values: unknown): string {
+  return Array.isArray(values) ? values.map((value) => String(value)).join(',') : '';
+}
+
+export function createCopiedExperimentDraft(detail: ExperimentDetail): ExperimentDraft {
+  const plan = detail.frozenDefinition.plan;
+  const stages = Array.isArray(plan.stages) ? plan.stages : [];
+  const stage = stages[0] && typeof stages[0] === 'object'
+    ? stages[0] as Record<string, unknown>
+    : {};
+  const parameterGrid = Array.isArray(stage.parameterGrid) ? stage.parameterGrid : [];
+  const costScenarios = Array.isArray(stage.costScenarios) ? stage.costScenarios : [];
+  const dateScenarios = Array.isArray(stage.dateScenarios) ? stage.dateScenarios : [];
+  return {
+    schemaVersion: DRAFT_SCHEMA_VERSION,
+    name: `${detail.name} · 调整`,
+    description: detail.description,
+    parameterValues: Object.fromEntries(parameterGrid.flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const value = item as Record<string, unknown>;
+      return typeof value.inputId === 'string'
+        ? [[value.inputId, joinValues(value.values)]]
+        : [];
+    })),
+    dateScenarios: dateScenarios.map((item) => ({
+      ...(item as ExperimentDraft['dateScenarios'][number]),
+    })),
+    capitalValues: joinValues(stage.capitalScenarios),
+    slippageValues: costScenarios.map((item) => (
+      item && typeof item === 'object' ? String((item as Record<string, unknown>).slippage) : ''
+    )).filter(Boolean).join(','),
+  };
 }
 
 export function createExperimentDraft(subject: ExperimentSubject): ExperimentDraft {
@@ -33,9 +74,10 @@ export function loadExperimentDraft(
   storage: Storage,
   userId: string,
   subject: ExperimentSubjectRef,
+  scope?: string,
 ): ExperimentDraft | null {
   try {
-    const raw = storage.getItem(experimentDraftKey(userId, subject));
+    const raw = storage.getItem(experimentDraftKey(userId, subject, scope));
     if (!raw) return null;
     const draft = JSON.parse(raw) as Partial<ExperimentDraft>;
     if (
@@ -67,9 +109,10 @@ export function saveExperimentDraft(
   userId: string,
   subject: ExperimentSubjectRef,
   draft: ExperimentDraft,
+  scope?: string,
 ): void {
   try {
-    storage.setItem(experimentDraftKey(userId, subject), JSON.stringify(draft));
+    storage.setItem(experimentDraftKey(userId, subject, scope), JSON.stringify(draft));
   } catch {
     // 本地存储不可用不应阻断服务端预览。
   }
@@ -79,9 +122,10 @@ export function clearExperimentDraft(
   storage: Storage,
   userId: string,
   subject: ExperimentSubjectRef,
+  scope?: string,
 ): void {
   try {
-    storage.removeItem(experimentDraftKey(userId, subject));
+    storage.removeItem(experimentDraftKey(userId, subject, scope));
   } catch {
     // 清理失败不影响已经提交成功的实验。
   }

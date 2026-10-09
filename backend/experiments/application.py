@@ -115,11 +115,12 @@ class ExperimentApplication:
       idempotency_key=idempotency_key,
       request_hash=digest(with_version({
         "operationType": "experiment.create.v1",
-        "request": request.model_dump(),
+        "request": request.model_dump(mode="json"),
       })),
       preview_token=request.previewToken,
       expected_bindings=self._preview_bindings(response),
       normalized_spec=response["normalizedSpec"],
+      source=request.source.model_dump(mode="json") if request.source else None,
       request_id=request_id,
     )
     return result.response, result.status_code

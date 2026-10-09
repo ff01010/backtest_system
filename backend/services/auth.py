@@ -30,6 +30,9 @@ API_KEY_SCOPES = {
   "backtest:submit",
   "backtest:read",
   "backtest:cancel",
+  "experiment:submit",
+  "experiment:read",
+  "experiment:cancel",
   "strategy:read",
   "strategy:write",
   "strategy:publish",
@@ -203,6 +206,26 @@ def _audit_api_key(
       api_key_id, owner_user_id, event_type, request_id, detail
     ) VALUES (%s, %s, %s, %s, %s)
   """, (key_id, owner_user_id, event_type, request_id, Jsonb(detail or {})))
+
+
+def audit_api_key_event(
+  key_id: str,
+  owner_user_id: str,
+  event_type: str,
+  detail: dict[str, Any] | None = None,
+  request_id: str | None = None,
+) -> None:
+  """记录开放 API 资源操作，不保存请求载荷或 API Key 明文。"""
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      _audit_api_key(
+        cur,
+        key_id,
+        owner_user_id,
+        event_type,
+        detail,
+        request_id,
+      )
 
 
 def create_api_key(

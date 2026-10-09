@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from backend import schemas, settings
+from backend.bar_strategy_session import _execute_script
 from backend.experiments.canonicalization import digest, with_version
 from backend.experiments.compiler import LegacySingleBarTrialCompiler
 from backend.experiments.coordinator import ExperimentCoordinator
@@ -163,6 +164,46 @@ def _dataset() -> dict[str, Any]:
   }
 
 
+def _numeric_parameter_execution_case(
+) -> tuple[ResolvedRunTemplate, dict[str, Any]]:
+  template = _execution_template()
+  code = (
+    "def on_bar(bar, state):\n"
+    "  if state[\"params\"][\"threshold\"] >= 0:\n"
+    "    state[\"numericParameterAccepted\"] = True\n"
+    "  return []\n"
+  )
+  code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+  snapshot = template.snapshot
+  snapshot["fixedStructure"]["scriptCodeDigest"] = code_hash
+  snapshot["executionSnapshot"]["script"].update({
+    "code": code,
+    "codeHash": code_hash,
+  })
+  snapshot["executionSnapshot"]["publishedConfig"]["savedStrategyParams"] = {
+    "window": 20,
+    "threshold": "0.25",
+  }
+  inputs = template.tunable_inputs + ({
+    "inputId": "strategyParameters.threshold",
+    "sourceName": "threshold",
+    "type": "number",
+    "group": "strategyParameters",
+    "defaultValue": "0.25",
+    "overridePolicy": "finite_candidates",
+  },)
+  snapshot["tunableInputCatalog"]["inputs"] = list(inputs)
+  resolved = ResolvedRunTemplate(
+    snapshot=snapshot,
+    digest=digest(snapshot),
+    tunable_inputs=inputs,
+    defaults={"strategyParameters": {"window": 20, "threshold": "0.25"}},
+  )
+  assignment = _assignment()
+  assignment["strategyParameters"]["threshold"] = "0.5"
+  return resolved, assignment
+
+
 def test_compiler_builds_frozen_standard_bar_request() -> None:
   compiler = LegacySingleBarTrialCompiler()
 
@@ -182,6 +223,70 @@ def test_compiler_builds_frozen_standard_bar_request() -> None:
     "2026-07-01", "2026-07-02",
   ]
   assert request["seedBundle"]["baseSeed"] == 42
+
+
+def test_compiler_restores_number_parameters_before_bar_execution() -> None:
+  template, assignment = _numeric_parameter_execution_case()
+  compiler = LegacySingleBarTrialCompiler()
+
+  assert compiler.compile(template, assignment) == {
+    "contractVersion": "backtest_run_request_v1",
+    "requestDigest": "19c6ab0265b237734f406e9cf3c8ae05f45e86363cc749317be4437ebb8b86ef",
+  }
+  request = compiler.compile_request(
+    template,
+    assignment,
+    _dataset(),
+    {"derivationVersion": "trial-seed-v1", "baseSeed": 42},
+  )
+
+  assert request["savedStrategyParams"]["threshold"] == 0.25
+  assert request["strategyParamOverrides"]["threshold"] == 0.5
+  assert request["strategyParams"]["threshold"] == 0.5
+  assert request["effectiveStrategyParams"]["threshold"] == 0.5
+  assert request["savedConfigSnapshot"]["runParams"]["threshold"] == 0.5
+  assert request["savedConfigSnapshot"]["savedStrategyParams"]["threshold"] == 0.25
+  assert request["savedConfigSnapshot"]["strategyParamOverrides"]["threshold"] == 0.5
+  assert request["savedConfigSnapshot"]["effectiveStrategyParams"]["threshold"] == 0.5
+
+  result = _execute_script({
+    "scriptId": "numeric-parameter-regression",
+    "code": request["savedScriptSnapshot"]["code"],
+    "params": request["effectiveStrategyParams"],
+    "runtimeVersion": template.snapshot["fixedStructure"]["runtimeVersion"],
+    "capabilityDigest": template.snapshot["fixedStructure"]["runtimeCapabilityDigest"],
+    "bars": [{
+      "time": "2026-07-01 09:35:00",
+      "symbol": "688981.SH",
+      "open": 10,
+      "high": 11,
+      "low": 9,
+      "close": 10.5,
+      "volume": 100,
+    }],
+    "initialCapital": request["initialCapital"],
+    "commissionRate": request["commissionRate"],
+    "feeProfile": request["feeProfile"],
+    "slippage": request["slippage"],
+    "holdingPolicy": request["holdingPolicy"],
+    "baseQuantity": request["baseQuantity"],
+    "baseCostPrice": request["baseCostPrice"],
+    "t0Enabled": request["t0Enabled"],
+    "strategyCategory": request["strategyCategory"],
+    "overlaySettlementPolicy": request["overlaySettlementPolicy"],
+  })
+
+  assert result["fills"] == []
+
+
+def test_compiler_keeps_canonical_decimal_text_in_request_digest() -> None:
+  template, assignment = _numeric_parameter_execution_case()
+  assignment["strategyParameters"]["threshold"] = "0.1234567890123456789"
+
+  assert LegacySingleBarTrialCompiler().compile(template, assignment) == {
+    "contractVersion": "backtest_run_request_v1",
+    "requestDigest": "c11a336af57f21c226b113218cf63e6a1df6788723fe761dd7c81db2e7602203",
+  }
 
 
 def test_compiler_matches_manual_standard_bar_request_contract() -> None:

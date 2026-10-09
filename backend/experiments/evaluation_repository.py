@@ -136,6 +136,7 @@ class PostgresEvaluationRepository:
     pipeline_version: str,
     adapter_type: str,
     adapter_version: str,
+    force_recompute: bool,
     idempotency_key: str,
     request_hash: str,
     request_id: str | None,
@@ -154,15 +155,24 @@ class PostgresEvaluationRepository:
           "executionSet": execution_set,
           "completeness": completeness,
         }))
-        response = _insert_evaluation_run(
-          cur, spec, execution_set, completeness, result_set_hash, catalog_snapshot,
-          pipeline_version, adapter_type, adapter_version, request_id,
+        existing = None if force_recompute else _find_succeeded_evaluation_run(
+          cur, str(spec["id"]), result_set_hash, pipeline_version,
         )
+        if existing:
+          response = {**_run_item(existing, include_output=False), "replayed": True}
+          status_code = 200
+        else:
+          response = _insert_evaluation_run(
+            cur, spec, execution_set, completeness, result_set_hash, catalog_snapshot,
+            pipeline_version, adapter_type, adapter_version, request_id,
+          )
+          response["replayed"] = False
+          status_code = 202
         _save_idempotency(
           cur, owner_id, CREATE_RUN_OPERATION, idempotency_key, request_hash,
-          "evaluation_run", response["evaluationRunId"], 202, response,
+          "evaluation_run", response["evaluationRunId"], status_code, response,
         )
-        return CommandResult(response, 202)
+        return CommandResult(response, status_code)
 
   def list_runs(self, experiment_id: str) -> dict[str, Any]:
     owner_id = state_store.current_user_id()
@@ -170,7 +180,8 @@ class PostgresEvaluationRepository:
       with conn.cursor() as cur:
         _require_experiment(cur, experiment_id, owner_id)
         cur.execute("""
-          SELECT run.*, spec.version_no AS spec_version_no, spec.name AS spec_name
+          SELECT run.*, spec.version_no AS spec_version_no, spec.name AS spec_name,
+            spec.spec_hash
           FROM backtest_experiment_evaluation_run run
           JOIN backtest_experiment_evaluation_spec spec
             ON spec.id=run.evaluation_spec_id
@@ -830,7 +841,33 @@ def _insert_evaluation_run(
     "evaluation.run_created", request_id,
     {"resultSetHash": result_set_hash, "executionCount": len(execution_set)},
   )
-  return _run_item(row, include_output=False)
+  return {
+    **_run_item(row, include_output=False),
+    "specHash": spec["spec_hash"],
+  }
+
+
+def _find_succeeded_evaluation_run(
+  cur: Any,
+  evaluation_spec_id: str,
+  result_set_hash: str,
+  pipeline_version: str,
+) -> dict[str, Any] | None:
+  cur.execute("""
+    SELECT run.*, spec.version_no AS spec_version_no, spec.name AS spec_name,
+      spec.spec_hash
+    FROM backtest_experiment_evaluation_run run
+    JOIN backtest_experiment_evaluation_spec spec
+      ON spec.id=run.evaluation_spec_id
+    WHERE run.evaluation_spec_id=%s
+      AND run.result_set_hash=%s
+      AND run.pipeline_version=%s
+      AND run.status='succeeded'
+    ORDER BY run.finished_at DESC, run.created_at DESC, run.id DESC
+    LIMIT 1
+  """, (evaluation_spec_id, result_set_hash, pipeline_version))
+  row = cur.fetchone()
+  return dict(row) if row else None
 
 
 def _require_experiment(cur: Any, experiment_id: str, owner_id: str) -> None:
@@ -853,7 +890,7 @@ def _load_run(
   lock = " FOR UPDATE OF run" if for_update else ""
   cur.execute(f"""
     SELECT run.*, spec.version_no AS spec_version_no, spec.name AS spec_name,
-      spec.evaluation_spec
+      spec.spec_hash, spec.evaluation_spec
     FROM backtest_experiment_evaluation_run run
     JOIN backtest_experiment_evaluation_spec spec ON spec.id=run.evaluation_spec_id
     WHERE run.id=%s AND run.experiment_id=%s AND run.owner_user_id=%s{lock}
@@ -887,6 +924,7 @@ def _run_item(row: dict[str, Any], *, include_output: bool) -> dict[str, Any]:
     "revisionId": str(row["revision_id"]),
     "specVersionNo": row.get("spec_version_no"),
     "specName": row.get("spec_name"),
+    "specHash": row.get("spec_hash"),
     "status": row["status"],
     "pipelineVersion": row["pipeline_version"],
     "adapterType": row["adapter_type"],

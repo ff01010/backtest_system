@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import EvaluationBuilder from '../features/experiments/EvaluationBuilder';
 import {
@@ -194,6 +194,13 @@ const EXPORT: EvaluationExport = {
   finishedAt: null, expiresAt: null,
 };
 
+async function selectFirstReport(): Promise<void> {
+  fireEvent.change(
+    await screen.findByRole('combobox', { name: '选择评价报告' }),
+    { target: { value: DETAIL.evaluationRunId } },
+  );
+}
+
 beforeEach(() => {
   vi.mocked(fetchEvaluationCatalogs).mockReset().mockResolvedValue(CATALOGS);
   vi.mocked(fetchEvaluationSpecs).mockReset().mockResolvedValue({ items: [], nextCursor: null });
@@ -217,11 +224,34 @@ beforeEach(() => {
 });
 
 describe('EvaluationBuilder', () => {
+  it('uses a full-width report layout until advanced evaluation is expanded', async () => {
+    const { container } = render(
+      <EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />,
+    );
+
+    await screen.findByRole('button', { name: '生成基础评价' });
+    const layout = container.querySelector('.evaluation-layout');
+    const basic = container.querySelector('.evaluation-basic-card');
+    const reportBrowser = container.querySelector('.evaluation-report-browser');
+    expect(layout?.classList.contains('is-advanced-open')).toBe(false);
+    expect(basic).not.toBeNull();
+    expect(reportBrowser).not.toBeNull();
+    expect(basic!.compareDocumentPosition(reportBrowser!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByText(/评价数据来自冻结 Trial/)).toBeNull();
+    expect(screen.queryByText(/按完整策略参数组合汇总/)).toBeNull();
+    expect(screen.queryByText(/选择报告后/)).toBeNull();
+    expect(screen.queryByText(/完整评价规则编辑器/)).toBeNull();
+    expect(screen.queryByText(/需要复用或重新计算/)).toBeNull();
+
+    fireEvent.click(screen.getByText('自定义评价（高级）'));
+    await waitFor(() => expect(layout?.classList.contains('is-advanced-open')).toBe(true));
+  });
+
   it('saves and runs once while preserving null metric semantics', async () => {
     const onOpenRun = vi.fn();
     render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" onOpenRun={onOpenRun} />);
 
-    const button = await screen.findByRole('button', { name: '保存版本并运行' });
+    const button = await screen.findByRole('button', { name: '生成基础评价' });
     fireEvent.click(button);
     fireEvent.click(button);
 
@@ -239,6 +269,7 @@ describe('EvaluationBuilder', () => {
     vi.mocked(fetchEvaluationSpecs).mockResolvedValue({ items: [SAVED], nextCursor: null });
     render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
 
+    fireEvent.click(await screen.findByText('自定义规则版本（1）'));
     fireEvent.click(await screen.findByRole('button', { name: '载入为副本' }));
 
     expect(screen.getByDisplayValue('基础评价 副本')).not.toBeNull();
@@ -249,7 +280,12 @@ describe('EvaluationBuilder', () => {
     vi.mocked(fetchEvaluationRuns).mockResolvedValue({ items: [DETAIL], nextCursor: null });
     render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+    await selectFirstReport();
+    expect(await screen.findByText('完整评价')).not.toBeNull();
+    expect(screen.queryByText(/冻结的展示与分组标签/)).toBeNull();
+    expect((screen.getByRole('combobox', { name: '选择评价报告' }) as HTMLSelectElement).value).toBe(DETAIL.evaluationRunId);
+    expect(((await screen.findByText('技术标识与冻结摘要')).closest('details') as HTMLDetailsElement).open).toBe(false);
+    expect(within(screen.getByLabelText('评价导出')).queryByText(DETAIL.outputHash!)).toBeNull();
     fireEvent.click(await screen.findByRole('button', { name: '创建导出' }));
 
     await waitFor(() => expect(createEvaluationExport).toHaveBeenCalledTimes(1));
@@ -280,7 +316,7 @@ describe('EvaluationBuilder', () => {
       });
     render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+    await selectFirstReport();
     const createButton = await screen.findByRole('button', { name: '创建导出' });
     await waitFor(() => expect(fetchEvaluationExports).toHaveBeenCalledTimes(1));
     fireEvent.click(createButton);
@@ -299,7 +335,7 @@ describe('EvaluationBuilder', () => {
       .mockResolvedValueOnce(EXPORT);
     render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+    await selectFirstReport();
     const createButton = await screen.findByRole('button', { name: '创建导出' });
     fireEvent.click(createButton);
     expect(await screen.findByText('network failed')).not.toBeNull();
@@ -332,7 +368,7 @@ describe('EvaluationBuilder', () => {
     });
     render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+    await selectFirstReport();
 
     expect(await screen.findByRole('link', { name: '下载' })).not.toBeNull();
     expect(screen.getAllByRole('button', { name: '重新创建评价导出' })).toHaveLength(3);
@@ -358,51 +394,137 @@ describe('EvaluationBuilder', () => {
     });
     render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+    await selectFirstReport();
 
     expect(await screen.findByText('完整评价')).not.toBeNull();
-    expect(screen.getByText(/历史基础评价按保存时/)).not.toBeNull();
+    expect(screen.queryByText(/历史基础评价按保存时/)).toBeNull();
   });
 
-  it('saves partial policy, safe formula and an actual-point parameter curve', async () => {
+  it('formats decimals and replaces automatic conclusions with the comparison matrix', async () => {
+    const analysisDetail: EvaluationRunDetail = {
+      ...DETAIL,
+      output: {
+        ...DETAIL.output!,
+        rows: [{
+          ...DETAIL.output!.rows[0],
+          values: {
+            totalReturn: '0.123456', annualSharpe: '-1.18345',
+            maxDrawdownRate: '0.07558971490884193035845026230900836',
+          },
+          unsupportedReasons: {},
+        }],
+        visualizations: [
+          {
+            type: 'parameter_curve_v1',
+            metricId: 'annualSharpe',
+            parameterDimensionId: 'parameter.strategyParameters.lookback',
+            series: [
+              { seriesKey: 'series-1', points: [{ x: 10, median: '-1.18345', count: 1 }, { x: 20, median: '-1.18345', count: 1 }] },
+              { seriesKey: 'series-2', points: [{ x: 10, median: '-1.1000', count: 1 }, { x: 20, median: '-1.1000', count: 1 }] },
+            ],
+          },
+          {
+            type: 'time_stability_v1',
+            metricId: 'annualSharpe',
+            candidates: [{
+              candidateKey: 'candidate-1',
+              dimensions: { 'parameter.strategyParameters.lookback': 10 },
+              values: [
+                { dateScenarioId: 'development-1', dateScenarioOrder: 0, role: 'development', value: '-1.18345' },
+                { dateScenarioId: 'validation-1', dateScenarioOrder: 1, role: 'validation', value: '-1.2369' },
+              ],
+            }],
+          },
+        ],
+      },
+    };
+    vi.mocked(fetchEvaluationRun).mockResolvedValue(analysisDetail);
+    vi.mocked(fetchEvaluationRuns).mockResolvedValue({ items: [analysisDetail], nextCursor: null });
     render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
 
-    fireEvent.click(await screen.findByLabelText('允许 provisional 部分评价'));
-    fireEvent.change(screen.getByLabelText('最低完成率'), { target: { value: '0.7500' } });
+    await selectFirstReport();
+
+    expect(await screen.findByText('0.1235')).not.toBeNull();
+    expect(screen.getByText('0.0756')).not.toBeNull();
+    expect(screen.queryByText('0.123456')).toBeNull();
+    expect(screen.getByRole('table', { name: '参数组合与日期场景比较矩阵' })).not.toBeNull();
+    expect(screen.queryByText('各参数值的典型表现相同')).toBeNull();
+    expect(screen.queryByText('当前只有一个候选')).toBeNull();
+    expect(screen.getAllByText('-1.1835').length).toBeGreaterThan(0);
+    expect(screen.queryByText(/共同参数：/)).toBeNull();
+    expect(screen.getByText('其他已保存分析（1）').closest('details')?.open).toBe(false);
+    expect(screen.queryByText(/纵向比较参数组合/)).toBeNull();
+    expect(screen.queryByText(/全表共用色标/)).toBeNull();
+    expect(screen.queryByText(/按报告保存的分组展示中位数/)).toBeNull();
+  });
+
+  it('only shows provisional thresholds after the user chooses a temporary evaluation', async () => {
+    const onRetryFailed = vi.fn();
+    render(
+      <EvaluationBuilder
+        experimentId="experiment-1"
+        symbol="688981.SH"
+        timeframe="5m"
+        trialSummary={{ planned: 3, generated: 3, succeeded: 1, failed: 1, cancelled: 0 }}
+        onRetryFailed={onRetryFailed}
+      />,
+    );
+
+    expect(screen.queryByLabelText('最低完成率')).toBeNull();
+    fireEvent.click(await screen.findByRole('button', { name: '重试失败项' }));
+    expect(onRetryFailed).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: '使用成功结果生成临时评价' }));
+    expect((screen.getByLabelText('最低完成率') as HTMLInputElement).value).toBe('0.3333');
+    fireEvent.change(screen.getByLabelText('最低完成率'), { target: { value: '0.3000' } });
     fireEvent.click(screen.getByRole('button', { name: '添加维度覆盖' }));
     fireEvent.change(screen.getByLabelText('最低覆盖率 dateScenarioId'), { target: { value: '0.5000' } });
-    fireEvent.click(screen.getByRole('button', { name: '添加安全公式' }));
-    fireEvent.click(screen.getByRole('button', { name: '参数曲线' }));
-    fireEvent.click(screen.getByRole('button', { name: '成本压力' }));
-    fireEvent.change(screen.getByLabelText('成本退化阈值'), { target: { value: '0.2500' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存版本并运行' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认生成临时评价' }));
 
     await waitFor(() => expect(saveEvaluationSpec).toHaveBeenCalledTimes(1));
     const payload = vi.mocked(saveEvaluationSpec).mock.calls[0][1];
     expect(payload.completeness).toMatchObject({
       allowPartial: true,
-      minimumCompletionRate: '0.7500',
+      minimumCompletionRate: '0.3000',
       requiredDimensionCoverage: [{
         dimensionId: 'dateScenarioId',
         minimumCoverageRate: '0.5000',
       }],
     });
-    expect(payload.derivedMetrics[0]).toMatchObject({
-      type: 'row_formula_v1',
-      formula: 'coalesce(totalReturn, 0)',
-    });
-    expect(payload.visualizations[0]).toMatchObject({
-      type: 'parameter_curve_v1',
-      parameterDimensionId: 'parameter.strategyParameters.lookback',
-    });
-    expect(payload.visualizations[1]).toMatchObject({
+    expect(payload.groupBy).toEqual(['parameter.strategyParameters.lookback']);
+    expect(payload.catalogs.normalizerVersion).toBe('candidate_rate_distribution_v1');
+    expect(payload.aggregates.map((item) => item.aggregateId)).toEqual([
+      'medianAnnualSharpe',
+      'meanTotalReturn',
+      'worstMaxDrawdownRate',
+      'annualSharpeDispersion',
+      'successfulTrialCount',
+    ]);
+    expect(payload.visualizations.slice(0, 3)).toEqual([
+      { type: 'time_stability_v1', metricId: 'annualSharpe' },
+      { type: 'time_stability_v1', metricId: 'totalReturn' },
+      { type: 'time_stability_v1', metricId: 'maxDrawdownRate' },
+    ]);
+    expect(payload.visualizations[3]).toMatchObject({
       type: 'cost_stress_v1',
       baselineScenarioId: 'base',
-      degradationThreshold: '0.2500',
     });
   });
 
-  it('shows provisional coverage, exceptions and the final-test disclaimer', async () => {
+  it('shows formula metric ids and validates unknown metrics and literal division by zero', async () => {
+    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+
+    fireEvent.click(await screen.findByText('自定义评价（高级）'));
+    fireEvent.click(screen.getByRole('button', { name: '添加安全公式' }));
+    expect(screen.getByText('totalReturn')).not.toBeNull();
+
+    const formula = screen.getByLabelText('安全公式');
+    fireEvent.change(formula, { target: { value: 'unknownMetric + 1' } });
+    expect(screen.getAllByText('未知指标：unknownMetric').length).toBeGreaterThan(0);
+    fireEvent.change(formula, { target: { value: 'totalReturn / 0' } });
+    expect(screen.getAllByText('公式存在明确的除零').length).toBeGreaterThan(0);
+  });
+
+  it('shows provisional coverage and exceptions without redundant dataset hints', async () => {
     const partialCompleteness: EvaluationCompletenessSnapshot = {
       ...RUN.completeness,
       plannedTrialCount: 3,
@@ -448,11 +570,11 @@ describe('EvaluationBuilder', () => {
     });
     render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /基础评价 · succeeded/ }));
+    await selectFirstReport();
 
-    expect(await screen.findByText('部分评价（provisional）')).not.toBeNull();
+    expect(await screen.findByText('临时评价')).not.toBeNull();
     expect(screen.getByText('失败 1')).not.toBeNull();
-    expect(screen.getByText(/不是最终 test/)).not.toBeNull();
+    expect(screen.queryByText(/不代表最终测试/)).toBeNull();
     expect(screen.getByText('关键维度覆盖（1）')).not.toBeNull();
     expect(screen.getByText(/development：1\/2/)).not.toBeNull();
     expect(screen.getByText(/失败、取消与缺失项/)).not.toBeNull();

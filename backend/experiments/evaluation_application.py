@@ -11,6 +11,7 @@ from backend.experiments.evaluation import (
   DIMENSION_CATALOG_VERSION,
   EVALUATION_PIPELINE_VERSION,
   METRIC_CATALOG_VERSION,
+  CANDIDATE_RATE_DISTRIBUTION_NORMALIZER_VERSION,
   RESULT_ADAPTER_TYPE,
   RESULT_ADAPTER_VERSION,
   catalog_snapshot,
@@ -42,6 +43,11 @@ class EvaluationApplication:
       **catalogs,
       "pipelineVersion": EVALUATION_PIPELINE_VERSION,
       "adapter": {"type": RESULT_ADAPTER_TYPE, "version": RESULT_ADAPTER_VERSION},
+      "normalizers": [{
+        "version": CANDIDATE_RATE_DISTRIBUTION_NORMALIZER_VERSION,
+        "name": "候选率指标跨场景分布",
+        "supportedUnits": ["ratio"],
+      }],
     }
 
   def save_spec(
@@ -80,6 +86,7 @@ class EvaluationApplication:
     evaluation_spec_id: str,
     idempotency_key: str,
     request_id: str | None = None,
+    force_recompute: bool = False,
   ) -> tuple[dict[str, Any], int]:
     stored = self._repository.get_spec(experiment_id, evaluation_spec_id)
     evaluation_spec = dict(stored["evaluation_spec"])
@@ -92,11 +99,13 @@ class EvaluationApplication:
       pipeline_version=EVALUATION_PIPELINE_VERSION,
       adapter_type=RESULT_ADAPTER_TYPE,
       adapter_version=RESULT_ADAPTER_VERSION,
+      force_recompute=force_recompute,
       idempotency_key=idempotency_key,
       request_hash=digest(with_version({
         "operationType": "experiment.evaluation_run.create.v1",
         "experimentId": experiment_id,
         "evaluationSpecId": evaluation_spec_id,
+        "forceRecompute": force_recompute,
       })),
       request_id=request_id,
     )
@@ -144,7 +153,9 @@ class EvaluationApplication:
     if (
       catalog_versions["metricCatalogVersion"] != METRIC_CATALOG_VERSION
       or catalog_versions["dimensionCatalogVersion"] != DIMENSION_CATALOG_VERSION
-      or catalog_versions["normalizerVersion"] is not None
+      or catalog_versions["normalizerVersion"] not in {
+        None, CANDIDATE_RATE_DISTRIBUTION_NORMALIZER_VERSION,
+      }
     ):
       raise ExperimentError(
         "experiment.evaluation_catalog_unsupported", "评价目录版本不受支持", 422,

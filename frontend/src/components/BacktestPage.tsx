@@ -1224,8 +1224,21 @@ export function buildStrategyDraftFingerprint(input: {
   }));
 }
 
+export function normalizeSavedBacktestParams(
+  savedParams: Record<string, unknown> | null | undefined,
+  strategyParams: Record<string, unknown> | null | undefined = undefined,
+): BacktestParams {
+  const normalized: BacktestParams = { ...DEFAULT_PARAMS };
+  Object.entries({ ...(savedParams || {}), ...(strategyParams || {}) }).forEach(([key, value]) => {
+    const inputValue = strategyParameterInputValue(value);
+    if (key !== 'warmupTradingDays' && inputValue !== undefined) normalized[key] = inputValue;
+  });
+  return normalized;
+}
+
 export function buildSavedStrategyFingerprint(config: StrategyConfig): string {
   const savedParams = config.paramsJson.params as Record<string, unknown> | undefined;
+  const savedStrategyParams = config.paramsJson.strategyParams;
   const definitions = config.paramsJson.strategyParameterDefinitions;
   const strategyParameterNames = definitions != null && typeof definitions === 'object'
     ? Object.keys(definitions)
@@ -1237,8 +1250,11 @@ export function buildSavedStrategyFingerprint(config: StrategyConfig): string {
     timeframe: config.timeframe,
     benchmarkSymbol: config.benchmarkSymbol || config.symbol,
     accountId: config.accountId || '',
-    params: Object.fromEntries(
-      Object.entries(savedParams || {}).filter(([key]) => key !== 'warmupTradingDays')
+    params: normalizeSavedBacktestParams(
+      savedParams,
+      savedStrategyParams != null && typeof savedStrategyParams === 'object'
+        ? savedStrategyParams as Record<string, unknown>
+        : undefined,
     ),
     strategyParameterNames,
     script: {
@@ -1966,6 +1982,7 @@ export default function BacktestPage({
       const value = strategyParameterInputValue(source);
       return value === undefined ? [] : [[name, value]];
     }));
+    const normalizedParams = normalizeSavedBacktestParams(savedParams, nextSavedStrategyParams);
     setSelectedConfigId(config.id);
     setConfigVersions([]);
     setPublishedFingerprint('');
@@ -1976,16 +1993,7 @@ export default function BacktestPage({
     setSelectedStrategy(config.strategy);
     setSelectedScriptId(config.scriptId || '');
     setSelectedAccountId(config.accountId || '');
-    if (savedParams) {
-      setParams((prev) => {
-        const next: BacktestParams = { ...prev };
-        Object.entries(savedParams).forEach(([key, value]) => {
-          const inputValue = strategyParameterInputValue(value);
-          if (key !== 'warmupTradingDays' && inputValue !== undefined) next[key] = inputValue;
-        });
-        return next;
-      });
-    }
+    setParams(normalizedParams);
     setStrategyParameterSchema(parameterSchema);
     setSavedStrategyParams(nextSavedStrategyParams);
     setVersionDirty(false);
@@ -2004,7 +2012,7 @@ export default function BacktestPage({
     );
     setPublishedFingerprint(buildSavedStrategyFingerprint(config));
     setPublishedExperimentFingerprint(buildExperimentFingerprint(
-      { ...(savedParams || {}), ...nextSavedStrategyParams },
+      normalizedParams,
       parameterNames,
     ));
     setStatus(`已加载策略 ${config.name}`);

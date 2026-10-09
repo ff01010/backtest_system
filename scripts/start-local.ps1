@@ -55,7 +55,7 @@ function Wait-PostgresHealthy {
   throw 'PostgreSQL did not become healthy within 60 seconds'
 }
 
-function Test-RunnerContainersReady {
+function Test-ServiceContainersReady {
   param([string]$Service, [int]$ExpectedCount)
 
   $containerIds = @(& docker compose --env-file $envFile -f $composeFile ps -q $Service)
@@ -63,8 +63,12 @@ function Test-RunnerContainersReady {
     return $false
   }
   foreach ($containerId in $containerIds) {
-    $status = (& docker inspect --format '{{.State.Status}}' $containerId 2>$null).Trim()
-    if ($status -ne 'running') {
+    $state = (& docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' $containerId 2>$null).Trim()
+    $parts = $state.Split('|', 2)
+    if ($parts[0] -ne 'running') {
+      return $false
+    }
+    if ($parts.Count -eq 2 -and $parts[1] -and $parts[1] -ne 'healthy') {
       return $false
     }
   }
@@ -75,17 +79,26 @@ function Wait-ApplicationHealthy {
   param(
     [int]$Port,
     [int]$BarRunnerReplicas,
-    [int]$L2RunnerReplicas
+    [int]$L2RunnerReplicas,
+    [string[]]$RequiredWorkerServices
   )
 
   $healthUrl = "http://127.0.0.1:$Port/api/health"
   for ($attempt = 1; $attempt -le 30; $attempt += 1) {
     try {
       $response = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 3
+      $workersReady = @(
+        $RequiredWorkerServices | Where-Object {
+          -not (Test-ServiceContainersReady -Service $_ -ExpectedCount 1)
+        }
+      ).Count -eq 0
       if (
         $response.status -eq 'ok' -and
-        (Test-RunnerContainersReady 'bar-runner' $BarRunnerReplicas) -and
-        (Test-RunnerContainersReady 'l2-runner' $L2RunnerReplicas)
+        $response.signalExportRunner.healthy -eq $true -and
+        $response.evaluationExportWorker.healthy -eq $true -and
+        (Test-ServiceContainersReady 'bar-runner' $BarRunnerReplicas) -and
+        (Test-ServiceContainersReady 'l2-runner' $L2RunnerReplicas) -and
+        $workersReady
       ) {
         Write-Host "Local environment is ready: $healthUrl"
         return
@@ -96,7 +109,7 @@ function Wait-ApplicationHealthy {
     Start-Sleep -Seconds 2
   }
   Invoke-Compose @('ps')
-  throw "Application or runners did not pass health check within 60 seconds: $healthUrl"
+  throw "Application, runners, or workers did not pass health check within 60 seconds: $healthUrl"
 }
 
 if (-not (Test-Path $envFile)) {
@@ -107,6 +120,13 @@ Get-Command docker -ErrorAction Stop | Out-Null
 $httpPort = Get-HttpPort
 $barRunnerReplicas = Get-RunnerReplicas 'TREND_GRID_BAR_RUNNER_REPLICAS'
 $l2RunnerReplicas = Get-RunnerReplicas 'TREND_GRID_L2_RUNNER_REPLICAS'
+$requiredWorkerServices = @(
+  'experiment-coordinator',
+  'evaluation-worker',
+  'evaluation-export-worker',
+  'experiment-purge-worker',
+  'signal-export-runner'
+)
 
 Push-Location $projectRoot
 try {
@@ -121,9 +141,10 @@ try {
     $upArguments += '--build'
   }
   $upArguments += 'redis', 'bar-runner', 'l2-runner', 'backend', 'frontend'
+  $upArguments += $requiredWorkerServices
   Invoke-Compose $upArguments
   Invoke-Compose @('ps')
-  Wait-ApplicationHealthy $httpPort $barRunnerReplicas $l2RunnerReplicas
+  Wait-ApplicationHealthy $httpPort $barRunnerReplicas $l2RunnerReplicas $requiredWorkerServices
 } finally {
   Pop-Location
 }

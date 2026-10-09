@@ -82,6 +82,7 @@ class ExperimentRepository(PreviewRepository, Protocol):
     preview_token: str,
     expected_bindings: dict[str, str],
     normalized_spec: dict[str, Any],
+    source: dict[str, str] | None,
     request_id: str | None,
   ) -> CommandResult:
     """原子创建首个实验修订。"""
@@ -268,6 +269,7 @@ class PostgresExperimentRepository:
     preview_token: str,
     expected_bindings: dict[str, str],
     normalized_spec: dict[str, Any],
+    source: dict[str, str] | None,
     request_id: str | None,
   ) -> CommandResult:
     owner_id = state_store.current_user_id()
@@ -283,6 +285,7 @@ class PostgresExperimentRepository:
         validate_preview_bindings(preview, expected_bindings, datetime.now(timezone.utc))
         if digest(preview["normalized_spec"]) != digest(normalized_spec):
           raise _preview_stale(["normalizedSpec"])
+        source_row = _load_experiment_source(cur, owner_id, source)
         planned_count = int(preview["planned_trial_count"])
         _reserve_user_plan(cur, owner_id, planned_count)
         response = _insert_experiment_graph(
@@ -290,6 +293,7 @@ class PostgresExperimentRepository:
           owner_id=owner_id,
           normalized_spec=normalized_spec,
           preview=preview,
+          source=source_row,
           request_id=request_id,
         )
         _save_idempotency(
@@ -362,6 +366,10 @@ class PostgresExperimentRepository:
             e.status, e.blocked_reason_code, e.blocked_reason_message,
             e.archived_at, e.archive_retention_until, e.purge_job_id,
             e.row_version, e.created_at, e.updated_at,
+            source_e.id AS source_experiment_id,
+            source_e.name AS source_experiment_name,
+            source_r.id AS source_revision_id,
+            source_r.revision_no AS source_revision_no,
             r.id AS revision_id, r.revision_no, r.experiment_spec,
             r.spec_hash, r.planned_trial_count, r.resource_budget,
             r.failure_policy,
@@ -376,6 +384,10 @@ class PostgresExperimentRepository:
           FROM backtest_experiment e
           JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
           JOIN backtest_experiment_stage s ON s.revision_id=r.id AND s.stage_index=0
+          LEFT JOIN backtest_experiment_revision source_r
+            ON source_r.id=e.source_revision_id
+          LEFT JOIN backtest_experiment source_e
+            ON source_e.id=source_r.experiment_id
           WHERE e.id=%s AND e.owner_user_id=%s
         """, (experiment_id, owner_id))
         row = cur.fetchone()
@@ -415,6 +427,10 @@ class PostgresExperimentRepository:
             e.blocked_reason_code, e.blocked_reason_message,
             e.archived_at, e.archive_retention_until, e.purge_job_id,
             e.created_at, e.updated_at,
+            source_e.id AS source_experiment_id,
+            source_e.name AS source_experiment_name,
+            source_r.id AS source_revision_id,
+            source_r.revision_no AS source_revision_no,
             r.id AS revision_id, r.revision_no, r.experiment_spec,
             r.planned_trial_count,
             s.id AS stage_id, s.status AS stage_status,
@@ -423,6 +439,10 @@ class PostgresExperimentRepository:
           FROM backtest_experiment e
           JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
           JOIN backtest_experiment_stage s ON s.revision_id=r.id AND s.stage_index=0
+          LEFT JOIN backtest_experiment_revision source_r
+            ON source_r.id=e.source_revision_id
+          LEFT JOIN backtest_experiment source_e
+            ON source_e.id=source_r.experiment_id
           WHERE e.owner_user_id=%s
             AND e.archived_at IS {'NOT NULL' if archived else 'NULL'} {after_sql}
           ORDER BY e.updated_at DESC, e.id DESC
@@ -2274,6 +2294,7 @@ def _experiment_list_item(row: dict[str, Any]) -> dict[str, Any]:
   return {
     "experimentId": str(row["experiment_id"]),
     "name": row["name"],
+    "source": _experiment_source_response(row),
     "subject": {
       **spec["subjectRef"],
       "name": fixed["strategyName"],
@@ -2282,8 +2303,8 @@ def _experiment_list_item(row: dict[str, Any]) -> dict[str, Any]:
     "revisionNo": int(row["revision_no"]),
     "status": row["status"],
     "reason": _row_reason(row),
-    "runPath": spec["runTemplateSnapshot"]["runPath"],
-    "scopeType": spec["runTemplateSnapshot"]["scopeType"],
+    "runPath": str(spec["runTemplateSnapshot"].get("runPath") or "unknown"),
+    "scopeType": str(spec["runTemplateSnapshot"].get("scopeType") or "unknown"),
     "symbol": fixed["symbol"],
     "timeframe": fixed["timeframe"],
     "fillModel": fixed["fillModel"],
@@ -3088,12 +3109,35 @@ def _revision_created_response(
   }
 
 
+def _load_experiment_source(
+  cur: Any,
+  owner_id: str,
+  source: dict[str, str] | None,
+) -> dict[str, Any] | None:
+  if source is None:
+    return None
+  cur.execute("""
+    SELECT e.id AS experiment_id, e.name, r.id AS revision_id,
+      r.revision_no
+    FROM backtest_experiment e
+    JOIN backtest_experiment_revision r ON r.experiment_id=e.id
+    WHERE e.id=%s AND r.id=%s AND e.owner_user_id=%s
+  """, (source["experimentId"], source["revisionId"], owner_id))
+  row = cur.fetchone()
+  if row is None:
+    raise ExperimentError(
+      "experiment.source_not_found", "来源实验不存在或不可访问", 404,
+    )
+  return dict(row)
+
+
 def _insert_experiment_graph(
   cur: Any,
   *,
   owner_id: str,
   normalized_spec: dict[str, Any],
   preview: dict[str, Any],
+  source: dict[str, Any] | None,
   request_id: str | None,
 ) -> dict[str, Any]:
   experiment_id = str(uuid4())
@@ -3102,11 +3146,12 @@ def _insert_experiment_graph(
   stage_spec = dict(normalized_spec["plan"]["stages"][0])
   cur.execute("""
     INSERT INTO backtest_experiment (
-      id, owner_user_id, name, description, status
-    ) VALUES (%s,%s,%s,%s,'preparing')
+      id, owner_user_id, name, description, source_revision_id, status
+    ) VALUES (%s,%s,%s,%s,%s,'preparing')
     RETURNING created_at
   """, (
     experiment_id, owner_id, normalized_spec["name"], normalized_spec["description"],
+    source["revision_id"] if source else None,
   ))
   created_at = cur.fetchone()["created_at"]
   _insert_revision(
@@ -3125,7 +3170,11 @@ def _insert_experiment_graph(
     ) VALUES (%s,%s,%s,%s,'experiment.created',%s,%s)
   """, (
     owner_id, experiment_id, revision_id, stage_id, request_id,
-    Jsonb({"plannedTrialCount": preview["planned_trial_count"]}),
+    Jsonb({
+      "plannedTrialCount": preview["planned_trial_count"],
+      "sourceExperimentId": str(source["experiment_id"]) if source else None,
+      "sourceRevisionId": str(source["revision_id"]) if source else None,
+    }),
   ))
   return {
     "experimentId": experiment_id,
@@ -3248,6 +3297,7 @@ def _detail_response(row: dict[str, Any]) -> dict[str, Any]:
     "experimentId": str(row["experiment_id"]),
     "name": row["name"],
     "description": row["description"],
+    "source": _experiment_source_response(row),
     "status": row["status"],
     "snapshotVersion": int(row["row_version"]),
     "archivedAt": row["archived_at"].isoformat() if row.get("archived_at") else None,
@@ -3298,6 +3348,17 @@ def _detail_response(row: dict[str, Any]) -> dict[str, Any]:
     "blockedReason": reason,
     "createdAt": row["created_at"].isoformat(),
     "updatedAt": row["updated_at"].isoformat(),
+  }
+
+
+def _experiment_source_response(row: dict[str, Any]) -> dict[str, Any] | None:
+  if not row.get("source_revision_id"):
+    return None
+  return {
+    "experimentId": str(row["source_experiment_id"]),
+    "experimentName": row["source_experiment_name"],
+    "revisionId": str(row["source_revision_id"]),
+    "revisionNo": int(row["source_revision_no"]),
   }
 
 

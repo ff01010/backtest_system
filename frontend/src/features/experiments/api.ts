@@ -13,7 +13,6 @@ import type {
   ExperimentRetryResult,
   ExperimentRetrySelection,
   ExperimentRevision,
-  ExperimentRevisionCreateRequest,
   ExperimentSubject,
   ExperimentSubjectRef,
   ExperimentTrial,
@@ -49,19 +48,6 @@ export function createExperiment(
 export function findCreatedExperiment(idempotencyKey: string): Promise<ExperimentCreateResponse> {
   return fetchJson(
     `/api/backtest/experiments/by-idempotency-key/${encodeURIComponent(idempotencyKey)}`,
-  );
-}
-
-export function createExperimentRevision(
-  experimentId: string,
-  request: ExperimentRevisionCreateRequest,
-  idempotencyKey: string,
-): Promise<ExperimentCreateResponse> {
-  return sendJson(
-    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/revisions`,
-    'POST',
-    request,
-    { 'Idempotency-Key': idempotencyKey },
   );
 }
 
@@ -246,11 +232,12 @@ export function createEvaluationRun(
   experimentId: string,
   evaluationSpecId: string,
   idempotencyKey: string,
+  forceRecompute = false,
 ): Promise<EvaluationRun> {
   return sendJson(
     `/api/backtest/experiments/${encodeURIComponent(experimentId)}/evaluation-runs`,
     'POST',
-    { evaluationSpecId },
+    { evaluationSpecId, forceRecompute },
     { 'Idempotency-Key': idempotencyKey },
   );
 }

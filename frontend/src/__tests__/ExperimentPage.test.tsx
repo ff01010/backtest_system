@@ -1,12 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import ExperimentPage from '../features/experiments/ExperimentPage';
+import ExperimentPage, { isStandardBarConfig } from '../features/experiments/ExperimentPage';
 import { fetchStrategyConfigs } from '../api/client';
 import {
   archiveExperiment,
   cancelExperiment,
   createExperiment,
-  createExperimentRevision,
   fetchAdminArchivedExperiments,
   fetchExperimentDetail,
   fetchExperimentRevisions,
@@ -40,7 +39,6 @@ vi.mock('../features/experiments/api', () => ({
   archiveExperiment: vi.fn(),
   cancelExperiment: vi.fn(),
   createExperiment: vi.fn(),
-  createExperimentRevision: vi.fn(),
   fetchAdminArchivedExperiments: vi.fn(),
   fetchExperimentDetail: vi.fn(),
   fetchExperimentRevisions: vi.fn(),
@@ -160,6 +158,7 @@ const DETAIL: ExperimentDetail = {
   experimentId: 'experiment-1',
   name: '均值回归 · 有限网格',
   description: '',
+  source: null,
   status: 'queued',
   snapshotVersion: 2,
   revision: { revisionId: 'revision-1', revisionNo: 1, specHash: PREVIEW.specHash },
@@ -186,7 +185,18 @@ const DETAIL: ExperimentDetail = {
   frozenDefinition: {
     subjectRef: SUBJECT_REF,
     fixedStructure: SUBJECT.fixedStructure,
-    plan: {},
+    plan: {
+      planVersion: 'experiment_plan_v1',
+      stages: [{
+        stageType: 'finite_grid_v1',
+        generatorVersion: '1',
+        parameterGrid: [{ inputId: 'strategyParameters.window', values: [10, 20] }],
+        dateScenarios: [{ ...SUBJECT.defaultExperimentInputs.dateScenario }],
+        capitalScenarios: ['100000'],
+        costScenarios: [{ scenarioId: 'cost-1', slippage: '0' }],
+        executionScenarios: [{ scenarioId: 'immediate-1', algorithm: 'immediate', parameters: {} }],
+      }],
+    },
     datasetSnapshots: [{}],
     determinism: {},
   },
@@ -202,6 +212,7 @@ function experimentListItem(experimentId: string, name: string): ExperimentListI
   return {
     experimentId,
     name,
+    source: null,
     subject: { ...SUBJECT_REF, name: '均值回归' },
     currentRevisionId: `revision-${experimentId}`,
     revisionNo: 1,
@@ -234,10 +245,29 @@ const TRIAL: ExperimentTrial = {
   stageId: 'stage-1',
   candidateKey: 'candidate-1',
   dimensionAssignment: {
+    strategyParameters: {
+      window: 10,
+      threshold: '0.5',
+      enabled: true,
+      note: '',
+    },
     dateScenario: {
       scenarioId: 'development-1',
       name: '开发集',
+      role: 'development',
       startDate: '2026-07-01',
+      endDate: '2026-07-02',
+    },
+    initialCapital: '100000',
+    costScenario: {
+      scenarioId: 'cost-1',
+      name: '基础成本',
+      slippage: '0',
+    },
+    executionScenario: {
+      scenarioId: 'immediate-1',
+      algorithm: 'immediate',
+      parameters: {},
     },
   },
   materializationStatus: 'materialized',
@@ -326,10 +356,6 @@ beforeEach(() => {
     revisionId: 'revision-1',
     status: 'queued',
   });
-  vi.mocked(createExperimentRevision).mockReset().mockResolvedValue({
-    ...CREATED,
-    revisionId: 'revision-2',
-  });
   vi.mocked(previewRetryFailedTrials).mockReset().mockResolvedValue({
     experimentId: 'experiment-1',
     revisionId: 'revision-1',
@@ -363,6 +389,33 @@ beforeEach(() => {
 });
 
 describe('ExperimentPage', () => {
+  it('只把明确使用标准 Bar 成交模型的发布策略列入自动化入口', () => {
+    const base = {
+      id: 'config-1', name: '标准 Bar', scriptId: 'script-1', strategyVersionId: 'strategy-v1',
+      scriptVersionNo: 1, description: '', code: 'def on_bar(bar, state): return []',
+      entryType: 'on_bar', signalRequired: false, strategy: 'user_script', mode: 'backtest',
+      symbol: '688981.SH', timeframe: '5m', benchmarkSymbol: null, accountId: null,
+      enabled: true, published: true, publishedVersionId: 'published-1', revision: 1,
+      createdAt: '2026-10-08', updatedAt: '2026-10-08',
+    } as const;
+
+    expect(isStandardBarConfig({
+      ...base,
+      paramsJson: { params: { fillModel: 'bar_next_open' } },
+    })).toBe(true);
+    expect(isStandardBarConfig({
+      ...base,
+      paramsJson: { params: { fillModel: 'l2_quote' } },
+    })).toBe(false);
+    expect(isStandardBarConfig({
+      ...base,
+      paramsJson: { params: { fillModel: 'unknown_model' } },
+    })).toBe(false);
+    expect(isStandardBarConfig({
+      ...base,
+      paramsJson: { params: {} },
+    })).toBe(false);
+  });
   it('keeps an admin owner archived experiment reachable for restore', async () => {
     const onExperimentChange = vi.fn();
     vi.mocked(fetchExperiments)
@@ -632,7 +685,7 @@ describe('ExperimentPage', () => {
 
   it('shows aggregate progress and drills down through the selected ordinary run', async () => {
     const onOpenRun = vi.fn();
-    render(
+    const { container } = render(
       <ExperimentPage
         userId="user-1"
         subject={null}
@@ -646,6 +699,24 @@ describe('ExperimentPage', () => {
 
     await screen.findByText('2 / 2');
     expect(screen.getByText('冻结定义')).not.toBeNull();
+    expect(screen.getAllByText('排队中').length).toBeGreaterThan(0);
+    expect(screen.queryByText('queued')).toBeNull();
+    expect(screen.getByText('Bar 下一根开盘价')).not.toBeNull();
+    expect(screen.getByText('开发 · 2026-07-01 至 2026-07-02')).not.toBeNull();
+    expect((screen.getByText('技术信息与编号').closest('details') as HTMLDetailsElement).open).toBe(false);
+    expect((screen.getByText('执行记录（1）').closest('details') as HTMLDetailsElement).open).toBe(false);
+    const parameters = screen.getByText('查看参数').closest('details') as HTMLDetailsElement;
+    expect(parameters.open).toBe(false);
+    fireEvent.click(within(parameters).getByText('查看参数'));
+    expect(parameters.open).toBe(true);
+    expect(within(parameters).getByText('window')).not.toBeNull();
+    expect(within(parameters).getByText('10')).not.toBeNull();
+    expect(within(parameters).getByText('threshold')).not.toBeNull();
+    expect(within(parameters).getByText('0.5')).not.toBeNull();
+    expect(within(parameters).getByText('基础成本')).not.toBeNull();
+    expect(within(parameters).getByText('立即成交')).not.toBeNull();
+    expect(container.querySelector('.experiment-detail-kpis')).not.toBeNull();
+    expect(container.querySelector('.experiment-detail-workspace')).not.toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '查看单次结果' }));
     expect(onOpenRun).toHaveBeenCalledWith('run-1', '688981.SH', '5m', '20260701');
     expect(fetchExperimentDetail).toHaveBeenCalledTimes(1);
@@ -708,9 +779,12 @@ describe('ExperimentPage', () => {
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining('保留旧执行'));
   });
 
-  it('re-previews and explicitly confirms a new Revision', async () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  it('copies the frozen inputs into an independent experiment and shows the change', async () => {
     const onExperimentChange = vi.fn();
+    vi.mocked(createExperiment).mockResolvedValueOnce({
+      ...CREATED,
+      experimentId: 'experiment-copy-1',
+    });
     vi.mocked(fetchExperimentDetail).mockResolvedValue({
       ...DETAIL,
       status: 'completed',
@@ -733,23 +807,73 @@ describe('ExperimentPage', () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: '创建新 Revision' }));
+    fireEvent.click(await screen.findByRole('button', { name: '复制实验并调整' }));
     await screen.findByRole('heading', { name: '均值回归' });
+    expect(screen.getByDisplayValue('10,20')).not.toBeNull();
+    expect(screen.getByText('运行配置尚未变化。修改参数候选、日期、资金或滑点后，差异会显示在这里。')).not.toBeNull();
+    fireEvent.change(screen.getByDisplayValue('10,20'), { target: { value: '10,20,30' } });
+    expect(screen.getByText('10,20,30')).not.toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '生成预览' }));
     await screen.findByText('Trial 总数');
-    fireEvent.click(screen.getByRole('button', { name: '确认创建新 Revision' }));
+    fireEvent.click(screen.getByRole('button', { name: '创建新实验并开始' }));
 
-    await waitFor(() => expect(createExperimentRevision).toHaveBeenCalledTimes(1));
-    expect(createExperimentRevision).toHaveBeenCalledWith(
-      'experiment-1',
+    await waitFor(() => expect(createExperiment).toHaveBeenCalledTimes(1));
+    expect(createExperiment).toHaveBeenCalledWith(
       expect.objectContaining({
-        expectedRevisionId: 'revision-1',
-        expectedSnapshotVersion: 2,
+        source: { experimentId: 'experiment-1', revisionId: 'revision-1' },
+        experimentSpec: expect.objectContaining({
+          plan: expect.objectContaining({
+            stages: [expect.objectContaining({
+              parameterGrid: [{
+                inputId: 'strategyParameters.window',
+                values: ['10', '20', '30'],
+              }],
+            })],
+          }),
+        }),
       }),
       expect.any(String),
     );
-    expect(createExperiment).not.toHaveBeenCalled();
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('旧 Revision 保持只读'));
+    expect(onExperimentChange).toHaveBeenCalledWith('experiment-copy-1');
+  });
+
+  it('keeps execution and evaluation in the main workspace with compact lifecycle actions', async () => {
+    vi.mocked(fetchExperimentDetail).mockResolvedValue({
+      ...DETAIL,
+      status: 'completed',
+      stage: {
+        ...DETAIL.stage,
+        status: 'completed',
+        terminalTrialCount: 2,
+        succeededTrialCount: 2,
+        queuedTrialCount: 0,
+      },
+    });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    const trialHeading = await screen.findByRole('heading', { name: 'Trial 运行' });
+    expect(trialHeading.closest('.experiment-detail-main')).not.toBeNull();
+    expect(screen.getByRole('heading', { name: '冻结定义' }).closest(
+      '.experiment-detail-sidebar',
+    )).not.toBeNull();
+    expect(screen.getByRole('heading', { name: '修订历史' }).closest(
+      '.experiment-detail-sidebar',
+    )).not.toBeNull();
+    expect(screen.getByRole('button', { name: '复制实验并调整' }).closest(
+      '.experiment-detail-actions',
+    )).not.toBeNull();
+    expect(screen.getByRole('button', { name: '归档实验' }).closest(
+      '.experiment-detail-actions',
+    )).not.toBeNull();
   });
 
   it('explains that capacity blocks resume the same revision', async () => {

@@ -97,7 +97,12 @@ class ExperimentPreviewRequest(StrictModel):
     return normalized
 
 
-class ExperimentCreateRequest(StrictModel):
+class ExperimentSourceRef(StrictModel):
+  experimentId: UUID
+  revisionId: UUID
+
+
+class ExperimentCreateSpecRequest(StrictModel):
   previewToken: str = Field(
     min_length=36,
     max_length=36,
@@ -115,7 +120,11 @@ class ExperimentCreateRequest(StrictModel):
       raise ValueError("previewToken 必须是 UUID") from error
 
 
-class ExperimentRevisionCreateRequest(ExperimentCreateRequest):
+class ExperimentCreateRequest(ExperimentCreateSpecRequest):
+  source: ExperimentSourceRef | None = None
+
+
+class ExperimentRevisionCreateRequest(ExperimentCreateSpecRequest):
   expectedRevisionId: UUID
   expectedSnapshotVersion: int = Field(ge=1)
 
@@ -193,7 +202,7 @@ class EvaluationSource(StrictModel):
 class EvaluationCatalogs(StrictModel):
   metricCatalogVersion: Literal["metric_catalog_v1"]
   dimensionCatalogVersion: Literal["dimension_catalog_v1"]
-  normalizerVersion: None = None
+  normalizerVersion: Literal["candidate_rate_distribution_v1"] | None = None
 
 
 class EvaluationDimensionCoverage(StrictModel):
@@ -417,6 +426,7 @@ class EvaluationSpecRequest(StrictModel):
 
 class EvaluationRunCreateRequest(StrictModel):
   evaluationSpecId: UUID
+  forceRecompute: bool = False
 
 
 class EvaluationExportCreateRequest(StrictModel):

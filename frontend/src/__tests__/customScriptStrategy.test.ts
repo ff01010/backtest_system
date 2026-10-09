@@ -11,6 +11,7 @@ import {
   hasLegacyTimeSlice,
   hasSavedStrategyId,
   isCustomScriptStrategy,
+  normalizeSavedBacktestParams,
   serializeStrategyParameterValues,
   strategyParameterSchemaFromConfig,
 } from '../components/BacktestPage';
@@ -160,7 +161,7 @@ describe('isCustomScriptStrategy', () => {
       timeframe: saved.timeframe,
       benchmarkSymbol: saved.benchmarkSymbol,
       accountId: '',
-      params: saved.paramsJson.params,
+      params: normalizeSavedBacktestParams(saved.paramsJson.params),
       strategyParameterNames: ['window'],
       script: {
         code: saved.code,
@@ -170,6 +171,32 @@ describe('isCustomScriptStrategy', () => {
     });
 
     expect(buildSavedStrategyFingerprint(saved)).toBe(draft);
+  });
+
+  it('加载旧方案时补齐当前默认值且不会保留上一方案的自定义参数', () => {
+    const first = normalizeSavedBacktestParams(
+      { allowLong: false, staleParameter: 'legacy' },
+      { window: 20 },
+    );
+    const second = normalizeSavedBacktestParams(
+      { allowShort: false },
+      { threshold: 0.03 },
+    );
+
+    expect(first).toMatchObject({
+      fillModel: 'bar_next_open',
+      allowLong: false,
+      window: '20',
+      staleParameter: 'legacy',
+    });
+    expect(second).toMatchObject({
+      fillModel: 'bar_next_open',
+      allowLong: true,
+      allowShort: false,
+      threshold: '0.03',
+    });
+    expect(second).not.toHaveProperty('window');
+    expect(second).not.toHaveProperty('staleParameter');
   });
 
   it('从完整策略生成四种基础参数控件并按声明类型序列化', () => {

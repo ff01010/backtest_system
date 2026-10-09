@@ -344,11 +344,99 @@ def test_formula_filter_group_aggregate_and_group_formula_use_frozen_order() -> 
   assert output["sourceRowCount"] == 2
   assert output["matchedRowCount"] == 1
   assert output["rows"][0]["memberCount"] == 1
+  assert output["rows"][0]["members"] == [{
+    "trialId": "50000000-0000-4000-8000-000000000001",
+    "trialExecutionId": "30000000-0000-4000-8000-000000000001",
+    "runId": "40000000-0000-4000-8000-000000000001",
+    "stageId": "20000000-0000-4000-8000-000000000001",
+    "stageIndex": 0,
+    "trialIndex": 1,
+    "resultHash": output["rows"][0]["members"][0]["resultHash"],
+    "startDate": "2025-01-01",
+  }]
   assert output["rows"][0]["values"] == {
     "dateScenarioId": "development",
     "meanScore": "1.2000",
     "groupScore": "2.4000",
   }
+
+
+def test_candidate_rate_distribution_normalizer_aggregates_frozen_scenarios() -> None:
+  first = _source(0, 0.1, 1.0, capital="1000000")
+  second = _source(1, 0.3, 2.0, capital="2000000")
+  first["dimension_projection"]["strategyParameters"]["lookback"] = 20
+  second["dimension_projection"]["strategyParameters"]["lookback"] = 20
+  second["dimension_projection"]["dateScenario"] = {
+    "scenarioId": "validation",
+    "role": "validation",
+    "startDate": "2025-04-01",
+    "endDate": "2025-06-30",
+  }
+  spec = _evaluation_spec(
+    catalogs={
+      "metricCatalogVersion": METRIC_CATALOG_VERSION,
+      "dimensionCatalogVersion": DIMENSION_CATALOG_VERSION,
+      "normalizerVersion": "candidate_rate_distribution_v1",
+    },
+    columns=["parameter.strategyParameters.lookback", "medianSharpe"],
+    groupBy=["parameter.strategyParameters.lookback"],
+    aggregates=[{
+      "type": "metric_aggregate_v1",
+      "aggregateId": "medianSharpe",
+      "metricId": "annualSharpe",
+      "function": "median",
+      "percentile": None,
+    }],
+    sort=[{
+      "type": "metric_sort_v1",
+      "metricId": "medianSharpe",
+      "direction": "desc",
+    }],
+  )
+  normalized = EvaluationSpecRequest.model_validate(spec).model_dump(mode="json")
+
+  output = evaluate(
+    normalized, catalog_snapshot(_experiment_spec()), [first, second], "8" * 64,
+  )
+
+  assert output["rows"][0]["memberCount"] == 2
+  assert output["rows"][0]["values"]["medianSharpe"] == "1.5"
+
+
+def test_candidate_rate_distribution_normalizer_does_not_merge_amount_metrics() -> None:
+  first = _source(0, 0.1, 1.0, capital="1000000")
+  second = _source(1, 0.3, 2.0, capital="2000000")
+  first["dimension_projection"]["strategyParameters"]["lookback"] = 20
+  second["dimension_projection"]["strategyParameters"]["lookback"] = 20
+  first["result_json"]["summary"]["totalPnl"] = 100
+  second["result_json"]["summary"]["totalPnl"] = 200
+  first["expected_result_hash"] = stable_result_hash(first["result_json"])
+  second["expected_result_hash"] = stable_result_hash(second["result_json"])
+  spec = _evaluation_spec(
+    catalogs={
+      "metricCatalogVersion": METRIC_CATALOG_VERSION,
+      "dimensionCatalogVersion": DIMENSION_CATALOG_VERSION,
+      "normalizerVersion": "candidate_rate_distribution_v1",
+    },
+    columns=["meanPnl"],
+    groupBy=["parameter.strategyParameters.lookback"],
+    aggregates=[{
+      "type": "metric_aggregate_v1",
+      "aggregateId": "meanPnl",
+      "metricId": "totalPnl",
+      "function": "mean",
+      "percentile": None,
+    }],
+    sort=[{"type": "metric_sort_v1", "metricId": "meanPnl", "direction": "desc"}],
+  )
+  normalized = EvaluationSpecRequest.model_validate(spec).model_dump(mode="json")
+
+  with pytest.raises(ExperimentError) as raised:
+    evaluate(
+      normalized, catalog_snapshot(_experiment_spec()), [first, second], "7" * 64,
+    )
+
+  assert raised.value.code == "experiment.metric_not_comparable"
 
 
 def test_statistical_boundaries_use_sample_stddev_and_nearest_rank() -> None:
@@ -401,9 +489,12 @@ def test_reference_dataset_is_never_claimed_as_final_test() -> None:
   output = evaluate(spec, catalog_snapshot(_experiment_spec()), [source], "b" * 64)
 
   assert output["finalTestEligible"] is False
-  assert "不是最终 test" in output["datasetNotice"]
+  assert "不代表最终测试" in output["datasetNotice"]
   assert output["visualizations"][0]["referenceSemantics"] == "reference_is_not_final_test"
-  frozen = output["visualizations"][0]["candidates"][0]["values"][0]
+  candidate = output["visualizations"][0]["candidates"][0]
+  assert candidate["dimensions"]["parameter.strategyParameters.lookback"] == 10
+  assert candidate["dimensions"]["initialCapital"] == "1000000"
+  frozen = candidate["values"][0]
   assert frozen["dateScenarioOrder"] == 2
   assert frozen["adjustmentMode"] == "forward"
   assert frozen["datasetContentDigest"] == "c" * 64
@@ -635,6 +726,8 @@ def test_evaluation_migration_freezes_result_set_and_enforces_rls() -> None:
   assert "UNIQUE (revision_id, spec_hash)" in migration
   assert migration.count("ENABLE ROW LEVEL SECURITY") == 2
   assert "backtest_evaluation_run_owner" in migration
+  assert 'TO :"app_db_user";' in migration
+  assert "TO backtest_app;" not in migration
 
   advanced_migration = (
     ROOT / "db" / "migrations" / "049_experiment_advanced_evaluation.sql"

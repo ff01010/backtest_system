@@ -22,10 +22,11 @@ from backend.experiments.evaluation_statistics import (
 
 METRIC_CATALOG_VERSION = "metric_catalog_v1"
 DIMENSION_CATALOG_VERSION = "dimension_catalog_v1"
-EVALUATION_PIPELINE_VERSION = "advanced_evaluation_pipeline_v1"
+EVALUATION_PIPELINE_VERSION = "advanced_evaluation_pipeline_v2"
 LEGACY_EVALUATION_PIPELINE_VERSION = "basic_evaluation_pipeline_v1"
 RESULT_ADAPTER_TYPE = "legacy_single_bar_result"
 RESULT_ADAPTER_VERSION = "1"
+CANDIDATE_RATE_DISTRIBUTION_NORMALIZER_VERSION = "candidate_rate_distribution_v1"
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class GroupRow:
   dimensions: dict[str, Any]
   metrics: dict[str, MetricValue]
   member_count: int
+  members: tuple[dict[str, Any], ...]
 
 
 def metric_catalog() -> dict[str, Any]:
@@ -147,8 +149,18 @@ def validate_evaluation_spec(
   )
   row_formulas = _formula_definitions(evaluation_spec, "row_formula_v1")
   group_formulas = _formula_definitions(evaluation_spec, "group_formula_v1")
+  row_metrics = {**base_metrics, **row_formulas}
   aggregate_definitions = {
-    item["aggregateId"]: item for item in evaluation_spec["aggregates"]
+    item["aggregateId"]: {
+      **item,
+      "dataType": "integer" if item["function"] == "count" else "decimal",
+      "unit": (
+        None if item["function"] == "count"
+        else row_metrics.get(item["metricId"], {}).get("unit")
+      ),
+      "grain": "group",
+    }
+    for item in evaluation_spec["aggregates"]
   }
   numeric_base_metrics = {
     metric_id for metric_id, definition in base_metrics.items()
@@ -157,7 +169,6 @@ def validate_evaluation_spec(
   _validate_unique_metric_ids(
     base_metrics, row_formulas, aggregate_definitions, group_formulas,
   )
-  row_metrics = {**base_metrics, **row_formulas}
   group_metrics = {**aggregate_definitions, **group_formulas}
   uses_group_output = _uses_group_output(evaluation_spec)
   output_metrics = group_metrics if uses_group_output else row_metrics
@@ -511,7 +522,9 @@ def _apply_formulas(
     )
     values[metric_id] = value
   if isinstance(row, GroupRow):
-    return GroupRow(row.identity, row.dimensions, metrics, row.member_count)
+    return GroupRow(
+      row.identity, row.dimensions, metrics, row.member_count, row.members,
+    )
   return EvaluationRow(row.identity, row.dimensions, metrics)
 
 
@@ -525,6 +538,10 @@ def _group_pipeline(
     item["aggregateId"]: {
       **item,
       "dataType": "integer" if item["function"] == "count" else "decimal",
+      "unit": (
+        None if item["function"] == "count"
+        else row_definitions.get(item["metricId"], {}).get("unit")
+      ),
       "grain": "group",
     }
     for item in evaluation_spec["aggregates"]
@@ -533,6 +550,7 @@ def _group_pipeline(
     _aggregate_group(
       key, members, evaluation_spec["groupBy"],
       evaluation_spec["aggregates"], row_definitions,
+      evaluation_spec["catalogs"].get("normalizerVersion"),
     )
     for key, members in grouped
   ]
@@ -570,6 +588,7 @@ def _aggregate_group(
   group_by: list[str],
   aggregates: list[dict[str, Any]],
   row_definitions: dict[str, dict[str, Any]],
+  normalizer_version: str | None,
 ) -> GroupRow:
   dimensions = dict(zip(group_by, key, strict=True))
   metrics: dict[str, MetricValue] = {}
@@ -580,7 +599,12 @@ def _aggregate_group(
       for value in source_values
       if value.value is not None and value.comparability_key
     }
-    if len(domains) > 1:
+    definition = row_definitions[item["metricId"]]
+    normalized_distribution = (
+      normalizer_version == CANDIDATE_RATE_DISTRIBUTION_NORMALIZER_VERSION
+      and definition.get("unit") == "ratio"
+    )
+    if len(domains) > 1 and not normalized_distribution:
       raise ExperimentError(
         "experiment.metric_not_comparable",
         f"指标 {item['metricId']} 存在多个不可直接聚合的口径",
@@ -597,7 +621,14 @@ def _aggregate_group(
     )
     metrics[item["aggregateId"]] = MetricValue(
       value,
-      next(iter(domains), None),
+      (
+        digest(with_version({
+          "normalizerVersion": normalizer_version,
+          "metricId": item["metricId"],
+          "sourceDomains": sorted(domains),
+        }))
+        if normalized_distribution else next(iter(domains), None)
+      ),
       "all_values_null" if value is None else None,
     )
   first = min(members, key=lambda row: (
@@ -613,6 +644,18 @@ def _aggregate_group(
     dimensions=dimensions,
     metrics=metrics,
     member_count=len(members),
+    members=tuple(
+      {
+        key: member.identity.get(key)
+        for key in (
+          "trialId", "trialExecutionId", "runId", "stageId", "stageIndex",
+          "trialIndex", "resultHash", "startDate",
+        )
+      }
+      for member in sorted(members, key=lambda row: (
+        row.identity["stageIndex"], row.identity["trialIndex"], row.identity["trialId"],
+      ))
+    ),
   )
 
 
@@ -953,8 +996,8 @@ def _output_snapshot(
     "candidateSelectionEligible": not is_partial,
     "finalTestEligible": False,
     "datasetNotice": (
-      "development、validation 和 reference 仅是冻结的展示与分组标签；"
-      "对全部候选运行过的 reference 不是最终 test。"
+      "“开发”“验证”和“参考”仅是冻结的展示与分组标签；"
+      "对全部候选运行过的“参考”不代表最终测试。"
     ),
     "completeness": completeness,
     "columns": evaluation_spec["columns"],
@@ -964,6 +1007,7 @@ def _output_snapshot(
       {
         **row.identity,
         **({"memberCount": row.member_count} if isinstance(row, GroupRow) else {}),
+        **({"members": list(row.members)} if isinstance(row, GroupRow) else {}),
         "values": {
           field_id: _json_value(
             row.metrics[field_id].value if field_id in row.metrics
@@ -1331,6 +1375,15 @@ def _time_stability(
   item: dict[str, Any],
   rows: list[EvaluationRow],
 ) -> dict[str, Any]:
+  candidate_dimensions = sorted({
+    dimension_id
+    for row in rows
+    for dimension_id in row.dimensions
+    if dimension_id.startswith("parameter.")
+    or dimension_id in {
+      "initialCapital", "costScenarioId", "slippage", "executionScenarioId",
+    }
+  })
   grouped: dict[str, list[EvaluationRow]] = {}
   for row in rows:
     candidate_key = str(row.identity.get("candidateKey") or "")
@@ -1355,6 +1408,10 @@ def _time_stability(
     ))
     candidates.append({
       "candidateKey": candidate_key,
+      "dimensions": {
+        dimension_id: members[0].dimensions.get(dimension_id)
+        for dimension_id in candidate_dimensions
+      },
       "values": values,
       "comparisonMode": "side_by_side_frozen_scenarios",
     })

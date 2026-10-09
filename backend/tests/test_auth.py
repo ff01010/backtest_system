@@ -221,6 +221,54 @@ def test_api_key_audit_uses_request_id_without_credential_material() -> None:
   assert "secret" not in repr(cursor.params).lower()
 
 
+def test_public_api_key_event_audit_persists_only_resource_metadata(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class Cursor:
+    def __init__(self) -> None:
+      self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def __enter__(self) -> "Cursor":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def execute(self, sql: str, params: tuple[object, ...]) -> None:
+      self.calls.append((sql, params))
+
+  class Connection:
+    def __init__(self) -> None:
+      self.cursor_instance = Cursor()
+
+    def cursor(self) -> Cursor:
+      return self.cursor_instance
+
+  connection = Connection()
+
+  @contextmanager
+  def system_db():
+    yield connection
+
+  monkeypatch.setattr(auth, "_system_db", system_db)
+  auth.audit_api_key_event(
+    "00000000-0000-0000-0000-000000000456",
+    "00000000-0000-0000-0000-000000000123",
+    "experiment.create",
+    {"operation": "experiment.create", "resourceId": "experiment-1"},
+    "req_experiment",
+  )
+
+  sql, params = connection.cursor_instance.calls[0]
+  assert "INSERT INTO api_access_audit" in sql
+  assert params[3] == "req_experiment"
+  assert params[4].obj == {
+    "operation": "experiment.create",
+    "resourceId": "experiment-1",
+  }
+  assert "previewToken" not in repr(params)
+
+
 def test_csrf_migration_is_idempotent_and_keeps_old_sessions_compatible() -> None:
   migration = (
     Path(__file__).resolve().parents[2]
@@ -233,7 +281,7 @@ def test_csrf_migration_is_idempotent_and_keeps_old_sessions_compatible() -> Non
   assert "csrf_previous_valid_until" in migration
 
 
-def test_api_key_schema_accepts_strategy_scopes() -> None:
+def test_api_key_schema_accepts_strategy_and_experiment_scopes() -> None:
   request = schemas.ApiKeyCreateRequest(
     name="strategy-client",
     scopes=[
@@ -241,6 +289,9 @@ def test_api_key_schema_accepts_strategy_scopes() -> None:
       "strategy:write",
       "strategy:publish",
       "strategy:delete",
+      "experiment:submit",
+      "experiment:read",
+      "experiment:cancel",
     ],
   )
 
