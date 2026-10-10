@@ -2,6 +2,7 @@
 """QMT ClickHouse 行情读取和派生周期测试。"""
 
 from datetime import datetime, timedelta
+import re
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -39,7 +40,13 @@ def test_load_bars_uses_history_dev_for_sh_symbol(monkeypatch: pytest.MonkeyPatc
     "low": 9.0, "close": 10.5, "volume": 100,
   }]
   assert any("qmt_history_dev.qmt_ingest_runs" in query for query in queries)
-  assert any("qmt_history_dev.qmt_kline_1m_raw" in query and "GROUP BY bar_time" in query for query in queries)
+  raw_query = next(query for query in queries if "qmt_history_dev.qmt_kline_1m_raw" in query)
+  assert "qmt_time_ms AS time" in raw_query
+  assert "trade_date IN (toDate('2026-07-30'))" in raw_query
+  assert "SETTINGS max_execution_time = 25" in raw_query
+  assert all(item not in raw_query for item in (
+    "argMax", "GROUP BY", "revision", "ingested_at", "qmt_index",
+  ))
   assert all("qmt_history_dev" in query for query in queries)
 
 
@@ -70,9 +77,12 @@ def test_bj_load_uses_published_history_dev_period_table(monkeypatch: pytest.Mon
   coverage_query = next(
     query for query in queries if "eligible_runs.target_date AS trade_date" in query
   )
-  raw_query = next(query for query in queries if "GROUP BY bar_time" in query)
+  raw_query = next(
+    query for query in queries if "qmt_history_dev.qmt_kline_5m_raw" in query
+  )
   assert "qmt_history_dev.qmt_ingest_runs" in coverage_query
   assert "qmt_history_dev.qmt_universe_snapshot" in coverage_query
+  assert "argMax" in coverage_query
   assert "latest_runs.state = 'PUBLISHED'" in coverage_query
   assert "latest_runs.validation_result = 'PASS'" in coverage_query
   assert "has(latest_runs.actual_routes, '5m/none')" in coverage_query
@@ -83,6 +93,8 @@ def test_bj_load_uses_published_history_dev_period_table(monkeypatch: pytest.Mon
   assert "adjustment = 'none'" in raw_query
   assert "quality_status" not in raw_query
   assert "is_final = 1" in raw_query
+  assert "argMax" not in raw_query
+  assert "GROUP BY" not in raw_query
 
 
 @pytest.mark.parametrize("symbol", ["688981.SH", "000001.SZ", "920001.BJ"])
@@ -162,13 +174,17 @@ def test_history_dev_uses_matching_period_table(
   assert resolution.derivation is None
   assert len(frame) == 1
   coverage_query = next(query for query in queries if "WITH latest_runs" in query)
-  raw_query = next(query for query in queries if "GROUP BY bar_time" in query)
+  raw_query = next(
+    query for query in queries if f"qmt_history_dev.{table}" in query
+  )
   assert "qmt_history_dev.qmt_universe_snapshot" in coverage_query
   assert f"qmt_history_dev.{table}" not in coverage_query
   assert f"has(latest_runs.actual_routes, '{source_period}/none')" in coverage_query
   assert f"qmt_history_dev.{table}" in raw_query
   assert f"period = '{source_period}'" in raw_query
   assert "quality_status" not in raw_query
+  assert "argMax" not in raw_query
+  assert "GROUP BY" not in raw_query
 
 
 def test_history_dev_skips_unpublished_exchange_day(
@@ -500,6 +516,303 @@ def test_load_backtest_bars_keeps_available_rows_without_daily_quality_check(
   assert frame["time"].tolist() == ["202609100930"]
 
 
+def test_load_backtest_bars_batches_minute_source_dates(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  formal_dates = tuple(
+    f"2026-01-{day:02d}" for day in range(1, 26)
+  )
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=formal_dates,
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  queries: list[str] = []
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    queries.append(query)
+    batch_number = len(queries)
+    timestamp = datetime(2026, 1, 1 + ((batch_number - 1) * 10), 9, 30, tzinfo=_TIMEZONE)
+    return [{
+      "time": int(timestamp.timestamp() * 1000),
+      "open": 10.0,
+      "high": 11.0,
+      "low": 9.0,
+      "close": 10.5,
+      "volume": 100,
+    }]
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+
+  frame, _ = market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert frame["time"].tolist() == [
+    "202601010930", "202601110930", "202601210930",
+  ]
+  assert [query.count("toDate(") for query in queries] == [10, 10, 5]
+  assert "toDate('2026-01-01')" in queries[0]
+  assert "toDate('2026-01-10')" in queries[0]
+  assert "toDate('2026-01-11')" in queries[1]
+  assert "toDate('2026-01-20')" in queries[1]
+  assert "toDate('2026-01-21')" in queries[2]
+  assert "toDate('2026-01-25')" in queries[2]
+
+
+def test_load_backtest_bars_queries_only_non_contiguous_requested_dates(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=("2026-01-05", "2026-01-09"),
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  queries: list[str] = []
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    queries.append(query)
+    timestamp = datetime(2026, 1, 5, 9, 30, tzinfo=_TIMEZONE)
+    return [{
+      "time": int(timestamp.timestamp() * 1000),
+      "open": 10.0,
+      "high": 11.0,
+      "low": 9.0,
+      "close": 10.5,
+      "volume": 100,
+    }]
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+
+  market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert len(queries) == 1
+  assert "toDate('2026-01-05')" in queries[0]
+  assert "toDate('2026-01-09')" in queries[0]
+  assert "BETWEEN" not in queries[0]
+  assert "2026-01-06" not in queries[0]
+
+
+def test_load_backtest_bars_batches_non_minute_source_by_forty_dates(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  first_date = datetime(2026, 1, 1)
+  formal_dates = tuple(
+    (first_date + timedelta(days=offset)).date().isoformat()
+    for offset in range(41)
+  )
+  resolution = market_data.BacktestDataResolution(
+    timeframe="5m",
+    source_period="5m",
+    derivation=None,
+    formal_dates=formal_dates,
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  queries: list[str] = []
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    queries.append(query)
+    day = 1 if len(queries) == 1 else 10
+    month = 1 if len(queries) == 1 else 2
+    timestamp = datetime(2026, month, day, 9, 30, tzinfo=_TIMEZONE)
+    return [{
+      "time": int(timestamp.timestamp() * 1000),
+      "open": 10.0,
+      "high": 11.0,
+      "low": 9.0,
+      "close": 10.5,
+      "volume": 100,
+    }]
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+
+  frame, _ = market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert len(frame) == 2
+  assert [query.count("toDate(") for query in queries] == [40, 1]
+
+
+@pytest.mark.parametrize("timeframe", ["3m", "45m"])
+def test_derived_periods_use_minute_source_batch_size(
+  timeframe: str,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  formal_dates = tuple(
+    f"2026-01-{day:02d}" for day in range(1, 12)
+  )
+  resolution = market_data.BacktestDataResolution(
+    timeframe=timeframe,
+    source_period="1m",
+    derivation=f"{timeframe}-from-1m-v1",
+    formal_dates=formal_dates,
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  queries: list[str] = []
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    queries.append(query)
+    day = 1 if len(queries) == 1 else 11
+    timestamp = datetime(2026, 1, day, 9, 30, tzinfo=_TIMEZONE)
+    return [{
+      "time": int(timestamp.timestamp() * 1000),
+      "open": 10.0,
+      "high": 11.0,
+      "low": 9.0,
+      "close": 10.5,
+      "volume": 100,
+    }]
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+
+  frame, _ = market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert len(frame) == 2
+  assert [query.count("toDate(") for query in queries] == [10, 1]
+
+
+def test_load_backtest_bars_counts_warmup_across_batches(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  warmup_dates = tuple(
+    f"2026-01-{day:02d}" for day in range(1, 12)
+  )
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=("2026-01-12",),
+    warmup_dates=warmup_dates,
+    available_warmup_days=len(warmup_dates),
+    source="history_dev",
+  )
+  queries: list[str] = []
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    queries.append(query)
+    rows: list[dict[str, object]] = []
+    for value in re.findall(r"toDate\('(\d{4}-\d{2}-\d{2})'\)", query):
+      timestamp = datetime.fromisoformat(value).replace(
+        hour=9,
+        minute=30,
+        tzinfo=_TIMEZONE,
+      )
+      rows.append({
+        "time": int(timestamp.timestamp() * 1000),
+        "open": 10.0,
+        "high": 11.0,
+        "low": 9.0,
+        "close": 10.5,
+        "volume": 100,
+      })
+    return rows
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+
+  frame, warmup_bar_count = market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert len(frame) == 12
+  assert warmup_bar_count == 11
+  assert [query.count("toDate(") for query in queries] == [10, 2]
+
+
+def test_load_backtest_bars_allows_empty_intermediate_batch(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  formal_dates = tuple(
+    f"2026-01-{day:02d}" for day in range(1, 12)
+  )
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=formal_dates,
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  calls = 0
+
+  def query_rows(_: str) -> list[dict[str, object]]:
+    nonlocal calls
+    calls += 1
+    if calls == 1:
+      return []
+    timestamp = datetime(2026, 1, 11, 9, 30, tzinfo=_TIMEZONE)
+    return [{
+      "time": int(timestamp.timestamp() * 1000),
+      "open": 10.0,
+      "high": 11.0,
+      "low": 9.0,
+      "close": 10.5,
+      "volume": 100,
+    }]
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+
+  frame, _ = market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert frame["time"].tolist() == ["202601110930"]
+  assert calls == 2
+
+
+def test_load_backtest_bars_retries_only_current_failed_batch(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  formal_dates = tuple(
+    f"2026-01-{day:02d}" for day in range(1, 12)
+  )
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=formal_dates,
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  queries: list[str] = []
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    queries.append(query)
+    if "toDate('2026-01-01')" in query:
+      timestamp = datetime(2026, 1, 1, 9, 30, tzinfo=_TIMEZONE)
+    elif sum("toDate('2026-01-11')" in item for item in queries) == 1:
+      try:
+        raise TimeoutError("temporary timeout")
+      except TimeoutError as error:
+        raise clickhouse_client.ClickHouseError("ClickHouse 查询超时") from error
+    else:
+      timestamp = datetime(2026, 1, 11, 9, 30, tzinfo=_TIMEZONE)
+    return [{
+      "time": int(timestamp.timestamp() * 1000),
+      "open": 10.0,
+      "high": 11.0,
+      "low": 9.0,
+      "close": 10.5,
+      "volume": 100,
+    }]
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+  monkeypatch.setattr(market_data.clickhouse_client.time, "sleep", lambda _: None)
+
+  frame, _ = market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert frame["time"].tolist() == ["202601010930", "202601110930"]
+  assert len(queries) == 3
+  assert queries[1] == queries[2]
+  assert sum("toDate('2026-01-01')" in query for query in queries) == 1
+
+
 def test_load_backtest_bars_rejects_empty_result(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -512,6 +825,165 @@ def test_load_backtest_bars_rejects_empty_result(
 
   with pytest.raises(market_data.MarketDataError, match="区间内无可用 QMT 行情"):
     market_data.load_backtest_bars("688981.SH", resolution)
+
+
+def test_load_backtest_bars_rejects_duplicate_source_time(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  first_epoch = int(datetime(2026, 9, 11, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
+  second_epoch = int(datetime(2026, 9, 11, 9, 30, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=("2026-09-11",),
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  duplicate_row = {
+    "time": first_epoch,
+    "open": 10.0,
+    "high": 11.0,
+    "low": 9.0,
+    "close": 10.5,
+    "volume": 100,
+  }
+  monkeypatch.setattr(
+    market_data.clickhouse_client,
+    "query_rows",
+    lambda _: [duplicate_row, {**duplicate_row, "time": second_epoch}],
+  )
+
+  with pytest.raises(market_data.MarketDataError) as raised:
+    market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert raised.value.reason == "invalid_bar_data"
+  assert "重复" in str(raised.value)
+
+
+def test_load_backtest_bars_rejects_non_finite_ohlcv(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  epoch = int(datetime(2026, 9, 11, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=("2026-09-11",),
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  monkeypatch.setattr(
+    market_data.clickhouse_client,
+    "query_rows",
+    lambda _: [{
+      "time": epoch,
+      "open": 10.0,
+      "high": 11.0,
+      "low": 9.0,
+      "close": float("nan"),
+      "volume": 100,
+    }],
+  )
+
+  with pytest.raises(market_data.MarketDataError) as raised:
+    market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert raised.value.reason == "invalid_bar_data"
+  assert "非有限数值" in str(raised.value)
+
+
+def test_load_backtest_bars_rejects_unrequested_returned_date(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  epoch = int(datetime(2026, 9, 12, 9, 30, tzinfo=_TIMEZONE).timestamp() * 1000)
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=("2026-09-11",),
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  monkeypatch.setattr(
+    market_data.clickhouse_client,
+    "query_rows",
+    lambda _: [{
+      "time": epoch,
+      "open": 10.0,
+      "high": 11.0,
+      "low": 9.0,
+      "close": 10.5,
+      "volume": 100,
+    }],
+  )
+
+  with pytest.raises(market_data.MarketDataError) as raised:
+    market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert raised.value.reason == "invalid_bar_data"
+  assert "请求范围外" in str(raised.value)
+
+
+def test_load_backtest_bars_preserves_failed_batch_error_after_retries(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=("2026-09-11",),
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  calls = 0
+
+  def query_rows(_: str) -> list[dict[str, object]]:
+    nonlocal calls
+    calls += 1
+    try:
+      raise TimeoutError("temporary timeout")
+    except TimeoutError as error:
+      raise clickhouse_client.ClickHouseError("ClickHouse 查询超时") from error
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+  monkeypatch.setattr(market_data.clickhouse_client.time, "sleep", lambda _: None)
+
+  with pytest.raises(market_data.MarketDataError) as raised:
+    market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert calls == 2
+  assert raised.value.reason == "source_read_failed"
+  assert isinstance(raised.value.__cause__, clickhouse_client.ClickHouseError)
+
+
+def test_load_backtest_bars_rejects_invalid_client_timeout_before_query(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  resolution = market_data.BacktestDataResolution(
+    timeframe="1m",
+    source_period="1m",
+    derivation=None,
+    formal_dates=("2026-09-11",),
+    warmup_dates=(),
+    available_warmup_days=0,
+    source="history_dev",
+  )
+  monkeypatch.setattr(market_data.settings, "CLICKHOUSE_TIMEOUT_SECONDS", 1)
+  monkeypatch.setattr(
+    market_data.clickhouse_client,
+    "query_rows",
+    lambda _: pytest.fail("非法超时配置不应发起 ClickHouse 查询"),
+  )
+
+  with pytest.raises(market_data.MarketDataError) as raised:
+    market_data.load_backtest_bars("688981.SH", resolution)
+
+  assert raised.value.reason == "source_config_invalid"
 
 
 def test_qmt_normalized_bar_uses_completed_bar_time() -> None:
@@ -741,6 +1213,49 @@ def test_status_uses_only_coverage_metadata(monkeypatch: pytest.MonkeyPatch) -> 
   assert "max(eligible_runs.target_date)" in queries[0]
   assert "snapshots.effective_date" not in queries[0]
   assert all("qmt_kline_1m_raw" not in query for query in queries)
+
+
+def test_history_preview_reads_unique_final_rows_without_version_aggregation(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  epoch = int(datetime(2026, 9, 11, 15, 0, tzinfo=_TIMEZONE).timestamp() * 1000)
+  queries: list[str] = []
+
+  def query_rows(query: str) -> list[dict[str, object]]:
+    queries.append(query)
+    return [{
+      "time": epoch,
+      "open": 10.0,
+      "high": 11.0,
+      "low": 9.0,
+      "close": 10.5,
+      "volume": 100,
+    }]
+
+  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
+
+  result = market_data._query_preview(
+    "688981.SH",
+    market_data._SourceCandidate("history_dev", "1m"),
+    "2026-09-01",
+    "2026-09-11",
+    20,
+  )
+
+  assert result == [{
+    "time": "202609111500",
+    "open": 10.0,
+    "high": 11.0,
+    "low": 9.0,
+    "close": 10.5,
+    "volume": 100.0,
+  }]
+  assert len(queries) == 1
+  assert "qmt_time_ms AS time" in queries[0]
+  assert "ORDER BY bar_time DESC LIMIT 20" in queries[0]
+  assert all(item not in queries[0] for item in (
+    "argMax", "GROUP BY", "revision", "ingested_at", "qmt_index",
+  ))
 
 
 def test_status_uses_history_range(

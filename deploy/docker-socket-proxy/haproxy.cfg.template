@@ -2,6 +2,7 @@ global
   log stdout format raw daemon "${LOG_LEVEL}"
   pidfile /run/haproxy.pid
   maxconn 4000
+  nbthread 2
 
 defaults
   mode http

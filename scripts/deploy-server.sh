@@ -94,10 +94,11 @@ read_runner_replicas() {
   replicas="$(grep -E "^${name}=" "$env_file" | tail -n 1 | cut -d= -f2- || true)"
   replicas="${replicas//[[:space:]]/}"
   if [[ -z "$replicas" ]]; then
-    echo "12"
+    echo "16"
     return
   fi
-  [[ "$replicas" =~ ^([1-9]|1[0-2])$ ]] || fail "deploy/.env 中的 ${name} 必须是 1 至 12 的整数"
+  [[ "$replicas" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] \
+    || fail "deploy/.env 中的 ${name} 必须是 1 至 32 的整数"
   echo "$replicas"
 }
 
@@ -113,7 +114,7 @@ check_active_backtests() {
 stop_submission_and_wait_for_backtests() {
   local attempt
   echo "停止 backend，阻断新的页面和开放 API 回测提交"
-  "${compose[@]}" stop frontend backend signal-export-runner
+  "${compose[@]}" stop frontend backend experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner
   for attempt in $(seq 1 360); do
     if check_active_backtests; then
       echo "回测队列已排空，可以开始迁移和同批发布"
@@ -169,9 +170,14 @@ wait_for_application() {
     response="$(curl --fail --silent --show-error "$health_url" 2>/dev/null || true)"
     if runner_containers_ready "bar-runner" "$bar_replicas" \
       && runner_containers_ready "l2-runner" "$l2_replicas" \
+      && runner_containers_ready "experiment-coordinator" "1" \
+      && runner_containers_ready "evaluation-worker" "1" \
+      && runner_containers_ready "evaluation-export-worker" "1" \
+      && runner_containers_ready "experiment-purge-worker" "1" \
       && runner_containers_ready "signal-export-runner" "1" \
       && [[ "$response" == *'"status":"ok"'* ]] \
       && [[ "$response" == *'"signalExportRunner":{"healthy":true}'* ]] \
+      && [[ "$response" == *'"evaluationExportWorker":{"healthy":true}'* ]] \
       && [[ "$response" == *'"observability":{"status":'* ]] \
       && [[ "$response" == *"\"applicationBuildId\":\"${APPLICATION_BUILD_ID}\""* ]] \
       && [[ "$response" == *"\"clientCompatibilityVersion\":${CLIENT_COMPATIBILITY_VERSION}"* ]]; then
@@ -353,7 +359,7 @@ fi
 "${compose[@]}" up -d --build --remove-orphans \
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \
-  backend bar-runner l2-runner signal-export-runner
+  backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner
 "${compose[@]}" --profile release-admin build release-admin
 verify_release_admin_image
 # Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。

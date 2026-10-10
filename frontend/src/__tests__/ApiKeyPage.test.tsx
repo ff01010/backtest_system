@@ -15,11 +15,14 @@ describe('ApiKeyPage', () => {
     vi.mocked(createApiKey).mockReset();
   });
 
-  it('新增高权限策略 Scope 默认不勾选', async () => {
+  it('新增实验与高权限策略 Scope 默认不勾选', async () => {
     render(<ApiKeyPage />);
     await waitFor(() => expect(fetchApiKeys).toHaveBeenCalled());
 
     expect((screen.getByRole('checkbox', { name: '读取策略与版本' }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole('checkbox', { name: '创建、重试与恢复实验' }) as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByRole('checkbox', { name: '读取实验与 Trial' }) as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByRole('checkbox', { name: '取消实验' }) as HTMLInputElement).checked).toBe(false);
     expect((screen.getByRole('checkbox', { name: '创建、修改与恢复策略' }) as HTMLInputElement).checked).toBe(false);
     expect((screen.getByRole('checkbox', { name: '发布策略版本' }) as HTMLInputElement).checked).toBe(false);
     expect((screen.getByRole('checkbox', { name: '归档策略' }) as HTMLInputElement).checked).toBe(false);

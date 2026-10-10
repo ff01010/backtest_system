@@ -2,7 +2,7 @@
 
 ## 1. 文档信息
 
-- 文档版本：`1.1`
+- 文档版本：`1.2`
 - 接口版本：`v1`
 - 接口状态：当前已实现
 - 调用方：系统 A 策略 Hub
@@ -24,6 +24,8 @@
 - 查询回测任务详情；
 - 分页查询信号和成交明细；
 - 取消排队中或运行中的任务。
+- 预览并创建单标的有限网格自动化实验；
+- 查询实验和 Trial，重试失败 Trial、恢复或取消实验。
 
 提交接口以本系统策略方案 ID 作为策略入口，标的、周期和策略逻辑均从方案读取。策略方案必须满足：
 
@@ -55,12 +57,15 @@ API Key 无效、已撤销、已过期，或者所属用户已停用时，接口
 | `backtest:submit` | 创建回测任务 |
 | `backtest:read` | 查询任务、信号和成交 |
 | `backtest:cancel` | 取消回测任务 |
+| `experiment:submit` | 预览、创建、重试和恢复自动化实验 |
+| `experiment:read` | 查询实验及其 Trial |
+| `experiment:cancel` | 取消自动化实验 |
 | `strategy:read` | 读取策略、归档状态和不可变版本 |
 | `strategy:write` | 创建、修改和恢复完整策略 |
 | `strategy:publish` | 显式发布或复用当前不可变版本 |
 | `strategy:delete` | 可恢复地归档策略，不执行物理删除 |
 
-策略、版本、回测任务、信号和成交查询均按 API Key 所属用户隔离。API Key 不继承管理员权限。已有 Key 不会自动增加策略 Scope，必须由用户重新创建并明确授权。
+策略、版本、回测任务、自动化实验、Trial、信号和成交查询均按 API Key 所属用户隔离。API Key 不继承管理员权限。已有 Key 不会自动增加策略或实验 Scope，必须由用户重新创建并明确授权。
 
 当前取消接口只校验 `backtest:cancel` Scope 和 `run_id`，尚未按任务所有者过滤。因此只应向受信任的系统 A 调用凭据授予 `backtest:cancel`，并将 `run_id` 视为敏感的不透明标识。
 
@@ -72,7 +77,7 @@ API Key 无效、已撤销、已过期，或者所属用户已停用时，接口
 |---|---:|---|
 | `Authorization` | 是 | Bearer API Key |
 | `Content-Type` | POST JSON 接口必填 | `application/json` |
-| `Idempotency-Key` | 提交回测及策略 POST/PUT 写接口必填 | 8～128 个字符，建议使用 UUID；查询接口和取消回测不要求 |
+| `Idempotency-Key` | 提交回测、实验命令及策略 POST/PUT 写接口必填 | 8～128 个字符，建议使用 UUID；实验预览和查询接口不要求 |
 
 ### 4.2 日期和数值
 
@@ -760,3 +765,163 @@ curl -sS "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9/vers
 4. 使用 `POST /api/v1/backtests` 的 `overrides.strategy_params` 做一次局部覆盖，确认它不修改策略读取结果中的 `strategy_parameters`。
 5. 归档后确认活动列表不再返回该策略、`archived=true` 查询可见、历史版本仍可读且新回测被拒绝。
 6. 恢复后重新读取最新 revision，并验证同名冲突不会静默改名。
+
+## 16. 单标的自动化实验
+
+### 16.1 能力边界
+
+开放实验接口与前端“自动化回测”使用同一套实验应用服务、冻结规则、容量门禁和所有权隔离。当前公开范围只支持：
+
+- 单个已发布策略版本；
+- `finite_grid_v1` 有限网格；
+- 当前已启用的 Bar 成交路径；
+- 创建一个新 Experiment 的 Revision 1；
+- 查询 Experiment 和 Trial；
+- 对已选择的失败 Trial 进行重试预览和确认；
+- 恢复或取消实验。
+
+当前不公开评价、报告导出、创建新 Revision、归档和物理清理接口。更换策略发布版本或发起新的研究目标时，应创建新的 Experiment。
+
+实验契约沿用前端接口的 `camelCase` 字段，不转换为回测接口的 `snake_case`。调用方必须原样保存预览返回的 `previewToken`、`specHash` 和实验定义，创建时不得自行重排或改写。
+
+### 16.2 路由与 Scope
+
+| 方法与路径 | Scope | Idempotency-Key | 用途 |
+|---|---|---:|---|
+| `POST /api/v1/experiments/preview` | `experiment:submit` | 否 | 校验并计算 Trial 数量、预算和冻结摘要 |
+| `POST /api/v1/experiments` | `experiment:submit` | 是 | 使用有效预览创建新实验 |
+| `GET /api/v1/experiments` | `experiment:read` | 否 | 游标分页查询未归档实验 |
+| `GET /api/v1/experiments/{experimentId}` | `experiment:read` | 否 | 查询实验详情 |
+| `GET /api/v1/experiments/{experimentId}/trials` | `experiment:read` | 否 | 游标分页查询 Trial |
+| `POST /api/v1/experiments/{experimentId}/retry-failed/preview` | `experiment:submit` | 否 | 冻结本次失败 Trial 选择 |
+| `POST /api/v1/experiments/{experimentId}/retry-failed` | `experiment:submit` | 是 | 确认重试所选失败 Trial |
+| `POST /api/v1/experiments/{experimentId}/resume` | `experiment:submit` | 是 | 恢复可恢复的实验 |
+| `POST /api/v1/experiments/{experimentId}/cancel` | `experiment:cancel` | 是 | 取消实验及可取消的执行 |
+
+### 16.3 预览和创建
+
+先从 `GET /api/v1/strategies/{configId}/versions/{versionId}` 取得不可变策略版本及参数声明，再提交预览：
+
+```json
+{
+  "schemaVersion": "experiment_create_v1",
+  "name": "均线窗口有限网格",
+  "description": "比较 window 与 threshold 的组合",
+  "subjectRef": {
+    "subjectType": "legacy_single_strategy",
+    "subjectId": "932a0ce2-9d8d-4060-8614-5df0adbbf8a9",
+    "subjectVersion": "62737778-daf6-431d-b4c4-09b558d317ea"
+  },
+  "plan": {
+    "planVersion": "experiment_plan_v1",
+    "stages": [
+      {
+        "stageType": "finite_grid_v1",
+        "generatorVersion": "1",
+        "parameterGrid": [
+          {"inputId": "strategyParameters.window", "values": [10, 20, 50]},
+          {"inputId": "strategyParameters.threshold", "values": [0.01, 0.02]}
+        ],
+        "dateScenarios": [
+          {
+            "scenarioId": "development-1",
+            "name": "开发区间",
+            "role": "development",
+            "startDate": "2025-01-01",
+            "endDate": "2025-12-31"
+          }
+        ],
+        "capitalScenarios": [1000000],
+        "costScenarios": [{"scenarioId": "cost-1", "slippage": 0}],
+        "executionScenarios": [
+          {"scenarioId": "immediate-1", "algorithm": "immediate", "parameters": {}}
+        ]
+      }
+    ]
+  }
+}
+```
+
+预览成功返回 `previewToken`、`expiresAt`、`specHash`、规范化定义、`plannedTrialCount`、预算摘要和门禁决定。只有 `limitDecision.allowed=true` 才能创建。预览不会创建 Experiment、Trial 或普通回测任务。
+
+创建请求必须把预览时的完整定义放入 `experimentSpec`：
+
+```http
+POST {BASE_URL}/api/v1/experiments
+Authorization: Bearer qbk_xxx
+Idempotency-Key: 8fd14f15-4969-49e3-a0d9-c10f0ef7824d
+Content-Type: application/json
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `previewToken` | string(UUID) | 预览返回的令牌 |
+| `specHash` | string | 预览返回的 64 位摘要 |
+| `experimentSpec` | object | 16.3 第一个 JSON 的完整预览请求对象 |
+
+预览已过期、策略版本或数据快照发生变化、`specHash` 不一致时会返回 `409`，调用方应重新预览，不得修改摘要后重试。
+
+实验写命令的原始 `Idempotency-Key` 按当前 API Key 隔离；同一 Key 下相同命令可以安全重试，不同请求复用同一 Key 返回 `409`。服务端传给实验内核的命名空间摘要不会在响应中暴露。
+
+### 16.4 查询 Experiment 和 Trial
+
+实验列表使用签名游标：
+
+```http
+GET {BASE_URL}/api/v1/experiments?limit=50&cursor={nextCursor}
+```
+
+`limit` 范围为 `1～200`，默认 `50`。`nextCursor` 必须原样回传，不能解析、拼接或自行生成。列表只返回未归档实验。
+
+详情接口支持条件读取。响应头返回 `ETag: "{snapshotVersion}"`；再次读取可传 `If-None-Match`，未变化时返回 HTTP `304`。
+
+Trial 查询参数：
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `limit` | 50 | `1～200` |
+| `cursor` | 空 | 上一页的 `nextCursor` |
+| `revisionId` | 空 | 限定 Revision；省略时由服务端按实验查询语义返回 |
+| `status` | 空 | `pending`、`queued`、`running`、`cancelling`、`succeeded`、`failed` 或 `cancelled` |
+
+### 16.5 重试、恢复和取消
+
+失败重试必须先预览选择，再确认执行。预览请求示例：
+
+```json
+{
+  "expectedRevisionId": "10000000-0000-4000-8000-000000000002",
+  "selection": {
+    "mode": "trial_ids",
+    "trialIds": ["10000000-0000-4000-8000-000000000003"]
+  }
+}
+```
+
+确认重试时，在相同对象上增加预览返回的 `expectedSelectedTrialCount`、`expectedSelectionDigest`，以及可选 `reason`，并使用新的 `Idempotency-Key`。选择已变化时服务端拒绝执行，调用方应重新读取失败 Trial 并重新预览。
+
+恢复请求：
+
+```json
+{
+  "expectedRevisionId": "10000000-0000-4000-8000-000000000002",
+  "reason": "外部依赖恢复后继续运行"
+}
+```
+
+取消接口没有 JSON 请求体，但仍必须提供新的 `Idempotency-Key`。重试、恢复和取消均保留既有 Trial、执行记录和结果，不会覆盖历史事实。
+
+### 16.6 容量、审计和建议调用流程
+
+公开入口不建立第二套调度器或容量池。它与前端入口共用按用户累计的实验计划额度、单实验 Trial 上限、在途额度、普通单次回测保留额度和现有 Worker。预览返回的门禁结果是是否允许创建的唯一依据；部署环境可调整额度，调用方不得把当前数值写死。
+
+实验内核原子记录用户、请求 ID、幂等结果和资源变更；公开适配层尽力补充 API Key ID、操作类型、资源 ID 和是否幂等重放，不记录完整实验定义、策略源码或密钥明文。附加的 API Key 归因审计失败不会把已经成功创建的实验伪装成失败，服务端会保留错误日志供运维核查。
+
+推荐调用顺序：
+
+1. 用 `strategy:read` 取得已发布策略版本和参数声明。
+2. 生成有限候选网格并调用实验预览。
+3. 检查 `limitDecision` 和 `plannedTrialCount`，保存预览返回值。
+4. 用新的 `Idempotency-Key` 创建实验；超时重试复用原 Key。
+5. 轮询实验详情和 Trial 列表，使用服务端返回的游标。
+6. 仅在明确需要时执行失败重试、恢复或取消；每个新命令使用新的幂等键。

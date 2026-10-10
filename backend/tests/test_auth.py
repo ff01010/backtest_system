@@ -161,6 +161,40 @@ def test_concurrent_csrf_rotation_keeps_both_returned_tokens_temporarily_valid(
   assert auth.validate_csrf_token("old-session", "wrong-token") is False
 
 
+def test_validate_csrf_rejects_expired_previous_token(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class Cursor:
+    def __enter__(self) -> "Cursor":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def execute(self, _sql: str, _params: object = None) -> None:
+      return None
+
+    def fetchone(self) -> dict[str, object]:
+      return {
+        "csrf_token_hash": auth._token_hash("current-token"),
+        "csrf_previous_token_hash": auth._token_hash("expired-token"),
+        "previous_is_valid": False,
+      }
+
+  class Connection:
+    def cursor(self) -> Cursor:
+      return Cursor()
+
+  @contextmanager
+  def system_db():
+    yield Connection()
+
+  monkeypatch.setattr(auth, "_system_db", system_db)
+
+  assert auth.validate_csrf_token("session-token", "current-token") is True
+  assert auth.validate_csrf_token("session-token", "expired-token") is False
+
+
 def test_api_key_audit_uses_request_id_without_credential_material() -> None:
   class Cursor:
     def __init__(self) -> None:
@@ -187,6 +221,54 @@ def test_api_key_audit_uses_request_id_without_credential_material() -> None:
   assert "secret" not in repr(cursor.params).lower()
 
 
+def test_public_api_key_event_audit_persists_only_resource_metadata(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class Cursor:
+    def __init__(self) -> None:
+      self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def __enter__(self) -> "Cursor":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def execute(self, sql: str, params: tuple[object, ...]) -> None:
+      self.calls.append((sql, params))
+
+  class Connection:
+    def __init__(self) -> None:
+      self.cursor_instance = Cursor()
+
+    def cursor(self) -> Cursor:
+      return self.cursor_instance
+
+  connection = Connection()
+
+  @contextmanager
+  def system_db():
+    yield connection
+
+  monkeypatch.setattr(auth, "_system_db", system_db)
+  auth.audit_api_key_event(
+    "00000000-0000-0000-0000-000000000456",
+    "00000000-0000-0000-0000-000000000123",
+    "experiment.create",
+    {"operation": "experiment.create", "resourceId": "experiment-1"},
+    "req_experiment",
+  )
+
+  sql, params = connection.cursor_instance.calls[0]
+  assert "INSERT INTO api_access_audit" in sql
+  assert params[3] == "req_experiment"
+  assert params[4].obj == {
+    "operation": "experiment.create",
+    "resourceId": "experiment-1",
+  }
+  assert "previewToken" not in repr(params)
+
+
 def test_csrf_migration_is_idempotent_and_keeps_old_sessions_compatible() -> None:
   migration = (
     Path(__file__).resolve().parents[2]
@@ -199,7 +281,7 @@ def test_csrf_migration_is_idempotent_and_keeps_old_sessions_compatible() -> Non
   assert "csrf_previous_valid_until" in migration
 
 
-def test_api_key_schema_accepts_strategy_scopes() -> None:
+def test_api_key_schema_accepts_strategy_and_experiment_scopes() -> None:
   request = schemas.ApiKeyCreateRequest(
     name="strategy-client",
     scopes=[
@@ -207,6 +289,9 @@ def test_api_key_schema_accepts_strategy_scopes() -> None:
       "strategy:write",
       "strategy:publish",
       "strategy:delete",
+      "experiment:submit",
+      "experiment:read",
+      "experiment:cancel",
     ],
   )
 
@@ -322,3 +407,58 @@ def test_delete_user_preserves_backtest_history(monkeypatch: pytest.MonkeyPatch,
   statements = "\n".join(connection.cursor_instance.calls)
   assert ("DELETE FROM app_user" in statements) is (not has_history)
   assert ("status='disabled'" in statements) is has_history
+
+
+def test_delete_user_preserves_pending_experiment_without_run(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class Cursor:
+    def __init__(self) -> None:
+      self.last_sql = ""
+      self.calls: list[str] = []
+
+    def __enter__(self) -> "Cursor":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def execute(self, sql: str, _params: object = None) -> None:
+      self.last_sql = sql
+      self.calls.append(sql)
+
+    def fetchone(self) -> dict[str, object]:
+      if "SELECT id, role, status" in self.last_sql:
+        return {"id": "user-1", "role": "user", "status": "active"}
+      if "backtest_experiment" in self.last_sql:
+        return {"value": True}
+      return {"value": False}
+
+  class Connection:
+    def __init__(self) -> None:
+      self.cursor_instance = Cursor()
+
+    def __enter__(self) -> "Connection":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def cursor(self) -> Cursor:
+      return self.cursor_instance
+
+  connection = Connection()
+
+  @contextmanager
+  def system_db():
+    yield connection
+
+  monkeypatch.setattr(auth, "_system_db", system_db)
+
+  result = auth.delete_user("user-1", "admin-1")
+
+  assert result["action"] == "disabled"
+  statements = "\n".join(connection.cursor_instance.calls)
+  assert "DELETE FROM app_user" not in statements
+  assert "FROM backtest_experiment" in statements
+  assert "requested_by_user_id" in statements

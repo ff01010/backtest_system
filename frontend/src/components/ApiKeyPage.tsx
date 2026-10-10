@@ -17,6 +17,9 @@ const SCOPE_LABELS: Record<ApiAccessKey['scopes'][number], string> = {
   'backtest:submit': '提交回测',
   'backtest:read': '查询结果',
   'backtest:cancel': '取消任务',
+  'experiment:submit': '创建、重试与恢复实验',
+  'experiment:read': '读取实验与 Trial',
+  'experiment:cancel': '取消实验',
   'strategy:read': '读取策略与版本',
   'strategy:write': '创建、修改与恢复策略',
   'strategy:publish': '发布策略版本',
@@ -27,6 +30,10 @@ const SCOPE_GROUPS: Array<{ title: string; scopes: ApiAccessKey['scopes'] }> = [
   {
     title: '回测任务',
     scopes: ['backtest:submit', 'backtest:read', 'backtest:cancel'],
+  },
+  {
+    title: '自动化实验',
+    scopes: ['experiment:submit', 'experiment:read', 'experiment:cancel'],
   },
   {
     title: '策略管理',
@@ -161,7 +168,7 @@ export default function ApiKeyPage() {
               </div>
             ))}
             <div style={{ color: '#b45309', fontSize: 11, lineHeight: 1.5 }}>
-              创建、修改、发布和归档会改变策略资源；这些高权限默认不勾选，请按调用方最小需要授权。
+              实验创建、恢复、重试、取消以及策略写入会改变资源；这些高权限默认不勾选，请按调用方最小需要授权。
             </div>
           </div>
         </section>

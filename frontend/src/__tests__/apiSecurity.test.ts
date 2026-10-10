@@ -41,6 +41,58 @@ describe('API security context', () => {
     expect(writeHeaders.get('X-CSRF-Token')).toBe('csrf-from-login');
   });
 
+  it('uses the shared CSRF transport for existing write workflows', async () => {
+    const responseBody = {
+      script: {},
+      runId: 'run-1',
+      status: 'queued',
+      publication: {},
+      created: true,
+      export: {},
+      ok: true,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        user: USER,
+        csrfToken: 'shared-csrf-token',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockImplementation(async () => new Response(JSON.stringify(responseBody), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const {
+      cancelBacktestRun,
+      createSignalDetailExport,
+      createStrategyScript,
+      login,
+      logout,
+      publishBacktestRun,
+      runBacktest,
+    } = await import('../api/client');
+
+    await login('researcher', 'password');
+    await createStrategyScript({} as never);
+    await runBacktest({} as never);
+    await cancelBacktestRun('run-1');
+    await publishBacktestRun('run-1', { title: '共享', description: '', tags: [] });
+    await createSignalDetailExport({} as never, 'export-idempotency-key');
+    await logout();
+
+    const writeCalls = fetchMock.mock.calls.slice(1);
+    expect(writeCalls.map(([input]) => String(input))).toEqual([
+      '/api/strategy-scripts',
+      '/api/backtest/run',
+      '/api/backtest/runs/run-1/cancel',
+      '/api/backtest/runs/run-1/publication',
+      '/api/backtest/signal-detail-exports',
+      '/api/auth/logout',
+    ]);
+    for (const [, init] of writeCalls) {
+      expect(new Headers(init?.headers).get('X-CSRF-Token')).toBe('shared-csrf-token');
+    }
+  });
+
   it('initializes an old session once during concurrent page refreshes', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const url = String(input);

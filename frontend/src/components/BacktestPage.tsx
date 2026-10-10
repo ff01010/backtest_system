@@ -4,6 +4,7 @@ import {
   Code2,
   Database,
   FileSliders,
+  FlaskConical,
   History,
   Play,
   Plus,
@@ -105,6 +106,8 @@ interface Props {
     date: string;
   }) => void;
   onViewSharedBacktest?: (publicationId: string) => void;
+  onCreateExperiment?: (selection: { configId: string; versionId: string }) => void;
+  experimentPreviewEnabled?: boolean;
   requestedConfigId?: string | null;
 }
 
@@ -1221,8 +1224,21 @@ export function buildStrategyDraftFingerprint(input: {
   }));
 }
 
+export function normalizeSavedBacktestParams(
+  savedParams: Record<string, unknown> | null | undefined,
+  strategyParams: Record<string, unknown> | null | undefined = undefined,
+): BacktestParams {
+  const normalized: BacktestParams = { ...DEFAULT_PARAMS };
+  Object.entries({ ...(savedParams || {}), ...(strategyParams || {}) }).forEach(([key, value]) => {
+    const inputValue = strategyParameterInputValue(value);
+    if (key !== 'warmupTradingDays' && inputValue !== undefined) normalized[key] = inputValue;
+  });
+  return normalized;
+}
+
 export function buildSavedStrategyFingerprint(config: StrategyConfig): string {
   const savedParams = config.paramsJson.params as Record<string, unknown> | undefined;
+  const savedStrategyParams = config.paramsJson.strategyParams;
   const definitions = config.paramsJson.strategyParameterDefinitions;
   const strategyParameterNames = definitions != null && typeof definitions === 'object'
     ? Object.keys(definitions)
@@ -1234,8 +1250,11 @@ export function buildSavedStrategyFingerprint(config: StrategyConfig): string {
     timeframe: config.timeframe,
     benchmarkSymbol: config.benchmarkSymbol || config.symbol,
     accountId: config.accountId || '',
-    params: Object.fromEntries(
-      Object.entries(savedParams || {}).filter(([key]) => key !== 'warmupTradingDays')
+    params: normalizeSavedBacktestParams(
+      savedParams,
+      savedStrategyParams != null && typeof savedStrategyParams === 'object'
+        ? savedStrategyParams as Record<string, unknown>
+        : undefined,
     ),
     strategyParameterNames,
     script: {
@@ -1329,6 +1348,8 @@ export default function BacktestPage({
   onStrategySaveActionChange,
   onViewTradeChart,
   onViewSharedBacktest,
+  onCreateExperiment,
+  experimentPreviewEnabled = false,
   requestedConfigId = null,
 }: Props) {
   const [instrumentList, setInstrumentList] = useState<InstrumentItem[]>(instruments);
@@ -1961,6 +1982,7 @@ export default function BacktestPage({
       const value = strategyParameterInputValue(source);
       return value === undefined ? [] : [[name, value]];
     }));
+    const normalizedParams = normalizeSavedBacktestParams(savedParams, nextSavedStrategyParams);
     setSelectedConfigId(config.id);
     setConfigVersions([]);
     setPublishedFingerprint('');
@@ -1971,16 +1993,7 @@ export default function BacktestPage({
     setSelectedStrategy(config.strategy);
     setSelectedScriptId(config.scriptId || '');
     setSelectedAccountId(config.accountId || '');
-    if (savedParams) {
-      setParams((prev) => {
-        const next: BacktestParams = { ...prev };
-        Object.entries(savedParams).forEach(([key, value]) => {
-          const inputValue = strategyParameterInputValue(value);
-          if (key !== 'warmupTradingDays' && inputValue !== undefined) next[key] = inputValue;
-        });
-        return next;
-      });
-    }
+    setParams(normalizedParams);
     setStrategyParameterSchema(parameterSchema);
     setSavedStrategyParams(nextSavedStrategyParams);
     setVersionDirty(false);
@@ -1999,7 +2012,7 @@ export default function BacktestPage({
     );
     setPublishedFingerprint(buildSavedStrategyFingerprint(config));
     setPublishedExperimentFingerprint(buildExperimentFingerprint(
-      { ...(savedParams || {}), ...nextSavedStrategyParams },
+      normalizedParams,
       parameterNames,
     ));
     setStatus(`已加载策略 ${config.name}`);
@@ -3074,6 +3087,13 @@ export default function BacktestPage({
   const historyGridColumns = '32px 36px minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 88px';
   const activePanelLabel = resultTabs.find((item) => item.id === activePanel)?.label || '概览';
   const runDisabled = running || activeRun != null || !hasSelectedConfig || versionDirty;
+  const publishedConfigParams = asHistoryRecord(activeConfig?.paramsJson.params);
+  const publishedFillModel = String(publishedConfigParams.fillModel ?? 'bar_next_open');
+  const experimentEntryDisabled = versionDirty
+    || !experimentPreviewEnabled
+    || !activeConfig?.published
+    || !activeConfig.publishedVersionId
+    || publishedFillModel !== 'bar_next_open';
   const statusMessage = error || status || (versionDirty
     ? '策略内容已修改，请先保存策略后运行回测。'
     : activeConfig ? `当前策略：${activeConfig.name}` : '请先新建并保存策略');
@@ -3615,6 +3635,31 @@ export default function BacktestPage({
           </div>
         </div>
 
+        <div className="workbench-header-actions">
+          <button
+            className="app-button is-quiet"
+            type="button"
+            disabled={experimentEntryDisabled}
+            title={versionDirty
+              ? '策略结构已修改，请先保存并发布'
+              : !experimentPreviewEnabled
+                ? '自动化回测能力尚未开放'
+              : publishedFillModel !== 'bar_next_open'
+                ? '首期仅支持标准 Bar 自动化预览'
+                : !activeConfig?.publishedVersionId
+                  ? '请先发布策略版本'
+                  : '使用当前发布版本创建有限网格预览'}
+            onClick={() => {
+              if (activeConfig?.publishedVersionId) {
+                onCreateExperiment?.({
+                  configId: activeConfig.id,
+                  versionId: activeConfig.publishedVersionId,
+                });
+              }
+            }}
+          >
+            <FlaskConical size={15} /> 自动化预览
+          </button>
         {activeRun ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ color: '#a16207', fontSize: 12 }}>
@@ -3662,6 +3707,7 @@ export default function BacktestPage({
             {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : '运行回测'}
           </button>
         )}
+        </div>
       </header>}
 
       <div className="workbench-grid" style={{

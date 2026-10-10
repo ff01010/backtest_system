@@ -27,6 +27,36 @@ def _read_bool(name: str, default: bool) -> bool:
   return raw == "true"
 
 
+def _normalize_http_origin(value: str) -> str:
+  """规范化可信浏览器来源，拒绝带路径或凭据的配置。"""
+  parsed = urlsplit(value.strip())
+  if (
+    parsed.scheme not in {"http", "https"}
+    or not parsed.hostname
+    or parsed.username
+    or parsed.password
+    or parsed.query
+    or parsed.fragment
+    or parsed.path not in {"", "/"}
+  ):
+    raise ValueError("可信来源必须是 http/https Origin，且不能包含路径、凭据、查询或片段")
+  try:
+    port = parsed.port
+  except ValueError as error:
+    raise ValueError("可信来源端口无效") from error
+  hostname = parsed.hostname.lower()
+  host = f"[{hostname}]" if ":" in hostname else hostname
+  default_port = 80 if parsed.scheme == "http" else 443
+  port_suffix = f":{port}" if port is not None and port != default_port else ""
+  return f"{parsed.scheme}://{host}{port_suffix}"
+
+
+def _read_http_origins(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+  raw = os.getenv(name)
+  values = default if raw is None else tuple(item for item in raw.split(",") if item.strip())
+  return tuple(dict.fromkeys(_normalize_http_origin(item) for item in values))
+
+
 # K 线数据根目录。各周期位于 {KLINE_ROOT}/{timeframe}/{symbol}/ 下。
 KLINE_ROOT = os.getenv("TREND_GRID_KLINE_ROOT", "./runtime/kline")
 
@@ -75,9 +105,15 @@ L2_PAGE_SIZE = int(os.getenv("TREND_GRID_L2_PAGE_SIZE", "2000"))
 L2_QUOTE_PREFETCH_SIZE = _read_bounded_int("TREND_GRID_L2_QUOTE_PREFETCH_SIZE", 128, 16, 512)
 
 # Bar 与 L2 共用的全局调度容量。公平扩容只为尚未获得槽位的排队用户服务。
-BACKTEST_BASE_CONCURRENCY = _read_bounded_int("TREND_GRID_BACKTEST_BASE_CONCURRENCY", 8, 1, 12)
+BACKTEST_CONFIGURABLE_MAX_CONCURRENCY = 64
+BACKTEST_BASE_CONCURRENCY = _read_bounded_int(
+  "TREND_GRID_BACKTEST_BASE_CONCURRENCY", 16, 1, BACKTEST_CONFIGURABLE_MAX_CONCURRENCY,
+)
 BACKTEST_BURST_MAX_CONCURRENCY = _read_bounded_int(
-  "TREND_GRID_BACKTEST_BURST_MAX_CONCURRENCY", 12, BACKTEST_BASE_CONCURRENCY, 12,
+  "TREND_GRID_BACKTEST_BURST_MAX_CONCURRENCY",
+  24,
+  BACKTEST_BASE_CONCURRENCY,
+  BACKTEST_CONFIGURABLE_MAX_CONCURRENCY,
 )
 
 # 应用构建标识用于识别浏览器是否仍在运行旧 frontend。
@@ -200,6 +236,112 @@ def default_fee_profile() -> dict[str, float]:
 # 当前部署尚未配置 HTTPS，默认关闭 Secure 以保证同源 HTTP 登录可用。
 AUTH_COOKIE_SECURE = os.getenv("TREND_GRID_AUTH_COOKIE_SECURE", "false").lower() == "true"
 
+# 同源请求始终允许；这里仅列出本地开发代理等额外可信浏览器来源。
+CSRF_TRUSTED_ORIGINS = _read_http_origins(
+  "TREND_GRID_CSRF_TRUSTED_ORIGINS",
+  (
+    "http://localhost:5174", "http://127.0.0.1:5174",
+    "http://localhost:5175", "http://127.0.0.1:5175",
+    "http://localhost:5176", "http://127.0.0.1:5176",
+    "http://localhost:5177", "http://127.0.0.1:5177",
+  ),
+)
+
+# 单标有限网格实验按能力门禁逐步开放；预览不创建实验或回测任务。
+EXPERIMENTS_ENABLED = _read_bool("TREND_GRID_EXPERIMENTS_ENABLED", False)
+EXPERIMENT_BAR_ENABLED = _read_bool("TREND_GRID_EXPERIMENT_BAR_ENABLED", False)
+EXPERIMENT_MAX_VALUES_PER_DIMENSION = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_MAX_VALUES_PER_DIMENSION", 50, 1, 1000,
+)
+EXPERIMENT_MAX_TRIALS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_MAX_TRIALS", 1000, 1, 1_000_000,
+)
+EXPERIMENT_MAX_USER_PLANNED_TRIALS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_MAX_USER_PLANNED_TRIALS", 0, 0, 10_000_000,
+)
+EXPERIMENT_BAR_MAX_ESTIMATED_BARS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_BAR_MAX_ESTIMATED_BARS", 10_000_000, 1, 2_000_000_000,
+)
+EXPERIMENT_PREVIEW_TTL_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_PREVIEW_TTL_SECONDS", 900, 60, 3600,
+)
+EXPERIMENT_GENERATION_BATCH_SIZE = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_GENERATION_BATCH_SIZE", 100, 1, 1000,
+)
+EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT", 1, 1, 10_000,
+)
+EXPERIMENT_MAX_IN_FLIGHT_PER_USER = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_MAX_IN_FLIGHT_PER_USER", 1, 1, 10_000,
+)
+EXPERIMENT_MANUAL_RESERVED_PERMITS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_MANUAL_RESERVED_PERMITS", 1, 0, 10_000,
+)
+EXPERIMENT_MANUAL_MAX_WAIT_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_MANUAL_MAX_WAIT_SECONDS", 60, 1, 86_400,
+)
+EXPERIMENT_CURSOR_SIGNING_SECRET = os.getenv(
+  "TREND_GRID_EXPERIMENT_CURSOR_SIGNING_SECRET", "",
+).strip()
+EXPERIMENT_COORDINATOR_LEASE_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_COORDINATOR_LEASE_SECONDS", 30, 4, 300,
+)
+EXPERIMENT_COORDINATOR_HEARTBEAT_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_COORDINATOR_HEARTBEAT_SECONDS", 5, 1, 30,
+)
+EXPERIMENT_COORDINATOR_POLL_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_COORDINATOR_POLL_SECONDS", 1, 1, 30,
+)
+EXPERIMENT_PURGE_ENABLED = _read_bool(
+  "TREND_GRID_EXPERIMENT_PURGE_ENABLED", False,
+)
+EXPERIMENT_PURGE_RETENTION_DAYS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_PURGE_RETENTION_DAYS", 30, 1, 3650,
+)
+EXPERIMENT_PURGE_BATCH_SIZE = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_PURGE_BATCH_SIZE", 100, 1, 1000,
+)
+EXPERIMENT_PURGE_LEASE_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_PURGE_LEASE_SECONDS", 60, 10, 600,
+)
+EXPERIMENT_PURGE_RETRY_DELAY_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_PURGE_RETRY_DELAY_SECONDS", 30, 1, 3600,
+)
+EXPERIMENT_PURGE_MAX_ATTEMPTS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_PURGE_MAX_ATTEMPTS", 5, 1, 100,
+)
+
+
+def validate_experiment_configuration() -> None:
+  """实验开关开启时拒绝不安全或无法形成租约的配置。"""
+  if not EXPERIMENTS_ENABLED:
+    return
+  if not EXPERIMENT_BAR_ENABLED:
+    raise ValueError(
+      "TREND_GRID_EXPERIMENTS_ENABLED=true 时必须启用至少一个实验执行路径",
+    )
+  if EXPERIMENT_MAX_USER_PLANNED_TRIALS <= 0:
+    raise ValueError("启用实验时必须配置正数的用户计划 Trial 上限")
+  if EXPERIMENT_MAX_TRIALS > EXPERIMENT_MAX_USER_PLANNED_TRIALS:
+    raise ValueError("单实验 Trial 上限不能大于用户计划 Trial 上限")
+  if EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT > EXPERIMENT_MAX_IN_FLIGHT_PER_USER:
+    raise ValueError("单实验在途上限不能大于用户实验在途上限")
+  if EXPERIMENT_MANUAL_RESERVED_PERMITS > EXPERIMENT_MAX_IN_FLIGHT_PER_USER:
+    raise ValueError("普通任务保留额度不能大于用户实验在途上限")
+  if EXPERIMENT_MANUAL_RESERVED_PERMITS > BACKTEST_BASE_CONCURRENCY:
+    raise ValueError("普通任务保留额度不能大于统一调度基础容量")
+  if (
+    EXPERIMENT_COORDINATOR_LEASE_SECONDS
+    <= EXPERIMENT_COORDINATOR_HEARTBEAT_SECONDS * 3
+  ):
+    raise ValueError("实验协调器租约必须大于心跳间隔的三倍")
+  if EXPERIMENT_EXPORT_LEASE_SECONDS <= EXPERIMENT_EXPORT_HEARTBEAT_SECONDS * 3:
+    raise ValueError("评价导出 Worker 租约必须大于心跳间隔的三倍")
+  if EXPERIMENT_EXPORT_WORKER_TTL_SECONDS <= EXPERIMENT_EXPORT_HEARTBEAT_SECONDS * 2:
+    raise ValueError("评价导出 Worker 健康 TTL 必须大于心跳间隔的两倍")
+  if len(EXPERIMENT_CURSOR_SIGNING_SECRET) < 32:
+    raise ValueError("启用实验时必须配置至少 32 个字符的游标签名密钥")
+
 # 研究服务兑换一次性授权码时使用的后端间凭据，不能为空才允许兑换。
 RESEARCH_AUTH_SERVICE_TOKEN = os.getenv("TREND_GRID_RESEARCH_AUTH_SERVICE_TOKEN", "")
 RESEARCH_AUTH_CODE_LIFETIME_SECONDS = _read_bounded_int(
@@ -244,6 +386,35 @@ SIGNAL_EXPORT_MAX_ATTEMPTS = _read_bounded_int(
 )
 SIGNAL_EXPORT_MIN_FREE_BYTES = _read_bounded_int(
   "TREND_GRID_SIGNAL_EXPORT_MIN_FREE_BYTES", 536870912, 0, 10**15,
+)
+
+# 评价表格与报告由独立 Worker 生成，默认保留七天。
+EXPERIMENT_EXPORT_TTL_DAYS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_EXPORT_TTL_DAYS", 7, 1, 365,
+)
+EXPERIMENT_EXPORT_CLEANUP_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_EXPORT_CLEANUP_SECONDS", 300, 30, 86400,
+)
+EXPERIMENT_EXPORT_STALE_PART_HOURS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_EXPORT_STALE_PART_HOURS", 24, 1, 24 * 30,
+)
+EXPERIMENT_EXPORT_LEASE_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_EXPORT_LEASE_SECONDS", 90, 30, 600,
+)
+EXPERIMENT_EXPORT_HEARTBEAT_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_EXPORT_HEARTBEAT_SECONDS", 10, 1, 60,
+)
+EXPERIMENT_EXPORT_WORKER_TTL_SECONDS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_EXPORT_WORKER_TTL_SECONDS", 30, 5, 300,
+)
+EXPERIMENT_EXPORT_WORKER_AVAILABILITY_REQUIRED = _read_bool(
+  "TREND_GRID_EXPERIMENT_EXPORT_WORKER_AVAILABILITY_REQUIRED", True,
+)
+EXPERIMENT_EXPORT_MAX_ATTEMPTS = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_EXPORT_MAX_ATTEMPTS", 3, 1, 20,
+)
+EXPERIMENT_EXPORT_MIN_FREE_BYTES = _read_bounded_int(
+  "TREND_GRID_EXPERIMENT_EXPORT_MIN_FREE_BYTES", 536870912, 0, 10**15,
 )
 
 

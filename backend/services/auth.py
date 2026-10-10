@@ -30,6 +30,9 @@ API_KEY_SCOPES = {
   "backtest:submit",
   "backtest:read",
   "backtest:cancel",
+  "experiment:submit",
+  "experiment:read",
+  "experiment:cancel",
   "strategy:read",
   "strategy:write",
   "strategy:publish",
@@ -203,6 +206,26 @@ def _audit_api_key(
       api_key_id, owner_user_id, event_type, request_id, detail
     ) VALUES (%s, %s, %s, %s, %s)
   """, (key_id, owner_user_id, event_type, request_id, Jsonb(detail or {})))
+
+
+def audit_api_key_event(
+  key_id: str,
+  owner_user_id: str,
+  event_type: str,
+  detail: dict[str, Any] | None = None,
+  request_id: str | None = None,
+) -> None:
+  """记录开放 API 资源操作，不保存请求载荷或 API Key 明文。"""
+  with _system_db() as conn:
+    with conn.cursor() as cur:
+      _audit_api_key(
+        cur,
+        key_id,
+        owner_user_id,
+        event_type,
+        detail,
+        request_id,
+      )
 
 
 def create_api_key(
@@ -597,12 +620,21 @@ def delete_user(user_id: str, actor_user_id: str) -> dict[str, str]:
       if not target:
         raise KeyError(user_id)
       _ensure_deletable_admin(cur, target)
-      cur.execute("SELECT EXISTS(SELECT 1 FROM backtest_run WHERE owner_user_id=%s) AS value", (user_id,))
+      cur.execute("""
+        SELECT (
+          EXISTS(SELECT 1 FROM backtest_run WHERE owner_user_id=%s)
+          OR EXISTS(SELECT 1 FROM backtest_experiment WHERE owner_user_id=%s)
+          OR EXISTS(
+            SELECT 1 FROM backtest_experiment_purge
+            WHERE owner_user_id=%s OR requested_by_user_id=%s
+          )
+        ) AS value
+      """, (user_id, user_id, user_id, user_id))
       has_history = bool(cur.fetchone()["value"])
       if has_history:
         cur.execute("UPDATE app_user SET status='disabled', updated_at=now() WHERE id=%s", (user_id,))
         cur.execute("UPDATE auth_session SET revoked_at=now() WHERE user_id=%s AND revoked_at IS NULL", (user_id,))
-        return {"action": "disabled", "message": "该用户存在历史回测记录，已禁用并保留历史归属。"}
+        return {"action": "disabled", "message": "该用户存在回测或实验历史，已禁用并保留审计归属。"}
       cur.execute("DELETE FROM app_user WHERE id=%s", (user_id,))
       return {"action": "deleted", "message": "用户已删除。"}
 

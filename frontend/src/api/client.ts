@@ -81,7 +81,7 @@ async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promi
   });
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
+export async function fetchJson<T>(url: string): Promise<T> {
   const res = await apiFetch(url);
   if (!res.ok) {
     throw await apiResponseError(res);
@@ -164,10 +164,17 @@ async function apiResponseError(response: Response): Promise<ApiResponseError> {
   );
 }
 
-async function sendJson<T>(url: string, method: string, payload: unknown): Promise<T> {
+export async function sendJson<T>(
+  url: string,
+  method: string,
+  payload: unknown,
+  headers?: HeadersInit,
+): Promise<T> {
+  const requestHeaders = new Headers(headers);
+  requestHeaders.set('Content-Type', 'application/json');
   const res = await apiFetch(url, {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: requestHeaders,
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
@@ -199,7 +206,10 @@ function getApiErrorMessage(text: string): string {
   }
 }
 
-export async function fetchHealth(): Promise<{ status: string }> {
+export async function fetchHealth(): Promise<{
+  status: string;
+  experiments?: { enabled: boolean; barPreviewEnabled: boolean; capabilityVersion: string };
+}> {
   return fetchJson(`${BASE}/health`);
 }
 
@@ -258,6 +268,9 @@ export interface ApiAccessKey {
     | 'backtest:submit'
     | 'backtest:read'
     | 'backtest:cancel'
+    | 'experiment:submit'
+    | 'experiment:read'
+    | 'experiment:cancel'
     | 'strategy:read'
     | 'strategy:write'
     | 'strategy:publish'

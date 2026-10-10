@@ -9,11 +9,14 @@ import UserManagementPage from './components/UserManagementPage';
 import ApiKeyPage from './components/ApiKeyPage';
 import SharedBacktestPage from './components/SharedBacktestPage';
 import ReleaseNotificationManager from './components/ReleaseNotificationManager';
+import ExperimentPage from './features/experiments/ExperimentPage';
+import type { ExperimentSubjectRef } from './features/experiments/contracts';
 import {
   fetchBacktestRunChart,
   fetchChart,
   fetchCurrentUser,
   fetchDates,
+  fetchHealth,
   fetchInstruments,
   fetchStrategies,
   createResearchAuthorizationCode,
@@ -40,16 +43,28 @@ async function enterResearchCenter(): Promise<void> {
 }
 
 function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogout: () => void }) {
-  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'sharedBacktests' | 'apiKeys' | 'users' | 'systemErrors'>('backtest');
+  const [urlParams, setUrlParams] = useUrlState();
+  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'experiments' | 'sharedBacktests' | 'apiKeys' | 'users' | 'systemErrors'>(
+    urlParams.workspace === 'experiments' ? 'experiments' : 'backtest',
+  );
+  const [experimentSubject, setExperimentSubject] = useState<ExperimentSubjectRef | null>(() => (
+    urlParams.experimentConfigId && urlParams.experimentVersionId
+      ? {
+        subjectType: 'legacy_single_strategy',
+        subjectId: urlParams.experimentConfigId,
+        subjectVersion: urlParams.experimentVersionId,
+      }
+      : null
+  ));
   const [sharedPublicationId, setSharedPublicationId] = useState<string | null>(null);
   const [strategyConfigToOpen, setStrategyConfigToOpen] = useState<string | null>(null);
-  const [urlParams, setUrlParams] = useUrlState();
   const [researchError, setResearchError] = useState<string | null>(null);
   const [researchStarting, setResearchStarting] = useState(false);
   const [workspaceSafety, setWorkspaceSafety] = useState({
     hasUnsavedStrategy: false,
     isStrategySavePending: false,
   });
+  const [experimentPreviewEnabled, setExperimentPreviewEnabled] = useState<boolean | null>(null);
   const strategySaveActionRef = useRef<() => Promise<boolean>>(async () => false);
   const requestStrategySave = useCallback(
     () => strategySaveActionRef.current(),
@@ -58,6 +73,23 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
   const registerStrategySave = useCallback((action: () => Promise<boolean>) => {
     strategySaveActionRef.current = action;
   }, []);
+
+  useEffect(() => {
+    if (urlParams.workspace === 'experiments') {
+      setActivePage('experiments');
+      setExperimentSubject(
+        urlParams.experimentConfigId && urlParams.experimentVersionId
+          ? {
+            subjectType: 'legacy_single_strategy',
+            subjectId: urlParams.experimentConfigId,
+            subjectVersion: urlParams.experimentVersionId,
+          }
+          : null,
+      );
+    } else {
+      setActivePage((page) => page === 'experiments' ? 'backtest' : page);
+    }
+  }, [urlParams.experimentConfigId, urlParams.experimentVersionId, urlParams.workspace]);
 
   const [instruments, setInstruments] = useState<InstrumentItem[]>([]);
   const [strategies, setStrategies] = useState<string[]>(['user_script']);
@@ -77,6 +109,11 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
   useEffect(() => {
     fetchInstruments().then(setInstruments).catch(() => {});
     fetchStrategies().then(setStrategies).catch(() => {});
+    fetchHealth().then((health) => {
+      setExperimentPreviewEnabled(Boolean(
+        health.experiments?.enabled && health.experiments.barPreviewEnabled,
+      ));
+    }).catch(() => setExperimentPreviewEnabled(false));
   }, []);
 
   // load dates when symbol changes
@@ -177,6 +214,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
         </div>
         {[
           { key: 'backtest' as const, label: '策略回测' },
+          ...(experimentPreviewEnabled === true ? [{ key: 'experiments' as const, label: '自动化回测' }] : []),
           { key: 'sharedBacktests' as const, label: '策略广场' },
           { key: 'signals' as const, label: '信号可视化' },
           { key: 'apiKeys' as const, label: 'API Key' },
@@ -191,6 +229,11 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
               onClick={() => {
                 if (item.key === 'sharedBacktests') setSharedPublicationId(null);
                 setActivePage(item.key);
+                setUrlParams({
+                  workspace: item.key === 'experiments' ? 'experiments' : 'backtest',
+                  experimentConfigId: item.key === 'experiments' ? experimentSubject?.subjectId : undefined,
+                  experimentVersionId: item.key === 'experiments' ? experimentSubject?.subjectVersion : undefined,
+                });
               }}
               style={{
                 height: 44, padding: '0 12px', borderRadius: 0,
@@ -295,9 +338,69 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
             setSharedPublicationId(publicationId);
             setActivePage('sharedBacktests');
           }}
+          onCreateExperiment={({ configId, versionId }) => {
+            const nextSubject: ExperimentSubjectRef = {
+              subjectType: 'legacy_single_strategy',
+              subjectId: configId,
+              subjectVersion: versionId,
+            };
+            setExperimentSubject(nextSubject);
+            setUrlParams({
+              workspace: 'experiments',
+              experimentConfigId: configId,
+              experimentVersionId: versionId,
+              experimentId: undefined,
+            });
+            setActivePage('experiments');
+          }}
+          experimentPreviewEnabled={experimentPreviewEnabled === true}
           requestedConfigId={strategyConfigToOpen}
         />
       </div>
+
+      {activePage === 'experiments' && (
+        <ExperimentPage
+          userId={currentUser.id}
+          isAdmin={currentUser.role === 'admin'}
+          enabled={experimentPreviewEnabled}
+          subject={experimentSubject}
+          experimentId={urlParams.experimentId ?? null}
+          onExperimentChange={(experimentId) => {
+            setUrlParams({ workspace: 'experiments', experimentId: experimentId ?? undefined });
+          }}
+          onSubjectChange={(nextSubject) => {
+            setExperimentSubject(nextSubject);
+            setUrlParams({
+              workspace: 'experiments',
+              experimentConfigId: nextSubject?.subjectId,
+              experimentVersionId: nextSubject?.subjectVersion,
+              experimentId: undefined,
+            });
+          }}
+          onBackToStrategy={() => {
+            setActivePage('backtest');
+            setUrlParams({
+              workspace: 'backtest',
+              experimentConfigId: undefined,
+              experimentVersionId: undefined,
+              experimentId: undefined,
+            });
+          }}
+          onOpenRun={(runId, symbol, timeframe, date) => {
+            setUrlParams({
+              workspace: 'backtest',
+              runId,
+              symbol,
+              timeframe,
+              date,
+              experimentConfigId: undefined,
+              experimentVersionId: undefined,
+              experimentId: undefined,
+            });
+            setActivePage('signals');
+          }}
+        />
+      )}
 
       {activePage === 'sharedBacktests' && (
         <SharedBacktestPage

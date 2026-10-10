@@ -63,6 +63,10 @@ class SelectionChangedError(ConflictError):
   """批量删除范围与用户最后确认的快照不一致。"""
 
 
+class ExperimentRunRetainedError(ValueError):
+  """回测运行被实验历史引用，禁止通过普通接口删除。"""
+
+
 _BACKTEST_SCHEDULER_LOCK_KEY = 314159265
 _STRATEGY_NAME_MAX_LENGTH = 64
 # 保留旧名称，避免外部诊断脚本在迁移期间失效。
@@ -178,6 +182,9 @@ def ensure_schema() -> None:
       cur.execute("SELECT to_regclass('public.strategy_runtime_error_stat') AS runtime_error_table")
       if cur.fetchone()["runtime_error_table"] is None:
         raise DatabaseError("数据库缺少策略运行时错误统计迁移 025，请先运行 deploy 的 migrate 服务")
+      cur.execute("SELECT to_regclass('public.backtest_experiment_preview') AS preview_table")
+      if cur.fetchone()["preview_table"] is None:
+        raise DatabaseError("数据库缺少实验预览迁移 044，请先运行 deploy 的 migrate 服务")
       cur.execute("""
         SELECT to_regclass('public.backtest_signal_detail_export') AS export_table,
           to_regclass('public.backtest_signal_detail_export_item') AS item_table,
@@ -190,6 +197,20 @@ def ensure_schema() -> None:
         "export_table", "item_table", "health_table",
       )):
         raise DatabaseError("数据库缺少信号明细批量导出迁移 040，请先运行 migrate 服务")
+      cur.execute("""
+        SELECT
+          to_regclass(
+            'public.backtest_experiment_evaluation_export'
+          ) AS evaluation_export_table,
+          to_regclass(
+            'public.backtest_experiment_export_worker_health'
+          ) AS evaluation_export_health_table
+      """)
+      evaluation_export_tables = cur.fetchone()
+      if any(evaluation_export_tables[key] is None for key in (
+        "evaluation_export_table", "evaluation_export_health_table",
+      )):
+        raise DatabaseError("数据库缺少评价异步导出迁移 051，请先运行 migrate 服务")
 def get_release_status_record() -> dict[str, Any] | None:
   """返回当前部署、有效公告和当前用户回执。"""
   with _db() as conn:
@@ -1513,6 +1534,9 @@ def _create_backtest_run_row(
   payload: dict[str, Any],
   status: str,
   owner_user_id: str,
+  *,
+  request_key: str | None = None,
+  origin: dict[str, Any] | None = None,
 ) -> tuple[str, int]:
   config_id = payload.get("configId")
   display_no = _next_backtest_display_no(cur, owner_user_id)
@@ -1520,21 +1544,30 @@ def _create_backtest_run_row(
   benchmark_id = _instrument_id(cur, payload["benchmarkSymbol"]) if payload.get("benchmarkSymbol") else None
   script_snapshot = payload.get("savedScriptSnapshot")
   params_snapshot = payload.get("savedConfigSnapshot", {})
+  origin = origin or {}
+  origin_type = str(origin.get("type") or "manual")
+  if origin_type not in {"manual", "experiment"}:
+    raise ValueError("回测任务来源无效")
   db_status = "running" if status == "running" else "queued"
   cur.execute("""
     INSERT INTO backtest_run (
-      id, owner_user_id, display_no, strategy_version_id, status, requested_params, market_data_snapshot,
+      id, owner_user_id, display_no, strategy_version_id, status, request_key,
+      requested_params, market_data_snapshot,
       started_at, config_id, config_version_id, account_id, instrument_id,
-      benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot, execution_kind
+      benchmark_instrument_id, timeframe, fill_model, script_snapshot, params_snapshot,
+      execution_kind, origin_type, origin_experiment_id, origin_stage_id,
+      origin_trial_execution_id
     ) VALUES (
-      gen_random_uuid(), %s, %s, %s, %s, %s, %s,
-      CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+      gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s,
+      CASE WHEN %s='running' THEN now() ELSE NULL END, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+      %s, %s, %s, %s, %s
     ) RETURNING id, display_no
-  """, (owner_user_id, display_no, payload.get("strategyVersionId"), db_status,
+  """, (owner_user_id, display_no, payload.get("strategyVersionId"), db_status, request_key,
          Jsonb(payload), Jsonb(payload.get("marketDataSnapshot", {})), db_status,
          config_id, payload.get("configVersionId"), payload.get("accountId"), instrument_id, benchmark_id,
          payload.get("timeframe", "5m"), "bar_close_signal_fill", Jsonb(script_snapshot) if script_snapshot else None,
-         Jsonb(params_snapshot), payload.get("executionKind", "published")))
+         Jsonb(params_snapshot), payload.get("executionKind", "published"), origin_type,
+         origin.get("experimentId"), origin.get("stageId"), origin.get("trialExecutionId")))
   row = cur.fetchone()
   return _uuid(row["id"]) or "", int(row["display_no"])
 
@@ -1552,13 +1585,23 @@ def _create_queued_backtest_job(
   owner_user_id: str,
   job_table: str,
   fill_model: str,
+  *,
+  request_key: str | None = None,
+  origin: dict[str, Any] | None = None,
 ) -> tuple[str, int]:
   routed_payload = {
     **payload,
     "runtimeVersion": SCRIPT_RUNTIME_VERSION,
     "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
   }
-  run_id, display_no = _create_backtest_run_row(cur, routed_payload, "queued", owner_user_id)
+  run_id, display_no = _create_backtest_run_row(
+    cur,
+    routed_payload,
+    "queued",
+    owner_user_id,
+    request_key=request_key,
+    origin=origin,
+  )
   cur.execute("UPDATE backtest_run SET fill_model=%s WHERE id=%s AND owner_user_id=%s", (
     fill_model, run_id, owner_user_id,
   ))
@@ -1574,6 +1617,28 @@ def _create_queued_backtest_job(
     cur, run_id, owner_user_id, routed_payload.get("researchSignalSnapshot"),
   )
   return run_id, display_no
+
+
+def create_queued_backtest_job_in_transaction(
+  cur: Any,
+  payload: dict[str, Any],
+  owner_user_id: str,
+  *,
+  request_key: str,
+  origin: dict[str, Any],
+) -> tuple[str, int]:
+  """加入调用方事务创建普通任务，供实验物化保持原子性。"""
+  fill_model = str(payload.get("fillModel", "bar_next_open"))
+  job_table = "l2_backtest_job" if fill_model == "l2_quote" else "bar_backtest_job"
+  return _create_queued_backtest_job(
+    cur,
+    payload,
+    owner_user_id,
+    job_table,
+    fill_model,
+    request_key=request_key,
+    origin=origin,
+  )
 
 
 def _save_research_signal_snapshot(cur: Any, run_id: str, owner_user_id: str, snapshot: object) -> None:
@@ -1894,26 +1959,41 @@ def _next_backtest_candidate(
   runtime_version: str = SCRIPT_RUNTIME_VERSION,
   capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
 ) -> dict[str, Any] | None:
-  """在全局锁内按用户当前占用数、提交时间选择下一条任务。"""
+  """先按用户公平选队首，再优先领取该用户的普通手工任务。"""
   cur.execute("""
-    SELECT candidate.*,
-      (SELECT count(*) FROM backtest_execution_slot slot
-       WHERE slot.owner_user_id=candidate.owner_user_id) AS owner_active_count
-    FROM (
-      SELECT 'bar' AS job_kind, run_id, owner_user_id, created_at
-      FROM bar_backtest_job
-      WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
-        AND NOT cancel_requested
-        AND runtime_version=%s AND capability_digest=%s
+    WITH candidates AS (
+      SELECT 'bar' AS job_kind, job.run_id, job.owner_user_id,
+        job.created_at, run.origin_type
+      FROM bar_backtest_job job
+      JOIN backtest_run run ON run.id=job.run_id
+      WHERE (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
+        AND NOT job.cancel_requested
+        AND job.runtime_version=%s AND job.capability_digest=%s
       UNION ALL
-      SELECT 'l2' AS job_kind, run_id, owner_user_id, created_at
-      FROM l2_backtest_job
-      WHERE (status='queued' OR (status='running' AND lease_expires_at < now()))
-        AND NOT cancel_requested
-        AND runtime_version=%s AND capability_digest=%s
-    ) AS candidate
-    WHERE (%s::text IS NULL OR candidate.job_kind=%s::text)
-    ORDER BY owner_active_count, candidate.created_at, candidate.run_id
+      SELECT 'l2' AS job_kind, job.run_id, job.owner_user_id,
+        job.created_at, run.origin_type
+      FROM l2_backtest_job job
+      JOIN backtest_run run ON run.id=job.run_id
+      WHERE (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
+        AND NOT job.cancel_requested
+        AND job.runtime_version=%s AND job.capability_digest=%s
+    ), eligible AS (
+      SELECT * FROM candidates
+      WHERE (%s::text IS NULL OR job_kind=%s::text)
+    ), ranked AS (
+      SELECT eligible.*,
+        (SELECT count(*) FROM backtest_execution_slot slot
+         WHERE slot.owner_user_id=eligible.owner_user_id) AS owner_active_count,
+        row_number() OVER (
+          PARTITION BY eligible.owner_user_id
+          ORDER BY CASE WHEN eligible.origin_type='manual' THEN 0 ELSE 1 END,
+            eligible.created_at, eligible.run_id
+        ) AS owner_queue_rank
+      FROM eligible
+    )
+    SELECT * FROM ranked
+    WHERE owner_queue_rank=1
+    ORDER BY owner_active_count, created_at, run_id
     LIMIT 1
   """, (
     runtime_version, capability_digest, runtime_version, capability_digest,
@@ -2543,32 +2623,69 @@ def request_bar_backtest_cancel(run_id: str) -> bool:
 
 def request_backtest_cancel(run_id: str) -> str | None:
   """幂等取消任意回测，返回数据库真实状态。"""
-  status = _request_backtest_cancel(run_id, "l2_backtest_job")
-  return status if status is not None else _request_backtest_cancel(run_id, "bar_backtest_job")
+  owner_id = current_user_id()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      return request_backtest_cancel_in_transaction(cur, run_id, owner_id)
+
+
+def request_backtest_cancel_in_transaction(
+  cur: Any,
+  run_id: str,
+  owner_user_id: str,
+) -> str | None:
+  """加入调用方事务取消普通任务，供实验取消保持锁顺序和原子性。"""
+  for table in ("l2_backtest_job", "bar_backtest_job"):
+    status = _request_backtest_cancel_with_cursor(
+      cur, run_id, owner_user_id, table,
+    )
+    if status is not None:
+      return status
+  return None
 
 
 def _request_backtest_cancel(run_id: str, table: str) -> str | None:
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(f"""
-        UPDATE {table}
-        SET cancel_requested=true,
-          status=CASE WHEN status='queued' THEN 'cancelled' WHEN status='running' THEN 'cancelling' ELSE status END,
-          finished_at=CASE WHEN status='queued' THEN now() ELSE finished_at END,
-          updated_at=now()
-        WHERE run_id=%s
-        RETURNING status
-      """, (run_id,))
-      row = cur.fetchone()
-      if row is None:
-        return None
-      status = str(row["status"])
-      cur.execute("""
-        UPDATE backtest_run
-        SET status=%s, finished_at=CASE WHEN %s='cancelled' THEN COALESCE(finished_at, now()) ELSE finished_at END
-        WHERE id=%s AND status IN ('queued', 'running', 'cancelling')
-      """, (status, status, run_id))
-      return status
+      return _request_backtest_cancel_with_cursor(
+        cur, run_id, current_user_id(), table,
+      )
+
+
+def _request_backtest_cancel_with_cursor(
+  cur: Any,
+  run_id: str,
+  owner_user_id: str,
+  table: str,
+) -> str | None:
+  cur.execute(f"""
+    UPDATE {table}
+    SET cancel_requested=true,
+      status=CASE
+        WHEN status='queued' THEN 'cancelled'
+        WHEN status='running' THEN 'cancelling'
+        ELSE status
+      END,
+      finished_at=CASE WHEN status='queued' THEN now() ELSE finished_at END,
+      updated_at=now()
+    WHERE run_id=%s AND owner_user_id=%s
+    RETURNING status
+  """, (run_id, owner_user_id))
+  row = cur.fetchone()
+  if row is None:
+    return None
+  status = str(row["status"])
+  cur.execute("""
+    UPDATE backtest_run
+    SET status=%s,
+      finished_at=CASE
+        WHEN %s='cancelled' THEN COALESCE(finished_at, now())
+        ELSE finished_at
+      END
+    WHERE id=%s AND owner_user_id=%s
+      AND status IN ('queued', 'running', 'cancelling')
+  """, (status, status, run_id, owner_user_id))
+  return status
 
 
 def get_backtest_scheduler_capacity() -> dict[str, Any]:
@@ -3300,6 +3417,7 @@ def create_shared_backtest_publication(
         if existing:
           artifacts = _publication_artifact_rows(cur, str(existing["id"]))
           return _publication_detail(existing, artifacts), False
+        _lock_runs_for_external_reference(cur, [run_id], user_id)
         cur.execute(_run_query("AND r.id=%s FOR UPDATE OF r"), (user_id, run_id))
         row = cur.fetchone()
         if not row:
@@ -3441,6 +3559,7 @@ def delete_backtest_run(run_id: str) -> bool:
         raise KeyError(run_id)
       if row["status"] not in {"succeeded", "failed", "cancelled"}:
         raise ValueError("排队或运行中的回测不能删除，请先取消任务")
+      _ensure_runs_not_retained_by_experiment(cur, [run_id])
       cur.execute(
         "DELETE FROM backtest_run WHERE id=%s AND owner_user_id=%s",
         (run_id, current_user_id()),
@@ -3464,6 +3583,7 @@ def delete_backtest_runs(run_ids: list[str]) -> int:
         raise KeyError("部分回测记录不存在或无删除权限")
       if any(row["status"] not in {"succeeded", "failed", "cancelled"} for row in rows):
         raise ValueError("选中的回测包含排队或运行中任务，请先取消任务")
+      _ensure_runs_not_retained_by_experiment(cur, unique_run_ids)
       cur.execute(
         "DELETE FROM backtest_run WHERE id=ANY(%s) AND owner_user_id=%s",
         (unique_run_ids, current_user_id()),
@@ -3503,12 +3623,29 @@ def delete_backtest_run_selection(
       actual_count, actual_digest = _selection_digest(iter(cur))
       if actual_count != expected_count or actual_digest != expected_digest:
         raise SelectionChangedError("选择范围已变化，请重新确认")
+      cur.execute("SELECT id FROM selected_backtest_run ORDER BY id")
+      _ensure_runs_not_retained_by_experiment(
+        cur, [str(row["id"]) for row in cur.fetchall()],
+      )
       cur.execute("""
         DELETE FROM backtest_run run
         USING selected_backtest_run selected
         WHERE run.id=selected.id AND run.owner_user_id=%s
       """, (owner_user_id,))
       return cur.rowcount
+
+
+def _ensure_runs_not_retained_by_experiment(cur: Any, run_ids: list[str]) -> None:
+  if not run_ids:
+    return
+  cur.execute("""
+    SELECT 1 FROM backtest_experiment_trial_execution
+    WHERE run_id=ANY(%s) LIMIT 1
+  """, (run_ids,))
+  if cur.fetchone() is not None:
+    raise ExperimentRunRetainedError(
+      "实验关联的回测结果受历史保留约束，不能单独删除",
+    )
 
 
 def get_backtest_result_page(
@@ -3994,6 +4131,33 @@ def _assert_signal_export_runner_available(cur: Any) -> None:
     raise RunnerUnavailableError("信号明细导出服务暂不可用")
 
 
+def _lock_runs_for_external_reference(
+  cur: Any,
+  run_ids: list[str],
+  owner_user_id: str,
+) -> None:
+  """先锁实验、再锁运行，阻止归档/清理与新外部引用交错提交。"""
+  unique_run_ids = _unique_selection_ids(run_ids)
+  cur.execute("""
+    SELECT e.id, e.archived_at, e.purge_job_id
+    FROM backtest_run run
+    JOIN backtest_experiment e ON e.id=run.origin_experiment_id
+    WHERE run.id=ANY(%s) AND run.owner_user_id=%s
+    ORDER BY e.id
+    FOR SHARE OF e
+  """, (unique_run_ids, owner_user_id))
+  experiments = cur.fetchall()
+  if any(row["archived_at"] is not None or row["purge_job_id"] is not None for row in experiments):
+    raise ExperimentRunRetainedError("实验已归档或正在清理，不能创建新的运行引用")
+  cur.execute("""
+    SELECT id FROM backtest_run
+    WHERE id=ANY(%s) AND owner_user_id=%s
+    ORDER BY id FOR UPDATE
+  """, (unique_run_ids, owner_user_id))
+  if len(cur.fetchall()) != len(unique_run_ids):
+    raise KeyError("部分回测记录不存在或无操作权限")
+
+
 def create_signal_detail_export(
   selection: dict[str, Any],
   idempotency_key: str,
@@ -4019,14 +4183,15 @@ def create_signal_detail_export(
         _validate_explicit_backtest_selection(
           cur, canonical_selection["runIds"], owner_user_id,
         )
-      count_query, count_params = _backtest_selection_query(
-        canonical_selection, owner_user_id, columns="count(*) AS value", order_by="r.id",
+      selected_query, selected_params = _backtest_selection_query(
+        canonical_selection, owner_user_id, columns="r.id", order_by="r.id",
       )
-      count_query = count_query.rsplit("ORDER BY", 1)[0]
-      cur.execute(count_query, count_params)
-      selected_count = int(cur.fetchone()["value"])
+      cur.execute(selected_query, selected_params)
+      selected_run_ids = [str(row["id"]) for row in cur.fetchall()]
+      selected_count = len(selected_run_ids)
       if selected_count == 0:
         raise ValueError("当前选择中没有可处理的终态回测")
+      _lock_runs_for_external_reference(cur, selected_run_ids, owner_user_id)
       cur.execute("""
         INSERT INTO backtest_signal_detail_export (
           id, owner_user_id, selection_mode, selection_snapshot,
@@ -4190,6 +4355,13 @@ def retry_signal_detail_export(
       if not retryable:
         raise ValueError("当前导出任务不能重新导出")
       _assert_signal_export_runner_available(cur)
+      cur.execute("""
+        SELECT source_run_id AS id
+        FROM backtest_signal_detail_export_item
+        WHERE export_id=%s ORDER BY source_run_id
+      """, (export_id,))
+      selected_run_ids = [str(row["id"]) for row in cur.fetchall()]
+      _lock_runs_for_external_reference(cur, selected_run_ids, owner_user_id)
       snapshot = _json(source["selection_snapshot"], {})
       snapshot["retrySourceExportId"] = export_id
       cur.execute("""
