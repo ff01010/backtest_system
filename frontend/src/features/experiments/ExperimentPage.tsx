@@ -81,6 +81,7 @@ type Props = {
   onSubjectChange: (subject: ExperimentSubjectRef | null) => void;
   onBackToStrategy: () => void;
   onOpenRun?: (runId: string, symbol: string, timeframe: string, date: string) => void;
+  onOpenBacktestDetail?: (runId: string) => void;
 };
 
 type DraftChange = (draft: ExperimentDraft) => ExperimentDraft;
@@ -641,12 +642,14 @@ function ExperimentDetailView({
   isAdmin,
   onClose,
   onOpenRun,
+  onOpenBacktestDetail,
   onCopyExperiment,
 }: {
   experimentId: string;
   isAdmin: boolean;
   onClose: () => void;
   onOpenRun?: (runId: string, symbol: string, timeframe: string, date: string) => void;
+  onOpenBacktestDetail?: (runId: string) => void;
   onCopyExperiment: (detail: ExperimentDetail) => void;
 }) {
   const [detail, setDetail] = useState<ExperimentDetail | null>(null);
@@ -1246,6 +1249,7 @@ function ExperimentDetailView({
         open={relatedRunsOpen}
         summary={relatedBacktestRuns}
         onClose={() => setRelatedRunsOpen(false)}
+        onOpenRunDetail={(runId) => onOpenBacktestDetail?.(runId)}
       />
     </main>
   );
@@ -1514,6 +1518,7 @@ export default function ExperimentPage({
   onSubjectChange,
   onBackToStrategy,
   onOpenRun,
+  onOpenBacktestDetail,
 }: Props) {
   const [copyTarget, setCopyTarget] = useState<ExperimentCopyTarget | null>(null);
   if (enabled === null) {
@@ -1559,6 +1564,7 @@ export default function ExperimentPage({
         isAdmin={isAdmin}
         onClose={() => changeExperiment(null)}
         onOpenRun={onOpenRun}
+        onOpenBacktestDetail={onOpenBacktestDetail}
         onCopyExperiment={(detail) => setCopyTarget({
           experimentId: detail.experimentId,
           revisionId: detail.revision.revisionId,

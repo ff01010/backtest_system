@@ -4864,7 +4864,7 @@ button.experiment-trial-row:hover {
 
 .experiment-run-row {
   display: grid;
-  grid-template-columns: 74px 74px minmax(90px, 1fr);
+  grid-template-columns: 74px 74px minmax(90px, 1fr) 76px;
   align-items: center;
   gap: 8px;
   min-height: 38px;
@@ -4878,6 +4878,27 @@ button.experiment-trial-row:hover {
 
 .experiment-run-row > strong {
   font-variant-numeric: tabular-nums;
+}
+
+.experiment-run-detail-action {
+  justify-self: end;
+  border: 0;
+  background: transparent;
+  padding: 3px 0;
+  color: var(--accent-strong);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.experiment-run-detail-action:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.experiment-run-detail-action:focus-visible {
+  border-radius: 3px;
 }
 
 .experiment-run-load-more {
@@ -6102,7 +6123,7 @@ button.experiment-trial-row:hover {
   }
 
   .experiment-run-row {
-    grid-template-columns: 64px 64px minmax(80px, 1fr);
+    grid-template-columns: 64px 64px minmax(80px, 1fr) 68px;
   }
 
   .experiment-overview-grid,

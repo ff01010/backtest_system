@@ -10,6 +10,7 @@ type Props = {
   open: boolean;
   summary: { totalCount: number; initialCount: number; retryCount: number };
   onClose: () => void;
+  onOpenRunDetail: (runId: string) => void;
 };
 
 type TrialGroup = {
@@ -61,6 +62,7 @@ export default function ExperimentBacktestRunDrawer({
   open,
   summary,
   onClose,
+  onOpenRunDetail,
 }: Props) {
   const [items, setItems] = useState<ExperimentBacktestRun[]>([]);
   const [counts, setCounts] = useState({
@@ -181,6 +183,14 @@ export default function ExperimentBacktestRunDrawer({
                         <strong>#{run.displayNo}</strong>
                         <span>{statusLabel(run.status)}</span>
                         <span>{createdReasonLabel(run.createdReason)}</span>
+                        <button
+                          aria-label={`查看回测 #${run.displayNo} 详情`}
+                          className="experiment-run-detail-action"
+                          type="button"
+                          onClick={() => onOpenRunDetail(run.runId)}
+                        >
+                          查看详情
+                        </button>
                       </div>
                     ))}
                   </section>

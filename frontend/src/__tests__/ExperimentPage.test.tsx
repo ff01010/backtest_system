@@ -815,6 +815,7 @@ describe('ExperimentPage', () => {
 
   it('shows execution progress and the experiment-wide backtest task index', async () => {
     const onOpenRun = vi.fn();
+    const onOpenBacktestDetail = vi.fn();
     const { container } = render(
       <ExperimentPage
         userId="user-1"
@@ -824,6 +825,7 @@ describe('ExperimentPage', () => {
         onSubjectChange={vi.fn()}
         onBackToStrategy={vi.fn()}
         onOpenRun={onOpenRun}
+        onOpenBacktestDetail={onOpenBacktestDetail}
       />,
     );
 
@@ -858,6 +860,8 @@ describe('ExperimentPage', () => {
     expect(within(drawer).getByText('人工重试')).not.toBeNull();
     expect(within(drawer).queryByText('选定结果')).toBeNull();
     expect(within(drawer).queryByText('查看信号图表')).toBeNull();
+    fireEvent.click(within(drawer).getByRole('button', { name: '查看回测 #193 详情' }));
+    expect(onOpenBacktestDetail).toHaveBeenCalledWith('run-2');
     expect(onOpenRun).not.toHaveBeenCalled();
     expect(fetchExperimentBacktestRuns).toHaveBeenCalledWith('experiment-1', undefined, '');
     const runSearch = within(drawer).getByRole('textbox', { name: '筛选回测任务编号' });
