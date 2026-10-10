@@ -3817,9 +3817,9 @@ button, input, select, textarea {
 
 .experiment-eyebrow {
   color: var(--accent);
-  font-size: 10px;
+  font-size: var(--font-sm);
   font-weight: 800;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.1em;
 }
 
 .experiment-layout,
@@ -3849,7 +3849,7 @@ button, input, select, textarea {
 .experiment-source-banner span,
 .experiment-source-banner small {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .experiment-copy-summary {
@@ -3880,7 +3880,7 @@ button, input, select, textarea {
 .experiment-copy-summary > header small,
 .experiment-copy-summary > p {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .experiment-copy-summary > p {
@@ -3908,7 +3908,7 @@ button, input, select, textarea {
 .experiment-copy-diff-list span {
   overflow-wrap: anywhere;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .experiment-copy-diff-list i {
@@ -3962,7 +3962,7 @@ button, input, select, textarea {
   place-items: center;
   border-radius: 50%;
   background: var(--accent-soft);
-  font-size: 10px;
+  font-size: var(--font-sm);
   font-weight: 800;
 }
 
@@ -3995,8 +3995,8 @@ button, input, select, textarea {
 }
 
 .experiment-fixed-grid dt {
-  color: var(--text-subtle);
-  font-size: 10px;
+  color: var(--text-muted);
+  font-size: var(--font-sm);
   text-transform: uppercase;
 }
 
@@ -4016,8 +4016,8 @@ button, input, select, textarea {
   align-items: center;
   gap: 8px;
   margin-top: 13px;
-  color: var(--text-subtle);
-  font-size: 10px;
+  color: var(--text-muted);
+  font-size: var(--font-sm);
 }
 
 .experiment-digest code {
@@ -4043,15 +4043,15 @@ button, input, select, textarea {
 .experiment-field > span,
 .experiment-readonly-field > span {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-sm);
   font-weight: 700;
 }
 
 .experiment-field small,
 .experiment-readonly-field small {
   margin-left: 5px;
-  color: var(--text-subtle);
-  font-size: 10px;
+  color: var(--text-muted);
+  font-size: var(--font-sm);
   font-weight: 500;
 }
 
@@ -4089,8 +4089,8 @@ button, input, select, textarea {
 }
 
 .experiment-scenario-row > span {
-  color: var(--text-subtle);
-  font-size: 11px;
+  color: var(--text-muted);
+  font-size: var(--font-sm);
 }
 
 .experiment-icon-button {
@@ -4149,7 +4149,7 @@ button, input, select, textarea {
 
 .experiment-command-bar span {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .experiment-preview {
@@ -4178,7 +4178,7 @@ button, input, select, textarea {
 
 .experiment-preview-metrics span {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .experiment-preview-metrics strong {
@@ -4204,7 +4204,7 @@ button, input, select, textarea {
 
 .experiment-preview-decision span {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .experiment-dimensions {
@@ -4223,7 +4223,7 @@ button, input, select, textarea {
   background: var(--surface);
   color: var(--text-muted);
   padding: 4px 8px;
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .experiment-dimensions code {
@@ -4246,7 +4246,7 @@ button, input, select, textarea {
   align-items: center;
   padding: 7px 9px;
   border-top: 1px solid var(--border);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .experiment-samples code {
@@ -4303,7 +4303,7 @@ button, input, select, textarea {
 .experiment-subject-card span,
 .experiment-subject-card small {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .experiment-subject-icon {
@@ -4453,7 +4453,7 @@ button, input, select, textarea {
 .experiment-detail-kpis span,
 .experiment-sidebar-heading span {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .experiment-detail-kpis strong {
@@ -4552,7 +4552,7 @@ button, input, select, textarea {
   justify-content: space-between;
   min-height: 28px;
   list-style: none;
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .experiment-technical-card .experiment-technical-details summary::after {
@@ -4575,7 +4575,7 @@ button, input, select, textarea {
 .experiment-execution-attempts summary {
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 10px;
+  font-size: var(--font-sm);
   font-weight: 700;
 }
 
@@ -4669,12 +4669,12 @@ button.experiment-trial-row:hover {
 
 .experiment-date-scenario strong {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .experiment-date-scenario small {
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: var(--font-sm);
 }
 
 .experiment-execution-attempts {
@@ -4703,12 +4703,12 @@ button.experiment-trial-row:hover {
 
 .experiment-trial-parameters span {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .experiment-trial-parameters strong {
   overflow-wrap: anywhere;
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .experiment-execution-attempts[open] {
@@ -4722,7 +4722,7 @@ button.experiment-trial-row:hover {
   gap: 8px;
   padding: 4px 0 0 12px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 @media (max-width: 900px) {
@@ -4778,7 +4778,7 @@ button.experiment-trial-row:hover {
 .experiment-preview-heading span,
 .experiment-structure-grid span {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-heading,
@@ -4795,7 +4795,7 @@ button.experiment-trial-row:hover {
   overflow: hidden;
   color: var(--text-muted);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 10px;
+  font-size: var(--font-sm);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -4833,7 +4833,7 @@ button.experiment-trial-row:hover {
 .evaluation-report-browser span,
 .evaluation-report-browser small {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-report-browser select {
@@ -4871,8 +4871,9 @@ button.experiment-trial-row:hover {
 .evaluation-basic-kicker {
   color: var(--accent);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 9px;
-  letter-spacing: 0.12em;
+  font-size: var(--font-sm);
+  font-weight: 700;
+  letter-spacing: 0.08em;
 }
 
 .evaluation-basic-rules {
@@ -4885,9 +4886,11 @@ button.experiment-trial-row:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--surface) 82%, transparent);
-  color: var(--text-secondary);
+  color: var(--text);
   padding: 7px 8px;
-  font-size: 10px;
+  font-size: var(--font-sm);
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .evaluation-failure-panel {
@@ -4918,7 +4921,7 @@ button.experiment-trial-row:hover {
 .evaluation-failure-summary span,
 .evaluation-temporary-policy p {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-temporary-policy {
@@ -4933,7 +4936,7 @@ button.experiment-trial-row:hover {
   max-width: 260px;
   gap: 5px;
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-temporary-policy input {
@@ -5012,7 +5015,7 @@ button.experiment-trial-row:hover {
   border-radius: var(--radius-sm);
   color: var(--text-muted);
   padding: 11px;
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-form input,
@@ -5092,12 +5095,12 @@ button.experiment-trial-row:hover {
 .evaluation-formula-catalog code,
 .evaluation-formula-catalog span {
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-inline-error {
   color: var(--danger);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-toggle {
@@ -5192,7 +5195,7 @@ button.experiment-trial-row:hover {
 
 .evaluation-run-link span {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-result {
@@ -5221,7 +5224,7 @@ button.experiment-trial-row:hover {
 .evaluation-report-identity span,
 .evaluation-report-identity small {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-member-results {
@@ -5240,10 +5243,10 @@ button.experiment-trial-row:hover {
   border: 0;
   border-top: 1px solid var(--border);
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--text);
   padding: 6px 0;
   cursor: pointer;
-  font-size: 10px;
+  font-size: var(--font-sm);
   text-align: left;
 }
 
@@ -5278,9 +5281,9 @@ button.experiment-trial-row:hover {
 .evaluation-analysis-section > div:first-child > span,
 .evaluation-analysis-card header > span {
   color: var(--accent);
-  font-size: 9px;
+  font-size: var(--font-sm);
   font-weight: 800;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.08em;
 }
 
 .evaluation-analysis-section h3,
@@ -5290,7 +5293,7 @@ button.experiment-trial-row:hover {
 
 .evaluation-analysis-section > div:first-child > p {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-analysis-grid {
@@ -5323,7 +5326,7 @@ button.experiment-trial-row:hover {
 
 .evaluation-analysis-card header p {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
   line-height: 1.6;
 }
 
@@ -5341,12 +5344,12 @@ button.experiment-trial-row:hover {
 .evaluation-insight span,
 .evaluation-insight small {
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-insight strong {
   overflow: hidden;
-  font-size: 11px;
+  font-size: var(--font-sm);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -5363,7 +5366,7 @@ button.experiment-trial-row:hover {
   gap: 8px;
   border-top: 1px solid var(--border);
   padding-top: 6px;
-  font-size: 10px;
+  font-size: var(--font-sm);
   font-variant-numeric: tabular-nums;
 }
 
@@ -5401,7 +5404,7 @@ button.experiment-trial-row:hover {
 }
 
 .evaluation-stability-list > div > strong {
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-stability-list > div > div {
@@ -5422,12 +5425,12 @@ button.experiment-trial-row:hover {
 .evaluation-stability-list small,
 .evaluation-stability-list em {
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: var(--font-sm);
   font-style: normal;
 }
 
 .evaluation-stability-list b {
-  font-size: 11px;
+  font-size: var(--font-sm);
   font-variant-numeric: tabular-nums;
 }
 
@@ -5455,7 +5458,7 @@ button.experiment-trial-row:hover {
   padding: 10px;
   border-radius: 8px;
   background: rgba(102, 126, 234, 0.16);
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-exceptions > div {
@@ -5470,7 +5473,7 @@ button.experiment-trial-row:hover {
 .evaluation-evidence {
   justify-content: flex-start;
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-evidence code {
@@ -5485,7 +5488,7 @@ button.experiment-trial-row:hover {
 .evaluation-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-table th,
@@ -5505,7 +5508,7 @@ button.experiment-trial-row:hover {
 .evaluation-execution-set {
   margin-top: 14px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-execution-set > div {
@@ -5541,7 +5544,7 @@ button.experiment-trial-row:hover {
 
 .evaluation-export-item span {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-export-item code {
@@ -5549,7 +5552,7 @@ button.experiment-trial-row:hover {
   max-width: 360px;
   color: var(--text-muted);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 10px;
+  font-size: var(--font-sm);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -5557,7 +5560,7 @@ button.experiment-trial-row:hover {
 .evaluation-evidence,
 .evaluation-card-technical {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-evidence {
@@ -5599,7 +5602,7 @@ button.experiment-trial-row:hover {
   display: grid;
   gap: 6px;
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-export-form select {
@@ -5629,7 +5632,7 @@ button.experiment-trial-row:hover {
   align-items: center;
   gap: 5px;
   color: var(--text);
-  font-size: 10px;
+  font-size: var(--font-sm);
 }
 
 .evaluation-export-history {
