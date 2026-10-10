@@ -856,13 +856,14 @@ describe('ExperimentPage', () => {
     expect(within(drawer).getByText('#187')).not.toBeNull();
     expect(within(drawer).getByText('#193')).not.toBeNull();
     expect(within(drawer).getByText('人工重试')).not.toBeNull();
-    expect(within(drawer).getByText('选定结果')).not.toBeNull();
+    expect(within(drawer).queryByText('选定结果')).toBeNull();
     expect(within(drawer).queryByText('查看信号图表')).toBeNull();
     expect(onOpenRun).not.toHaveBeenCalled();
     expect(fetchExperimentBacktestRuns).toHaveBeenCalledWith('experiment-1', undefined, '');
     expect(fetchExperimentDetail).toHaveBeenCalledTimes(1);
     expect(fetchExperimentTrials).toHaveBeenCalledWith('experiment-1');
     expect(screen.getByText('执行 #1')).not.toBeNull();
+    expect(screen.queryByText('选定结果')).toBeNull();
   });
 
   it('兼容缺少关联回测任务摘要的实验详情', async () => {

@@ -4864,7 +4864,7 @@ button.experiment-trial-row:hover {
 
 .experiment-run-row {
   display: grid;
-  grid-template-columns: 74px 74px minmax(90px, 1fr) 76px;
+  grid-template-columns: 74px 74px minmax(90px, 1fr);
   align-items: center;
   gap: 8px;
   min-height: 38px;
@@ -4878,11 +4878,6 @@ button.experiment-trial-row:hover {
 
 .experiment-run-row > strong {
   font-variant-numeric: tabular-nums;
-}
-
-.experiment-run-row > small {
-  color: var(--accent-strong);
-  font-weight: 700;
 }
 
 .experiment-run-load-more {
@@ -5084,7 +5079,7 @@ button.experiment-trial-row:hover {
 
 .experiment-execution-attempts > div {
   display: grid;
-  grid-template-columns: 90px 90px 100px minmax(90px, 1fr) minmax(120px, 1fr);
+  grid-template-columns: 90px 90px 100px minmax(120px, 1fr);
   gap: 8px;
   padding: 4px 0 0 12px;
   color: var(--text-muted);
@@ -6108,10 +6103,6 @@ button.experiment-trial-row:hover {
 
   .experiment-run-row {
     grid-template-columns: 64px 64px minmax(80px, 1fr);
-  }
-
-  .experiment-run-row > small {
-    grid-column: 1 / -1;
   }
 
   .experiment-overview-grid,

@@ -180,7 +180,6 @@ export default function ExperimentBacktestRunDrawer({
                         <strong>#{run.displayNo}</strong>
                         <span>{statusLabel(run.status)}</span>
                         <span>{createdReasonLabel(run.createdReason)}</span>
-                        {run.selected ? <small>选定结果</small> : <small />}
                       </div>
                     ))}
                   </section>

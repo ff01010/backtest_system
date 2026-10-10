@@ -1099,7 +1099,6 @@ function ExperimentDetailView({
                             ? '人工重试'
                             : execution.createdReason === 'automatic_retry' ? '系统重试' : '首次执行'}
                         </span>
-                        {execution.selected && <small>选定结果</small>}
                         {execution.errorSummary && (
                           <small>{String(execution.errorSummary.code ?? '执行失败')}</small>
                         )}
