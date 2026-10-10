@@ -194,6 +194,8 @@ class ExperimentRepository(PreviewRepository, Protocol):
     limit: int,
     cursor: str | None,
     archived: bool,
+    query: str,
+    status: str | None,
   ) -> dict[str, Any]:
     """游标分页读取当前用户实验。"""
 
@@ -433,14 +435,36 @@ class PostgresExperimentRepository:
     limit: int,
     cursor: str | None,
     archived: bool,
+    query: str,
+    status: str | None,
   ) -> dict[str, Any]:
     owner_id = state_store.current_user_id()
-    filters = {"archived": archived}
+    filters = {"archived": archived, "query": query, "status": status}
     after = (
       _decode_cursor(cursor, "experiment-list", owner_id, filters)
       if cursor else None
     )
     params: list[Any] = [owner_id]
+    filter_sql: list[str] = []
+    if query:
+      pattern = f"%{query}%"
+      filter_sql.append("""
+        AND (
+          e.name ILIKE %s
+          OR COALESCE(
+            r.experiment_spec #>> '{runTemplateSnapshot,fixedStructure,strategyName}',
+            ''
+          ) ILIKE %s
+          OR COALESCE(
+            r.experiment_spec #>> '{runTemplateSnapshot,fixedStructure,symbol}',
+            ''
+          ) ILIKE %s
+        )
+      """)
+      params.extend([pattern, pattern, pattern])
+    if status:
+      filter_sql.append("AND e.status=%s")
+      params.append(status)
     after_sql = ""
     if after:
       after_sql = "AND (e.updated_at, e.id) < (%s::timestamptz, %s::uuid)"
@@ -470,7 +494,9 @@ class PostgresExperimentRepository:
           LEFT JOIN backtest_experiment source_e
             ON source_e.id=source_r.experiment_id
           WHERE e.owner_user_id=%s
-            AND e.archived_at IS {'NOT NULL' if archived else 'NULL'} {after_sql}
+            AND e.archived_at IS {'NOT NULL' if archived else 'NULL'}
+            {' '.join(filter_sql)}
+            {after_sql}
           ORDER BY e.updated_at DESC, e.id DESC
           LIMIT %s
         """, params)

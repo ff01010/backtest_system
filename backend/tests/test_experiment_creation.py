@@ -42,7 +42,7 @@ class MemoryExperimentRepository:
     self.retried: dict[str, Any] | None = None
     self.archived: dict[str, Any] | None = None
     self.restored_archive: dict[str, Any] | None = None
-    self.list_archived: bool | None = None
+    self.list_values: dict[str, Any] | None = None
     self.purge_requested: dict[str, Any] | None = None
 
   def save_preview(self, preview: dict[str, Any]) -> None:
@@ -143,7 +143,7 @@ class MemoryExperimentRepository:
     }, 200)
 
   def list_experiments(self, **values: Any) -> dict[str, Any]:
-    self.list_archived = values["archived"]
+    self.list_values = values
     return {"items": [], "nextCursor": None}
 
   def request_purge(self, **values: Any) -> CommandResult:
@@ -431,14 +431,40 @@ def test_restore_archive_application_preserves_revision_identity() -> None:
   assert repository.restored_archive["idempotency_key"] == "restore-archive-key-1"
 
 
-def test_list_archived_experiments_uses_a_distinct_query_scope() -> None:
+def test_list_experiments_normalizes_search_and_status_filters() -> None:
   repository = MemoryExperimentRepository()
   application = _application(repository)
 
   assert application.list_experiments(
-    limit=50, cursor=None, archived=True,
+    limit=20,
+    cursor=None,
+    archived=True,
+    query="  均值回归  ",
+    status="completed",
   ) == {"items": [], "nextCursor": None}
-  assert repository.list_archived is True
+  assert repository.list_values == {
+    "limit": 20,
+    "cursor": None,
+    "archived": True,
+    "query": "均值回归",
+    "status": "completed",
+  }
+
+
+def test_list_experiments_rejects_unknown_status_filter() -> None:
+  repository = MemoryExperimentRepository()
+  application = _application(repository)
+
+  with pytest.raises(ExperimentError) as rejected:
+    application.list_experiments(
+      limit=20,
+      cursor=None,
+      query="",
+      status="not-a-status",
+    )
+
+  assert rejected.value.code == "experiment.list_filter_invalid"
+  assert repository.list_values is None
 
 
 def test_purge_application_creates_an_audited_async_job() -> None:

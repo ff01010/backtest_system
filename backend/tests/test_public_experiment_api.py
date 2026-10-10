@@ -162,7 +162,13 @@ def test_public_experiment_preview_and_read_routes(
   assert listed.json()["items"][0]["experimentId"] == EXPERIMENT_ID
   assert detail.json()["snapshotVersion"] == 3
   assert trials.json()["items"][0]["trialId"] == TRIAL_ID
-  assert ("list", {"limit": 50, "cursor": None, "archived": False}) in application.calls
+  assert ("list", {
+    "limit": 50,
+    "cursor": None,
+    "archived": False,
+    "query": "",
+    "status": None,
+  }) in application.calls
 
 
 def test_public_experiment_write_routes_namespace_idempotency_and_audit(

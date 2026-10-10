@@ -44,6 +44,19 @@ from backend.experiments.resolvers import (
 )
 
 
+_EXPERIMENT_LIST_STATUSES = frozenset({
+  "preparing",
+  "queued",
+  "running",
+  "completed",
+  "partially_completed",
+  "failed",
+  "cancelling",
+  "cancelled",
+  "generation_blocked",
+})
+
+
 class ExperimentApplication:
   """在一个深 Module 内封装预览权限、规范化、快照与预算。"""
 
@@ -164,9 +177,25 @@ class ExperimentApplication:
     limit: int,
     cursor: str | None,
     archived: bool = False,
+    query: str = "",
+    status: str | None = None,
   ) -> dict[str, Any]:
+    normalized_query = query.strip()
+    normalized_status = status.strip() if status else None
+    if len(normalized_query) > 100:
+      raise ExperimentError(
+        "experiment.list_filter_invalid", "实验搜索内容不能超过 100 个字符", 400,
+      )
+    if normalized_status and normalized_status not in _EXPERIMENT_LIST_STATUSES:
+      raise ExperimentError(
+        "experiment.list_filter_invalid", "实验状态筛选无效", 400,
+      )
     return self._experiment_repository().list_experiments(
-      limit=limit, cursor=cursor, archived=archived,
+      limit=limit,
+      cursor=cursor,
+      archived=archived,
+      query=normalized_query,
+      status=normalized_status,
     )
 
   def list_admin_archived_experiments(

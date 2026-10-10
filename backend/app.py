@@ -1920,10 +1920,16 @@ def list_experiments(
   limit: int = Query(50, ge=1, le=200),
   cursor: str | None = Query(default=None, max_length=2048),
   archived: bool = Query(False),
+  search_query: str = Query(default="", alias="query", max_length=100),
+  status: str | None = Query(default=None, max_length=64),
 ) -> dict[str, Any]:
   try:
     return _experiment_application.list_experiments(
-      limit=limit, cursor=cursor, archived=archived,
+      limit=limit,
+      cursor=cursor,
+      archived=archived,
+      query=search_query,
+      status=status,
     )
   except ExperimentError as error:
     _raise_experiment_error(error)
@@ -3076,7 +3082,11 @@ def public_experiments(
   _require_public_scope(request, "experiment:read")
   try:
     return _experiment_application.list_experiments(
-      limit=limit, cursor=cursor, archived=False,
+      limit=limit,
+      cursor=cursor,
+      archived=False,
+      query="",
+      status=None,
     )
   except ExperimentError as error:
     _raise_experiment_error(error)

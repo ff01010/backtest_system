@@ -60,6 +60,7 @@ import {
 } from './draftStore';
 import EvaluationBuilder from './EvaluationBuilder';
 import ExperimentBacktestRunDrawer from './ExperimentBacktestRunDrawer';
+import ExperimentCatalogDrawer from './ExperimentCatalogDrawer';
 import { frozenScenarioNames } from './comparisonData';
 import {
   dateRoleLabel,
@@ -188,6 +189,18 @@ export function isStandardBarConfig(config: StrategyConfig): boolean {
     && fillModel === 'bar_next_open';
 }
 
+function formatExperimentUpdatedAt(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return '—';
+  return new Date(timestamp).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
 function ExperimentLanding({
   isAdmin,
   onSelect,
@@ -202,9 +215,9 @@ function ExperimentLanding({
   const [configs, setConfigs] = useState<StrategyConfig[]>([]);
   const [experiments, setExperiments] = useState<ExperimentListItem[]>([]);
   const [adminArchived, setAdminArchived] = useState<AdminArchivedExperimentItem[]>([]);
-  const [nextExperimentCursor, setNextExperimentCursor] = useState<string | null>(null);
   const [nextAdminCursor, setNextAdminCursor] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
+  const [allExperimentsOpen, setAllExperimentsOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
@@ -219,14 +232,13 @@ function ExperimentLanding({
       : Promise.resolve({ items: [], nextCursor: null });
     Promise.all([
       fetchStrategyConfigs(),
-      fetchExperiments(undefined, showArchived),
+      fetchExperiments(undefined, showArchived, { limit: 5 }),
       adminRequest,
     ])
       .then(([items, page, adminPage]) => {
         if (!active) return;
         setConfigs(items.filter(isStandardBarConfig));
         setExperiments(page.items);
-        setNextExperimentCursor(page.nextCursor);
         setAdminArchived(adminPage.items);
         setNextAdminCursor(adminPage.nextCursor);
       })
@@ -240,21 +252,6 @@ function ExperimentLanding({
       active = false;
     };
   }, [isAdmin, showArchived]);
-
-  const loadMoreExperiments = async () => {
-    if (!nextExperimentCursor || loadingMore) return;
-    setLoadingMore(true);
-    setError('');
-    try {
-      const page = await fetchExperiments(nextExperimentCursor, showArchived);
-      setExperiments((current) => [...current, ...page.items]);
-      setNextExperimentCursor(page.nextCursor);
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setLoadingMore(false);
-    }
-  };
 
   const loadMoreAdminArchived = async () => {
     if (!nextAdminCursor || loadingMore) return;
@@ -320,7 +317,10 @@ function ExperimentLanding({
         <button
           className="app-button is-quiet"
           type="button"
-          onClick={() => setShowArchived((current) => !current)}
+          onClick={() => {
+            setAllExperimentsOpen(false);
+            setShowArchived((current) => !current);
+          }}
         >
           {showArchived ? <RotateCcw size={15} /> : <Archive size={15} />}
           {showArchived ? '返回当前实验' : '查看已归档实验'}
@@ -328,11 +328,24 @@ function ExperimentLanding({
       </section>
       {!loading && experiments.length > 0 && (
         <section className="experiment-preview-card">
-          <h2>最近实验</h2>
+          <div className="experiment-recent-heading">
+            <div>
+              <h2>{showArchived ? '最近归档实验' : '最近实验'}</h2>
+              <span>按最近更新时间显示 5 条</span>
+            </div>
+            <button
+              className="app-button is-quiet"
+              type="button"
+              onClick={() => setAllExperimentsOpen(true)}
+            >
+              {showArchived ? '查看全部归档实验' : '查看全部实验'}
+              <ChevronRight size={15} />
+            </button>
+          </div>
           <div className="experiment-trial-table">
             {experiments.map((experiment) => (
               <button
-                className="experiment-trial-row"
+                className="experiment-trial-row is-experiment-summary"
                 key={experiment.experimentId}
                 type="button"
                 onClick={() => onOpenExperiment(experiment.experimentId)}
@@ -343,19 +356,12 @@ function ExperimentLanding({
                 <span>
                   成功 {experiment.succeededTrialCount} / {experiment.plannedTrialCount}
                 </span>
+                <time dateTime={experiment.updatedAt}>
+                  更新 {formatExperimentUpdatedAt(experiment.updatedAt)}
+                </time>
               </button>
             ))}
           </div>
-          {nextExperimentCursor && (
-            <button
-              className="app-button is-quiet"
-              type="button"
-              disabled={loadingMore}
-              onClick={() => { void loadMoreExperiments(); }}
-            >
-              {loadingMore ? '正在加载…' : '加载更多我的实验'}
-            </button>
-          )}
         </section>
       )}
       {showArchived && isAdmin && (
@@ -423,6 +429,15 @@ function ExperimentLanding({
           </button>
         ))}
       </section>
+      <ExperimentCatalogDrawer
+        archived={showArchived}
+        open={allExperimentsOpen}
+        onClose={() => setAllExperimentsOpen(false)}
+        onOpenExperiment={(nextExperimentId) => {
+          setAllExperimentsOpen(false);
+          onOpenExperiment(nextExperimentId);
+        }}
+      />
     </main>
   );
 }

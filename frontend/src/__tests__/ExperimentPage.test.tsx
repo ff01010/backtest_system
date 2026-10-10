@@ -544,6 +544,10 @@ describe('ExperimentPage', () => {
         nextCursor: 'owner-next',
       })
       .mockResolvedValueOnce({
+        items: [experimentListItem('owned-first', '我的归档第一页')],
+        nextCursor: 'owner-next',
+      })
+      .mockResolvedValueOnce({
         items: [experimentListItem('owned-second', '我的归档第二页')],
         nextCursor: null,
       });
@@ -588,9 +592,15 @@ describe('ExperimentPage', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: '查看已归档实验' }));
-    fireEvent.click(await screen.findByRole('button', { name: '加载更多我的实验' }));
+    fireEvent.click(await screen.findByRole('button', { name: '查看全部归档实验' }));
+    const drawer = await screen.findByRole('dialog', { name: '全部归档实验' });
+    fireEvent.click(await within(drawer).findByRole('button', { name: '加载更多实验' }));
     expect(await screen.findByText('我的归档第二页')).not.toBeNull();
-    expect(fetchExperiments).toHaveBeenLastCalledWith('owner-next', true);
+    expect(fetchExperiments).toHaveBeenLastCalledWith('owner-next', true, {
+      limit: 20,
+      query: '',
+      status: '',
+    });
 
     fireEvent.click(screen.getByRole('button', { name: '加载更多待清理实验' }));
     expect(await screen.findByText('待清理第二页')).not.toBeNull();
@@ -614,12 +624,69 @@ describe('ExperimentPage', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: '查看已归档实验' }));
-    await waitFor(() => expect(fetchExperiments).toHaveBeenLastCalledWith(undefined, true));
+    await waitFor(() => expect(fetchExperiments).toHaveBeenLastCalledWith(
+      undefined, true, { limit: 5 },
+    ));
     expect(screen.getByText('暂无可用的已发布标准 Bar 策略。请先在策略回测中完成保存与发布。')).not.toBeNull();
 
     await act(async () => rejectCurrent(new Error('stale list failed')));
     expect(screen.queryByRole('alert')).toBeNull();
     expect(fetchExperiments).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the landing list compact and filters the full experiment drawer on the server', async () => {
+    vi.mocked(fetchExperiments)
+      .mockResolvedValueOnce({
+        items: [experimentListItem('recent-1', '最近实验一')],
+        nextCursor: 'recent-next',
+      })
+      .mockResolvedValueOnce({
+        items: [experimentListItem('all-1', '全部实验一')],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        items: [experimentListItem('search-1', 'Alpha 参数研究')],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        items: [experimentListItem('failed-1', 'Alpha 失败实验')],
+        nextCursor: null,
+      });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('最近实验一')).not.toBeNull();
+    expect(fetchExperiments).toHaveBeenNthCalledWith(
+      1, undefined, false, { limit: 5 },
+    );
+    expect(screen.queryByRole('button', { name: '加载更多我的实验' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '查看全部实验' }));
+    const drawer = await screen.findByRole('dialog', { name: '全部实验' });
+    await within(drawer).findByText('全部实验一');
+
+    fireEvent.change(within(drawer).getByLabelText('搜索实验'), {
+      target: { value: '  Alpha  ' },
+    });
+    fireEvent.click(within(drawer).getByRole('button', { name: '搜索' }));
+    await waitFor(() => expect(fetchExperiments).toHaveBeenLastCalledWith(
+      undefined, false, { limit: 20, query: 'Alpha', status: '' },
+    ));
+    expect(await within(drawer).findByText('Alpha 参数研究')).not.toBeNull();
+
+    fireEvent.change(within(drawer).getByLabelText('筛选实验状态'), {
+      target: { value: 'failed' },
+    });
+    await waitFor(() => expect(fetchExperiments).toHaveBeenLastCalledWith(
+      undefined, false, { limit: 20, query: 'Alpha', status: 'failed' },
+    ));
+    expect(await within(drawer).findByText('Alpha 失败实验')).not.toBeNull();
   });
 
   it('shows a clear gate when automation is not enabled', () => {

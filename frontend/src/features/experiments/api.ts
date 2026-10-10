@@ -14,6 +14,7 @@ import type {
   ExperimentRetryResult,
   ExperimentRetrySelection,
   ExperimentRevision,
+  ExperimentStatus,
   ExperimentSubject,
   ExperimentSubjectRef,
   ExperimentTrial,
@@ -59,10 +60,18 @@ export function fetchExperimentDetail(experimentId: string): Promise<ExperimentD
 export function fetchExperiments(
   cursor?: string,
   archived = false,
+  options: {
+    limit?: number;
+    query?: string;
+    status?: ExperimentStatus | '';
+  } = {},
 ): Promise<{ items: ExperimentListItem[]; nextCursor: string | null }> {
   const query = new URLSearchParams();
   if (cursor) query.set('cursor', cursor);
   if (archived) query.set('archived', 'true');
+  if (options.limit) query.set('limit', String(options.limit));
+  if (options.query?.trim()) query.set('query', options.query.trim());
+  if (options.status) query.set('status', options.status);
   const suffix = query.size ? `?${query.toString()}` : '';
   return fetchJson(`/api/backtest/experiments${suffix}`);
 }
