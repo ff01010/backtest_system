@@ -59,7 +59,14 @@ import {
 } from './draftStore';
 import EvaluationBuilder from './EvaluationBuilder';
 import { frozenScenarioNames } from './comparisonData';
-import { dateRoleLabel, fillModelLabel, statusLabel } from './displayLabels';
+import {
+  dateRoleLabel,
+  executionAlgorithmLabel,
+  fillModelLabel,
+  resourceClassLabel,
+  statusLabel,
+  systemDimensionValueLabel,
+} from './displayLabels';
 
 type Props = {
   userId: string;
@@ -126,17 +133,26 @@ function trialParameterEntries(assignment: Record<string, unknown>): Array<{
   if (costScenario) {
     entries.push({
       label: '成本场景',
-      value: trialParameterValue(costScenario.name ?? costScenario.scenarioId),
+      value: trialParameterValue(
+        costScenario.name
+        ?? systemDimensionValueLabel('costScenarioId', costScenario.scenarioId)
+        ?? costScenario.scenarioId,
+      ),
     });
     entries.push({ label: '滑点', value: trialParameterValue(costScenario.slippage) });
   }
   if (executionScenario) {
-    const algorithm = executionScenario.algorithm === 'immediate'
-      ? '立即成交'
-      : executionScenario.algorithm;
+    const algorithm = executionScenario.algorithm == null
+      ? null
+      : executionAlgorithmLabel(executionScenario.algorithm);
     entries.push({
       label: '执行场景',
-      value: trialParameterValue(executionScenario.name ?? algorithm ?? executionScenario.scenarioId),
+      value: trialParameterValue(
+        executionScenario.name
+        ?? systemDimensionValueLabel('executionScenarioId', executionScenario.scenarioId)
+        ?? algorithm
+        ?? executionScenario.scenarioId,
+      ),
     });
   }
   return entries;
@@ -545,7 +561,7 @@ function RuntimeDimensions({
           <input value={draft.slippageValues} onChange={(event) => onChange({ slippageValues: event.target.value })} />
         </label>
         <div className="experiment-readonly-field">
-          <span>执行算法</span><strong>immediate</strong><small>标准 Bar 首期固定</small>
+          <span>执行算法</span><strong>{executionAlgorithmLabel('immediate')}</strong><small>标准 Bar 首期固定</small>
         </div>
       </div>
     </section>
@@ -558,7 +574,7 @@ function PreviewResult({ preview }: { preview: ExperimentPreview }) {
       <div className="experiment-preview-metrics">
         <div><span>Trial 总数</span><strong>{preview.plannedTrialCount.toLocaleString()}</strong></div>
         <div><span>预计 Bar</span><strong>{preview.resourceEstimate.estimatedBarCount.toLocaleString()}</strong></div>
-        <div><span>资源等级</span><strong>{preview.resourceEstimate.resourceClass}</strong></div>
+        <div><span>资源等级</span><strong>{resourceClassLabel(preview.resourceEstimate.resourceClass)}</strong></div>
         <div><span>维度数量</span><strong>{Object.keys(preview.dimensionCounts).length}</strong></div>
       </div>
       <div className="experiment-preview-decision">

@@ -568,7 +568,15 @@ describe('EvaluationBuilder', () => {
       items: [{ ...RUN, status: 'succeeded', completeness: partialDetail.completeness }],
       nextCursor: null,
     });
-    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+    render(<EvaluationBuilder
+      experimentId="experiment-1"
+      symbol="688981.SH"
+      timeframe="5m"
+      scenarioNames={[{
+        scenarioId: 'development', name: '开发区间',
+        startDate: '2026-07-01', endDate: '2026-07-02',
+      }]}
+    />);
 
     await selectFirstReport();
 
@@ -576,7 +584,8 @@ describe('EvaluationBuilder', () => {
     expect(screen.getByText('失败 1')).not.toBeNull();
     expect(screen.queryByText(/不代表最终测试/)).toBeNull();
     expect(screen.getByText('关键维度覆盖（1）')).not.toBeNull();
-    expect(screen.getByText(/development：1\/2/)).not.toBeNull();
+    expect(screen.getByText(/开发区间：1\/2/)).not.toBeNull();
+    expect(screen.queryByText(/development：1\/2/)).toBeNull();
     expect(screen.getByText(/失败、取消与缺失项/)).not.toBeNull();
   });
 });

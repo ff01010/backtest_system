@@ -614,6 +614,25 @@ describe('ExperimentPage', () => {
     expect(screen.getByText('配置已变化，之前的预览令牌已失效。')).not.toBeNull();
   });
 
+  it('shows localized labels for built-in execution and resource values', async () => {
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={SUBJECT_REF}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+    await screen.findByRole('heading', { name: '均值回归' });
+
+    expect(screen.getByText('立即成交')).not.toBeNull();
+    expect(screen.queryByText('immediate')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '生成预览' }));
+
+    expect(await screen.findByText('轻量')).not.toBeNull();
+    expect(screen.queryByText('light')).toBeNull();
+  });
+
   it('discards an in-flight preview response after the draft changes', async () => {
     let resolvePreview: (preview: ExperimentPreview) => void = () => {};
     vi.mocked(previewExperiment).mockReturnValue(new Promise((resolve) => {
@@ -714,7 +733,7 @@ describe('ExperimentPage', () => {
     expect(within(parameters).getByText('threshold')).not.toBeNull();
     expect(within(parameters).getByText('0.5')).not.toBeNull();
     expect(within(parameters).getByText('基础成本')).not.toBeNull();
-    expect(within(parameters).getByText('立即成交')).not.toBeNull();
+    expect(within(parameters).getByText('立即成交（默认）')).not.toBeNull();
     expect(container.querySelector('.experiment-detail-kpis')).not.toBeNull();
     expect(container.querySelector('.experiment-detail-workspace')).not.toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '查看单次结果' }));

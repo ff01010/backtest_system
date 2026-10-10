@@ -6,7 +6,7 @@ import {
 } from './comparisonData';
 import type { ComparisonCandidate, ComparisonMetric, ScenarioName, ScenarioValue } from './comparisonData';
 import { scenariosFor } from './comparisonData';
-import { dateRoleLabel } from './displayLabels';
+import { dateRoleLabel, dimensionDisplayLabel } from './displayLabels';
 import ParameterComparisonChart from './ParameterComparisonChart';
 import './comparison.css';
 
@@ -72,8 +72,11 @@ function MetricComparison({ metric, catalogs, labels, names = [], onOpenRun }: O
   const [selectedAxis, setSelectedAxis] = useState('');
   const [selectedParameters, setSelectedParameters] = useState('');
   const definitions = new Map(catalogs.dimensionCatalog.dimensions.map((item) => [item.dimensionId, item]));
-  const labelFor = (id: string) => labels.get(id) ?? DIMENSION_LABELS[id] ?? id.replace('parameter.strategyParameters.', '');
-  const format = (id: string, value: unknown) => dimensionValue(value, definitions.get(id));
+  const labelFor = (id: string) => dimensionDisplayLabel(
+    id,
+    labels.get(id) ?? DIMENSION_LABELS[id] ?? id.replace('parameter.strategyParameters.', ''),
+  );
+  const format = (id: string, value: unknown) => dimensionValue(value, definitions.get(id), names);
   const describe = (values: Record<string, unknown>) => Object.entries(values)
     .map(([id, value]) => `${labelFor(id)} ${format(id, value)}`).join(' · ');
   const knownIds = dimensionIds(metric.candidates);
