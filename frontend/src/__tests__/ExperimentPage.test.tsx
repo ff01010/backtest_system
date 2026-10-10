@@ -860,6 +860,14 @@ describe('ExperimentPage', () => {
     expect(within(drawer).queryByText('查看信号图表')).toBeNull();
     expect(onOpenRun).not.toHaveBeenCalled();
     expect(fetchExperimentBacktestRuns).toHaveBeenCalledWith('experiment-1', undefined, '');
+    const runSearch = within(drawer).getByRole('textbox', { name: '筛选回测任务编号' });
+    expect(runSearch.getAttribute('placeholder')).toBe('输入回测任务编号，例如 187');
+    fireEvent.change(runSearch, { target: { value: '#193' } });
+    expect((runSearch as HTMLInputElement).value).toBe('193');
+    fireEvent.click(within(drawer).getByRole('button', { name: '筛选' }));
+    await waitFor(() => {
+      expect(fetchExperimentBacktestRuns).toHaveBeenCalledWith('experiment-1', undefined, '193');
+    });
     expect(fetchExperimentDetail).toHaveBeenCalledTimes(1);
     expect(fetchExperimentTrials).toHaveBeenCalledWith('experiment-1');
     expect(screen.getByText('执行 #1')).not.toBeNull();

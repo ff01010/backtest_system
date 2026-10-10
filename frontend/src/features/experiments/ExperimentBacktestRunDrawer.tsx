@@ -154,9 +154,10 @@ export default function ExperimentBacktestRunDrawer({
           <input
             aria-label="筛选回测任务编号"
             inputMode="numeric"
-            placeholder="输入回测任务编号，例如 #187"
+            pattern="[0-9]*"
+            placeholder="输入回测任务编号，例如 187"
             value={searchInput}
-            onChange={(event) => setSearchInput(event.target.value)}
+            onChange={(event) => setSearchInput(event.target.value.replace(/\D/g, ''))}
           />
           <button className="app-button is-quiet" type="submit">筛选</button>
         </form>
