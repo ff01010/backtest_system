@@ -2010,6 +2010,21 @@ def experiment_trials(
     _raise_experiment_error(error)
 
 
+@app.get("/api/backtest/experiments/{experiment_id}/backtest-runs")
+def experiment_backtest_runs(
+  experiment_id: UUID,
+  limit: int = Query(50, ge=1, le=200),
+  cursor: str | None = Query(default=None, max_length=2048),
+  query: str = Query(default="", max_length=32),
+) -> dict[str, Any]:
+  try:
+    return _experiment_application.list_related_runs(
+      str(experiment_id), limit=limit, cursor=cursor, query=query,
+    )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
 @app.get("/api/backtest/experiments/{experiment_id}/evaluation-catalogs")
 def experiment_evaluation_catalogs(experiment_id: UUID) -> dict[str, Any]:
   try:

@@ -567,6 +567,37 @@ def test_revision_routes_forward_optimistic_identity_and_history_filter(
   assert trials == {"items": [], "nextCursor": None}
 
 
+def test_related_backtest_run_route_forwards_experiment_scope(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  experiment_id = UUID("10000000-0000-4000-8000-000000000001")
+
+  class FakeApplication:
+    def list_related_runs(
+      self,
+      forwarded_experiment_id: str,
+      **values: Any,
+    ) -> dict[str, Any]:
+      assert forwarded_experiment_id == str(experiment_id)
+      assert values == {"limit": 20, "cursor": "next", "query": "#187"}
+      return {
+        "totalCount": 2,
+        "initialCount": 1,
+        "retryCount": 1,
+        "items": [],
+        "nextCursor": None,
+      }
+
+  monkeypatch.setattr(app_module, "_experiment_application", FakeApplication())
+
+  response = app_module.experiment_backtest_runs(
+    experiment_id, limit=20, cursor="next", query="#187",
+  )
+
+  assert response["totalCount"] == 2
+  assert response["retryCount"] == 1
+
+
 def test_retry_routes_forward_frozen_selection_and_idempotency(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:

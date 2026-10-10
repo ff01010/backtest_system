@@ -7,6 +7,7 @@ import {
   cancelExperiment,
   createExperiment,
   fetchAdminArchivedExperiments,
+  fetchExperimentBacktestRuns,
   fetchExperimentDetail,
   fetchExperimentRevisions,
   fetchExperiments,
@@ -40,6 +41,7 @@ vi.mock('../features/experiments/api', () => ({
   cancelExperiment: vi.fn(),
   createExperiment: vi.fn(),
   fetchAdminArchivedExperiments: vi.fn(),
+  fetchExperimentBacktestRuns: vi.fn(),
   fetchExperimentDetail: vi.fn(),
   fetchExperimentRevisions: vi.fn(),
   fetchExperiments: vi.fn(),
@@ -161,6 +163,11 @@ const DETAIL: ExperimentDetail = {
   source: null,
   status: 'queued',
   snapshotVersion: 2,
+  relatedBacktestRuns: {
+    totalCount: 2,
+    initialCount: 1,
+    retryCount: 1,
+  },
   revision: { revisionId: 'revision-1', revisionNo: 1, specHash: PREVIEW.specHash },
   stage: {
     stageId: 'stage-1',
@@ -339,6 +346,43 @@ beforeEach(() => {
   vi.mocked(fetchExperiments).mockReset().mockResolvedValue({ items: [], nextCursor: null });
   vi.mocked(fetchAdminArchivedExperiments).mockReset().mockResolvedValue({
     items: [], nextCursor: null,
+  });
+  vi.mocked(fetchExperimentBacktestRuns).mockReset().mockResolvedValue({
+    totalCount: 2,
+    initialCount: 1,
+    retryCount: 1,
+    items: [{
+      revisionId: 'revision-1',
+      revisionNo: 1,
+      currentRevision: true,
+      stageId: 'stage-1',
+      stageIndex: 0,
+      trialId: 'trial-1',
+      trialIndex: 0,
+      executionId: 'execution-1',
+      executionNo: 1,
+      createdReason: 'initial',
+      selected: false,
+      runId: 'run-1',
+      displayNo: 187,
+      status: 'failed',
+    }, {
+      revisionId: 'revision-1',
+      revisionNo: 1,
+      currentRevision: true,
+      stageId: 'stage-1',
+      stageIndex: 0,
+      trialId: 'trial-1',
+      trialIndex: 0,
+      executionId: 'execution-2',
+      executionNo: 2,
+      createdReason: 'manual_retry',
+      selected: true,
+      runId: 'run-2',
+      displayNo: 193,
+      status: 'succeeded',
+    }],
+    nextCursor: null,
   });
   vi.mocked(fetchExperimentTrials).mockReset().mockResolvedValue({
     items: [TRIAL],
@@ -702,7 +746,7 @@ describe('ExperimentPage', () => {
     expect(onExperimentChange).toHaveBeenCalledWith('experiment-1');
   });
 
-  it('shows aggregate progress and drills down through the selected ordinary run', async () => {
+  it('shows execution progress and the experiment-wide backtest task index', async () => {
     const onOpenRun = vi.fn();
     const { container } = render(
       <ExperimentPage
@@ -734,10 +778,21 @@ describe('ExperimentPage', () => {
     expect(within(parameters).getByText('0.5')).not.toBeNull();
     expect(within(parameters).getByText('基础成本')).not.toBeNull();
     expect(within(parameters).getByText('立即成交（默认）')).not.toBeNull();
-    expect(container.querySelector('.experiment-detail-kpis')).not.toBeNull();
+    const kpis = container.querySelector('.experiment-detail-kpis') as HTMLElement;
+    expect(kpis).not.toBeNull();
+    expect(within(kpis).getByText('取消')).not.toBeNull();
+    expect(within(kpis).queryByText('日期场景')).toBeNull();
     expect(container.querySelector('.experiment-detail-workspace')).not.toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '查看单次结果' }));
-    expect(onOpenRun).toHaveBeenCalledWith('run-1', '688981.SH', '5m', '20260701');
+    expect(screen.queryByRole('button', { name: '查看单次结果' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /关联回测任务/ }));
+    const drawer = await screen.findByRole('dialog', { name: '关联回测任务' });
+    expect(within(drawer).getByText('#187')).not.toBeNull();
+    expect(within(drawer).getByText('#193')).not.toBeNull();
+    expect(within(drawer).getByText('人工重试')).not.toBeNull();
+    expect(within(drawer).getByText('选定结果')).not.toBeNull();
+    expect(within(drawer).queryByText('查看信号图表')).toBeNull();
+    expect(onOpenRun).not.toHaveBeenCalled();
+    expect(fetchExperimentBacktestRuns).toHaveBeenCalledWith('experiment-1', undefined, '');
     expect(fetchExperimentDetail).toHaveBeenCalledTimes(1);
     expect(fetchExperimentTrials).toHaveBeenCalledWith('experiment-1');
     expect(screen.getByText('执行 #1')).not.toBeNull();

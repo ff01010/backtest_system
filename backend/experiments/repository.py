@@ -225,6 +225,16 @@ class ExperimentRepository(PreviewRepository, Protocol):
   ) -> dict[str, Any]:
     """游标分页读取当前实验 Trial。"""
 
+  def list_related_runs(
+    self,
+    experiment_id: str,
+    *,
+    limit: int,
+    cursor: str | None,
+    query: str,
+  ) -> dict[str, Any]:
+    """分页读取整个实验产生的普通回测任务。"""
+
 
 class PostgresExperimentRepository:
   def save_preview(self, preview: dict[str, Any]) -> None:
@@ -366,6 +376,9 @@ class PostgresExperimentRepository:
             e.status, e.blocked_reason_code, e.blocked_reason_message,
             e.archived_at, e.archive_retention_until, e.purge_job_id,
             e.row_version, e.created_at, e.updated_at,
+            related_runs.total_count AS related_run_count,
+            related_runs.initial_count AS related_initial_run_count,
+            related_runs.retry_count AS related_retry_run_count,
             source_e.id AS source_experiment_id,
             source_e.name AS source_experiment_name,
             source_r.id AS source_revision_id,
@@ -388,6 +401,19 @@ class PostgresExperimentRepository:
             ON source_r.id=e.source_revision_id
           LEFT JOIN backtest_experiment source_e
             ON source_e.id=source_r.experiment_id
+          LEFT JOIN LATERAL (
+            SELECT count(*) AS total_count,
+              count(*) FILTER (WHERE execution.created_reason='initial') AS initial_count,
+              count(*) FILTER (WHERE execution.created_reason<>'initial') AS retry_count
+            FROM backtest_experiment_revision related_revision
+            JOIN backtest_experiment_stage related_stage
+              ON related_stage.revision_id=related_revision.id
+            JOIN backtest_experiment_trial related_trial
+              ON related_trial.stage_id=related_stage.id
+            JOIN backtest_experiment_trial_execution execution
+              ON execution.trial_id=related_trial.id
+            WHERE related_revision.experiment_id=e.id
+          ) related_runs ON true
           WHERE e.id=%s AND e.owner_user_id=%s
         """, (experiment_id, owner_id))
         row = cur.fetchone()
@@ -647,6 +673,92 @@ class PostgresExperimentRepository:
         "trialIndex": int(page[-1]["trial_index"]),
       })
     return {"items": [_trial_list_item(row) for row in page], "nextCursor": next_cursor}
+
+  def list_related_runs(
+    self,
+    experiment_id: str,
+    *,
+    limit: int,
+    cursor: str | None,
+    query: str,
+  ) -> dict[str, Any]:
+    owner_id = state_store.current_user_id()
+    normalized_query = query.strip().removeprefix("#").strip()
+    display_no = int(normalized_query) if normalized_query.isdigit() else None
+    bindings = {"experimentId": experiment_id, "query": normalized_query}
+    after = (
+      _decode_cursor(cursor, "experiment-related-run-list", owner_id, bindings)
+      if cursor else None
+    )
+    filters = ["e.id=%s", "e.owner_user_id=%s"]
+    params: list[Any] = [experiment_id, owner_id]
+    if normalized_query:
+      filters.append("run.display_no=%s" if display_no is not None else "false")
+      if display_no is not None:
+        params.append(display_no)
+    if after:
+      filters.append("""
+        (revision.revision_no < %s OR (
+          revision.revision_no=%s AND (
+            stage.stage_index > %s OR (
+              stage.stage_index=%s AND (
+                trial.trial_index > %s OR (
+                  trial.trial_index=%s AND execution.execution_no > %s
+                )
+              )
+            )
+          )
+        ))
+      """)
+      params.extend([
+        after["revisionNo"], after["revisionNo"], after["stageIndex"],
+        after["stageIndex"], after["trialIndex"], after["trialIndex"],
+        after["executionNo"],
+      ])
+    params.append(limit + 1)
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        _require_owned_experiment(cur, experiment_id, owner_id)
+        summary = _load_related_run_summary(cur, experiment_id, owner_id)
+        cur.execute(f"""
+          SELECT revision.id AS revision_id, revision.revision_no,
+            revision.id=e.current_revision_id AS current_revision,
+            stage.id AS stage_id, stage.stage_index,
+            trial.id AS trial_id, trial.trial_index,
+            execution.id AS execution_id, execution.execution_no,
+            execution.created_reason,
+            execution.id=trial.selected_execution_id AS selected,
+            run.id AS run_id, run.display_no, run.status
+          FROM backtest_experiment e
+          JOIN backtest_experiment_revision revision ON revision.experiment_id=e.id
+          JOIN backtest_experiment_stage stage ON stage.revision_id=revision.id
+          JOIN backtest_experiment_trial trial ON trial.stage_id=stage.id
+          JOIN backtest_experiment_trial_execution execution
+            ON execution.trial_id=trial.id
+          JOIN backtest_run run ON run.id=execution.run_id
+          WHERE {' AND '.join(filters)}
+          ORDER BY revision.revision_no DESC, stage.stage_index,
+            trial.trial_index, execution.execution_no
+          LIMIT %s
+        """, params)
+        rows = [dict(row) for row in cur.fetchall()]
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit:
+      last = page[-1]
+      next_cursor = _encode_cursor(
+        "experiment-related-run-list", owner_id, bindings, {
+          "revisionNo": int(last["revision_no"]),
+          "stageIndex": int(last["stage_index"]),
+          "trialIndex": int(last["trial_index"]),
+          "executionNo": int(last["execution_no"]),
+        },
+      )
+    return {
+      **summary,
+      "items": [_related_run_list_item(row) for row in page],
+      "nextCursor": next_cursor,
+    }
 
   def preview_retry_selection(
     self,
@@ -2413,6 +2525,50 @@ def _trial_list_item(row: dict[str, Any]) -> dict[str, Any]:
   }
 
 
+def _load_related_run_summary(
+  cur: Any,
+  experiment_id: str,
+  owner_id: str,
+) -> dict[str, int]:
+  cur.execute("""
+    SELECT count(*) AS total_count,
+      count(*) FILTER (WHERE execution.created_reason='initial') AS initial_count,
+      count(*) FILTER (WHERE execution.created_reason<>'initial') AS retry_count
+    FROM backtest_experiment experiment
+    JOIN backtest_experiment_revision revision
+      ON revision.experiment_id=experiment.id
+    JOIN backtest_experiment_stage stage ON stage.revision_id=revision.id
+    JOIN backtest_experiment_trial trial ON trial.stage_id=stage.id
+    JOIN backtest_experiment_trial_execution execution ON execution.trial_id=trial.id
+    WHERE experiment.id=%s AND experiment.owner_user_id=%s
+  """, (experiment_id, owner_id))
+  row = cur.fetchone() or {}
+  return {
+    "totalCount": int(row.get("total_count") or 0),
+    "initialCount": int(row.get("initial_count") or 0),
+    "retryCount": int(row.get("retry_count") or 0),
+  }
+
+
+def _related_run_list_item(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "revisionId": str(row["revision_id"]),
+    "revisionNo": int(row["revision_no"]),
+    "currentRevision": bool(row["current_revision"]),
+    "stageId": str(row["stage_id"]),
+    "stageIndex": int(row["stage_index"]),
+    "trialId": str(row["trial_id"]),
+    "trialIndex": int(row["trial_index"]),
+    "executionId": str(row["execution_id"]),
+    "executionNo": int(row["execution_no"]),
+    "createdReason": str(row["created_reason"]),
+    "selected": bool(row["selected"]),
+    "runId": str(row["run_id"]),
+    "displayNo": int(row["display_no"]),
+    "status": str(row["status"]),
+  }
+
+
 def _require_owned_experiment(cur: Any, experiment_id: str, owner_id: str) -> None:
   cur.execute(
     "SELECT 1 FROM backtest_experiment WHERE id=%s AND owner_user_id=%s",
@@ -3300,6 +3456,11 @@ def _detail_response(row: dict[str, Any]) -> dict[str, Any]:
     "source": _experiment_source_response(row),
     "status": row["status"],
     "snapshotVersion": int(row["row_version"]),
+    "relatedBacktestRuns": {
+      "totalCount": int(row.get("related_run_count") or 0),
+      "initialCount": int(row.get("related_initial_run_count") or 0),
+      "retryCount": int(row.get("related_retry_run_count") or 0),
+    },
     "archivedAt": row["archived_at"].isoformat() if row.get("archived_at") else None,
     "retentionUntil": (
       row["archive_retention_until"].isoformat()

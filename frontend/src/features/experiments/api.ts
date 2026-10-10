@@ -6,6 +6,7 @@ import type {
   ExperimentCreateRequest,
   ExperimentCreateResponse,
   ExperimentCreateResult,
+  ExperimentBacktestRunPage,
   ExperimentDetail,
   ExperimentListItem,
   ExperimentLifecycleResult,
@@ -139,6 +140,20 @@ export function fetchExperimentTrials(
   const suffix = query.size ? `?${query.toString()}` : '';
   return fetchJson(
     `/api/backtest/experiments/${encodeURIComponent(experimentId)}/trials${suffix}`,
+  );
+}
+
+export function fetchExperimentBacktestRuns(
+  experimentId: string,
+  cursor?: string,
+  query = '',
+): Promise<ExperimentBacktestRunPage> {
+  const search = new URLSearchParams();
+  if (cursor) search.set('cursor', cursor);
+  if (query.trim()) search.set('query', query.trim());
+  const suffix = search.size ? `?${search.toString()}` : '';
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/backtest-runs${suffix}`,
   );
 }
 

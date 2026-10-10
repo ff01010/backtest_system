@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Archive,
   Ban,
+  ChevronRight,
   Copy,
   FlaskConical,
   LockKeyhole,
@@ -58,6 +59,7 @@ import {
   saveExperimentDraft,
 } from './draftStore';
 import EvaluationBuilder from './EvaluationBuilder';
+import ExperimentBacktestRunDrawer from './ExperimentBacktestRunDrawer';
 import { frozenScenarioNames } from './comparisonData';
 import {
   dateRoleLabel,
@@ -644,6 +646,7 @@ function ExperimentDetailView({
   const [retrying, setRetrying] = useState(false);
   const [lifecycleAction, setLifecycleAction] = useState<'' | 'archive' | 'restore' | 'purge'>('');
   const [lifecycleMessage, setLifecycleMessage] = useState('');
+  const [relatedRunsOpen, setRelatedRunsOpen] = useState(false);
   const cancelInFlight = useRef(false);
   const resumeInFlight = useRef(false);
   const retryInFlight = useRef(false);
@@ -988,7 +991,7 @@ function ExperimentDetailView({
         </div>
         <div><span>成功</span><strong>{detail.stage.succeededTrialCount}</strong></div>
         <div><span>失败</span><strong>{detail.stage.failedTrialCount}</strong></div>
-        <div><span>日期场景</span><strong>{detail.frozenDefinition.datasetSnapshots.length}</strong></div>
+        <div><span>取消</span><strong>{detail.stage.cancelledTrialCount}</strong></div>
       </section>
       <div className="experiment-detail-workspace">
         <div className="experiment-detail-main">
@@ -1051,20 +1054,6 @@ function ExperimentDetailView({
                     {dateRoleLabel(dateScenario?.role)} · {String(dateScenario?.startDate ?? '—')} 至 {String(dateScenario?.endDate ?? '—')}
                   </small>
                 </span>
-                {trial.runId ? (
-                  <button
-                    className="app-button is-quiet"
-                    type="button"
-                    onClick={() => onOpenRun?.(
-                      trial.runId!,
-                      String(fixed.symbol ?? ''),
-                      String(fixed.timeframe ?? '5m'),
-                      String(dateScenario?.startDate ?? '').replace(/-/g, ''),
-                    )}
-                  >
-                    查看单次结果
-                  </button>
-                ) : <span>尚未物化</span>}
                 {parameterEntries.length > 0 && (
                   <details className="experiment-trial-parameters">
                     <summary>查看参数</summary>
@@ -1184,6 +1173,22 @@ function ExperimentDetailView({
               </div>
             )}
           </section>
+          <button
+            className="experiment-related-runs-card"
+            type="button"
+            disabled={detail.relatedBacktestRuns.totalCount === 0}
+            onClick={() => setRelatedRunsOpen(true)}
+          >
+            <span>
+              <strong>关联回测任务</strong>
+              <b>{detail.relatedBacktestRuns.totalCount} 个</b>
+              <ChevronRight size={16} />
+            </span>
+            <small>
+              首次执行 {detail.relatedBacktestRuns.initialCount}
+              {' · '}重试 {detail.relatedBacktestRuns.retryCount}
+            </small>
+          </button>
           <section className="experiment-preview-card experiment-technical-card">
             <details className="experiment-technical-details">
               <summary>技术信息与编号</summary>
@@ -1217,6 +1222,12 @@ function ExperimentDetailView({
           </button>
         </section>
       )}
+      <ExperimentBacktestRunDrawer
+        experimentId={experimentId}
+        open={relatedRunsOpen}
+        summary={detail.relatedBacktestRuns}
+        onClose={() => setRelatedRunsOpen(false)}
+      />
     </main>
   );
 }

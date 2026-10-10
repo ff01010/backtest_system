@@ -318,6 +318,11 @@ export type ExperimentDetail = {
   source: ExperimentSourceSummary | null;
   status: ExperimentStatus;
   snapshotVersion: number;
+  relatedBacktestRuns: {
+    totalCount: number;
+    initialCount: number;
+    retryCount: number;
+  };
   revision: {
     revisionId: string;
     revisionNo: number;
@@ -371,6 +376,31 @@ export type ExperimentDetail = {
   purgeJobId: string | null;
   createdAt: string;
   updatedAt: string;
+};
+
+export type ExperimentBacktestRun = {
+  revisionId: string;
+  revisionNo: number;
+  currentRevision: boolean;
+  stageId: string;
+  stageIndex: number;
+  trialId: string;
+  trialIndex: number;
+  executionId: string;
+  executionNo: number;
+  createdReason: 'initial' | 'automatic_retry' | 'manual_retry';
+  selected: boolean;
+  runId: string;
+  displayNo: number;
+  status: string;
+};
+
+export type ExperimentBacktestRunPage = {
+  totalCount: number;
+  initialCount: number;
+  retryCount: number;
+  items: ExperimentBacktestRun[];
+  nextCursor: string | null;
 };
 
 export type ExperimentSourceSummary = {

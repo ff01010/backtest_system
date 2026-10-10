@@ -207,6 +207,21 @@ class ExperimentApplication:
       revision_id=revision_id,
     )
 
+  def list_related_runs(
+    self,
+    experiment_id: str,
+    *,
+    limit: int,
+    cursor: str | None,
+    query: str,
+  ) -> dict[str, Any]:
+    return self._experiment_repository().list_related_runs(
+      experiment_id,
+      limit=limit,
+      cursor=cursor,
+      query=query,
+    )
+
   def preview_retry(
     self,
     experiment_id: str,

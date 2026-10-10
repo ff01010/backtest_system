@@ -1535,6 +1535,31 @@ def test_manual_retry_freezes_selection_and_competing_requests_create_one_execut
   assert [item["executionNo"] for item in attempts] == [1, 2]
   assert [item["createdReason"] for item in attempts] == ["initial", "manual_retry"]
   assert _experiment_run_seeds(experiment_id)[0] == _experiment_run_seeds(experiment_id)[1]
+  related = _as_user(
+    OWNER,
+    lambda: execution_application.list_related_runs(
+      experiment_id, limit=10, cursor=None, query="",
+    ),
+  )
+  assert related["totalCount"] == 2
+  assert related["initialCount"] == 1
+  assert related["retryCount"] == 1
+  assert [item["executionNo"] for item in related["items"]] == [1, 2]
+  assert all(item["displayNo"] > 0 for item in related["items"])
+  selected_display_no = related["items"][0]["displayNo"]
+  filtered = _as_user(
+    OWNER,
+    lambda: execution_application.list_related_runs(
+      experiment_id, limit=10, cursor=None, query=f"#{selected_display_no}",
+    ),
+  )
+  assert [item["displayNo"] for item in filtered["items"]] == [selected_display_no]
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert detail["relatedBacktestRuns"] == {
+    "totalCount": 2,
+    "initialCount": 1,
+    "retryCount": 1,
+  }
 
 
 def test_new_revision_requires_terminal_current_and_preserves_history(
