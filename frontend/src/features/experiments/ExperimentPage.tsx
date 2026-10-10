@@ -866,6 +866,11 @@ function ExperimentDetailView({
   const progress = detail.stage.plannedTrialCount > 0
     ? Math.round((detail.stage.generatedTrialCount / detail.stage.plannedTrialCount) * 100)
     : 0;
+  const relatedBacktestRuns = detail.relatedBacktestRuns ?? {
+    totalCount: 0,
+    initialCount: 0,
+    retryCount: 0,
+  };
   const fixed = detail.frozenDefinition.fixedStructure;
   const viewingCurrentRevision = !viewRevisionId
     || viewRevisionId === detail.revision.revisionId;
@@ -1176,17 +1181,17 @@ function ExperimentDetailView({
           <button
             className="experiment-related-runs-card"
             type="button"
-            disabled={detail.relatedBacktestRuns.totalCount === 0}
+            disabled={relatedBacktestRuns.totalCount === 0}
             onClick={() => setRelatedRunsOpen(true)}
           >
             <span>
               <strong>关联回测任务</strong>
-              <b>{detail.relatedBacktestRuns.totalCount} 个</b>
+              <b>{relatedBacktestRuns.totalCount} 个</b>
               <ChevronRight size={16} />
             </span>
             <small>
-              首次执行 {detail.relatedBacktestRuns.initialCount}
-              {' · '}重试 {detail.relatedBacktestRuns.retryCount}
+              首次执行 {relatedBacktestRuns.initialCount}
+              {' · '}重试 {relatedBacktestRuns.retryCount}
             </small>
           </button>
           <section className="experiment-preview-card experiment-technical-card">
@@ -1225,7 +1230,7 @@ function ExperimentDetailView({
       <ExperimentBacktestRunDrawer
         experimentId={experimentId}
         open={relatedRunsOpen}
-        summary={detail.relatedBacktestRuns}
+        summary={relatedBacktestRuns}
         onClose={() => setRelatedRunsOpen(false)}
       />
     </main>

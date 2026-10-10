@@ -318,7 +318,7 @@ export type ExperimentDetail = {
   source: ExperimentSourceSummary | null;
   status: ExperimentStatus;
   snapshotVersion: number;
-  relatedBacktestRuns: {
+  relatedBacktestRuns?: {
     totalCount: number;
     initialCount: number;
     retryCount: number;

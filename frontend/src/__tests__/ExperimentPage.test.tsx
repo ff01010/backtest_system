@@ -798,6 +798,29 @@ describe('ExperimentPage', () => {
     expect(screen.getByText('执行 #1')).not.toBeNull();
   });
 
+  it('兼容缺少关联回测任务摘要的实验详情', async () => {
+    vi.mocked(fetchExperimentDetail).mockResolvedValue({
+      ...DETAIL,
+      relatedBacktestRuns: undefined,
+    } as unknown as ExperimentDetail);
+
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    await screen.findByText('2 / 2');
+    const relatedRunsButton = screen.getByRole('button', { name: /关联回测任务/ });
+    expect((relatedRunsButton as HTMLButtonElement).disabled).toBe(true);
+    expect(relatedRunsButton.textContent).toContain('0 个');
+  });
+
   it('freezes and confirms failed Trial selection before one manual retry', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     const failedTrial: ExperimentTrial = {
