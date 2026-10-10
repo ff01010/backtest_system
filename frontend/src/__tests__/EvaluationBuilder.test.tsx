@@ -282,6 +282,10 @@ describe('EvaluationBuilder', () => {
 
     await selectFirstReport();
     expect(await screen.findByText('完整评价')).not.toBeNull();
+    expect(screen.getByText('报告列表')).not.toBeNull();
+    expect(screen.getByText('共 1 份')).not.toBeNull();
+    expect(screen.getByText('当前报告')).not.toBeNull();
+    expect(document.querySelectorAll('.evaluation-report-timestamps time')).toHaveLength(2);
     expect(screen.queryByText(/冻结的展示与分组标签/)).toBeNull();
     expect((screen.getByRole('combobox', { name: '选择评价报告' }) as HTMLSelectElement).value).toBe(DETAIL.evaluationRunId);
     expect(((await screen.findByText('技术标识与冻结摘要')).closest('details') as HTMLDetailsElement).open).toBe(false);

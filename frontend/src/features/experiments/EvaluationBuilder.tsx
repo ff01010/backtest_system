@@ -745,9 +745,12 @@ function EvaluationResult({
     <div className="evaluation-result">
       <div className="evaluation-report-identity">
         <div>
-          <span>评价报告</span>
+          <span>当前报告</span>
           <strong>{detail.specName ?? detail.spec.name} · 规则 v{detail.specVersionNo ?? '—'}</strong>
-          <small>创建 {formatDateTime(detail.createdAt)} · 完成 {formatDateTime(detail.finishedAt)}</small>
+          <small className="evaluation-report-timestamps">
+            <span>创建 <time dateTime={detail.createdAt}>{formatDateTime(detail.createdAt)}</time></span>
+            <span>完成 <time dateTime={detail.finishedAt ?? undefined}>{formatDateTime(detail.finishedAt)}</time></span>
+          </small>
         </div>
         <div>
           <span>{detail.output.sort.length > 0 ? '排序首行' : '首行记录'}</span>
@@ -1142,8 +1145,8 @@ export default function EvaluationBuilder({
       {notice && <div className="experiment-alert" role="status">{notice}</div>}
       <section className="evaluation-report-browser" aria-label="评价报告选择">
         <div>
-          <span>评价报告</span>
-          <strong>{runs.length > 0 ? `${runs.length} 份已保存报告` : '尚未生成报告'}</strong>
+          <span>报告列表</span>
+          <strong>{runs.length > 0 ? `共 ${runs.length} 份` : '尚未生成报告'}</strong>
         </div>
         {runs.length > 0 && <label><span>打开报告</span><select aria-label="选择评价报告" value={selectedRun?.evaluationRunId ?? ''} onChange={(event) => { if (event.target.value) void loadRun(event.target.value); else setSelectedRun(null); }}><option value="">请选择一份报告</option>{runs.map((run, index) => <option value={run.evaluationRunId} key={run.evaluationRunId}>报告 #{runs.length - index} · {run.specName ?? '评价'} v{run.specVersionNo ?? '—'} · {statusLabel(run.status)} · {formatDateTime(run.finishedAt)}</option>)}</select></label>}
         {selectedRun?.status === 'failed' && <button className="app-button is-quiet" type="button" disabled={busy} onClick={() => { void retryRun(selectedRun.evaluationRunId); }}><RotateCcw size={14} /> 重试当前报告</button>}

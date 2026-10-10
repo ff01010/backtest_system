@@ -26,4 +26,10 @@ describe('automation experiment typography', () => {
     expect(comparisonCss).not.toContain('var(--text-subtle)');
     expect(comparisonCss).not.toContain('var(--text-secondary)');
   });
+
+  it('keeps report identity cards balanced and timestamp units intact', () => {
+    expect(experimentCss).toMatch(/\.evaluation-report-identity\s*{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
+    expect(experimentCss).toMatch(/\.evaluation-report-timestamps\s*{[^}]*flex-wrap:\s*wrap/s);
+    expect(experimentCss).toMatch(/\.evaluation-report-timestamps\s*>\s*span\s*{[^}]*white-space:\s*nowrap/s);
+  });
 });
