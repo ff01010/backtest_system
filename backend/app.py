@@ -2000,6 +2000,10 @@ def experiment_trials(
   limit: int = Query(50, ge=1, le=200),
   cursor: str | None = Query(default=None, max_length=2048),
   revision_id: UUID | None = Query(default=None, alias="revisionId"),
+  query: str = Query(default="", max_length=32),
+  date_scenario_id: str | None = Query(
+    default=None, alias="dateScenarioId", max_length=128,
+  ),
   status: Literal[
     "pending", "queued", "running", "cancelling", "succeeded", "failed", "cancelled"
   ] | None = Query(default=None),
@@ -2011,6 +2015,8 @@ def experiment_trials(
       cursor=cursor,
       status=status,
       revision_id=str(revision_id) if revision_id else None,
+      query=query,
+      date_scenario_id=date_scenario_id,
     )
   except ExperimentError as error:
     _raise_experiment_error(error)
@@ -3112,6 +3118,10 @@ def public_experiment_trials(
   limit: int = Query(50, ge=1, le=200),
   cursor: str | None = Query(default=None, max_length=2048),
   revision_id: UUID | None = Query(default=None, alias="revisionId"),
+  query: str = Query(default="", max_length=32),
+  date_scenario_id: str | None = Query(
+    default=None, alias="dateScenarioId", max_length=128,
+  ),
   status: Literal[
     "pending", "queued", "running", "cancelling", "succeeded", "failed", "cancelled"
   ] | None = Query(default=None),
@@ -3124,6 +3134,8 @@ def public_experiment_trials(
       cursor=cursor,
       status=status,
       revision_id=str(revision_id) if revision_id else None,
+      query=query,
+      date_scenario_id=date_scenario_id,
     )
   except ExperimentError as error:
     _raise_experiment_error(error)

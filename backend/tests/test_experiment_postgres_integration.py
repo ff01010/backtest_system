@@ -934,6 +934,25 @@ def test_complete_standard_bar_execution_reconciles_once_and_keeps_window_bounde
   assert page["items"][0]["runId"] == run_id
   assert page["items"][0]["selectedExecution"]["resultHash"]
   assert page["items"][0]["selectedExecution"]["actualDataHash"] == "d" * 64
+  filtered = _as_user(
+    OWNER,
+    lambda: execution_application.list_trials(
+      experiment_id,
+      limit=20,
+      cursor=None,
+      status="succeeded",
+      query="1",
+      date_scenario_id="development-1",
+    ),
+  )
+  missing = _as_user(
+    OWNER,
+    lambda: execution_application.list_trials(
+      experiment_id, limit=20, cursor=None, status=None, query="2",
+    ),
+  )
+  assert [item["trialIndex"] for item in filtered["items"]] == [0]
+  assert missing["items"] == []
 
 
 def test_archive_hides_and_restore_preserves_the_complete_graph(

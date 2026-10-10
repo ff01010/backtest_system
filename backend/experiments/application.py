@@ -227,6 +227,8 @@ class ExperimentApplication:
     cursor: str | None,
     status: str | None,
     revision_id: str | None = None,
+    query: str = "",
+    date_scenario_id: str | None = None,
   ) -> dict[str, Any]:
     return self._experiment_repository().list_trials(
       experiment_id,
@@ -234,6 +236,8 @@ class ExperimentApplication:
       cursor=cursor,
       status=status,
       revision_id=revision_id,
+      query=query,
+      date_scenario_id=date_scenario_id,
     )
 
   def list_related_runs(

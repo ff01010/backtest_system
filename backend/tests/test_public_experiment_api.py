@@ -169,6 +169,14 @@ def test_public_experiment_preview_and_read_routes(
     "query": "",
     "status": None,
   }) in application.calls
+  assert ("trials", EXPERIMENT_ID, {
+    "limit": 50,
+    "cursor": None,
+    "status": None,
+    "revision_id": None,
+    "query": "",
+    "date_scenario_id": None,
+  }) in application.calls
 
 
 def test_public_experiment_write_routes_namespace_idempotency_and_audit(

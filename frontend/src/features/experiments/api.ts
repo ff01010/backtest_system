@@ -141,11 +141,21 @@ export function fetchExperimentRevisions(
 export function fetchExperimentTrials(
   experimentId: string,
   cursor?: string,
-  revisionId?: string,
+  filters: {
+    revisionId?: string;
+    status?: ExperimentTrial['summaryStatus'] | '';
+    dateScenarioId?: string;
+    query?: string;
+    limit?: number;
+  } = {},
 ): Promise<{ items: ExperimentTrial[]; nextCursor: string | null }> {
   const query = new URLSearchParams();
   if (cursor) query.set('cursor', cursor);
-  if (revisionId) query.set('revisionId', revisionId);
+  if (filters.revisionId) query.set('revisionId', filters.revisionId);
+  if (filters.status) query.set('status', filters.status);
+  if (filters.dateScenarioId) query.set('dateScenarioId', filters.dateScenarioId);
+  if (filters.query?.trim()) query.set('query', filters.query.trim());
+  query.set('limit', String(filters.limit ?? 20));
   const suffix = query.size ? `?${query.toString()}` : '';
   return fetchJson(
     `/api/backtest/experiments/${encodeURIComponent(experimentId)}/trials${suffix}`,

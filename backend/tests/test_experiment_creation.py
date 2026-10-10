@@ -572,7 +572,14 @@ def test_revision_routes_forward_optimistic_identity_and_history_filter(
 
     def list_trials(self, forwarded_experiment_id: str, **values: Any) -> dict[str, Any]:
       assert forwarded_experiment_id == str(experiment_id)
-      assert values["revision_id"] == str(revision_id)
+      assert values == {
+        "limit": 20,
+        "cursor": None,
+        "status": "failed",
+        "revision_id": str(revision_id),
+        "query": "12",
+        "date_scenario_id": "validation-2",
+      }
       return {"items": [], "nextCursor": None}
 
   monkeypatch.setattr(app_module, "_experiment_application", FakeApplication())
@@ -586,7 +593,13 @@ def test_revision_routes_forward_optimistic_identity_and_history_filter(
 
   response = app_module.create_experiment_revision(experiment_id, payload, request)
   trials = app_module.experiment_trials(
-    experiment_id, limit=50, cursor=None, revision_id=revision_id, status=None,
+    experiment_id,
+    limit=20,
+    cursor=None,
+    revision_id=revision_id,
+    query="12",
+    date_scenario_id="validation-2",
+    status="failed",
   )
 
   assert response.status_code == 201

@@ -224,6 +224,8 @@ class ExperimentRepository(PreviewRepository, Protocol):
     cursor: str | None,
     status: str | None,
     revision_id: str | None,
+    query: str = "",
+    date_scenario_id: str | None = None,
   ) -> dict[str, Any]:
     """游标分页读取当前实验 Trial。"""
 
@@ -611,8 +613,13 @@ class PostgresExperimentRepository:
     cursor: str | None,
     status: str | None,
     revision_id: str | None = None,
+    query: str = "",
+    date_scenario_id: str | None = None,
   ) -> dict[str, Any]:
     owner_id = state_store.current_user_id()
+    normalized_query = query.strip().removeprefix("#").strip()
+    trial_number = int(normalized_query) if normalized_query.isdigit() else None
+    valid_trial_number = trial_number is not None and 0 < trial_number <= 2**63
     with state_store.database_session() as conn:
       with conn.cursor() as cur:
         selected_revision_id = _resolve_revision_id(
@@ -622,6 +629,8 @@ class PostgresExperimentRepository:
           "experimentId": experiment_id,
           "revisionId": selected_revision_id,
           "status": status or "",
+          "query": normalized_query,
+          "dateScenarioId": date_scenario_id or "",
         }
         after = _decode_cursor(cursor, "trial-list", owner_id, bindings) if cursor else None
         params: list[Any] = [experiment_id, owner_id, selected_revision_id]
@@ -629,6 +638,15 @@ class PostgresExperimentRepository:
         if status:
           filters.append("t.summary_status=%s")
           params.append(status)
+        if normalized_query:
+          filters.append("t.trial_index=%s" if valid_trial_number else "false")
+          if valid_trial_number:
+            params.append(trial_number - 1)
+        if date_scenario_id:
+          filters.append(
+            "t.dimension_projection #>> '{dateScenario,scenarioId}'=%s",
+          )
+          params.append(date_scenario_id)
         if after:
           filters.append("t.trial_index > %s")
           params.append(after["trialIndex"])

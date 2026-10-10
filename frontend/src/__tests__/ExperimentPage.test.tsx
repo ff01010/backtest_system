@@ -836,17 +836,18 @@ describe('ExperimentPage', () => {
     expect(screen.getByText('Bar 下一根开盘价')).not.toBeNull();
     expect(screen.getByText('开发 · 2026-07-01 至 2026-07-02')).not.toBeNull();
     expect((screen.getByText('技术信息与编号').closest('details') as HTMLDetailsElement).open).toBe(false);
-    expect((screen.getByText('执行记录（1）').closest('details') as HTMLDetailsElement).open).toBe(false);
-    const parameters = screen.getByText('查看参数').closest('details') as HTMLDetailsElement;
-    expect(parameters.open).toBe(false);
-    fireEvent.click(within(parameters).getByText('查看参数'));
-    expect(parameters.open).toBe(true);
-    expect(within(parameters).getByText('window')).not.toBeNull();
-    expect(within(parameters).getByText('10')).not.toBeNull();
-    expect(within(parameters).getByText('threshold')).not.toBeNull();
-    expect(within(parameters).getByText('0.5')).not.toBeNull();
-    expect(within(parameters).getByText('基础成本')).not.toBeNull();
-    expect(within(parameters).getByText('立即成交（默认）')).not.toBeNull();
+    expect(screen.queryByRole('dialog', { name: 'Trial #1 详情' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '查看 Trial #1 详情' }));
+    const trialDrawer = await screen.findByRole('dialog', { name: 'Trial #1 详情' });
+    expect(within(trialDrawer).getByText('执行记录（1）')).not.toBeNull();
+    expect(within(trialDrawer).getByText('window')).not.toBeNull();
+    expect(within(trialDrawer).getByText('10')).not.toBeNull();
+    expect(within(trialDrawer).getByText('threshold')).not.toBeNull();
+    expect(within(trialDrawer).getByText('0.5')).not.toBeNull();
+    expect(within(trialDrawer).getByText('基础成本')).not.toBeNull();
+    expect(within(trialDrawer).getByText('立即成交（默认）')).not.toBeNull();
+    expect(within(trialDrawer).getByText('执行 #1')).not.toBeNull();
+    fireEvent.click(within(trialDrawer).getByRole('button', { name: '关闭' }));
     const kpis = container.querySelector('.experiment-detail-kpis') as HTMLElement;
     expect(kpis).not.toBeNull();
     expect(within(kpis).getByText('取消')).not.toBeNull();
@@ -873,9 +874,58 @@ describe('ExperimentPage', () => {
       expect(fetchExperimentBacktestRuns).toHaveBeenCalledWith('experiment-1', undefined, '193');
     });
     expect(fetchExperimentDetail).toHaveBeenCalledTimes(1);
-    expect(fetchExperimentTrials).toHaveBeenCalledWith('experiment-1');
-    expect(screen.getByText('执行 #1')).not.toBeNull();
+    expect(fetchExperimentTrials).toHaveBeenCalledWith('experiment-1', undefined, {
+      revisionId: undefined,
+      status: '',
+      dateScenarioId: undefined,
+      query: '',
+      limit: 20,
+    });
     expect(screen.queryByText('选定结果')).toBeNull();
+  });
+
+  it('filters the compact Trial list on the server and opens details in a drawer', async () => {
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    await screen.findByRole('table');
+    const search = screen.getByRole('textbox', { name: '搜索 Trial 编号' });
+    fireEvent.change(search, { target: { value: '#12a' } });
+    expect((search as HTMLInputElement).value).toBe('12');
+    fireEvent.click(screen.getByRole('button', { name: '搜索' }));
+    await waitFor(() => expect(fetchExperimentTrials).toHaveBeenLastCalledWith(
+      'experiment-1', undefined, {
+        revisionId: undefined,
+        status: '',
+        dateScenarioId: undefined,
+        query: '12',
+        limit: 20,
+      },
+    ));
+
+    fireEvent.change(screen.getByRole('combobox', { name: '筛选 Trial 状态' }), {
+      target: { value: 'succeeded' },
+    });
+    fireEvent.change(screen.getByRole('combobox', { name: '筛选日期场景' }), {
+      target: { value: 'development-1' },
+    });
+    await waitFor(() => expect(fetchExperimentTrials).toHaveBeenLastCalledWith(
+      'experiment-1', undefined, {
+        revisionId: undefined,
+        status: 'succeeded',
+        dateScenarioId: 'development-1',
+        query: '12',
+        limit: 20,
+      },
+    ));
   });
 
   it('兼容缺少关联回测任务摘要的实验详情', async () => {
