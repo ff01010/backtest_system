@@ -180,10 +180,14 @@ def test_observability_services_are_pinned_isolated_and_started_before_applicati
   compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(
     encoding="utf-8",
   )
+  socket_proxy = compose.split("  docker-socket-proxy:", 1)[1].split(
+    "\n  loki:", 1,
+  )[0]
 
   assert "grafana/loki:3.7.6@sha256:" in compose
   assert "grafana/alloy:v1.19.2@sha256:" in compose
   assert "docker-socket-proxy:v0.4.2@sha256:" in compose
+  assert "pids_limit: 128" in socket_proxy
   assert "quant-backtest-observability-net" in compose
   assert "internal: true" in compose
   assert "driver: local" in compose

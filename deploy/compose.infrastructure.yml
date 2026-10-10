@@ -189,7 +189,7 @@ services:
       - /var/lib/haproxy
     cpus: 0.25
     mem_limit: 128m
-    pids_limit: 64
+    pids_limit: 128
     logging: *bounded-logging
     labels: *log-on-observability
     healthcheck:
