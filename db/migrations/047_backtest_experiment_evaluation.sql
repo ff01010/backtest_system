@@ -129,6 +129,6 @@ CREATE POLICY backtest_evaluation_run_owner
 GRANT SELECT, INSERT, UPDATE ON
   backtest_experiment_evaluation_spec,
   backtest_experiment_evaluation_run
-TO backtest_app;
+TO :"app_db_user";
 
 COMMIT;

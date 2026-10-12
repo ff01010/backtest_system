@@ -1,4 +1,5 @@
 import type { EvaluationDimensionDefinition } from './contracts';
+import { systemDimensionValueLabel } from './displayLabels';
 
 export type ScenarioValue = {
   dateScenarioId?: string;
@@ -39,8 +40,16 @@ export function decimal(value: unknown): string {
   return number === null ? '—' : number.toFixed(4);
 }
 
-export function dimensionValue(value: unknown, definition?: EvaluationDimensionDefinition): string {
+export function dimensionValue(
+  value: unknown,
+  definition?: EvaluationDimensionDefinition,
+  names: ScenarioName[] = [],
+): string {
   if (value === null || value === undefined) return '未记录';
+  const systemLabel = definition
+    ? systemDimensionValueLabel(definition.dimensionId, value, names)
+    : null;
+  if (systemLabel) return systemLabel;
   if (definition?.dataType === 'boolean' || typeof value === 'boolean') {
     return value === true || value === 'true' ? '是' : '否';
   }

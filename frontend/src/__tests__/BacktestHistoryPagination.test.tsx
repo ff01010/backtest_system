@@ -141,6 +141,27 @@ describe('BacktestPage history pagination', () => {
     apiMocks.deleteBacktestSelection.mockResolvedValue(35);
   });
 
+  it('opens a requested run in the history detail panel', async () => {
+    const requestedRun = makeRun(187);
+    apiMocks.fetchBacktestRun.mockResolvedValue(requestedRun);
+
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+        requestedHistoryRun={{ runId: requestedRun.id, requestNo: 1 }}
+      />,
+    );
+
+    expect(await screen.findByText('回测 #187')).toBeTruthy();
+    expect(apiMocks.fetchBacktestRun).toHaveBeenCalledWith('run-187');
+    expect(screen.getByText('回测记录与结果快照追溯')).toBeTruthy();
+  });
+
   it('shows the finished L2 no-data state instead of permanent range loading', async () => {
     apiMocks.fetchDataStatus.mockImplementation(async (symbol, timeframe, fillModel = 'bar_next_open') => ({
       symbol,

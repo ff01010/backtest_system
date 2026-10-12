@@ -6,6 +6,7 @@ import type {
   ExperimentCreateRequest,
   ExperimentCreateResponse,
   ExperimentCreateResult,
+  ExperimentBacktestRunPage,
   ExperimentDetail,
   ExperimentListItem,
   ExperimentLifecycleResult,
@@ -13,6 +14,7 @@ import type {
   ExperimentRetryResult,
   ExperimentRetrySelection,
   ExperimentRevision,
+  ExperimentStatus,
   ExperimentSubject,
   ExperimentSubjectRef,
   ExperimentTrial,
@@ -58,10 +60,18 @@ export function fetchExperimentDetail(experimentId: string): Promise<ExperimentD
 export function fetchExperiments(
   cursor?: string,
   archived = false,
+  options: {
+    limit?: number;
+    query?: string;
+    status?: ExperimentStatus | '';
+  } = {},
 ): Promise<{ items: ExperimentListItem[]; nextCursor: string | null }> {
   const query = new URLSearchParams();
   if (cursor) query.set('cursor', cursor);
   if (archived) query.set('archived', 'true');
+  if (options.limit) query.set('limit', String(options.limit));
+  if (options.query?.trim()) query.set('query', options.query.trim());
+  if (options.status) query.set('status', options.status);
   const suffix = query.size ? `?${query.toString()}` : '';
   return fetchJson(`/api/backtest/experiments${suffix}`);
 }
@@ -131,14 +141,38 @@ export function fetchExperimentRevisions(
 export function fetchExperimentTrials(
   experimentId: string,
   cursor?: string,
-  revisionId?: string,
+  filters: {
+    revisionId?: string;
+    status?: ExperimentTrial['summaryStatus'] | '';
+    dateScenarioId?: string;
+    query?: string;
+    limit?: number;
+  } = {},
 ): Promise<{ items: ExperimentTrial[]; nextCursor: string | null }> {
   const query = new URLSearchParams();
   if (cursor) query.set('cursor', cursor);
-  if (revisionId) query.set('revisionId', revisionId);
+  if (filters.revisionId) query.set('revisionId', filters.revisionId);
+  if (filters.status) query.set('status', filters.status);
+  if (filters.dateScenarioId) query.set('dateScenarioId', filters.dateScenarioId);
+  if (filters.query?.trim()) query.set('query', filters.query.trim());
+  query.set('limit', String(filters.limit ?? 20));
   const suffix = query.size ? `?${query.toString()}` : '';
   return fetchJson(
     `/api/backtest/experiments/${encodeURIComponent(experimentId)}/trials${suffix}`,
+  );
+}
+
+export function fetchExperimentBacktestRuns(
+  experimentId: string,
+  cursor?: string,
+  query = '',
+): Promise<ExperimentBacktestRunPage> {
+  const search = new URLSearchParams();
+  if (cursor) search.set('cursor', cursor);
+  if (query.trim()) search.set('query', query.trim());
+  const suffix = search.size ? `?${search.toString()}` : '';
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/backtest-runs${suffix}`,
   );
 }
 

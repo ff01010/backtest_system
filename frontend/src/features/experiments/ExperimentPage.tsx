@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Archive,
   Ban,
+  ChevronRight,
   Copy,
   FlaskConical,
   LockKeyhole,
@@ -10,8 +11,10 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  Search,
   ShieldCheck,
   Trash2,
+  X,
 } from 'lucide-react';
 import { ApiResponseError, fetchStrategyConfigs } from '../../api/client';
 import type { StrategyConfig } from '../../types';
@@ -58,8 +61,17 @@ import {
   saveExperimentDraft,
 } from './draftStore';
 import EvaluationBuilder from './EvaluationBuilder';
+import ExperimentBacktestRunDrawer from './ExperimentBacktestRunDrawer';
+import ExperimentCatalogDrawer from './ExperimentCatalogDrawer';
 import { frozenScenarioNames } from './comparisonData';
-import { dateRoleLabel, fillModelLabel, statusLabel } from './displayLabels';
+import {
+  dateRoleLabel,
+  executionAlgorithmLabel,
+  fillModelLabel,
+  resourceClassLabel,
+  statusLabel,
+  systemDimensionValueLabel,
+} from './displayLabels';
 
 type Props = {
   userId: string;
@@ -71,6 +83,7 @@ type Props = {
   onSubjectChange: (subject: ExperimentSubjectRef | null) => void;
   onBackToStrategy: () => void;
   onOpenRun?: (runId: string, symbol: string, timeframe: string, date: string) => void;
+  onOpenBacktestDetail?: (runId: string) => void;
 };
 
 type DraftChange = (draft: ExperimentDraft) => ExperimentDraft;
@@ -126,20 +139,118 @@ function trialParameterEntries(assignment: Record<string, unknown>): Array<{
   if (costScenario) {
     entries.push({
       label: '成本场景',
-      value: trialParameterValue(costScenario.name ?? costScenario.scenarioId),
+      value: trialParameterValue(
+        costScenario.name
+        ?? systemDimensionValueLabel('costScenarioId', costScenario.scenarioId)
+        ?? costScenario.scenarioId,
+      ),
     });
     entries.push({ label: '滑点', value: trialParameterValue(costScenario.slippage) });
   }
   if (executionScenario) {
-    const algorithm = executionScenario.algorithm === 'immediate'
-      ? '立即成交'
-      : executionScenario.algorithm;
+    const algorithm = executionScenario.algorithm == null
+      ? null
+      : executionAlgorithmLabel(executionScenario.algorithm);
     entries.push({
       label: '执行场景',
-      value: trialParameterValue(executionScenario.name ?? algorithm ?? executionScenario.scenarioId),
+      value: trialParameterValue(
+        executionScenario.name
+        ?? systemDimensionValueLabel('executionScenarioId', executionScenario.scenarioId)
+        ?? algorithm
+        ?? executionScenario.scenarioId,
+      ),
     });
   }
   return entries;
+}
+
+function trialExecutionReasonLabel(reason: string): string {
+  if (reason === 'manual_retry') return '人工重试';
+  if (reason === 'automatic_retry') return '系统重试';
+  return '首次执行';
+}
+
+function TrialDetailDrawer({
+  trial,
+  onClose,
+}: {
+  trial: ExperimentTrial;
+  onClose: () => void;
+}) {
+  const dateScenario = trial.dimensionAssignment.dateScenario as Record<string, unknown>
+    | undefined;
+  const parameters = trialParameterEntries(trial.dimensionAssignment);
+  const attempts = trial.executionAttempts ?? [];
+  return (
+    <div className="experiment-trial-drawer-backdrop" role="presentation" onMouseDown={onClose}>
+      <aside
+        aria-label={`Trial #${trial.trialIndex + 1} 详情`}
+        className="experiment-trial-drawer"
+        role="dialog"
+        aria-modal="true"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="experiment-trial-drawer-header">
+          <div>
+            <span>Trial 详情</span>
+            <h2>Trial #{trial.trialIndex + 1}</h2>
+            <small>{statusLabel(trial.summaryStatus)}</small>
+          </div>
+          <button className="app-button is-quiet" type="button" onClick={onClose}>
+            <X size={15} /> 关闭
+          </button>
+        </header>
+        <div className="experiment-trial-drawer-body">
+          <section>
+            <h3>日期场景</h3>
+            <div className="experiment-trial-drawer-scenario">
+              <strong>{String(dateScenario?.name ?? dateScenario?.scenarioId ?? '未记录')}</strong>
+              <span>
+                {dateRoleLabel(dateScenario?.role)} · {String(dateScenario?.startDate ?? '—')}
+                {' 至 '}{String(dateScenario?.endDate ?? '—')}
+              </span>
+            </div>
+          </section>
+          <section>
+            <h3>冻结参数</h3>
+            {parameters.length > 0 ? (
+              <dl className="experiment-trial-drawer-parameters">
+                {parameters.map((entry) => (
+                  <div key={entry.label}>
+                    <dt>{entry.label}</dt>
+                    <dd>{entry.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            ) : <div className="experiment-empty">未记录参数。</div>}
+          </section>
+          <section>
+            <h3>执行记录（{attempts.length}）</h3>
+            {attempts.length > 0 ? (
+              <div className="experiment-trial-drawer-attempts">
+                {attempts.map((execution) => (
+                  <article key={execution.executionId}>
+                    <div>
+                      <strong>执行 #{execution.executionNo}</strong>
+                      <span>{statusLabel(execution.status)}</span>
+                    </div>
+                    <small>{trialExecutionReasonLabel(execution.createdReason)}</small>
+                    {execution.errorSummary && (
+                      <p>
+                        {String(execution.errorSummary.message
+                          ?? execution.errorSummary.code
+                          ?? '执行失败')}
+                      </p>
+                    )}
+                  </article>
+                ))}
+              </div>
+            ) : <div className="experiment-empty">尚无执行记录。</div>}
+          </section>
+        </div>
+      </aside>
+    </div>
+  );
 }
 
 function errorMessage(error: unknown): string {
@@ -170,6 +281,18 @@ export function isStandardBarConfig(config: StrategyConfig): boolean {
     && fillModel === 'bar_next_open';
 }
 
+function formatExperimentUpdatedAt(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return '—';
+  return new Date(timestamp).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
 function ExperimentLanding({
   isAdmin,
   onSelect,
@@ -184,9 +307,9 @@ function ExperimentLanding({
   const [configs, setConfigs] = useState<StrategyConfig[]>([]);
   const [experiments, setExperiments] = useState<ExperimentListItem[]>([]);
   const [adminArchived, setAdminArchived] = useState<AdminArchivedExperimentItem[]>([]);
-  const [nextExperimentCursor, setNextExperimentCursor] = useState<string | null>(null);
   const [nextAdminCursor, setNextAdminCursor] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
+  const [allExperimentsOpen, setAllExperimentsOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
@@ -201,14 +324,13 @@ function ExperimentLanding({
       : Promise.resolve({ items: [], nextCursor: null });
     Promise.all([
       fetchStrategyConfigs(),
-      fetchExperiments(undefined, showArchived),
+      fetchExperiments(undefined, showArchived, { limit: 5 }),
       adminRequest,
     ])
       .then(([items, page, adminPage]) => {
         if (!active) return;
         setConfigs(items.filter(isStandardBarConfig));
         setExperiments(page.items);
-        setNextExperimentCursor(page.nextCursor);
         setAdminArchived(adminPage.items);
         setNextAdminCursor(adminPage.nextCursor);
       })
@@ -222,21 +344,6 @@ function ExperimentLanding({
       active = false;
     };
   }, [isAdmin, showArchived]);
-
-  const loadMoreExperiments = async () => {
-    if (!nextExperimentCursor || loadingMore) return;
-    setLoadingMore(true);
-    setError('');
-    try {
-      const page = await fetchExperiments(nextExperimentCursor, showArchived);
-      setExperiments((current) => [...current, ...page.items]);
-      setNextExperimentCursor(page.nextCursor);
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setLoadingMore(false);
-    }
-  };
 
   const loadMoreAdminArchived = async () => {
     if (!nextAdminCursor || loadingMore) return;
@@ -302,7 +409,10 @@ function ExperimentLanding({
         <button
           className="app-button is-quiet"
           type="button"
-          onClick={() => setShowArchived((current) => !current)}
+          onClick={() => {
+            setAllExperimentsOpen(false);
+            setShowArchived((current) => !current);
+          }}
         >
           {showArchived ? <RotateCcw size={15} /> : <Archive size={15} />}
           {showArchived ? '返回当前实验' : '查看已归档实验'}
@@ -310,11 +420,24 @@ function ExperimentLanding({
       </section>
       {!loading && experiments.length > 0 && (
         <section className="experiment-preview-card">
-          <h2>最近实验</h2>
+          <div className="experiment-recent-heading">
+            <div>
+              <h2>{showArchived ? '最近归档实验' : '最近实验'}</h2>
+              <span>按最近更新时间显示 5 条</span>
+            </div>
+            <button
+              className="app-button is-quiet"
+              type="button"
+              onClick={() => setAllExperimentsOpen(true)}
+            >
+              {showArchived ? '查看全部归档实验' : '查看全部实验'}
+              <ChevronRight size={15} />
+            </button>
+          </div>
           <div className="experiment-trial-table">
             {experiments.map((experiment) => (
               <button
-                className="experiment-trial-row"
+                className="experiment-trial-row is-experiment-summary"
                 key={experiment.experimentId}
                 type="button"
                 onClick={() => onOpenExperiment(experiment.experimentId)}
@@ -325,19 +448,12 @@ function ExperimentLanding({
                 <span>
                   成功 {experiment.succeededTrialCount} / {experiment.plannedTrialCount}
                 </span>
+                <time dateTime={experiment.updatedAt}>
+                  更新 {formatExperimentUpdatedAt(experiment.updatedAt)}
+                </time>
               </button>
             ))}
           </div>
-          {nextExperimentCursor && (
-            <button
-              className="app-button is-quiet"
-              type="button"
-              disabled={loadingMore}
-              onClick={() => { void loadMoreExperiments(); }}
-            >
-              {loadingMore ? '正在加载…' : '加载更多我的实验'}
-            </button>
-          )}
         </section>
       )}
       {showArchived && isAdmin && (
@@ -405,6 +521,15 @@ function ExperimentLanding({
           </button>
         ))}
       </section>
+      <ExperimentCatalogDrawer
+        archived={showArchived}
+        open={allExperimentsOpen}
+        onClose={() => setAllExperimentsOpen(false)}
+        onOpenExperiment={(nextExperimentId) => {
+          setAllExperimentsOpen(false);
+          onOpenExperiment(nextExperimentId);
+        }}
+      />
     </main>
   );
 }
@@ -545,7 +670,7 @@ function RuntimeDimensions({
           <input value={draft.slippageValues} onChange={(event) => onChange({ slippageValues: event.target.value })} />
         </label>
         <div className="experiment-readonly-field">
-          <span>执行算法</span><strong>immediate</strong><small>标准 Bar 首期固定</small>
+          <span>执行算法</span><strong>{executionAlgorithmLabel('immediate')}</strong><small>标准 Bar 首期固定</small>
         </div>
       </div>
     </section>
@@ -558,7 +683,7 @@ function PreviewResult({ preview }: { preview: ExperimentPreview }) {
       <div className="experiment-preview-metrics">
         <div><span>Trial 总数</span><strong>{preview.plannedTrialCount.toLocaleString()}</strong></div>
         <div><span>预计 Bar</span><strong>{preview.resourceEstimate.estimatedBarCount.toLocaleString()}</strong></div>
-        <div><span>资源等级</span><strong>{preview.resourceEstimate.resourceClass}</strong></div>
+        <div><span>资源等级</span><strong>{resourceClassLabel(preview.resourceEstimate.resourceClass)}</strong></div>
         <div><span>维度数量</span><strong>{Object.keys(preview.dimensionCounts).length}</strong></div>
       </div>
       <div className="experiment-preview-decision">
@@ -608,12 +733,14 @@ function ExperimentDetailView({
   isAdmin,
   onClose,
   onOpenRun,
+  onOpenBacktestDetail,
   onCopyExperiment,
 }: {
   experimentId: string;
   isAdmin: boolean;
   onClose: () => void;
   onOpenRun?: (runId: string, symbol: string, timeframe: string, date: string) => void;
+  onOpenBacktestDetail?: (runId: string) => void;
   onCopyExperiment: (detail: ExperimentDetail) => void;
 }) {
   const [detail, setDetail] = useState<ExperimentDetail | null>(null);
@@ -622,12 +749,18 @@ function ExperimentDetailView({
   const [viewRevisionId, setViewRevisionId] = useState<string | null>(null);
   const [selectedFailedIds, setSelectedFailedIds] = useState<Set<string>>(new Set());
   const [nextTrialCursor, setNextTrialCursor] = useState<string | null>(null);
+  const [trialSearchInput, setTrialSearchInput] = useState('');
+  const [trialQuery, setTrialQuery] = useState('');
+  const [trialStatus, setTrialStatus] = useState<ExperimentTrial['summaryStatus'] | ''>('');
+  const [trialDateScenarioId, setTrialDateScenarioId] = useState('');
+  const [selectedTrialId, setSelectedTrialId] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [lifecycleAction, setLifecycleAction] = useState<'' | 'archive' | 'restore' | 'purge'>('');
   const [lifecycleMessage, setLifecycleMessage] = useState('');
+  const [relatedRunsOpen, setRelatedRunsOpen] = useState(false);
   const cancelInFlight = useRef(false);
   const resumeInFlight = useRef(false);
   const retryInFlight = useRef(false);
@@ -648,13 +781,22 @@ function ExperimentDetailView({
         lastVersion.current = result.snapshotVersion;
         setDetail(result);
         const [trialPage, revisionPage] = await Promise.all([
-          viewRevisionId
-            ? fetchExperimentTrials(experimentId, undefined, viewRevisionId)
-            : fetchExperimentTrials(experimentId),
+          fetchExperimentTrials(experimentId, undefined, {
+            revisionId: viewRevisionId ?? undefined,
+            status: trialStatus,
+            dateScenarioId: trialDateScenarioId || undefined,
+            query: trialQuery,
+            limit: 20,
+          }),
           fetchExperimentRevisions(experimentId),
         ]);
         if (stopped) return;
         setTrials(trialPage.items);
+        setSelectedTrialId((current) => (
+          current && trialPage.items.some((trial) => trial.trialId === current)
+            ? current
+            : null
+        ));
         setRevisions(revisionPage.items);
         setSelectedFailedIds((current) => {
           const eligible = new Set(trialPage.items.filter((trial) => (
@@ -678,7 +820,16 @@ function ExperimentDetailView({
       stopped = true;
       if (timer) clearTimeout(timer);
     };
-  }, [experimentId, viewRevisionId]);
+  }, [experimentId, trialDateScenarioId, trialQuery, trialStatus, viewRevisionId]);
+
+  useEffect(() => {
+    if (!selectedTrialId) return undefined;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSelectedTrialId(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [selectedTrialId]);
 
   const handleCancel = async () => {
     if (cancelInFlight.current) return;
@@ -746,7 +897,13 @@ function ExperimentDetailView({
       setSelectedFailedIds(new Set());
       const [nextDetail, trialPage] = await Promise.all([
         fetchExperimentDetail(experimentId),
-        fetchExperimentTrials(experimentId),
+        fetchExperimentTrials(experimentId, undefined, {
+          revisionId: viewRevisionId ?? undefined,
+          status: trialStatus,
+          dateScenarioId: trialDateScenarioId || undefined,
+          query: trialQuery,
+          limit: 20,
+        }),
       ]);
       setDetail(nextDetail);
       setTrials(trialPage.items);
@@ -832,7 +989,15 @@ function ExperimentDetailView({
     if (!nextTrialCursor) return;
     try {
       const page = await fetchExperimentTrials(
-        experimentId, nextTrialCursor, viewRevisionId ?? undefined,
+        experimentId,
+        nextTrialCursor,
+        {
+          revisionId: viewRevisionId ?? undefined,
+          status: trialStatus,
+          dateScenarioId: trialDateScenarioId || undefined,
+          query: trialQuery,
+          limit: 20,
+        },
       );
       setTrials((current) => [...current, ...page.items]);
       setNextTrialCursor(page.nextCursor);
@@ -847,9 +1012,19 @@ function ExperimentDetailView({
   const progress = detail.stage.plannedTrialCount > 0
     ? Math.round((detail.stage.generatedTrialCount / detail.stage.plannedTrialCount) * 100)
     : 0;
+  const relatedBacktestRuns = detail.relatedBacktestRuns ?? {
+    totalCount: 0,
+    initialCount: 0,
+    retryCount: 0,
+  };
   const fixed = detail.frozenDefinition.fixedStructure;
+  const dateScenarios = frozenScenarioNames(detail.frozenDefinition.plan);
   const viewingCurrentRevision = !viewRevisionId
     || viewRevisionId === detail.revision.revisionId;
+  const selectedTrial = selectedTrialId
+    ? trials.find((trial) => trial.trialId === selectedTrialId) ?? null
+    : null;
+  const hasTrialFilters = Boolean(trialQuery || trialStatus || trialDateScenarioId);
   const failedTrials = trials.filter((trial) => (
     trial.summaryStatus === 'failed' && !trial.activeExecution
   ));
@@ -972,7 +1147,7 @@ function ExperimentDetailView({
         </div>
         <div><span>成功</span><strong>{detail.stage.succeededTrialCount}</strong></div>
         <div><span>失败</span><strong>{detail.stage.failedTrialCount}</strong></div>
-        <div><span>日期场景</span><strong>{detail.frozenDefinition.datasetSnapshots.length}</strong></div>
+        <div><span>取消</span><strong>{detail.stage.cancelledTrialCount}</strong></div>
       </section>
       <div className="experiment-detail-workspace">
         <div className="experiment-detail-main">
@@ -986,7 +1161,7 @@ function ExperimentDetailView({
                 type="button"
                 onClick={() => setSelectedFailedIds(new Set(failedTrials.map((trial) => trial.trialId)))}
               >
-                选择全部失败项
+                选择本页失败项
               </button>
               <button
                 className="app-button is-primary"
@@ -1007,92 +1182,169 @@ function ExperimentDetailView({
           <div><span>失败</span><strong>{detail.stage.failedTrialCount}</strong></div>
           <div><span>取消</span><strong>{detail.stage.cancelledTrialCount}</strong></div>
         </div>
-        <div className="experiment-trial-table">
-          {trials.map((trial) => {
-            const dateScenario = trial.dimensionAssignment.dateScenario as Record<string, unknown> | undefined;
-            const parameterEntries = trialParameterEntries(trial.dimensionAssignment);
-            return (
-              <div className="experiment-trial-row is-trial-detail" key={trial.trialId}>
-                {viewingCurrentRevision && !detail.archivedAt
-                  && trial.summaryStatus === 'failed' && !trial.activeExecution ? (
-                  <input
-                    aria-label={`选择 Trial #${trial.trialIndex + 1}`}
-                    type="checkbox"
-                    checked={selectedFailedIds.has(trial.trialId)}
-                    onChange={(event) => setSelectedFailedIds((current) => {
-                      const next = new Set(current);
-                      if (event.target.checked) next.add(trial.trialId);
-                      else next.delete(trial.trialId);
-                      return next;
-                    })}
-                  />
-                ) : <span />}
-                <strong>#{trial.trialIndex + 1}</strong>
-                <span>{statusLabel(trial.summaryStatus)}</span>
-                <span className="experiment-date-scenario">
-                  <strong>{String(dateScenario?.name ?? dateScenario?.scenarioId ?? '—')}</strong>
-                  <small>
-                    {dateRoleLabel(dateScenario?.role)} · {String(dateScenario?.startDate ?? '—')} 至 {String(dateScenario?.endDate ?? '—')}
-                  </small>
-                </span>
-                {trial.runId ? (
-                  <button
-                    className="app-button is-quiet"
-                    type="button"
-                    onClick={() => onOpenRun?.(
-                      trial.runId!,
-                      String(fixed.symbol ?? ''),
-                      String(fixed.timeframe ?? '5m'),
-                      String(dateScenario?.startDate ?? '').replace(/-/g, ''),
-                    )}
+        <form
+          className="experiment-trial-filters"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setSelectedTrialId(null);
+            setTrialQuery(trialSearchInput.trim());
+          }}
+        >
+          <label className="experiment-trial-search">
+            <Search size={15} />
+            <input
+              aria-label="搜索 Trial 编号"
+              inputMode="numeric"
+              maxLength={19}
+              placeholder="Trial 编号，例如 12"
+              value={trialSearchInput}
+              onChange={(event) => setTrialSearchInput(event.target.value.replace(/\D/g, ''))}
+            />
+          </label>
+          <button className="app-button is-quiet" type="submit">搜索</button>
+          <select
+            aria-label="筛选 Trial 状态"
+            value={trialStatus}
+            onChange={(event) => {
+              setSelectedTrialId(null);
+              setTrialStatus(event.target.value as ExperimentTrial['summaryStatus'] | '');
+            }}
+          >
+            <option value="">全部状态</option>
+            <option value="pending">等待生成</option>
+            <option value="queued">排队中</option>
+            <option value="running">运行中</option>
+            <option value="cancelling">取消中</option>
+            <option value="succeeded">成功</option>
+            <option value="failed">失败</option>
+            <option value="cancelled">已取消</option>
+          </select>
+          <select
+            aria-label="筛选日期场景"
+            value={trialDateScenarioId}
+            onChange={(event) => {
+              setSelectedTrialId(null);
+              setTrialDateScenarioId(event.target.value);
+            }}
+          >
+            <option value="">全部日期场景</option>
+            {dateScenarios.map((scenario) => (
+              <option key={scenario.scenarioId} value={scenario.scenarioId}>{scenario.name}</option>
+            ))}
+          </select>
+          {hasTrialFilters && (
+            <button
+              className="app-button is-quiet"
+              type="button"
+              onClick={() => {
+                setTrialSearchInput('');
+                setTrialQuery('');
+                setTrialStatus('');
+                setTrialDateScenarioId('');
+                setSelectedTrialId(null);
+              }}
+            >
+              重置
+            </button>
+          )}
+        </form>
+        <div className="experiment-trial-list-shell">
+          <table className="experiment-trial-list">
+            <thead>
+              <tr>
+                <th aria-label="选择" />
+                <th>Trial</th>
+                <th>状态</th>
+                <th>日期场景</th>
+                <th>参数</th>
+                <th>执行</th>
+                <th aria-label="操作" />
+              </tr>
+            </thead>
+            <tbody>
+              {trials.map((trial) => {
+                const dateScenario = trial.dimensionAssignment.dateScenario as
+                  Record<string, unknown> | undefined;
+                const parameterCount = trialParameterEntries(trial.dimensionAssignment).length;
+                const executionCount = (trial.executionAttempts ?? []).length;
+                const retryable = viewingCurrentRevision && !detail.archivedAt
+                  && trial.summaryStatus === 'failed' && !trial.activeExecution;
+                return (
+                  <tr
+                    className={selectedTrialId === trial.trialId ? 'is-selected' : ''}
+                    key={trial.trialId}
+                    onClick={() => setSelectedTrialId(trial.trialId)}
                   >
-                    查看单次结果
-                  </button>
-                ) : <span>尚未物化</span>}
-                {parameterEntries.length > 0 && (
-                  <details className="experiment-trial-parameters">
-                    <summary>查看参数</summary>
-                    <div>
-                      {parameterEntries.map((entry) => (
-                        <div key={entry.label}>
-                          <span>{entry.label}</span>
-                          <strong>{entry.value}</strong>
-                        </div>
-                      ))}
-                    </div>
-                  </details>
-                )}
-                {(trial.executionAttempts ?? []).length > 0 && (
-                  <details className="experiment-execution-attempts">
-                    <summary>执行记录（{trial.executionAttempts.length}）</summary>
-                    {(trial.executionAttempts ?? []).map((execution) => (
-                      <div key={execution.executionId}>
-                        <strong>执行 #{execution.executionNo}</strong>
-                        <span>{statusLabel(execution.status)}</span>
-                        <span>
-                          {execution.createdReason === 'manual_retry'
-                            ? '人工重试'
-                            : execution.createdReason === 'automatic_retry' ? '系统重试' : '首次执行'}
-                        </span>
-                        {execution.selected && <small>选定结果</small>}
-                        {execution.errorSummary && (
-                          <small>{String(execution.errorSummary.code ?? '执行失败')}</small>
-                        )}
-                      </div>
-                    ))}
-                  </details>
-                )}
-              </div>
-            );
-          })}
-          {trials.length === 0 && <div className="experiment-empty">Trial 尚未生成。</div>}
+                    <td>
+                      {retryable ? (
+                        <input
+                          aria-label={`选择 Trial #${trial.trialIndex + 1}`}
+                          type="checkbox"
+                          checked={selectedFailedIds.has(trial.trialId)}
+                          onClick={(event) => event.stopPropagation()}
+                          onChange={(event) => setSelectedFailedIds((current) => {
+                            const next = new Set(current);
+                            if (event.target.checked) next.add(trial.trialId);
+                            else next.delete(trial.trialId);
+                            return next;
+                          })}
+                        />
+                      ) : null}
+                    </td>
+                    <td><strong>#{trial.trialIndex + 1}</strong></td>
+                    <td>
+                      <span className="experiment-trial-status" data-status={trial.summaryStatus}>
+                        {statusLabel(trial.summaryStatus)}
+                      </span>
+                    </td>
+                    <td>
+                      <span className="experiment-trial-scenario-cell">
+                        <strong>{String(dateScenario?.name ?? dateScenario?.scenarioId ?? '—')}</strong>
+                        <small>
+                          {dateRoleLabel(dateScenario?.role)} · {String(dateScenario?.startDate ?? '—')}
+                          {' 至 '}{String(dateScenario?.endDate ?? '—')}
+                        </small>
+                      </span>
+                    </td>
+                    <td>{parameterCount} 项</td>
+                    <td>{executionCount} 次</td>
+                    <td>
+                      <button
+                        aria-label={`查看 Trial #${trial.trialIndex + 1} 详情`}
+                        className="experiment-trial-open"
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setSelectedTrialId(trial.trialId);
+                        }}
+                      >
+                        <ChevronRight size={16} />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {trials.length === 0 && (
+            <div className="experiment-empty">
+              {hasTrialFilters ? '没有符合筛选条件的 Trial。' : 'Trial 尚未生成。'}
+            </div>
+          )}
         </div>
         {nextTrialCursor && (
-          <button className="app-button is-quiet" type="button" onClick={() => { void loadMoreTrials(); }}>
-            加载更多 Trial
+          <button
+            className="app-button is-quiet experiment-trial-load-more"
+            type="button"
+            onClick={() => { void loadMoreTrials(); }}
+          >
+            加载更多（每次 20 条）
           </button>
         )}
       </section>
+      {selectedTrial && (
+        <TrialDetailDrawer trial={selectedTrial} onClose={() => setSelectedTrialId(null)} />
+      )}
       {TERMINAL_EXPERIMENT_STATUSES.has(detail.status)
         && viewingCurrentRevision && !detail.archivedAt ? (
         <EvaluationBuilder
@@ -1168,6 +1420,22 @@ function ExperimentDetailView({
               </div>
             )}
           </section>
+          <button
+            className="experiment-related-runs-card"
+            type="button"
+            disabled={relatedBacktestRuns.totalCount === 0}
+            onClick={() => setRelatedRunsOpen(true)}
+          >
+            <span>
+              <strong>关联回测任务</strong>
+              <b>{relatedBacktestRuns.totalCount} 个</b>
+              <ChevronRight size={16} />
+            </span>
+            <small>
+              首次执行 {relatedBacktestRuns.initialCount}
+              {' · '}重试 {relatedBacktestRuns.retryCount}
+            </small>
+          </button>
           <section className="experiment-preview-card experiment-technical-card">
             <details className="experiment-technical-details">
               <summary>技术信息与编号</summary>
@@ -1201,6 +1469,13 @@ function ExperimentDetailView({
           </button>
         </section>
       )}
+      <ExperimentBacktestRunDrawer
+        experimentId={experimentId}
+        open={relatedRunsOpen}
+        summary={relatedBacktestRuns}
+        onClose={() => setRelatedRunsOpen(false)}
+        onOpenRunDetail={(runId) => onOpenBacktestDetail?.(runId)}
+      />
     </main>
   );
 }
@@ -1468,6 +1743,7 @@ export default function ExperimentPage({
   onSubjectChange,
   onBackToStrategy,
   onOpenRun,
+  onOpenBacktestDetail,
 }: Props) {
   const [copyTarget, setCopyTarget] = useState<ExperimentCopyTarget | null>(null);
   if (enabled === null) {
@@ -1513,6 +1789,7 @@ export default function ExperimentPage({
         isAdmin={isAdmin}
         onClose={() => changeExperiment(null)}
         onOpenRun={onOpenRun}
+        onOpenBacktestDetail={onOpenBacktestDetail}
         onCopyExperiment={(detail) => setCopyTarget({
           experimentId: detail.experimentId,
           revisionId: detail.revision.revisionId,

@@ -369,6 +369,62 @@ def test_copied_experiment_preserves_owned_source_lineage(
   assert hidden.value.code == "experiment.source_not_found"
 
 
+def test_experiment_list_filters_search_status_and_cursor_scope(
+  application: ExperimentApplication,
+) -> None:
+  def create_named(name: str, key: str) -> str:
+    request = _request().model_copy(update={"name": name})
+    preview = _as_user(OWNER, lambda: application.preview(request))
+    payload = ExperimentCreateRequest(
+      previewToken=preview["previewToken"],
+      specHash=preview["specHash"],
+      experimentSpec=request,
+    )
+    created, _status = _as_user(
+      OWNER, lambda: application.create(payload, key),
+    )
+    return created["experimentId"]
+
+  alpha_id = create_named("Alpha 参数研究", "postgres-list-filter-alpha")
+  create_named("Beta 参数研究", "postgres-list-filter-beta")
+
+  name_page = _as_user(
+    OWNER,
+    lambda: application.list_experiments(
+      limit=20, cursor=None, query="Alpha", status="preparing",
+    ),
+  )
+  strategy_page = _as_user(
+    OWNER,
+    lambda: application.list_experiments(
+      limit=20, cursor=None, query="均值回归",
+    ),
+  )
+  symbol_page = _as_user(
+    OWNER,
+    lambda: application.list_experiments(
+      limit=20, cursor=None, query="688981.SH",
+    ),
+  )
+  first_page = _as_user(
+    OWNER,
+    lambda: application.list_experiments(limit=1, cursor=None),
+  )
+
+  assert [item["experimentId"] for item in name_page["items"]] == [alpha_id]
+  assert len(strategy_page["items"]) == 2
+  assert len(symbol_page["items"]) == 2
+  assert first_page["nextCursor"] is not None
+  with pytest.raises(ExperimentError) as mismatched_cursor:
+    _as_user(
+      OWNER,
+      lambda: application.list_experiments(
+        limit=1, cursor=first_page["nextCursor"], query="Alpha",
+      ),
+    )
+  assert mismatched_cursor.value.code == "experiment.cursor_invalid"
+
+
 def test_cross_user_ids_tokens_and_idempotency_keys_are_not_discoverable(
   application: ExperimentApplication,
 ) -> None:
@@ -878,6 +934,25 @@ def test_complete_standard_bar_execution_reconciles_once_and_keeps_window_bounde
   assert page["items"][0]["runId"] == run_id
   assert page["items"][0]["selectedExecution"]["resultHash"]
   assert page["items"][0]["selectedExecution"]["actualDataHash"] == "d" * 64
+  filtered = _as_user(
+    OWNER,
+    lambda: execution_application.list_trials(
+      experiment_id,
+      limit=20,
+      cursor=None,
+      status="succeeded",
+      query="1",
+      date_scenario_id="development-1",
+    ),
+  )
+  missing = _as_user(
+    OWNER,
+    lambda: execution_application.list_trials(
+      experiment_id, limit=20, cursor=None, status=None, query="2",
+    ),
+  )
+  assert [item["trialIndex"] for item in filtered["items"]] == [0]
+  assert missing["items"] == []
 
 
 def test_archive_hides_and_restore_preserves_the_complete_graph(
@@ -1535,6 +1610,31 @@ def test_manual_retry_freezes_selection_and_competing_requests_create_one_execut
   assert [item["executionNo"] for item in attempts] == [1, 2]
   assert [item["createdReason"] for item in attempts] == ["initial", "manual_retry"]
   assert _experiment_run_seeds(experiment_id)[0] == _experiment_run_seeds(experiment_id)[1]
+  related = _as_user(
+    OWNER,
+    lambda: execution_application.list_related_runs(
+      experiment_id, limit=10, cursor=None, query="",
+    ),
+  )
+  assert related["totalCount"] == 2
+  assert related["initialCount"] == 1
+  assert related["retryCount"] == 1
+  assert [item["executionNo"] for item in related["items"]] == [1, 2]
+  assert all(item["displayNo"] > 0 for item in related["items"])
+  selected_display_no = related["items"][0]["displayNo"]
+  filtered = _as_user(
+    OWNER,
+    lambda: execution_application.list_related_runs(
+      experiment_id, limit=10, cursor=None, query=f"#{selected_display_no}",
+    ),
+  )
+  assert [item["displayNo"] for item in filtered["items"]] == [selected_display_no]
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  assert detail["relatedBacktestRuns"] == {
+    "totalCount": 2,
+    "initialCount": 1,
+    "retryCount": 1,
+  }
 
 
 def test_new_revision_requires_terminal_current_and_preserves_history(

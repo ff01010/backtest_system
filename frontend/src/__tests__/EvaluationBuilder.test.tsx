@@ -282,6 +282,10 @@ describe('EvaluationBuilder', () => {
 
     await selectFirstReport();
     expect(await screen.findByText('完整评价')).not.toBeNull();
+    expect(screen.getByText('报告列表')).not.toBeNull();
+    expect(screen.getByText('共 1 份')).not.toBeNull();
+    expect(screen.getByText('当前报告')).not.toBeNull();
+    expect(document.querySelectorAll('.evaluation-report-timestamps time')).toHaveLength(2);
     expect(screen.queryByText(/冻结的展示与分组标签/)).toBeNull();
     expect((screen.getByRole('combobox', { name: '选择评价报告' }) as HTMLSelectElement).value).toBe(DETAIL.evaluationRunId);
     expect(((await screen.findByText('技术标识与冻结摘要')).closest('details') as HTMLDetailsElement).open).toBe(false);
@@ -568,7 +572,15 @@ describe('EvaluationBuilder', () => {
       items: [{ ...RUN, status: 'succeeded', completeness: partialDetail.completeness }],
       nextCursor: null,
     });
-    render(<EvaluationBuilder experimentId="experiment-1" symbol="688981.SH" timeframe="5m" />);
+    render(<EvaluationBuilder
+      experimentId="experiment-1"
+      symbol="688981.SH"
+      timeframe="5m"
+      scenarioNames={[{
+        scenarioId: 'development', name: '开发区间',
+        startDate: '2026-07-01', endDate: '2026-07-02',
+      }]}
+    />);
 
     await selectFirstReport();
 
@@ -576,7 +588,8 @@ describe('EvaluationBuilder', () => {
     expect(screen.getByText('失败 1')).not.toBeNull();
     expect(screen.queryByText(/不代表最终测试/)).toBeNull();
     expect(screen.getByText('关键维度覆盖（1）')).not.toBeNull();
-    expect(screen.getByText(/development：1\/2/)).not.toBeNull();
+    expect(screen.getByText(/开发区间：1\/2/)).not.toBeNull();
+    expect(screen.queryByText(/development：1\/2/)).toBeNull();
     expect(screen.getByText(/失败、取消与缺失项/)).not.toBeNull();
   });
 });

@@ -7,6 +7,7 @@ import {
   cancelExperiment,
   createExperiment,
   fetchAdminArchivedExperiments,
+  fetchExperimentBacktestRuns,
   fetchExperimentDetail,
   fetchExperimentRevisions,
   fetchExperiments,
@@ -40,6 +41,7 @@ vi.mock('../features/experiments/api', () => ({
   cancelExperiment: vi.fn(),
   createExperiment: vi.fn(),
   fetchAdminArchivedExperiments: vi.fn(),
+  fetchExperimentBacktestRuns: vi.fn(),
   fetchExperimentDetail: vi.fn(),
   fetchExperimentRevisions: vi.fn(),
   fetchExperiments: vi.fn(),
@@ -161,6 +163,11 @@ const DETAIL: ExperimentDetail = {
   source: null,
   status: 'queued',
   snapshotVersion: 2,
+  relatedBacktestRuns: {
+    totalCount: 2,
+    initialCount: 1,
+    retryCount: 1,
+  },
   revision: { revisionId: 'revision-1', revisionNo: 1, specHash: PREVIEW.specHash },
   stage: {
     stageId: 'stage-1',
@@ -340,6 +347,43 @@ beforeEach(() => {
   vi.mocked(fetchAdminArchivedExperiments).mockReset().mockResolvedValue({
     items: [], nextCursor: null,
   });
+  vi.mocked(fetchExperimentBacktestRuns).mockReset().mockResolvedValue({
+    totalCount: 2,
+    initialCount: 1,
+    retryCount: 1,
+    items: [{
+      revisionId: 'revision-1',
+      revisionNo: 1,
+      currentRevision: true,
+      stageId: 'stage-1',
+      stageIndex: 0,
+      trialId: 'trial-1',
+      trialIndex: 0,
+      executionId: 'execution-1',
+      executionNo: 1,
+      createdReason: 'initial',
+      selected: false,
+      runId: 'run-1',
+      displayNo: 187,
+      status: 'failed',
+    }, {
+      revisionId: 'revision-1',
+      revisionNo: 1,
+      currentRevision: true,
+      stageId: 'stage-1',
+      stageIndex: 0,
+      trialId: 'trial-1',
+      trialIndex: 0,
+      executionId: 'execution-2',
+      executionNo: 2,
+      createdReason: 'manual_retry',
+      selected: true,
+      runId: 'run-2',
+      displayNo: 193,
+      status: 'succeeded',
+    }],
+    nextCursor: null,
+  });
   vi.mocked(fetchExperimentTrials).mockReset().mockResolvedValue({
     items: [TRIAL],
     nextCursor: null,
@@ -500,6 +544,10 @@ describe('ExperimentPage', () => {
         nextCursor: 'owner-next',
       })
       .mockResolvedValueOnce({
+        items: [experimentListItem('owned-first', '我的归档第一页')],
+        nextCursor: 'owner-next',
+      })
+      .mockResolvedValueOnce({
         items: [experimentListItem('owned-second', '我的归档第二页')],
         nextCursor: null,
       });
@@ -544,9 +592,15 @@ describe('ExperimentPage', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: '查看已归档实验' }));
-    fireEvent.click(await screen.findByRole('button', { name: '加载更多我的实验' }));
+    fireEvent.click(await screen.findByRole('button', { name: '查看全部归档实验' }));
+    const drawer = await screen.findByRole('dialog', { name: '全部归档实验' });
+    fireEvent.click(await within(drawer).findByRole('button', { name: '加载更多实验' }));
     expect(await screen.findByText('我的归档第二页')).not.toBeNull();
-    expect(fetchExperiments).toHaveBeenLastCalledWith('owner-next', true);
+    expect(fetchExperiments).toHaveBeenLastCalledWith('owner-next', true, {
+      limit: 20,
+      query: '',
+      status: '',
+    });
 
     fireEvent.click(screen.getByRole('button', { name: '加载更多待清理实验' }));
     expect(await screen.findByText('待清理第二页')).not.toBeNull();
@@ -570,12 +624,69 @@ describe('ExperimentPage', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: '查看已归档实验' }));
-    await waitFor(() => expect(fetchExperiments).toHaveBeenLastCalledWith(undefined, true));
+    await waitFor(() => expect(fetchExperiments).toHaveBeenLastCalledWith(
+      undefined, true, { limit: 5 },
+    ));
     expect(screen.getByText('暂无可用的已发布标准 Bar 策略。请先在策略回测中完成保存与发布。')).not.toBeNull();
 
     await act(async () => rejectCurrent(new Error('stale list failed')));
     expect(screen.queryByRole('alert')).toBeNull();
     expect(fetchExperiments).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the landing list compact and filters the full experiment drawer on the server', async () => {
+    vi.mocked(fetchExperiments)
+      .mockResolvedValueOnce({
+        items: [experimentListItem('recent-1', '最近实验一')],
+        nextCursor: 'recent-next',
+      })
+      .mockResolvedValueOnce({
+        items: [experimentListItem('all-1', '全部实验一')],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        items: [experimentListItem('search-1', 'Alpha 参数研究')],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        items: [experimentListItem('failed-1', 'Alpha 失败实验')],
+        nextCursor: null,
+      });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('最近实验一')).not.toBeNull();
+    expect(fetchExperiments).toHaveBeenNthCalledWith(
+      1, undefined, false, { limit: 5 },
+    );
+    expect(screen.queryByRole('button', { name: '加载更多我的实验' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '查看全部实验' }));
+    const drawer = await screen.findByRole('dialog', { name: '全部实验' });
+    await within(drawer).findByText('全部实验一');
+
+    fireEvent.change(within(drawer).getByLabelText('搜索实验'), {
+      target: { value: '  Alpha  ' },
+    });
+    fireEvent.click(within(drawer).getByRole('button', { name: '搜索' }));
+    await waitFor(() => expect(fetchExperiments).toHaveBeenLastCalledWith(
+      undefined, false, { limit: 20, query: 'Alpha', status: '' },
+    ));
+    expect(await within(drawer).findByText('Alpha 参数研究')).not.toBeNull();
+
+    fireEvent.change(within(drawer).getByLabelText('筛选实验状态'), {
+      target: { value: 'failed' },
+    });
+    await waitFor(() => expect(fetchExperiments).toHaveBeenLastCalledWith(
+      undefined, false, { limit: 20, query: 'Alpha', status: 'failed' },
+    ));
+    expect(await within(drawer).findByText('Alpha 失败实验')).not.toBeNull();
   });
 
   it('shows a clear gate when automation is not enabled', () => {
@@ -612,6 +723,25 @@ describe('ExperimentPage', () => {
 
     await waitFor(() => expect(screen.queryByText('Trial 总数')).toBeNull());
     expect(screen.getByText('配置已变化，之前的预览令牌已失效。')).not.toBeNull();
+  });
+
+  it('shows localized labels for built-in execution and resource values', async () => {
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={SUBJECT_REF}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+    await screen.findByRole('heading', { name: '均值回归' });
+
+    expect(screen.getByText('立即成交')).not.toBeNull();
+    expect(screen.queryByText('immediate')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '生成预览' }));
+
+    expect(await screen.findByText('轻量')).not.toBeNull();
+    expect(screen.queryByText('light')).toBeNull();
   });
 
   it('discards an in-flight preview response after the draft changes', async () => {
@@ -683,8 +813,9 @@ describe('ExperimentPage', () => {
     expect(onExperimentChange).toHaveBeenCalledWith('experiment-1');
   });
 
-  it('shows aggregate progress and drills down through the selected ordinary run', async () => {
+  it('shows execution progress and the experiment-wide backtest task index', async () => {
     const onOpenRun = vi.fn();
+    const onOpenBacktestDetail = vi.fn();
     const { container } = render(
       <ExperimentPage
         userId="user-1"
@@ -694,6 +825,7 @@ describe('ExperimentPage', () => {
         onSubjectChange={vi.fn()}
         onBackToStrategy={vi.fn()}
         onOpenRun={onOpenRun}
+        onOpenBacktestDetail={onOpenBacktestDetail}
       />,
     );
 
@@ -704,24 +836,119 @@ describe('ExperimentPage', () => {
     expect(screen.getByText('Bar 下一根开盘价')).not.toBeNull();
     expect(screen.getByText('开发 · 2026-07-01 至 2026-07-02')).not.toBeNull();
     expect((screen.getByText('技术信息与编号').closest('details') as HTMLDetailsElement).open).toBe(false);
-    expect((screen.getByText('执行记录（1）').closest('details') as HTMLDetailsElement).open).toBe(false);
-    const parameters = screen.getByText('查看参数').closest('details') as HTMLDetailsElement;
-    expect(parameters.open).toBe(false);
-    fireEvent.click(within(parameters).getByText('查看参数'));
-    expect(parameters.open).toBe(true);
-    expect(within(parameters).getByText('window')).not.toBeNull();
-    expect(within(parameters).getByText('10')).not.toBeNull();
-    expect(within(parameters).getByText('threshold')).not.toBeNull();
-    expect(within(parameters).getByText('0.5')).not.toBeNull();
-    expect(within(parameters).getByText('基础成本')).not.toBeNull();
-    expect(within(parameters).getByText('立即成交')).not.toBeNull();
-    expect(container.querySelector('.experiment-detail-kpis')).not.toBeNull();
+    expect(screen.queryByRole('dialog', { name: 'Trial #1 详情' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '查看 Trial #1 详情' }));
+    const trialDrawer = await screen.findByRole('dialog', { name: 'Trial #1 详情' });
+    expect(within(trialDrawer).getByText('执行记录（1）')).not.toBeNull();
+    expect(within(trialDrawer).getByText('window')).not.toBeNull();
+    expect(within(trialDrawer).getByText('10')).not.toBeNull();
+    expect(within(trialDrawer).getByText('threshold')).not.toBeNull();
+    expect(within(trialDrawer).getByText('0.5')).not.toBeNull();
+    expect(within(trialDrawer).getByText('基础成本')).not.toBeNull();
+    expect(within(trialDrawer).getByText('立即成交（默认）')).not.toBeNull();
+    expect(within(trialDrawer).getByText('执行 #1')).not.toBeNull();
+    fireEvent.click(within(trialDrawer).getByRole('button', { name: '关闭' }));
+    const kpis = container.querySelector('.experiment-detail-kpis') as HTMLElement;
+    expect(kpis).not.toBeNull();
+    expect(within(kpis).getByText('取消')).not.toBeNull();
+    expect(within(kpis).queryByText('日期场景')).toBeNull();
     expect(container.querySelector('.experiment-detail-workspace')).not.toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '查看单次结果' }));
-    expect(onOpenRun).toHaveBeenCalledWith('run-1', '688981.SH', '5m', '20260701');
+    expect(screen.queryByRole('button', { name: '查看单次结果' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /关联回测任务/ }));
+    const drawer = await screen.findByRole('dialog', { name: '关联回测任务' });
+    expect(within(drawer).getByText('#187')).not.toBeNull();
+    expect(within(drawer).getByText('#193')).not.toBeNull();
+    expect(within(drawer).getByText('人工重试')).not.toBeNull();
+    expect(within(drawer).queryByText('选定结果')).toBeNull();
+    expect(within(drawer).queryByText('查看信号图表')).toBeNull();
+    fireEvent.click(within(drawer).getByRole('button', { name: '查看回测 #193 详情' }));
+    expect(onOpenBacktestDetail).toHaveBeenCalledWith('run-2');
+    expect(onOpenRun).not.toHaveBeenCalled();
+    expect(fetchExperimentBacktestRuns).toHaveBeenCalledWith('experiment-1', undefined, '');
+    const runSearch = within(drawer).getByRole('textbox', { name: '筛选回测任务编号' });
+    expect(runSearch.getAttribute('placeholder')).toBe('输入回测任务编号，例如 187');
+    fireEvent.change(runSearch, { target: { value: '#193' } });
+    expect((runSearch as HTMLInputElement).value).toBe('193');
+    fireEvent.click(within(drawer).getByRole('button', { name: '筛选' }));
+    await waitFor(() => {
+      expect(fetchExperimentBacktestRuns).toHaveBeenCalledWith('experiment-1', undefined, '193');
+    });
     expect(fetchExperimentDetail).toHaveBeenCalledTimes(1);
-    expect(fetchExperimentTrials).toHaveBeenCalledWith('experiment-1');
-    expect(screen.getByText('执行 #1')).not.toBeNull();
+    expect(fetchExperimentTrials).toHaveBeenCalledWith('experiment-1', undefined, {
+      revisionId: undefined,
+      status: '',
+      dateScenarioId: undefined,
+      query: '',
+      limit: 20,
+    });
+    expect(screen.queryByText('选定结果')).toBeNull();
+  });
+
+  it('filters the compact Trial list on the server and opens details in a drawer', async () => {
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    await screen.findByRole('table');
+    const search = screen.getByRole('textbox', { name: '搜索 Trial 编号' });
+    fireEvent.change(search, { target: { value: '#12a' } });
+    expect((search as HTMLInputElement).value).toBe('12');
+    fireEvent.click(screen.getByRole('button', { name: '搜索' }));
+    await waitFor(() => expect(fetchExperimentTrials).toHaveBeenLastCalledWith(
+      'experiment-1', undefined, {
+        revisionId: undefined,
+        status: '',
+        dateScenarioId: undefined,
+        query: '12',
+        limit: 20,
+      },
+    ));
+
+    fireEvent.change(screen.getByRole('combobox', { name: '筛选 Trial 状态' }), {
+      target: { value: 'succeeded' },
+    });
+    fireEvent.change(screen.getByRole('combobox', { name: '筛选日期场景' }), {
+      target: { value: 'development-1' },
+    });
+    await waitFor(() => expect(fetchExperimentTrials).toHaveBeenLastCalledWith(
+      'experiment-1', undefined, {
+        revisionId: undefined,
+        status: 'succeeded',
+        dateScenarioId: 'development-1',
+        query: '12',
+        limit: 20,
+      },
+    ));
+  });
+
+  it('兼容缺少关联回测任务摘要的实验详情', async () => {
+    vi.mocked(fetchExperimentDetail).mockResolvedValue({
+      ...DETAIL,
+      relatedBacktestRuns: undefined,
+    } as unknown as ExperimentDetail);
+
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    await screen.findByText('2 / 2');
+    const relatedRunsButton = screen.getByRole('button', { name: /关联回测任务/ });
+    expect((relatedRunsButton as HTMLButtonElement).disabled).toBe(true);
+    expect(relatedRunsButton.textContent).toContain('0 个');
   });
 
   it('freezes and confirms failed Trial selection before one manual retry', async () => {

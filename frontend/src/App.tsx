@@ -58,6 +58,10 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
   ));
   const [sharedPublicationId, setSharedPublicationId] = useState<string | null>(null);
   const [strategyConfigToOpen, setStrategyConfigToOpen] = useState<string | null>(null);
+  const [historyRunRequest, setHistoryRunRequest] = useState<{
+    runId: string;
+    requestNo: number;
+  } | null>(null);
   const [researchError, setResearchError] = useState<string | null>(null);
   const [researchStarting, setResearchStarting] = useState(false);
   const [workspaceSafety, setWorkspaceSafety] = useState({
@@ -355,6 +359,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
           }}
           experimentPreviewEnabled={experimentPreviewEnabled === true}
           requestedConfigId={strategyConfigToOpen}
+          requestedHistoryRun={historyRunRequest}
         />
       </div>
 
@@ -398,6 +403,20 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
               experimentId: undefined,
             });
             setActivePage('signals');
+          }}
+          onOpenBacktestDetail={(runId) => {
+            setHistoryRunRequest((current) => ({
+              runId,
+              requestNo: (current?.requestNo ?? 0) + 1,
+            }));
+            setUrlParams({
+              workspace: 'backtest',
+              runId: undefined,
+              experimentConfigId: undefined,
+              experimentVersionId: undefined,
+              experimentId: undefined,
+            });
+            setActivePage('backtest');
           }}
         />
       )}

@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Copy, Download, Play, Plus, RefreshCw, RotateCcw, Save, Trash2, X } from 'lucide-react';
 import { createBrowserUuid } from '../../utils/browserUuid';
-import { statusLabel } from './displayLabels';
+import {
+  dimensionDisplayLabel,
+  statusLabel,
+  systemDimensionValueLabel,
+  visualizationTypeLabel,
+} from './displayLabels';
 import EvaluationComparison from './EvaluationComparison';
 import type { ScenarioName } from './comparisonData';
 import {
@@ -101,8 +106,11 @@ function formatEvaluationValue(
   value: unknown,
   fieldId: string,
   dataTypes: Map<string, EvaluationDataType>,
+  scenarioNames: ScenarioName[] = [],
 ): string {
   if (value === null || value === undefined || value === '') return '—';
+  const systemLabel = systemDimensionValueLabel(fieldId, value, scenarioNames);
+  if (systemLabel) return systemLabel;
   const dataType = dataTypes.get(fieldId);
   if (dataType === 'boolean') return value === true || value === 'true' ? '是' : '否';
   if (dataType === 'integer') return String(value);
@@ -182,7 +190,7 @@ function CoverageEditor({
             {dimensions.filter((dimension) => (
               dimension.dimensionId === item.dimensionId
               || !coverage.some((entry) => entry.dimensionId === dimension.dimensionId)
-            )).map((dimension) => <option value={dimension.dimensionId} key={dimension.dimensionId}>{dimension.displayName}</option>)}
+            )).map((dimension) => <option value={dimension.dimensionId} key={dimension.dimensionId}>{dimensionDisplayLabel(dimension.dimensionId, dimension.displayName)}</option>)}
           </select>
           <input aria-label={`最低覆盖率 ${item.dimensionId}`} value={item.minimumCoverageRate} onChange={(event) => update(index, { minimumCoverageRate: event.target.value })} />
           <button className="app-icon-button" type="button" aria-label="删除维度覆盖" onClick={() => onChange(coverage.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={14} /></button>
@@ -477,13 +485,13 @@ function VisualizationEditor({
     <div className="evaluation-rules">
       {visualizations.map((item, index) => (
         <div className="evaluation-rule" key={`${item.type}-${index}`}>
-          <strong>{item.type}</strong>
+          <strong>{visualizationTypeLabel(item.type)}</strong>
           <select aria-label="分析指标" value={item.metricId} onChange={(event) => update(index, { metricId: event.target.value })}>
             {metrics.map((metric) => <option key={metric.metricId} value={metric.metricId}>{metricLabel(metric)}</option>)}
           </select>
           {item.type === 'parameter_curve_v1' && <select aria-label="曲线参数" value={item.parameterDimensionId} onChange={(event) => update(index, { parameterDimensionId: event.target.value, seriesBy: seriesFor(event.target.value) })}>{parameters.map((parameter) => <option key={parameter.dimensionId} value={parameter.dimensionId}>{parameter.displayName}</option>)}</select>}
           {item.type === 'parameter_heatmap_v1' && <span className="evaluation-axis-pair"><select aria-label="热力图横轴" value={item.xDimensionId} onChange={(event) => update(index, { xDimensionId: event.target.value, facetBy: facetsFor(event.target.value, item.yDimensionId) })}>{parameters.map((parameter) => <option key={parameter.dimensionId} value={parameter.dimensionId}>{parameter.displayName}</option>)}</select><select aria-label="热力图纵轴" value={item.yDimensionId} onChange={(event) => update(index, { yDimensionId: event.target.value, facetBy: facetsFor(item.xDimensionId, event.target.value) })}>{parameters.map((parameter) => <option key={parameter.dimensionId} value={parameter.dimensionId}>{parameter.displayName}</option>)}</select></span>}
-          {item.type === 'cost_stress_v1' && <><select aria-label="成本基线" value={item.baselineScenarioId} onChange={(event) => update(index, { baselineScenarioId: event.target.value })}>{(cost?.orderedValues ?? []).map((value) => <option key={String(value)} value={String(value)}>{String(value)}</option>)}</select><input aria-label="成本退化阈值" value={item.degradationThreshold ?? ''} onChange={(event) => update(index, { degradationThreshold: event.target.value || null })} /></>}
+          {item.type === 'cost_stress_v1' && <><select aria-label="成本基线" value={item.baselineScenarioId} onChange={(event) => update(index, { baselineScenarioId: event.target.value })}>{(cost?.orderedValues ?? []).map((value) => <option key={String(value)} value={String(value)}>{systemDimensionValueLabel('costScenarioId', value) ?? String(value)}</option>)}</select><input aria-label="成本退化阈值" value={item.degradationThreshold ?? ''} onChange={(event) => update(index, { degradationThreshold: event.target.value || null })} /></>}
           <button className="app-icon-button" type="button" aria-label="删除分析图" onClick={() => onChange(visualizations.filter((_, itemIndex) => itemIndex !== index))}>
             <Trash2 size={14} />
           </button>
@@ -503,15 +511,16 @@ type VisualizationProps = {
   item: Record<string, unknown>;
   labels: Map<string, string>;
   dataTypes: Map<string, EvaluationDataType>;
+  scenarioNames?: ScenarioName[];
 };
 
-function LegacyParameterResult({ item, labels, dataTypes }: VisualizationProps) {
+function LegacyParameterResult({ item, labels, dataTypes, scenarioNames = [] }: VisualizationProps) {
   const series = (item.series ?? []) as Array<{ seriesKey: string; dimensions?: Record<string, unknown>; points: Array<Record<string, unknown>> }>;
   const axis = String(item.parameterDimensionId);
   return <article className="evaluation-analysis-card">
     <h4>{labels.get(axis) ?? axis} · {labels.get(String(item.metricId)) ?? String(item.metricId)}</h4>
     {series.map((group, index) => <div key={group.seriesKey ?? index}>
-      <p>{Object.entries(group.dimensions ?? {}).map(([id, value]) => `${labels.get(id) ?? id}=${formatEvaluationValue(value, id, dataTypes)}`).join(' · ') || `历史分组 ${index + 1}（未保存条件）`}</p>
+      <p>{Object.entries(group.dimensions ?? {}).map(([id, value]) => `${labels.get(id) ?? id}=${formatEvaluationValue(value, id, dataTypes, scenarioNames)}`).join(' · ') || `历史分组 ${index + 1}（未保存条件）`}</p>
       <table className="evaluation-table"><thead><tr><th>{labels.get(axis) ?? axis}</th><th>中位数</th><th>样本数</th></tr></thead>
         <tbody>{group.points.map((point, pointIndex) => <tr key={pointIndex}><td>{formatEvaluationValue(point.x, axis, dataTypes)}</td><td>{formatDecimal(point.median)}</td><td>{String(point.count ?? '—')}</td></tr>)}</tbody>
       </table>
@@ -520,14 +529,14 @@ function LegacyParameterResult({ item, labels, dataTypes }: VisualizationProps) 
 }
 
 function VisualizationResult(props: VisualizationProps) {
-  const { item, labels, dataTypes } = props;
+  const { item, labels, dataTypes, scenarioNames = [] } = props;
   if (item.type === 'parameter_curve_v1') return <LegacyParameterResult {...props} />;
   if (item.type === 'parameter_heatmap_v1') {
     const facets = item.facets as Array<{ facetKey: string; cells: Array<Record<string, unknown>> }>;
     return <article className="evaluation-analysis-card"><h4>二维参数对比 · {labels.get(String(item.metricId)) ?? String(item.metricId)}</h4>{facets.map((facet) => <div key={facet.facetKey} className="evaluation-heatmap">{facet.cells.map((cell) => <span key={`${String(cell.x)}-${String(cell.y)}`} title={`样本 ${String(cell.count)}`}>{formatDecimal(cell.x)} × {formatDecimal(cell.y)}<strong>{formatDecimal(cell.median)}</strong></span>)}</div>)}</article>;
   }
   const comparisons = item.comparisons as Array<Record<string, unknown>>;
-  return <article className="evaluation-analysis-card"><h4>成本压力 · {labels.get(String(item.metricId)) ?? String(item.metricId)}</h4><div className="evaluation-point-list">{comparisons.map((entry, index) => <span key={`${String(entry.pressureRunId)}-${index}`}>{String(entry.baselineScenarioId)} → {String(entry.pressureScenarioId)}：{formatDecimal(entry.delta)}</span>)}</div></article>;
+  return <article className="evaluation-analysis-card"><h4>成本压力 · {labels.get(String(item.metricId)) ?? String(item.metricId)}</h4><div className="evaluation-point-list">{comparisons.map((entry, index) => <span key={`${String(entry.pressureRunId)}-${index}`}>{formatEvaluationValue(entry.baselineScenarioId, 'costScenarioId', dataTypes, scenarioNames)} → {formatEvaluationValue(entry.pressureScenarioId, 'costScenarioId', dataTypes, scenarioNames)}：{formatDecimal(entry.delta)}</span>)}</div></article>;
 }
 
 const EXPORT_STATUS_LABELS: Record<EvaluationExport['status'], string> = {
@@ -698,7 +707,10 @@ function EvaluationResult({
 }) {
   const labels = new Map([
     ...catalogs.metricCatalog.metrics.map((item) => [item.metricId, item.displayName] as const),
-    ...catalogs.dimensionCatalog.dimensions.map((item) => [item.dimensionId, item.displayName] as const),
+    ...catalogs.dimensionCatalog.dimensions.map((item) => [
+      item.dimensionId,
+      dimensionDisplayLabel(item.dimensionId, item.displayName),
+    ] as const),
     ...Object.entries(BASIC_AGGREGATE_LABELS),
     ...detail.spec.derivedMetrics.map((item) => [item.metricId, item.displayName] as const),
   ]);
@@ -733,14 +745,17 @@ function EvaluationResult({
     <div className="evaluation-result">
       <div className="evaluation-report-identity">
         <div>
-          <span>评价报告</span>
+          <span>当前报告</span>
           <strong>{detail.specName ?? detail.spec.name} · 规则 v{detail.specVersionNo ?? '—'}</strong>
-          <small>创建 {formatDateTime(detail.createdAt)} · 完成 {formatDateTime(detail.finishedAt)}</small>
+          <small className="evaluation-report-timestamps">
+            <span>创建 <time dateTime={detail.createdAt}>{formatDateTime(detail.createdAt)}</time></span>
+            <span>完成 <time dateTime={detail.finishedAt ?? undefined}>{formatDateTime(detail.finishedAt)}</time></span>
+          </small>
         </div>
         <div>
           <span>{detail.output.sort.length > 0 ? '排序首行' : '首行记录'}</span>
           <strong>{firstRow ? candidateSummaryColumns.map((id) => (
-            `${labels.get(id) ?? id}=${formatEvaluationValue(firstRow.values[id], id, dataTypes)}`
+            `${labels.get(id) ?? id}=${formatEvaluationValue(firstRow.values[id], id, dataTypes, scenarioNames)}`
           )).join(' · ') : '没有符合规则的候选'}</strong>
         </div>
       </div>
@@ -770,7 +785,7 @@ function EvaluationResult({
             <tr key={row.trialExecutionId ?? row.groupKey ?? `${row.stageIndex}-${row.trialIndex}`}>
               <td>{index + 1}</td>
               {detail.output!.columns.map((id) => (
-                <td key={id} title={row.unsupportedReasons[id] ?? ''}>{formatEvaluationValue(row.values[id], id, dataTypes)}</td>
+                <td key={id} title={row.unsupportedReasons[id] ?? ''}>{formatEvaluationValue(row.values[id], id, dataTypes, scenarioNames)}</td>
               ))}
               <td>{row.runId ? <button className="app-button is-quiet" type="button" onClick={() => onOpenRun?.(row.runId!, symbol, timeframe, row.startDate ?? '')}>查看结果</button> : (
                 <details className="evaluation-member-results">
@@ -794,9 +809,9 @@ function EvaluationResult({
       <EvaluationComparison key={detail.evaluationRunId} visualizations={visualizations} catalogs={catalogs} labels={labels} names={scenarioNames}
         onOpenRun={onOpenRun ? (runId, date) => onOpenRun(runId, symbol, timeframe, date) : undefined} />
       {additionalVisualizations.length > 0 && <details className="evaluation-additional-analysis"><summary>其他已保存分析（{additionalVisualizations.length}）</summary>
-        <div className="evaluation-analysis-grid">{additionalVisualizations.map((item, index) => <VisualizationResult item={item} labels={labels} dataTypes={dataTypes} key={`${String(item.type)}-${index}`} />)}</div>
+        <div className="evaluation-analysis-grid">{additionalVisualizations.map((item, index) => <VisualizationResult item={item} labels={labels} dataTypes={dataTypes} scenarioNames={scenarioNames} key={`${String(item.type)}-${index}`} />)}</div>
       </details>}
-      {completeness.dimensionCoverage.length > 0 && <details className="evaluation-exceptions"><summary>关键维度覆盖（{completeness.dimensionCoverage.length}）</summary>{completeness.dimensionCoverage.map((dimension) => <div key={dimension.dimensionId}><strong>{labels.get(dimension.dimensionId) ?? dimension.dimensionId}</strong><span>最低观察值 {formatDecimal(dimension.minimumObservedRate)} / 门槛 {formatDecimal(dimension.requiredRate)}</span>{dimension.values.map((item) => <span key={JSON.stringify(item.value)}>{String(item.value ?? '空值')}：{item.succeededCount}/{item.expectedCount}（{formatDecimal(item.coverageRate)}）</span>)}</div>)}</details>}
+      {completeness.dimensionCoverage.length > 0 && <details className="evaluation-exceptions"><summary>关键维度覆盖（{completeness.dimensionCoverage.length}）</summary>{completeness.dimensionCoverage.map((dimension) => <div key={dimension.dimensionId}><strong>{labels.get(dimension.dimensionId) ?? dimension.dimensionId}</strong><span>最低观察值 {formatDecimal(dimension.minimumObservedRate)} / 门槛 {formatDecimal(dimension.requiredRate)}</span>{dimension.values.map((item) => <span key={JSON.stringify(item.value)}>{formatEvaluationValue(item.value, dimension.dimensionId, dataTypes, scenarioNames)}：{item.succeededCount}/{item.expectedCount}（{formatDecimal(item.coverageRate)}）</span>)}</div>)}</details>}
       {completeness.exceptions.length > 0 && <details className="evaluation-exceptions"><summary>失败、取消与缺失项（{completeness.exceptions.length}）</summary>{completeness.exceptions.map((item) => <div key={`${item.stageId}-${item.trialIndex}`}><span>Trial #{item.trialIndex + 1}</span><strong>{statusLabel(item.status)}</strong><span>{item.error ? JSON.stringify(item.error) : '无结果'}</span></div>)}</details>}
       <details className="evaluation-execution-set">
         <summary>查看冻结执行集合</summary>
@@ -1130,8 +1145,8 @@ export default function EvaluationBuilder({
       {notice && <div className="experiment-alert" role="status">{notice}</div>}
       <section className="evaluation-report-browser" aria-label="评价报告选择">
         <div>
-          <span>评价报告</span>
-          <strong>{runs.length > 0 ? `${runs.length} 份已保存报告` : '尚未生成报告'}</strong>
+          <span>报告列表</span>
+          <strong>{runs.length > 0 ? `共 ${runs.length} 份` : '尚未生成报告'}</strong>
         </div>
         {runs.length > 0 && <label><span>打开报告</span><select aria-label="选择评价报告" value={selectedRun?.evaluationRunId ?? ''} onChange={(event) => { if (event.target.value) void loadRun(event.target.value); else setSelectedRun(null); }}><option value="">请选择一份报告</option>{runs.map((run, index) => <option value={run.evaluationRunId} key={run.evaluationRunId}>报告 #{runs.length - index} · {run.specName ?? '评价'} v{run.specVersionNo ?? '—'} · {statusLabel(run.status)} · {formatDateTime(run.finishedAt)}</option>)}</select></label>}
         {selectedRun?.status === 'failed' && <button className="app-button is-quiet" type="button" disabled={busy} onClick={() => { void retryRun(selectedRun.evaluationRunId); }}><RotateCcw size={14} /> 重试当前报告</button>}
@@ -1145,11 +1160,14 @@ export default function EvaluationBuilder({
             <label>评价名称<input value={name} maxLength={128} onChange={(event) => setName(event.target.value)} /></label>
             <fieldset><legend>展示字段</legend><div className="evaluation-columns">{selectableFields.map((field) => {
               const id = 'metricId' in field ? field.metricId : field.dimensionId;
-              return <label key={id}><input type="checkbox" checked={columns.includes(id)} onChange={(event) => setColumns(event.target.checked ? [...columns, id] : columns.filter((item) => item !== id))} /> {field.displayName}</label>;
+              const displayName = 'dimensionId' in field
+                ? dimensionDisplayLabel(field.dimensionId, field.displayName)
+                : field.displayName;
+              return <label key={id}><input type="checkbox" checked={columns.includes(id)} onChange={(event) => setColumns(event.target.checked ? [...columns, id] : columns.filter((item) => item !== id))} /> {displayName}</label>;
             })}</div></fieldset>
             <fieldset><legend>安全派生公式</legend><FormulaEditor formulas={derivedMetrics} baseMetrics={catalogs.metricCatalog.metrics} aggregates={aggregates} onChange={setDerivedMetrics} /></fieldset>
             <fieldset><legend>过滤条件</legend><FilterEditor filters={filters} metrics={rowMetrics} onChange={setFilters} /></fieldset>
-            <fieldset><legend>分组维度</legend><div className="evaluation-columns">{catalogs.dimensionCatalog.dimensions.map((dimension) => <label key={dimension.dimensionId}><input type="checkbox" checked={groupBy.includes(dimension.dimensionId)} onChange={(event) => setGroupBy(event.target.checked ? [...groupBy, dimension.dimensionId] : groupBy.filter((item) => item !== dimension.dimensionId))} /> {dimension.displayName}</label>)}</div></fieldset>
+            <fieldset><legend>分组维度</legend><div className="evaluation-columns">{catalogs.dimensionCatalog.dimensions.map((dimension) => <label key={dimension.dimensionId}><input type="checkbox" checked={groupBy.includes(dimension.dimensionId)} onChange={(event) => setGroupBy(event.target.checked ? [...groupBy, dimension.dimensionId] : groupBy.filter((item) => item !== dimension.dimensionId))} /> {dimensionDisplayLabel(dimension.dimensionId, dimension.displayName)}</label>)}</div></fieldset>
             <fieldset><legend>聚合统计</legend><AggregateEditor aggregates={aggregates} metrics={rowMetrics} onChange={setAggregates} /></fieldset>
             {groupedOutput && <fieldset><legend>分组过滤</legend><FilterEditor filters={groupFilters.map((item) => ({ ...item, type: 'metric_comparison_v1' }))} metrics={outputMetrics} onChange={(items) => setGroupFilters(items.map((item) => ({ ...item, type: 'group_metric_comparison_v1' })))} /></fieldset>}
             <fieldset><legend>多级排序</legend><SortEditor sort={sort} metrics={outputMetrics} onChange={setSort} /></fieldset>

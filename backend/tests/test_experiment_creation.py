@@ -42,7 +42,7 @@ class MemoryExperimentRepository:
     self.retried: dict[str, Any] | None = None
     self.archived: dict[str, Any] | None = None
     self.restored_archive: dict[str, Any] | None = None
-    self.list_archived: bool | None = None
+    self.list_values: dict[str, Any] | None = None
     self.purge_requested: dict[str, Any] | None = None
 
   def save_preview(self, preview: dict[str, Any]) -> None:
@@ -143,7 +143,7 @@ class MemoryExperimentRepository:
     }, 200)
 
   def list_experiments(self, **values: Any) -> dict[str, Any]:
-    self.list_archived = values["archived"]
+    self.list_values = values
     return {"items": [], "nextCursor": None}
 
   def request_purge(self, **values: Any) -> CommandResult:
@@ -431,14 +431,40 @@ def test_restore_archive_application_preserves_revision_identity() -> None:
   assert repository.restored_archive["idempotency_key"] == "restore-archive-key-1"
 
 
-def test_list_archived_experiments_uses_a_distinct_query_scope() -> None:
+def test_list_experiments_normalizes_search_and_status_filters() -> None:
   repository = MemoryExperimentRepository()
   application = _application(repository)
 
   assert application.list_experiments(
-    limit=50, cursor=None, archived=True,
+    limit=20,
+    cursor=None,
+    archived=True,
+    query="  均值回归  ",
+    status="completed",
   ) == {"items": [], "nextCursor": None}
-  assert repository.list_archived is True
+  assert repository.list_values == {
+    "limit": 20,
+    "cursor": None,
+    "archived": True,
+    "query": "均值回归",
+    "status": "completed",
+  }
+
+
+def test_list_experiments_rejects_unknown_status_filter() -> None:
+  repository = MemoryExperimentRepository()
+  application = _application(repository)
+
+  with pytest.raises(ExperimentError) as rejected:
+    application.list_experiments(
+      limit=20,
+      cursor=None,
+      query="",
+      status="not-a-status",
+    )
+
+  assert rejected.value.code == "experiment.list_filter_invalid"
+  assert repository.list_values is None
 
 
 def test_purge_application_creates_an_audited_async_job() -> None:
@@ -546,7 +572,14 @@ def test_revision_routes_forward_optimistic_identity_and_history_filter(
 
     def list_trials(self, forwarded_experiment_id: str, **values: Any) -> dict[str, Any]:
       assert forwarded_experiment_id == str(experiment_id)
-      assert values["revision_id"] == str(revision_id)
+      assert values == {
+        "limit": 20,
+        "cursor": None,
+        "status": "failed",
+        "revision_id": str(revision_id),
+        "query": "12",
+        "date_scenario_id": "validation-2",
+      }
       return {"items": [], "nextCursor": None}
 
   monkeypatch.setattr(app_module, "_experiment_application", FakeApplication())
@@ -560,11 +593,48 @@ def test_revision_routes_forward_optimistic_identity_and_history_filter(
 
   response = app_module.create_experiment_revision(experiment_id, payload, request)
   trials = app_module.experiment_trials(
-    experiment_id, limit=50, cursor=None, revision_id=revision_id, status=None,
+    experiment_id,
+    limit=20,
+    cursor=None,
+    revision_id=revision_id,
+    query="12",
+    date_scenario_id="validation-2",
+    status="failed",
   )
 
   assert response.status_code == 201
   assert trials == {"items": [], "nextCursor": None}
+
+
+def test_related_backtest_run_route_forwards_experiment_scope(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  experiment_id = UUID("10000000-0000-4000-8000-000000000001")
+
+  class FakeApplication:
+    def list_related_runs(
+      self,
+      forwarded_experiment_id: str,
+      **values: Any,
+    ) -> dict[str, Any]:
+      assert forwarded_experiment_id == str(experiment_id)
+      assert values == {"limit": 20, "cursor": "next", "query": "#187"}
+      return {
+        "totalCount": 2,
+        "initialCount": 1,
+        "retryCount": 1,
+        "items": [],
+        "nextCursor": None,
+      }
+
+  monkeypatch.setattr(app_module, "_experiment_application", FakeApplication())
+
+  response = app_module.experiment_backtest_runs(
+    experiment_id, limit=20, cursor="next", query="#187",
+  )
+
+  assert response["totalCount"] == 2
+  assert response["retryCount"] == 1
 
 
 def test_retry_routes_forward_frozen_selection_and_idempotency(

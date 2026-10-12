@@ -109,6 +109,7 @@ interface Props {
   onCreateExperiment?: (selection: { configId: string; versionId: string }) => void;
   experimentPreviewEnabled?: boolean;
   requestedConfigId?: string | null;
+  requestedHistoryRun?: { runId: string; requestNo: number } | null;
 }
 
 const panelStyle = {
@@ -1351,6 +1352,7 @@ export default function BacktestPage({
   onCreateExperiment,
   experimentPreviewEnabled = false,
   requestedConfigId = null,
+  requestedHistoryRun = null,
 }: Props) {
   const [instrumentList, setInstrumentList] = useState<InstrumentItem[]>(instruments);
   const [accounts, setAccounts] = useState<BacktestAccount[]>([]);
@@ -1409,6 +1411,7 @@ export default function BacktestPage({
   const historyCompareRequestIdRef = useRef(0);
   const dataStatusRequestIdRef = useRef(0);
   const benchmarkDataStatusRequestIdRef = useRef(0);
+  const pendingRequestedHistoryRunIdRef = useRef<string | null>(null);
   const [historyNoteDraft, setHistoryNoteDraft] = useState('');
   const [historyTagsDraft, setHistoryTagsDraft] = useState('');
   const [publicationRun, setPublicationRun] = useState<BacktestRunHistory | null>(null);
@@ -1459,6 +1462,13 @@ export default function BacktestPage({
 
   const [activePanel, setActivePanel] = useState<WorkbenchPanel>('overview');
   const signalDetailExports = useSignalDetailExports(activePanel === 'history');
+
+  useEffect(() => {
+    if (!requestedHistoryRun) return;
+    pendingRequestedHistoryRunIdRef.current = requestedHistoryRun.runId;
+    setSelectedHistoryRunId(requestedHistoryRun.runId);
+    setActivePanel('history');
+  }, [requestedHistoryRun]);
   const historyFilters: BacktestRunFilters = useMemo(() => ({
     query: historyQuery,
     symbol: historySymbolFilter,
@@ -1801,17 +1811,17 @@ export default function BacktestPage({
 
   useEffect(() => {
     if (backtestRuns.length === 0) {
-      setSelectedHistoryRunId('');
+      if (!pendingRequestedHistoryRunIdRef.current) setSelectedHistoryRunId('');
       setCompareHistoryRunId('');
       return;
     }
     if (!selectedHistoryRunId) {
-      setSelectedHistoryRunId(backtestRuns[0].id);
+      setSelectedHistoryRunId(pendingRequestedHistoryRunIdRef.current ?? backtestRuns[0].id);
     }
     if (!compareHistoryRunId) {
       setCompareHistoryRunId(backtestRuns[1]?.id || backtestRuns[0].id);
     }
-  }, [backtestRuns]);
+  }, [backtestRuns, selectedHistoryRunId, compareHistoryRunId]);
 
   useEffect(() => {
     if (selectedHistoryRunId === '' || compareHistoryRunId === '') return;
@@ -1831,7 +1841,14 @@ export default function BacktestPage({
     fetchBacktestRun(selectedHistoryRunId)
       .then((run) => {
         if (cancelled) return;
-        setBacktestRuns((prev) => prev.map((item) => (item.id === run.id ? run : item)));
+        if (pendingRequestedHistoryRunIdRef.current === run.id) {
+          pendingRequestedHistoryRunIdRef.current = null;
+        }
+        setBacktestRuns((prev) => (
+          prev.some((item) => item.id === run.id)
+            ? prev.map((item) => (item.id === run.id ? run : item))
+            : [run, ...prev]
+        ));
         setHistoryRunDetails((previous) => ({ ...previous, [run.id]: run }));
         setHistoryNoteDraft(run.note || '');
         setHistoryTagsDraft(run.tags.join(', '));

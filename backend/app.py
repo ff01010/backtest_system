@@ -1920,10 +1920,16 @@ def list_experiments(
   limit: int = Query(50, ge=1, le=200),
   cursor: str | None = Query(default=None, max_length=2048),
   archived: bool = Query(False),
+  search_query: str = Query(default="", alias="query", max_length=100),
+  status: str | None = Query(default=None, max_length=64),
 ) -> dict[str, Any]:
   try:
     return _experiment_application.list_experiments(
-      limit=limit, cursor=cursor, archived=archived,
+      limit=limit,
+      cursor=cursor,
+      archived=archived,
+      query=search_query,
+      status=status,
     )
   except ExperimentError as error:
     _raise_experiment_error(error)
@@ -1994,6 +2000,10 @@ def experiment_trials(
   limit: int = Query(50, ge=1, le=200),
   cursor: str | None = Query(default=None, max_length=2048),
   revision_id: UUID | None = Query(default=None, alias="revisionId"),
+  query: str = Query(default="", max_length=32),
+  date_scenario_id: str | None = Query(
+    default=None, alias="dateScenarioId", max_length=128,
+  ),
   status: Literal[
     "pending", "queued", "running", "cancelling", "succeeded", "failed", "cancelled"
   ] | None = Query(default=None),
@@ -2005,6 +2015,23 @@ def experiment_trials(
       cursor=cursor,
       status=status,
       revision_id=str(revision_id) if revision_id else None,
+      query=query,
+      date_scenario_id=date_scenario_id,
+    )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get("/api/backtest/experiments/{experiment_id}/backtest-runs")
+def experiment_backtest_runs(
+  experiment_id: UUID,
+  limit: int = Query(50, ge=1, le=200),
+  cursor: str | None = Query(default=None, max_length=2048),
+  query: str = Query(default="", max_length=32),
+) -> dict[str, Any]:
+  try:
+    return _experiment_application.list_related_runs(
+      str(experiment_id), limit=limit, cursor=cursor, query=query,
     )
   except ExperimentError as error:
     _raise_experiment_error(error)
@@ -3061,7 +3088,11 @@ def public_experiments(
   _require_public_scope(request, "experiment:read")
   try:
     return _experiment_application.list_experiments(
-      limit=limit, cursor=cursor, archived=False,
+      limit=limit,
+      cursor=cursor,
+      archived=False,
+      query="",
+      status=None,
     )
   except ExperimentError as error:
     _raise_experiment_error(error)
@@ -3087,6 +3118,10 @@ def public_experiment_trials(
   limit: int = Query(50, ge=1, le=200),
   cursor: str | None = Query(default=None, max_length=2048),
   revision_id: UUID | None = Query(default=None, alias="revisionId"),
+  query: str = Query(default="", max_length=32),
+  date_scenario_id: str | None = Query(
+    default=None, alias="dateScenarioId", max_length=128,
+  ),
   status: Literal[
     "pending", "queued", "running", "cancelling", "succeeded", "failed", "cancelled"
   ] | None = Query(default=None),
@@ -3099,6 +3134,8 @@ def public_experiment_trials(
       cursor=cursor,
       status=status,
       revision_id=str(revision_id) if revision_id else None,
+      query=query,
+      date_scenario_id=date_scenario_id,
     )
   except ExperimentError as error:
     _raise_experiment_error(error)

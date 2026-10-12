@@ -6,6 +6,68 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+MIGRATION_ROOT = ROOT / "db" / "migrations"
+LEGACY_NON_TRANSACTIONAL_MIGRATIONS = frozenset(
+  {
+    "009_normalize_trading_date_json.sql",
+    "018_research_signal_snapshot_artifacts.sql",
+    "019_research_signal_result_outbox.sql",
+    "020_research_authorization_codes.sql",
+    "038_market_instrument_legacy_secid.sql",
+  },
+)
+ALLOWED_MIGRATION_PERMISSION_ROLES = frozenset(
+  {
+    ':"app_db_user"',
+    "PUBLIC",
+    "quant_backtest_release_admin",
+  },
+)
+MIGRATION_PERMISSION_ROLE_PATTERN = re.compile(
+  r"\b(?:GRANT|REVOKE)\b[^;]*?\b(?:TO|FROM)\s+([^\s;]+)\s*;",
+  re.IGNORECASE | re.DOTALL,
+)
+
+
+def test_migrations_only_grant_or_revoke_declared_roles() -> None:
+  unexpected_roles: list[str] = []
+
+  for migration in sorted(MIGRATION_ROOT.glob("*.sql")):
+    sql = migration.read_text(encoding="utf-8")
+    for match in MIGRATION_PERMISSION_ROLE_PATTERN.finditer(sql):
+      role = match.group(1)
+      if role not in ALLOWED_MIGRATION_PERMISSION_ROLES:
+        unexpected_roles.append(f"{migration.name}: {role}")
+
+  assert unexpected_roles == []
+
+
+def test_new_migrations_are_transactional() -> None:
+  non_transactional_migrations: list[str] = []
+
+  for migration in sorted(MIGRATION_ROOT.glob("*.sql")):
+    if migration.name in LEGACY_NON_TRANSACTIONAL_MIGRATIONS:
+      continue
+    sql = migration.read_text(encoding="utf-8")
+    if not re.search(r"(?m)^BEGIN;\s*$", sql) or not re.search(
+      r"(?m)^COMMIT;\s*$",
+      sql,
+    ):
+      non_transactional_migrations.append(migration.name)
+
+  assert non_transactional_migrations == []
+
+
+def test_scheduler_capacity_constraint_matches_configurable_maximum() -> None:
+  settings = (ROOT / "backend" / "settings.py").read_text(encoding="utf-8")
+  migration = (
+    MIGRATION_ROOT / "055_backtest_scheduler_capacity_limit.sql"
+  ).read_text(encoding="utf-8")
+
+  assert "BACKTEST_CONFIGURABLE_MAX_CONCURRENCY = 64" in settings
+  assert "DROP CONSTRAINT IF EXISTS" in migration
+  assert "backtest_scheduler_capacity_override_limit_check" in migration
+  assert "CHECK (override_limit BETWEEN 8 AND 64)" in migration
 
 
 def test_release_admin_uses_target_sha_and_preserves_recovery_image() -> None:
