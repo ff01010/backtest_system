@@ -19,6 +19,8 @@ from backend.experiments.generators import (
   seed_bundle,
 )
 from backend.experiments.repository import PostgresExperimentRepository
+from backend.experiments.rolling_window import NoWork, RollingTrialWindow
+from backend.experiments.rollout import ContractEpoch, current_contract_epoch
 from backend.experiments.resolvers import ResolvedRunTemplate
 from backend.services import state_store
 
@@ -72,11 +74,13 @@ class ExperimentCoordinator:
     repository: GenerationRepository | None = None,
     generator: FiniteGridGenerator | None = None,
     compiler: TrialCompiler | None = None,
+    rolling_window: RollingTrialWindow | None = None,
     worker_id: str | None = None,
   ) -> None:
     self._repository = repository or PostgresExperimentRepository()
     self._generator = generator or FiniteGridGenerator()
     self._compiler = compiler or LegacySingleBarTrialCompiler()
+    self._rolling_window = rolling_window
     self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
 
   def run_forever(self) -> None:
@@ -103,6 +107,15 @@ class ExperimentCoordinator:
     return handled
 
   def _generate_once(self) -> bool:
+    if current_contract_epoch() >= ContractEpoch.ROLLING_WINDOW_V1:
+      rolling = self._rolling_window or RollingTrialWindow(
+        generator=self._generator,
+        compiler=self._compiler,
+      )
+      result = rolling.generate_next_batch(
+        settings.EXPERIMENT_GENERATION_BATCH_SIZE,
+      )
+      return not isinstance(result, NoWork)
     stage = self._repository.claim_generation_stage(
       self._worker_id,
       settings.EXPERIMENT_COORDINATOR_LEASE_SECONDS,
@@ -150,6 +163,13 @@ class ExperimentCoordinator:
     return bool(refresh())
 
   def _repair_once(self) -> bool:
+    if current_contract_epoch() >= ContractEpoch.ROLLING_WINDOW_V1:
+      rolling = self._rolling_window or RollingTrialWindow(
+        generator=self._generator,
+        compiler=self._compiler,
+      )
+      if rolling.reconcile_next():
+        return True
     repair = getattr(self._repository, "repair_next_aggregate", None)
     if not callable(repair):
       return False

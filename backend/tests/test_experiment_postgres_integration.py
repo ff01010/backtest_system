@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -32,6 +33,8 @@ from backend.experiments.export_repository import PostgresEvaluationExportReposi
 from backend.experiments.repository import PostgresExperimentRepository
 from backend.experiments.purge_repository import PostgresExperimentPurgeRepository
 from backend.experiments.purge_worker import ExperimentPurgeWorker
+from backend.experiments.rolling_window import GeneratedBatch, RollingTrialWindow
+from backend.experiments.storage_pressure import StorageDecision
 from backend.services import auth, state_store
 from backend.services.user_context import (
   CurrentUser,
@@ -106,10 +109,25 @@ def users() -> None:
       cur.execute("DELETE FROM backtest_experiment_purge_item")
       cur.execute("DELETE FROM backtest_experiment_purge")
       cur.execute("DELETE FROM backtest_experiment_audit")
+      cur.execute("DELETE FROM backtest_signal_detail_export")
       cur.execute("DELETE FROM backtest_experiment_evaluation_export")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_exception")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_group_result")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_result_row")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_execution")
       cur.execute("DELETE FROM backtest_experiment_evaluation_run")
       cur.execute("DELETE FROM backtest_experiment_evaluation_spec")
       cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
+      cur.execute("DELETE FROM backtest_experiment_window_event")
+      cur.execute("DELETE FROM backtest_experiment_generation_token")
+      cur.execute("DELETE FROM backtest_experiment_window_stage")
+      cur.execute("DELETE FROM backtest_experiment_window_user")
+      cur.execute("""
+        UPDATE backtest_experiment_window_global
+        SET open_count=0, reserved_count=0, next_user_sequence=1,
+          row_version=row_version+1, updated_at=now()
+        WHERE singleton
+      """)
       cur.execute("DELETE FROM backtest_experiment_trial_execution")
       cur.execute("DELETE FROM backtest_run WHERE origin_type='experiment'")
       cur.execute("DELETE FROM backtest_experiment_trial")
@@ -192,6 +210,17 @@ class GenerationOnlyRepository:
     self._repository.block_generation(*args)
 
 
+class AlwaysOpenStorageGate:
+  def evaluate(self, now: datetime | None = None) -> StorageDecision:
+    return StorageDecision(
+      status="open",
+      reasons=(),
+      missing_signals=(),
+      observed_at=now or datetime.now(timezone.utc),
+      signals={},
+    )
+
+
 @pytest.fixture()
 def execution_application(monkeypatch: pytest.MonkeyPatch) -> ExperimentApplication:
   _clear_experiment_facts()
@@ -236,10 +265,25 @@ def _clear_experiment_facts() -> None:
       cur.execute("DELETE FROM backtest_experiment_purge_item")
       cur.execute("DELETE FROM backtest_experiment_purge")
       cur.execute("DELETE FROM backtest_experiment_audit")
+      cur.execute("DELETE FROM backtest_signal_detail_export")
       cur.execute("DELETE FROM backtest_experiment_evaluation_export")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_exception")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_group_result")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_result_row")
+      cur.execute("DELETE FROM backtest_experiment_evaluation_execution")
       cur.execute("DELETE FROM backtest_experiment_evaluation_run")
       cur.execute("DELETE FROM backtest_experiment_evaluation_spec")
       cur.execute("DELETE FROM backtest_experiment_dispatch_outbox")
+      cur.execute("DELETE FROM backtest_experiment_window_event")
+      cur.execute("DELETE FROM backtest_experiment_generation_token")
+      cur.execute("DELETE FROM backtest_experiment_window_stage")
+      cur.execute("DELETE FROM backtest_experiment_window_user")
+      cur.execute("""
+        UPDATE backtest_experiment_window_global
+        SET open_count=0, reserved_count=0, next_user_sequence=1,
+          row_version=row_version+1, updated_at=now()
+        WHERE singleton
+      """)
       cur.execute("DELETE FROM backtest_experiment_trial_execution")
       cur.execute("DELETE FROM backtest_run WHERE origin_type='experiment'")
       cur.execute("DELETE FROM backtest_experiment_trial")
@@ -372,6 +416,8 @@ def test_copied_experiment_preserves_owned_source_lineage(
 def test_experiment_list_filters_search_status_and_cursor_scope(
   application: ExperimentApplication,
 ) -> None:
+  _clear_experiment_facts()
+
   def create_named(name: str, key: str) -> str:
     request = _request().model_copy(update={"name": name})
     preview = _as_user(OWNER, lambda: application.preview(request))
@@ -751,7 +797,7 @@ def test_capacity_override_blocks_without_losing_grid_and_resumes(
 
   assert coordinator.run_once()
   blocked = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
-  assert blocked["status"] == "queued"
+  assert blocked["status"] == "generation_blocked"
   assert blocked["blockedReason"]["code"] == "experiment.capacity_blocked"
   assert blocked["snapshotVersion"] > before["snapshotVersion"]
   assert blocked["stage"]["generatedTrialCount"] == blocked["stage"]["plannedTrialCount"]
@@ -1802,7 +1848,7 @@ def test_three_terminal_sequence_failures_open_circuit_and_resume_same_revision(
     assert coordinator.run_once()
 
   blocked = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
-  assert blocked["status"] == "queued"
+  assert blocked["status"] == "generation_blocked"
   assert blocked["blockedReason"]["code"] == "experiment.execution_blocked"
   assert blocked["blockedReason"]["scope"] == "stage"
   assert blocked["consecutiveFailureCount"] == 3
@@ -2148,6 +2194,207 @@ def test_evaluation_export_idempotency_rls_lease_reclaim_and_failure_recovery(
   assert retry_status == 202
   assert retried["exportId"] != export_id
   assert retried["retryOfExportId"] == export_id
+
+
+def test_rolling_window_lifecycle_and_ledgers_are_idempotent(
+  execution_application: ExperimentApplication,
+) -> None:
+  _set_contract_epoch("rolling_window_v1")
+  try:
+    experiment_id = _create_execution_experiment(
+      execution_application,
+      "postgres-rolling-window",
+      _four_trial_execution_request(),
+    )
+    rolling = RollingTrialWindow(
+      storage_gate=AlwaysOpenStorageGate(),  # type: ignore[arg-type]
+    )
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+      results = list(executor.map(lambda _index: rolling.generate_next_batch(3), range(4)))
+    while _rolling_facts(experiment_id)["generated_count"] < 4:
+      rolling.generate_next_batch(3)
+
+    generated = [item for item in results if isinstance(item, GeneratedBatch)]
+    assert sum(item.generated_count for item in generated) <= 4
+    facts = _rolling_facts(experiment_id)
+    assert facts["generated_count"] == 4
+    assert facts["global_open"] == facts["user_open"] == facts["stage_open"] == 4
+    assert facts["global_reserved"] == 0
+    assert facts["user_reserved"] == 0
+    assert facts["stage_reserved"] == 0
+
+    first_trial_id = facts["trial_ids"][0]
+    first_settlement = rolling.settle_trial(first_trial_id, "failed", "settle-1")
+    replayed_settlement = rolling.settle_trial(first_trial_id, "failed", "settle-1")
+    assert first_settlement.settled and not first_settlement.replayed
+    assert replayed_settlement.settled and replayed_settlement.replayed
+    assert _rolling_facts(experiment_id)["global_open"] == 3
+    retry = rolling.request_retry(first_trial_id, "retry-1")
+    retry_replay = rolling.request_retry(first_trial_id, "retry-1")
+    assert retry.allowed and not retry.replayed
+    assert retry_replay.allowed and retry_replay.replayed
+    assert _rolling_facts(experiment_id)["global_open"] == 4
+
+    detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+    revision_id = detail["revision"]["revisionId"]
+    paused, pause_status = _as_user(
+      OWNER,
+      lambda: execution_application.pause_lifecycle(
+        experiment_id, revision_id, detail["lifecycleVersion"],
+        "集成测试暂停", "rolling-pause-1",
+      ),
+    )
+    repeated, repeated_status = _as_user(
+      OWNER,
+      lambda: execution_application.pause_lifecycle(
+        experiment_id, revision_id, paused["lifecycleVersion"],
+        "重复暂停不新增状态转换", "rolling-pause-2",
+      ),
+    )
+    assert pause_status == 202
+    assert repeated_status == 200
+    assert paused["lifecycleState"] == repeated["lifecycleState"] == "paused"
+    assert paused["lifecycleVersion"] == repeated["lifecycleVersion"]
+
+    resumed, resume_status = _as_user(
+      OWNER,
+      lambda: execution_application.resume_lifecycle(
+        experiment_id, revision_id, repeated["lifecycleVersion"],
+        "user_pause", "集成测试恢复", "rolling-resume-1",
+      ),
+    )
+    assert resume_status == 200
+    assert resumed["lifecycleState"] == "active"
+    cancelled, cancel_status = _as_user(
+      OWNER,
+      lambda: execution_application.cancel_lifecycle(
+        experiment_id, revision_id, resumed["lifecycleVersion"],
+        "集成测试取消", "rolling-cancel-1",
+      ),
+    )
+    assert cancel_status == 200
+    assert cancelled["lifecycleState"] == "terminal"
+    assert cancelled["terminalOutcome"] == "cancelled"
+    cancelled_facts = _rolling_facts(experiment_id)
+    assert cancelled_facts["global_open"] == 0
+    assert cancelled_facts["terminal_count"] == 4
+    assert cancelled_facts["cancelled_count"] == 4
+  finally:
+    _set_contract_epoch("legacy")
+
+
+def test_evaluation_v2_persists_pages_and_keeps_v1_readable(
+  execution_application: ExperimentApplication,
+) -> None:
+  experiment_id, _run_id = _complete_execution_experiment(
+    execution_application, "postgres-evaluation-v2",
+  )
+  detail = _as_user(OWNER, lambda: execution_application.detail(experiment_id))
+  application = EvaluationApplication()
+  spec, _ = _as_user(
+    OWNER,
+    lambda: application.save_spec(
+      experiment_id, _evaluation_request(detail), "save-evaluation-v2",
+    ),
+  )
+  legacy_run, _ = _as_user(
+    OWNER,
+    lambda: application.create_run(
+      experiment_id, spec["evaluationSpecId"], "run-evaluation-v1-before-rollout",
+    ),
+  )
+  worker = EvaluationWorker(worker_id="evaluation-version-worker")
+  assert worker.run_once()
+  legacy_detail = _as_user(
+    OWNER,
+    lambda: application.run_detail(experiment_id, legacy_run["evaluationRunId"]),
+  )
+  assert legacy_detail["outputSchemaVersion"] == "evaluation_output_v1"
+
+  _set_contract_epoch("evaluation_v2")
+  try:
+    still_readable = _as_user(
+      OWNER,
+      lambda: application.run_detail(experiment_id, legacy_run["evaluationRunId"]),
+    )
+    assert still_readable["output"] == legacy_detail["output"]
+    created, status = _as_user(
+      OWNER,
+      lambda: application.create_run(
+        experiment_id,
+        spec["evaluationSpecId"],
+        "run-evaluation-v2-after-rollout",
+        force_recompute=True,
+      ),
+    )
+    assert status == 202
+    assert created["outputSchemaVersion"] == "evaluation_output_v2"
+    assert worker.run_once()
+    result = _as_user(
+      OWNER,
+      lambda: application.run_detail(experiment_id, created["evaluationRunId"]),
+    )
+    page = _as_user(
+      OWNER,
+      lambda: application.run_results(
+        experiment_id, created["evaluationRunId"], after_ordinal=-1, limit=1,
+      ),
+    )
+    assert result["status"] == "succeeded"
+    assert result["outputSchemaVersion"] == "evaluation_output_v2"
+    assert result["executionSet"] is None
+    assert result["output"]["rows"] == []
+    assert len(page["items"]) == 1
+    assert page["items"][0]["trialExecutionId"]
+  finally:
+    _set_contract_epoch("legacy")
+
+
+def _set_contract_epoch(epoch: str) -> None:
+  with psycopg.connect(os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+      cur.execute(
+        "UPDATE backtest_experiment_rollout_state SET contract_epoch=%s WHERE singleton",
+        (epoch,),
+      )
+
+
+def _rolling_facts(experiment_id: str) -> dict[str, Any]:
+  with psycopg.connect(
+    os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"],
+    row_factory=dict_row,
+  ) as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT stage.generated_trial_count AS generated_count,
+          stage.terminal_count, stage.cancelled_count,
+          global_window.open_count AS global_open,
+          global_window.reserved_count AS global_reserved,
+          user_window.open_count AS user_open,
+          user_window.reserved_count AS user_reserved,
+          stage_window.open_count AS stage_open,
+          stage_window.reserved_count AS stage_reserved,
+          array_agg(trial.id ORDER BY trial.trial_index) AS trial_ids
+        FROM backtest_experiment experiment
+        JOIN backtest_experiment_stage stage
+          ON stage.revision_id=experiment.current_revision_id
+        JOIN backtest_experiment_trial trial ON trial.stage_id=stage.id
+        JOIN backtest_experiment_window_user user_window
+          ON user_window.owner_user_id=stage.owner_user_id
+        JOIN backtest_experiment_window_stage stage_window
+          ON stage_window.stage_id=stage.id
+        CROSS JOIN backtest_experiment_window_global global_window
+        WHERE experiment.id=%s
+        GROUP BY stage.id, global_window.open_count, global_window.reserved_count,
+          user_window.open_count, user_window.reserved_count,
+          stage_window.open_count, stage_window.reserved_count
+      """, (experiment_id,))
+      row = cur.fetchone()
+  assert row is not None
+  facts = dict(row)
+  facts["trial_ids"] = [str(value) for value in facts["trial_ids"]]
+  return facts
 
 
 def _execution_facts(experiment_id: str) -> dict[str, Any]:

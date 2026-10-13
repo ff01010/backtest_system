@@ -1285,8 +1285,9 @@ if __name__ == "__main__":
 | 409 | `experiment.preview_stale` | 重新读取 Subject 并重新预览 |
 | 410 | `experiment.preview_expired` | 重新预览，并生成新的创建意图 Key |
 | 422 | `experiment.validation_failed` | 根据 `details.field` 修正请求，不重试原请求 |
-| 429 | `experiment.plan_limit_exceeded` | 缩小网格或等待未完成实验释放计划额度 |
-| 503 | `experiment.capacity_unavailable` | 功能未启用或容量暂不可用，退避后重试或联系运维 |
+| 409 | `experiment.revision_conflict` | 当前 Revision 已变化；刷新详情并重新确认生命周期命令 |
+| 409 | `experiment.lifecycle_conflict` | 生命周期版本已变化；丢弃旧幂等键并重新确认 |
+| 503 | `experiment.capacity_unavailable` | 仅表示真实执行前置能力不可用；资源估算不可用本身只产生警告 |
 
 ### 15.2 请求追踪
 
@@ -1310,7 +1311,8 @@ if __name__ == "__main__":
 - 网格只引用 Subject 返回的可调参数；
 - Decimal 类字段使用字符串；
 - 开发区间与验证区间不重叠；
-- 预览允许创建，且 Trial 数和预计 Bar 数符合预算；
+- 预览允许创建，`plannedTrialCount` 等于完整有限笛卡尔积，预计 Bar 数只作为资源与耗时提示；
+- Trial 总数未超过 `2^53 - 1` 跨端精确整数边界，且没有由 Agent 自行拆分、截断或抽样；
 - 幂等键已持久化，网络重试不会生成重复资源；
 - 轮询具有退避、最长等待和终态判断；
 - `partially_completed` 不被误判为完整成功；

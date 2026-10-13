@@ -14,6 +14,7 @@ import {
   fetchExperimentSubject,
   fetchExperimentTrials,
   findCreatedExperiment,
+  pauseExperiment,
   previewExperiment,
   previewRetryFailedTrials,
   retryFailedTrials,
@@ -48,6 +49,7 @@ vi.mock('../features/experiments/api', () => ({
   fetchExperimentSubject: vi.fn(),
   fetchExperimentTrials: vi.fn(),
   findCreatedExperiment: vi.fn(),
+  pauseExperiment: vi.fn(),
   previewExperiment: vi.fn(),
   previewRetryFailedTrials: vi.fn(),
   retryFailedTrials: vi.fn(),
@@ -394,6 +396,13 @@ beforeEach(() => {
   vi.mocked(cancelExperiment).mockReset().mockResolvedValue({
     experimentId: 'experiment-1',
     status: 'cancelled',
+  });
+  vi.mocked(pauseExperiment).mockReset().mockResolvedValue({
+    experimentId: 'experiment-1',
+    revisionId: 'revision-1',
+    lifecycleState: 'paused',
+    lifecycleVersion: 8,
+    status: 'generation_blocked',
   });
   vi.mocked(resumeExperiment).mockReset().mockResolvedValue({
     experimentId: 'experiment-1',
@@ -1103,7 +1112,7 @@ describe('ExperimentPage', () => {
     )).not.toBeNull();
   });
 
-  it('explains that capacity blocks resume the same revision', async () => {
+  it('does not present a legacy capacity snapshot as user-recoverable', async () => {
     vi.mocked(fetchExperimentDetail).mockResolvedValueOnce({
       ...DETAIL,
       status: 'queued',
@@ -1126,7 +1135,7 @@ describe('ExperimentPage', () => {
     );
 
     const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toContain('条件恢复后会从当前 Revision 继续');
+    expect(alert.textContent).not.toContain('条件恢复后会从当前 Revision 继续');
   });
 
   it('resumes an execution block with one idempotent command', async () => {
@@ -1172,9 +1181,101 @@ describe('ExperimentPage', () => {
     expect(resumeExperiment).toHaveBeenCalledWith(
       'experiment-1',
       'revision-1',
-      '用户在实验详情页确认继续未完成 Trial',
+      1,
+      'execution_circuit',
+      '用户在实验详情页解除执行熔断',
       expect.any(String),
     );
+  });
+
+  it('pauses through the lifecycle v2 contract and suppresses duplicate clicks', async () => {
+    vi.mocked(fetchExperimentDetail).mockResolvedValueOnce({
+      ...DETAIL,
+      lifecycleCommandsAvailable: true,
+      lifecycleState: 'active',
+      lifecycleVersion: 7,
+      executionPhase: 'queued',
+      systemBlockCode: null,
+      terminalOutcome: null,
+    });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    const button = await screen.findByRole('button', { name: '暂停实验' });
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(pauseExperiment).toHaveBeenCalledTimes(1));
+    expect(pauseExperiment).toHaveBeenCalledWith(
+      'experiment-1',
+      'revision-1',
+      7,
+      '用户在实验详情页暂停实验',
+      expect.any(String),
+    );
+  });
+
+  it('confirms cancellation and reuses the idempotency key after an uncertain result', async () => {
+    vi.mocked(fetchExperimentDetail).mockResolvedValueOnce({
+      ...DETAIL,
+      lifecycleCommandsAvailable: true,
+      lifecycleState: 'active',
+      lifecycleVersion: 7,
+      executionPhase: 'queued',
+      systemBlockCode: null,
+      terminalOutcome: null,
+      stage: {
+        ...DETAIL.stage,
+        readyTrialCount: 1,
+        remainingLogicalTrialCount: 0,
+      },
+    });
+    vi.mocked(cancelExperiment)
+      .mockRejectedValueOnce(new TypeError('network result unknown'))
+      .mockResolvedValueOnce({
+        experimentId: 'experiment-1',
+        revisionId: 'revision-1',
+        lifecycleState: 'cancelling',
+        lifecycleVersion: 8,
+        status: 'cancelling',
+      });
+    render(
+      <ExperimentPage
+        userId="user-1"
+        subject={null}
+        experimentId="experiment-1"
+        onExperimentChange={vi.fn()}
+        onSubjectChange={vi.fn()}
+        onBackToStrategy={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '取消实验' }));
+    const dialog = screen.getByRole('dialog', { name: '确认取消实验' });
+    expect(cancelExperiment).not.toHaveBeenCalled();
+    expect(dialog.textContent).toContain('已有结果、参数快照和审计记录继续保留');
+    fireEvent.click(within(dialog).getByRole('button', { name: '确认取消' }));
+    await screen.findByText(/网络结果不明确/);
+    fireEvent.click(within(dialog).getByRole('button', { name: '重试取消' }));
+
+    await waitFor(() => expect(cancelExperiment).toHaveBeenCalledTimes(2));
+    const firstKey = vi.mocked(cancelExperiment).mock.calls[0][4];
+    const secondKey = vi.mocked(cancelExperiment).mock.calls[1][4];
+    expect(firstKey).toBe(secondKey);
+    expect(vi.mocked(cancelExperiment).mock.calls[0].slice(0, 4)).toEqual([
+      'experiment-1',
+      'revision-1',
+      7,
+      '用户在实验详情页确认取消当前 Revision',
+    ]);
   });
 
   it('archives a terminal experiment only after explicit confirmation', async () => {

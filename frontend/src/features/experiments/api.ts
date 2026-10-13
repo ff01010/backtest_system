@@ -8,6 +8,7 @@ import type {
   ExperimentCreateResult,
   ExperimentBacktestRunPage,
   ExperimentDetail,
+  ExperimentLifecycleCommandResult,
   ExperimentListItem,
   ExperimentLifecycleResult,
   ExperimentPurge,
@@ -23,6 +24,9 @@ import type {
   EvaluationExportFormat,
   EvaluationRun,
   EvaluationRunDetail,
+  EvaluationResultPage,
+  EvaluationExceptionPage,
+  EvaluationGroupMemberPage,
   EvaluationSpecPayload,
   SavedEvaluationSpec,
 } from './contracts';
@@ -211,12 +215,15 @@ export function retryFailedTrials(
 
 export function cancelExperiment(
   experimentId: string,
+  expectedRevisionId: string,
+  expectedLifecycleVersion: number,
+  reason: string,
   idempotencyKey: string,
-): Promise<{ experimentId: string; status: string }> {
+): Promise<ExperimentLifecycleCommandResult> {
   return sendJson(
-    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/cancel`,
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/commands/cancel`,
     'POST',
-    {},
+    { expectedRevisionId, expectedLifecycleVersion, reason },
     { 'Idempotency-Key': idempotencyKey },
   );
 }
@@ -224,13 +231,30 @@ export function cancelExperiment(
 export function resumeExperiment(
   experimentId: string,
   expectedRevisionId: string,
+  expectedLifecycleVersion: number,
+  resumeMode: 'user_pause' | 'execution_circuit',
   reason: string,
   idempotencyKey: string,
-): Promise<{ experimentId: string; revisionId: string; status: string }> {
+): Promise<ExperimentLifecycleCommandResult> {
   return sendJson(
-    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/resume`,
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/commands/resume`,
     'POST',
-    { expectedRevisionId, reason },
+    { expectedRevisionId, expectedLifecycleVersion, resumeMode, reason },
+    { 'Idempotency-Key': idempotencyKey },
+  );
+}
+
+export function pauseExperiment(
+  experimentId: string,
+  expectedRevisionId: string,
+  expectedLifecycleVersion: number,
+  reason: string,
+  idempotencyKey: string,
+): Promise<ExperimentLifecycleCommandResult> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}/commands/pause`,
+    'POST',
+    { expectedRevisionId, expectedLifecycleVersion, reason },
     { 'Idempotency-Key': idempotencyKey },
   );
 }
@@ -291,6 +315,62 @@ export function fetchEvaluationRun(
   return fetchJson(
     `/api/backtest/experiments/${encodeURIComponent(experimentId)}`
       + `/evaluation-runs/${encodeURIComponent(evaluationRunId)}`,
+  );
+}
+
+export function fetchEvaluationRunResults(
+  experimentId: string,
+  evaluationRunId: string,
+  cursor = -1,
+  limit = 100,
+): Promise<EvaluationResultPage> {
+  const query = new URLSearchParams({ cursor: String(cursor), limit: String(limit) });
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}`
+      + `/evaluation-runs/${encodeURIComponent(evaluationRunId)}/results?${query.toString()}`,
+  );
+}
+
+export function fetchEvaluationRunExceptions(
+  experimentId: string,
+  evaluationRunId: string,
+  cursor = -1,
+  limit = 100,
+): Promise<EvaluationExceptionPage> {
+  const query = new URLSearchParams({ cursor: String(cursor), limit: String(limit) });
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}`
+      + `/evaluation-runs/${encodeURIComponent(evaluationRunId)}/exceptions?${query.toString()}`,
+  );
+}
+
+export function fetchEvaluationGroupMembers(
+  experimentId: string,
+  evaluationRunId: string,
+  groupId: string,
+  cursor = -1,
+  limit = 100,
+): Promise<EvaluationGroupMemberPage> {
+  const query = new URLSearchParams({ cursor: String(cursor), limit: String(limit) });
+  return fetchJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}`
+      + `/evaluation-runs/${encodeURIComponent(evaluationRunId)}`
+      + `/groups/${encodeURIComponent(groupId)}/members?${query.toString()}`,
+  );
+}
+
+export function cancelEvaluationRun(
+  experimentId: string,
+  evaluationRunId: string,
+  reason: string,
+  idempotencyKey: string,
+): Promise<{ evaluationRunId: string; status: string; replayed: boolean }> {
+  return sendJson(
+    `/api/backtest/experiments/${encodeURIComponent(experimentId)}`
+      + `/evaluation-runs/${encodeURIComponent(evaluationRunId)}/cancel`,
+    'POST',
+    { reason },
+    { 'Idempotency-Key': idempotencyKey },
   );
 }
 

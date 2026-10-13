@@ -18,6 +18,11 @@ from backend import settings
 from backend.experiments.canonicalization import digest, with_version
 from backend.experiments.errors import ExperimentError
 from backend.experiments.evaluation import complete_snapshot
+from backend.experiments.evaluation_dataset import (
+  OUTPUT_SCHEMA_VERSION,
+  EvaluationDataset,
+)
+from backend.experiments.rollout import ContractEpoch, current_contract_epoch
 from backend.experiments.repository import (
   CommandResult,
   _load_idempotency,
@@ -32,6 +37,7 @@ from backend.services import state_store
 SAVE_SPEC_OPERATION = "experiment.evaluation_spec.save.v1"
 CREATE_RUN_OPERATION = "experiment.evaluation_run.create.v1"
 RETRY_RUN_OPERATION = "experiment.evaluation_run.retry.v1"
+CANCEL_RUN_OPERATION = "experiment.evaluation_run.cancel.v1"
 
 
 @dataclass(frozen=True)
@@ -142,7 +148,13 @@ class PostgresEvaluationRepository:
     request_id: str | None,
   ) -> CommandResult:
     owner_id = state_store.current_user_id()
-    with state_store.database_session() as conn:
+    epoch = current_contract_epoch()
+    session = (
+      _repeatable_read_user_session
+      if epoch >= ContractEpoch.EVALUATION_V2
+      else state_store.database_session
+    )
+    with session() as conn:
       with conn.cursor() as cur:
         _lock_command(cur, owner_id, CREATE_RUN_OPERATION, idempotency_key)
         replay = _load_idempotency(cur, owner_id, CREATE_RUN_OPERATION, idempotency_key)
@@ -150,6 +162,17 @@ class PostgresEvaluationRepository:
           return _replay_result(replay, request_hash)
         _lock_experiment_for_write(cur, experiment_id, owner_id)
         spec = _load_spec_for_run(cur, experiment_id, evaluation_spec_id, owner_id)
+        if epoch >= ContractEpoch.EVALUATION_V2:
+          response, status_code = _create_v2_evaluation_run(
+            cur, spec, catalog_snapshot, pipeline_version,
+            adapter_type, adapter_version, force_recompute, request_id,
+          )
+          response["replayed"] = status_code == 200
+          _save_idempotency(
+            cur, owner_id, CREATE_RUN_OPERATION, idempotency_key, request_hash,
+            "evaluation_run", response["evaluationRunId"], status_code, response,
+          )
+          return CommandResult(response, status_code)
         execution_set, completeness = _freeze_execution_set(cur, spec)
         result_set_hash = digest(with_version({
           "executionSet": execution_set,
@@ -201,6 +224,85 @@ class PostgresEvaluationRepository:
       raise ExperimentError("experiment.evaluation_run_not_found", "评价运行不存在", 404)
     return _run_item(row, include_output=True)
 
+  def page_run_results(
+    self,
+    experiment_id: str,
+    run_id: str,
+    *,
+    after_ordinal: int,
+    limit: int,
+  ) -> dict[str, Any]:
+    owner_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        row = _load_run(cur, experiment_id, run_id, owner_id)
+    if row is None:
+      raise ExperimentError("experiment.evaluation_run_not_found", "评价运行不存在", 404)
+    if row.get("output_schema_version") != OUTPUT_SCHEMA_VERSION:
+      raise ExperimentError(
+        "experiment.evaluation_pagination_unavailable",
+        "历史评价结果使用只读快照，不支持分页接口",
+        409,
+      )
+    output = dict(row.get("output_snapshot") or {})
+    dataset = EvaluationDataset()
+    if output.get("groupResultPage"):
+      return dataset.page_groups(
+        run_id, after_ordinal=after_ordinal, limit=limit,
+      )
+    return dataset.page_results(
+      run_id, after_ordinal=after_ordinal, limit=limit,
+    )
+
+  def page_run_exceptions(
+    self,
+    experiment_id: str,
+    run_id: str,
+    *,
+    after_ordinal: int,
+    limit: int,
+  ) -> dict[str, Any]:
+    owner_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        row = _load_run(cur, experiment_id, run_id, owner_id)
+    if row is None:
+      raise ExperimentError("experiment.evaluation_run_not_found", "评价运行不存在", 404)
+    if row.get("output_schema_version") != OUTPUT_SCHEMA_VERSION:
+      raise ExperimentError(
+        "experiment.evaluation_pagination_unavailable",
+        "历史评价结果使用只读快照，不支持异常分页接口",
+        409,
+      )
+    return EvaluationDataset().page_exceptions(
+      run_id, after_ordinal=after_ordinal, limit=limit,
+    )
+
+  def page_group_members(
+    self,
+    experiment_id: str,
+    run_id: str,
+    group_id: str,
+    *,
+    after_ordinal: int,
+    limit: int,
+  ) -> dict[str, Any]:
+    owner_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        row = _load_run(cur, experiment_id, run_id, owner_id)
+    if row is None:
+      raise ExperimentError("experiment.evaluation_run_not_found", "评价运行不存在", 404)
+    if row.get("output_schema_version") != OUTPUT_SCHEMA_VERSION:
+      raise ExperimentError(
+        "experiment.evaluation_pagination_unavailable",
+        "历史评价结果使用只读快照，不支持分组成员分页接口",
+        409,
+      )
+    return EvaluationDataset().page_group_members(
+      run_id, group_id, after_ordinal=after_ordinal, limit=limit,
+    )
+
   def retry_run(
     self,
     *,
@@ -243,6 +345,58 @@ class PostgresEvaluationRepository:
         )
         return CommandResult(response, 202)
 
+  def cancel_run(
+    self,
+    *,
+    experiment_id: str,
+    run_id: str,
+    reason: str | None,
+    idempotency_key: str,
+    request_hash: str,
+    request_id: str | None,
+  ) -> CommandResult:
+    owner_id = state_store.current_user_id()
+    with state_store.database_session() as conn:
+      with conn.cursor() as cur:
+        _lock_command(cur, owner_id, CANCEL_RUN_OPERATION, idempotency_key)
+        replay = _load_idempotency(cur, owner_id, CANCEL_RUN_OPERATION, idempotency_key)
+        if replay:
+          return _replay_result(replay, request_hash)
+        row = _load_run(cur, experiment_id, run_id, owner_id, for_update=True)
+        if row is None:
+          raise ExperimentError("experiment.evaluation_run_not_found", "评价运行不存在", 404)
+        status = str(row["status"])
+        if status in {"succeeded", "failed"}:
+          raise ExperimentError(
+            "experiment.evaluation_cancel_conflict",
+            "已完成的评价运行不能取消",
+            409,
+          )
+        target = "cancelled" if status == "queued" else "cancel_requested"
+        if status not in {"cancelled", "cancel_requested"}:
+          cur.execute("""
+            UPDATE backtest_experiment_evaluation_run
+            SET status=%s, cancel_requested_at=now(), cancel_reason=%s,
+              finished_at=CASE WHEN %s='cancelled' THEN now() ELSE finished_at END,
+              updated_at=now()
+            WHERE id=%s
+          """, (target, reason, target, run_id))
+          _insert_audit(
+            cur, owner_id, experiment_id, str(row["revision_id"]),
+            str(row["evaluation_spec_id"]), run_id,
+            "evaluation.run_cancel_requested", request_id,
+            {"reason": reason, "status": target},
+          )
+        else:
+          target = status
+        response = {"evaluationRunId": run_id, "status": target, "replayed": False}
+        status_code = 200 if target == "cancelled" else 202
+        _save_idempotency(
+          cur, owner_id, CANCEL_RUN_OPERATION, idempotency_key, request_hash,
+          "evaluation_run", run_id, status_code, response,
+        )
+        return CommandResult(response, status_code)
+
   def claim_next_run(
     self,
     worker_id: str,
@@ -251,6 +405,23 @@ class PostgresEvaluationRepository:
     attempt_token = str(uuid4())
     with _worker_session() as conn:
       with conn.cursor() as cur:
+        cur.execute("""
+          UPDATE backtest_experiment_evaluation_run
+          SET status='cancelled', lease_owner=NULL, attempt_token=NULL,
+            lease_expires_at=NULL, finished_at=now(), updated_at=now()
+          WHERE status='cancel_requested'
+            AND (lease_expires_at IS NULL OR lease_expires_at < now())
+          RETURNING owner_user_id, experiment_id, revision_id,
+            evaluation_spec_id, id
+        """)
+        for cancelled in cur.fetchall():
+          _insert_audit(
+            cur, str(cancelled["owner_user_id"]),
+            str(cancelled["experiment_id"]), str(cancelled["revision_id"]),
+            str(cancelled["evaluation_spec_id"]), str(cancelled["id"]),
+            "evaluation.run_cancelled", None,
+            {"reason": "worker_lease_expired"},
+          )
         cur.execute("""
           SELECT run.*, spec.evaluation_spec
           FROM backtest_experiment_evaluation_run run
@@ -279,6 +450,12 @@ class PostgresEvaluationRepository:
     return ClaimedEvaluation(claimed, attempt_token)
 
   def load_run_sources(self, run: dict[str, Any]) -> list[dict[str, Any]]:
+    if run.get("output_schema_version") == OUTPUT_SCHEMA_VERSION:
+      sources: list[dict[str, Any]] = []
+      dataset = EvaluationDataset()
+      for batch in dataset.iter_input_batches(str(run["id"])):
+        sources.extend(_v2_source_row(row) for row in batch)
+      return sources
     execution_set = list(run["execution_set"])
     completeness = dict(run.get("completeness_snapshot") or {})
     if run["pipeline_version"] == "basic_evaluation_pipeline_v1":
@@ -323,6 +500,31 @@ class PostgresEvaluationRepository:
       )
     return [_source_row(row, expected[str(row["execution_id"])]) for row in rows]
 
+  def renew_run_lease(
+    self,
+    run_id: str,
+    attempt_token: str,
+    lease_seconds: int,
+  ) -> str:
+    with _worker_session() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""
+          UPDATE backtest_experiment_evaluation_run
+          SET lease_expires_at=now() + (%s * interval '1 second'), updated_at=now()
+          WHERE id=%s AND status='running' AND attempt_token=%s
+          RETURNING status
+        """, (lease_seconds, run_id, attempt_token))
+        row = cur.fetchone()
+        if row is not None:
+          return str(row["status"])
+        cur.execute(
+          "SELECT status FROM backtest_experiment_evaluation_run "
+          "WHERE id=%s AND attempt_token=%s",
+          (run_id, attempt_token),
+        )
+        row = cur.fetchone()
+        return str(row["status"]) if row is not None else "lease_lost"
+
   def complete_run(
     self,
     run_id: str,
@@ -333,13 +535,48 @@ class PostgresEvaluationRepository:
     with _worker_session() as conn:
       with conn.cursor() as cur:
         cur.execute("""
+          SELECT owner_user_id, experiment_id, revision_id, evaluation_spec_id,
+            output_schema_version, status
+          FROM backtest_experiment_evaluation_run
+          WHERE id=%s AND status IN ('running','cancel_requested')
+            AND attempt_token=%s
+          FOR UPDATE
+        """, (run_id, attempt_token))
+        locked = cur.fetchone()
+        if locked is None:
+          return False
+        if locked["status"] == "cancel_requested":
+          cur.execute("""
+            UPDATE backtest_experiment_evaluation_run
+            SET status='cancelled', lease_owner=NULL, attempt_token=NULL,
+              lease_expires_at=NULL, finished_at=now(), updated_at=now()
+            WHERE id=%s AND status='cancel_requested' AND attempt_token=%s
+          """, (run_id, attempt_token))
+          _insert_audit(
+            cur, str(locked["owner_user_id"]), str(locked["experiment_id"]),
+            str(locked["revision_id"]), str(locked["evaluation_spec_id"]),
+            run_id, "evaluation.run_cancelled", None,
+          )
+          return True
+        stored_output = output
+        stored_output_digest = output_digest
+        if locked["output_schema_version"] == OUTPUT_SCHEMA_VERSION:
+          stored_output = EvaluationDataset().persist_output(
+            cur,
+            evaluation_run_id=run_id,
+            experiment_id=str(locked["experiment_id"]),
+            owner_user_id=str(locked["owner_user_id"]),
+            output=output,
+          )
+          stored_output_digest = digest(stored_output)
+        cur.execute("""
           UPDATE backtest_experiment_evaluation_run
           SET status='succeeded', output_snapshot=%s, output_hash=%s,
             error_code=NULL, error_message=NULL, lease_owner=NULL,
             attempt_token=NULL, lease_expires_at=NULL, finished_at=now(), updated_at=now()
           WHERE id=%s AND status='running' AND attempt_token=%s
           RETURNING owner_user_id, experiment_id, revision_id, evaluation_spec_id
-        """, (Jsonb(output), output_digest, run_id, attempt_token))
+        """, (Jsonb(stored_output), stored_output_digest, run_id, attempt_token))
         row = cur.fetchone()
         if row is None:
           return False
@@ -347,6 +584,26 @@ class PostgresEvaluationRepository:
           cur, str(row["owner_user_id"]), str(row["experiment_id"]),
           str(row["revision_id"]), str(row["evaluation_spec_id"]), run_id,
           "evaluation.run_succeeded", None,
+        )
+        return True
+
+  def finish_cancelled_run(self, run_id: str, attempt_token: str) -> bool:
+    with _worker_session() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""
+          UPDATE backtest_experiment_evaluation_run
+          SET status='cancelled', lease_owner=NULL, attempt_token=NULL,
+            lease_expires_at=NULL, finished_at=now(), updated_at=now()
+          WHERE id=%s AND status='cancel_requested' AND attempt_token=%s
+          RETURNING owner_user_id, experiment_id, revision_id, evaluation_spec_id
+        """, (run_id, attempt_token))
+        row = cur.fetchone()
+        if row is None:
+          return False
+        _insert_audit(
+          cur, str(row["owner_user_id"]), str(row["experiment_id"]),
+          str(row["revision_id"]), str(row["evaluation_spec_id"]), run_id,
+          "evaluation.run_cancelled", None,
         )
         return True
 
@@ -770,26 +1027,48 @@ def _completeness_exceptions(
     "materializationStatus": row["materialization_status"],
     "error": row.get("latest_error_summary"),
   } for row in trial_rows if not _is_successful_result(row)]
-  indexes = {
-    (str(row["stage_id"]), int(row["trial_index"])) for row in trial_rows
-  }
   for stage_id, stage in stages.items():
-    cancelled_remaining = int(stage["cancelled_before_generation"])
-    for trial_index in range(int(stage["planned_trial_count"])):
-      if (stage_id, trial_index) in indexes:
-        continue
-      status = "cancelled" if cancelled_remaining > 0 else "missing"
-      cancelled_remaining = max(0, cancelled_remaining - 1)
+    generated = stage.get("generated_trial_count")
+    if generated is None:
+      generated = sum(
+        1 for row in trial_rows if str(row["stage_id"]) == str(stage_id)
+      )
+    start = int(generated)
+    end = int(stage["planned_trial_count"])
+    if end <= start:
+      continue
+    cancelled_count = min(
+      end - start,
+      int(stage["cancelled_before_generation"]),
+    )
+    if cancelled_count:
       exceptions.append({
         "stageId": stage_id,
         "stageIndex": int(stage["stage_index"]),
         "trialId": None,
-        "trialIndex": trial_index,
-        "status": status,
+        "startTrialIndex": start,
+        "endTrialIndexExclusive": start + cancelled_count,
+        "count": cancelled_count,
+        "status": "cancelled",
         "materializationStatus": "not_generated",
         "error": None,
       })
-  return sorted(exceptions, key=lambda item: (item["stageIndex"], item["trialIndex"]))
+    missing_start = start + cancelled_count
+    if missing_start < end:
+      exceptions.append({
+        "stageId": stage_id,
+        "stageIndex": int(stage["stage_index"]),
+        "trialId": None,
+        "startTrialIndex": missing_start,
+        "endTrialIndexExclusive": end,
+        "count": end - missing_start,
+        "status": "missing",
+        "materializationStatus": "not_generated",
+        "error": None,
+      })
+  return sorted(exceptions, key=lambda item: (
+    item["stageIndex"], item.get("trialIndex", item.get("startTrialIndex", -1)),
+  ))
 
 
 def _rate_text(numerator: int, denominator: int) -> str:
@@ -845,6 +1124,101 @@ def _insert_evaluation_run(
     **_run_item(row, include_output=False),
     "specHash": spec["spec_hash"],
   }
+
+
+def _create_v2_evaluation_run(
+  cur: Any,
+  spec: dict[str, Any],
+  catalogs: dict[str, Any],
+  pipeline_version: str,
+  adapter_type: str,
+  adapter_version: str,
+  force_recompute: bool,
+  request_id: str | None,
+) -> tuple[dict[str, Any], int]:
+  cur.execute("""
+    SELECT lifecycle_state FROM backtest_experiment_revision
+    WHERE id=%s FOR SHARE
+  """, (spec["revision_id"],))
+  revision = cur.fetchone()
+  if revision is None or revision["lifecycle_state"] == "cancelling":
+    raise ExperimentError(
+      "experiment.evaluation_source_invalid",
+      "取消收敛中的实验不能创建新评价",
+      409,
+    )
+  run_id = str(uuid4())
+  cur.execute("""
+    INSERT INTO backtest_experiment_evaluation_run (
+      id, evaluation_spec_id, experiment_id, revision_id, owner_user_id,
+      pipeline_version, adapter_type, adapter_version,
+      metric_catalog_version, dimension_catalog_version, normalizer_version,
+      catalog_snapshot, execution_set, completeness_snapshot,
+      execution_count, result_set_hash, output_schema_version
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'[]'::jsonb,'{}'::jsonb,
+      1,%s,%s)
+  """, (
+    run_id, spec["id"], spec["experiment_id"], spec["revision_id"],
+    spec["owner_user_id"], pipeline_version, adapter_type, adapter_version,
+    spec["metric_catalog_version"], spec["dimension_catalog_version"],
+    spec["normalizer_version"], Jsonb(catalogs), "0" * 64,
+    OUTPUT_SCHEMA_VERSION,
+  ))
+  evaluation_spec = dict(spec["evaluation_spec"])
+  stage_ids = [str(item) for item in evaluation_spec["source"]["stageIds"]]
+  frozen = EvaluationDataset().freeze_execution_set(
+    cur,
+    evaluation_run_id=run_id,
+    experiment_id=str(spec["experiment_id"]),
+    owner_user_id=str(spec["owner_user_id"]),
+    revision_id=str(spec["revision_id"]),
+    stage_ids=stage_ids,
+    required_dimension_coverage=evaluation_spec["completeness"][
+      "requiredDimensionCoverage"
+    ],
+  )
+  _enforce_completeness_policy(
+    frozen.completeness,
+    evaluation_spec["completeness"],
+  )
+  existing = None if force_recompute else _find_succeeded_evaluation_run(
+    cur, str(spec["id"]), frozen.dataset_digest, pipeline_version,
+  )
+  if existing is not None:
+    cur.execute(
+      "DELETE FROM backtest_experiment_evaluation_exception "
+      "WHERE evaluation_run_id=%s",
+      (run_id,),
+    )
+    cur.execute(
+      "DELETE FROM backtest_experiment_evaluation_execution WHERE evaluation_run_id=%s",
+      (run_id,),
+    )
+    cur.execute(
+      "DELETE FROM backtest_experiment_evaluation_run WHERE id=%s",
+      (run_id,),
+    )
+    return _run_item(existing, include_output=False), 200
+  cur.execute("""
+    SELECT run.*, spec.version_no AS spec_version_no,
+      spec.name AS spec_name, spec.spec_hash
+    FROM backtest_experiment_evaluation_run run
+    JOIN backtest_experiment_evaluation_spec spec
+      ON spec.id=run.evaluation_spec_id
+    WHERE run.id=%s
+  """, (run_id,))
+  row = dict(cur.fetchone())
+  _insert_audit(
+    cur, str(spec["owner_user_id"]), str(spec["experiment_id"]),
+    str(spec["revision_id"]), str(spec["id"]), run_id,
+    "evaluation.run_created", request_id,
+    {
+      "resultSetHash": frozen.dataset_digest,
+      "executionCount": frozen.execution_count,
+      "outputSchemaVersion": OUTPUT_SCHEMA_VERSION,
+    },
+  )
+  return _run_item(row, include_output=False), 202
 
 
 def _find_succeeded_evaluation_run(
@@ -917,6 +1291,7 @@ def _spec_item(row: dict[str, Any], *, replayed: bool = False) -> dict[str, Any]
 
 
 def _run_item(row: dict[str, Any], *, include_output: bool) -> dict[str, Any]:
+  execution_count = int(row["execution_count"])
   item = {
     "evaluationRunId": str(row["id"]),
     "evaluationSpecId": str(row["evaluation_spec_id"]),
@@ -931,7 +1306,8 @@ def _run_item(row: dict[str, Any], *, include_output: bool) -> dict[str, Any]:
     "adapterVersion": row["adapter_version"],
     "metricCatalogVersion": row["metric_catalog_version"],
     "dimensionCatalogVersion": row["dimension_catalog_version"],
-    "executionCount": int(row["execution_count"]),
+    "executionCount": execution_count if execution_count <= 2**53 - 1 else None,
+    "executionCountExact": str(execution_count),
     "completeness": _stored_completeness(row),
     "resultSetHash": row["result_set_hash"],
     "outputHash": row.get("output_hash"),
@@ -939,9 +1315,19 @@ def _run_item(row: dict[str, Any], *, include_output: bool) -> dict[str, Any]:
     "attemptCount": int(row["attempt_count"]),
     "createdAt": row["created_at"].isoformat(),
     "finishedAt": row["finished_at"].isoformat() if row.get("finished_at") else None,
+    "outputSchemaVersion": row.get("output_schema_version", "evaluation_output_v1"),
   }
   if include_output:
-    item["executionSet"] = row["execution_set"]
+    if row.get("output_schema_version") == OUTPUT_SCHEMA_VERSION:
+      item["executionSet"] = None
+      item["dataset"] = {
+        "digest": row.get("dataset_digest"),
+        "digestVersion": row.get("dataset_digest_version"),
+        "executionCount": item["executionCount"],
+        "executionCountExact": item["executionCountExact"],
+      }
+    else:
+      item["executionSet"] = row["execution_set"]
     item["output"] = row.get("output_snapshot")
     item["spec"] = row.get("evaluation_spec")
   return item
@@ -958,6 +1344,19 @@ def _stored_completeness(row: dict[str, Any]) -> dict[str, Any]:
   if stored:
     return stored
   return complete_snapshot(int(row.get("execution_count") or 0))
+
+
+def _v2_source_row(row: dict[str, Any]) -> dict[str, Any]:
+  expected = {
+    "trialExecutionId": str(row["trial_execution_id"]),
+    "runId": str(row["run_id"]),
+    "trialId": str(row["trial_id"]),
+    "stageId": str(row["stage_id"]),
+    "resultHash": str(row["frozen_result_hash"]),
+    "resultSchemaVersion": str(row["frozen_result_schema_version"]),
+    "actualDataHash": row.get("frozen_actual_data_hash"),
+  }
+  return _source_row(row, expected)
 
 
 def _source_row(row: dict[str, Any], expected: dict[str, Any]) -> dict[str, Any]:
@@ -1063,6 +1462,27 @@ def _worker_session() -> Iterator[psycopg.Connection[Any]]:
           ("00000000-0000-0000-0000-000000000000",),
         )
         cur.execute("SELECT set_config('app.current_is_admin', 'true', true)")
+      yield conn
+  except psycopg.Error as error:
+    raise state_store.DatabaseError(str(error)) from error
+
+
+@contextmanager
+def _repeatable_read_user_session() -> Iterator[psycopg.Connection[Any]]:
+  if not settings.DATABASE_URL:
+    raise state_store.DatabaseError("未设置 TREND_GRID_DATABASE_URL")
+  try:
+    with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
+      conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+      with conn.cursor() as cur:
+        cur.execute(
+          "SELECT set_config('app.current_user_id', %s, true)",
+          (state_store.current_user_id(),),
+        )
+        cur.execute(
+          "SELECT set_config('app.current_is_admin', %s, true)",
+          ("true" if state_store.current_user_is_admin() else "false",),
+        )
       yield conn
   except psycopg.Error as error:
     raise state_store.DatabaseError(str(error)) from error

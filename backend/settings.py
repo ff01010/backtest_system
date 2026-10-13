@@ -20,6 +20,18 @@ def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> in
   return value
 
 
+def _read_optional_positive_int(name: str) -> int | None:
+  """读取部署容量；缺失或非法时由运行门禁按 unknown 故障安全处理。"""
+  raw = os.getenv(name, "").strip()
+  if not raw:
+    return None
+  try:
+    value = int(raw)
+  except ValueError:
+    return None
+  return value if value > 0 else None
+
+
 def _read_bool(name: str, default: bool) -> bool:
   raw = os.getenv(name, str(default)).strip().lower()
   if raw not in {"true", "false"}:
@@ -253,6 +265,7 @@ EXPERIMENT_BAR_ENABLED = _read_bool("TREND_GRID_EXPERIMENT_BAR_ENABLED", False)
 EXPERIMENT_MAX_VALUES_PER_DIMENSION = _read_bounded_int(
   "TREND_GRID_EXPERIMENT_MAX_VALUES_PER_DIMENSION", 50, 1, 1000,
 )
+# 仅供 rolling_window_v1 激活前的旧语义使用；达到收缩门槛后再删除。
 EXPERIMENT_MAX_TRIALS = _read_bounded_int(
   "TREND_GRID_EXPERIMENT_MAX_TRIALS", 1000, 1, 1_000_000,
 )
@@ -292,6 +305,30 @@ EXPERIMENT_COORDINATOR_HEARTBEAT_SECONDS = _read_bounded_int(
 EXPERIMENT_COORDINATOR_POLL_SECONDS = _read_bounded_int(
   "TREND_GRID_EXPERIMENT_COORDINATOR_POLL_SECONDS", 1, 1, 30,
 )
+EXPERIMENT_POSTGRES_LOGICAL_HIGH_WATER_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_POSTGRES_LOGICAL_HIGH_WATER_BYTES",
+)
+EXPERIMENT_POSTGRES_LOGICAL_LOW_WATER_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_POSTGRES_LOGICAL_LOW_WATER_BYTES",
+)
+EXPERIMENT_POSTGRES_VOLUME_MIN_FREE_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_POSTGRES_VOLUME_MIN_FREE_BYTES",
+)
+EXPERIMENT_POSTGRES_VOLUME_RESUME_FREE_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_POSTGRES_VOLUME_RESUME_FREE_BYTES",
+)
+EXPERIMENT_ARTIFACT_VOLUME_MIN_FREE_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_ARTIFACT_VOLUME_MIN_FREE_BYTES",
+)
+EXPERIMENT_ARTIFACT_VOLUME_RESUME_FREE_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_ARTIFACT_VOLUME_RESUME_FREE_BYTES",
+)
+EXPERIMENT_STORAGE_SIGNAL_MAX_AGE_SECONDS = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_STORAGE_SIGNAL_MAX_AGE_SECONDS",
+)
+EXPERIMENT_STORAGE_PROBE_URL = os.getenv(
+  "TREND_GRID_EXPERIMENT_STORAGE_PROBE_URL", "http://storage-probe:8091",
+).strip()
 EXPERIMENT_PURGE_ENABLED = _read_bool(
   "TREND_GRID_EXPERIMENT_PURGE_ENABLED", False,
 )
@@ -320,10 +357,13 @@ def validate_experiment_configuration() -> None:
     raise ValueError(
       "TREND_GRID_EXPERIMENTS_ENABLED=true 时必须启用至少一个实验执行路径",
     )
-  if EXPERIMENT_MAX_USER_PLANNED_TRIALS <= 0:
-    raise ValueError("启用实验时必须配置正数的用户计划 Trial 上限")
-  if EXPERIMENT_MAX_TRIALS > EXPERIMENT_MAX_USER_PLANNED_TRIALS:
-    raise ValueError("单实验 Trial 上限不能大于用户计划 Trial 上限")
+  from backend.experiments.rollout import ContractEpoch, current_contract_epoch
+
+  if current_contract_epoch() < ContractEpoch.ROLLING_WINDOW_V1:
+    if EXPERIMENT_MAX_USER_PLANNED_TRIALS <= 0:
+      raise ValueError("启用实验时必须配置正数的用户计划 Trial 上限")
+    if EXPERIMENT_MAX_TRIALS > EXPERIMENT_MAX_USER_PLANNED_TRIALS:
+      raise ValueError("单实验 Trial 上限不能大于用户计划 Trial 上限")
   if EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT > EXPERIMENT_MAX_IN_FLIGHT_PER_USER:
     raise ValueError("单实验在途上限不能大于用户实验在途上限")
   if EXPERIMENT_MANUAL_RESERVED_PERMITS > EXPERIMENT_MAX_IN_FLIGHT_PER_USER:

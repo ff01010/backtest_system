@@ -222,6 +222,18 @@ def test_health_reports_runner_degradation_without_internal_counts(
   monkeypatch.setattr(
     api_app._evaluation_export_application, "worker_available", lambda: True,
   )
+  monkeypatch.setattr(
+    api_app, "experiment_storage_health", lambda: {"status": "unknown"},
+  )
+  monkeypatch.setattr(api_app, "experiment_rollout_health", lambda: {
+    "contractEpoch": "legacy",
+    "supportedEpochRange": {
+      "minimum": "legacy",
+      "maximum": "rolling_window_v1",
+    },
+    "compatible": True,
+    "rolloutObservation": {"status": "unavailable"},
+  })
 
   assert api_app.health() == {
     "status": "degraded",
@@ -238,6 +250,14 @@ def test_health_reports_runner_degradation_without_internal_counts(
       "enabled": api_app.settings.EXPERIMENTS_ENABLED,
       "barPreviewEnabled": api_app.settings.EXPERIMENT_BAR_ENABLED,
       "capabilityVersion": "experiment_bar_execution_v1",
+      "storagePressure": {"status": "unknown"},
+      "contractEpoch": "legacy",
+      "supportedEpochRange": {
+        "minimum": "legacy",
+        "maximum": "rolling_window_v1",
+      },
+      "compatible": True,
+      "rolloutObservation": {"status": "unavailable"},
     },
   }
 

@@ -38,18 +38,29 @@ from backend.experiments import (
   EvaluationExportApplication,
   EvaluationExportCreateRequest,
   EvaluationRunCreateRequest,
+  EvaluationRunCancelRequest,
   EvaluationSpecRequest,
   ExperimentApplication,
+  ExperimentCancelCommandRequest,
   ExperimentCreateRequest,
   ExperimentLifecycleRequest,
+  ExperimentPauseCommandRequest,
   ExperimentPurgeRequest,
   ExperimentError,
   ExperimentPreviewRequest,
   ExperimentRetryFailedRequest,
   ExperimentRetryPreviewRequest,
   ExperimentRevisionCreateRequest,
+  ExperimentResumeCommandRequest,
   ExperimentResumeRequest,
   SubjectRef,
+)
+from backend.experiments.rollout import (
+  health_snapshot as experiment_rollout_health,
+  record_legacy_lifecycle_call,
+)
+from backend.experiments.storage_pressure import (
+  health_snapshot as experiment_storage_health,
 )
 from backend.experiments.purge_repository import PostgresExperimentPurgeRepository
 from backend.execution import execution_algorithm_snapshot, validate_execution_request
@@ -985,6 +996,7 @@ def _public_experiment_command(
   operation_type: str,
   action: Callable[[str, str | None], tuple[dict[str, Any], int]],
   resource_id: str | None = None,
+  response_headers: dict[str, str] | None = None,
 ) -> JSONResponse:
   try:
     body, status_code = action(
@@ -996,7 +1008,11 @@ def _public_experiment_command(
   _audit_public_experiment_operation(
     api_key, request, operation_type, body, resource_id,
   )
-  return JSONResponse(status_code=status_code, content=body)
+  return JSONResponse(
+    status_code=status_code,
+    content=body,
+    headers=response_headers,
+  )
 
 
 def _public_write_context(
@@ -1161,6 +1177,8 @@ def health():
       "enabled": settings.EXPERIMENTS_ENABLED,
       "barPreviewEnabled": settings.EXPERIMENT_BAR_ENABLED,
       "capabilityVersion": "experiment_bar_execution_v1",
+      "storagePressure": experiment_storage_health(),
+      **experiment_rollout_health(),
     },
   }
 
@@ -1865,6 +1883,17 @@ def _experiment_idempotency_key(request: Request) -> str:
   return value
 
 
+def _legacy_lifecycle_headers(experiment_id: str, command: str) -> dict[str, str]:
+  return {
+    "Deprecation": "true",
+    "Sunset": "Sat, 30 Jan 2027 00:00:00 GMT",
+    "Link": (
+      f'</api/v2/experiments/{experiment_id}/commands/{command}>; '
+      'rel="successor-version"'
+    ),
+  }
+
+
 @app.get(
   "/api/backtest/experiment-subjects/{subject_type}/{subject_id}/versions/{subject_version}",
 )
@@ -2238,15 +2267,161 @@ def _file_content_sha256(path: Path) -> str:
   return content_hash.hexdigest()
 
 
+@app.post("/api/backtest/experiments/{experiment_id}/commands/pause")
+def pause_experiment_v2(
+  experiment_id: UUID,
+  payload: ExperimentPauseCommandRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _experiment_application.pause_lifecycle(
+      str(experiment_id), str(payload.expectedRevisionId),
+      payload.expectedLifecycleVersion, payload.reason,
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post(
+  "/api/backtest/experiments/{experiment_id}/evaluation-runs/"
+  "{evaluation_run_id}/cancel",
+)
+def cancel_experiment_evaluation_run(
+  experiment_id: UUID,
+  evaluation_run_id: UUID,
+  payload: EvaluationRunCancelRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _evaluation_application.cancel_run(
+      str(experiment_id),
+      str(evaluation_run_id),
+      payload.reason,
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get(
+  "/api/backtest/experiments/{experiment_id}/evaluation-runs/{evaluation_run_id}/results",
+)
+def experiment_evaluation_run_results(
+  experiment_id: UUID,
+  evaluation_run_id: UUID,
+  cursor: int = Query(default=-1, ge=-1),
+  limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+  try:
+    return _evaluation_application.run_results(
+      str(experiment_id),
+      str(evaluation_run_id),
+      after_ordinal=cursor,
+      limit=limit,
+    )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get(
+  "/api/backtest/experiments/{experiment_id}/evaluation-runs/"
+  "{evaluation_run_id}/exceptions",
+)
+def experiment_evaluation_run_exceptions(
+  experiment_id: UUID,
+  evaluation_run_id: UUID,
+  cursor: int = Query(default=-1, ge=-1),
+  limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+  try:
+    return _evaluation_application.run_exceptions(
+      str(experiment_id),
+      str(evaluation_run_id),
+      after_ordinal=cursor,
+      limit=limit,
+    )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.get(
+  "/api/backtest/experiments/{experiment_id}/evaluation-runs/"
+  "{evaluation_run_id}/groups/{group_id}/members",
+)
+def experiment_evaluation_group_members(
+  experiment_id: UUID,
+  evaluation_run_id: UUID,
+  group_id: str,
+  cursor: int = Query(default=-1, ge=-1),
+  limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+  try:
+    return _evaluation_application.group_members(
+      str(experiment_id),
+      str(evaluation_run_id),
+      group_id,
+      after_ordinal=cursor,
+      limit=limit,
+    )
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/commands/resume")
+def resume_experiment_v2(
+  experiment_id: UUID,
+  payload: ExperimentResumeCommandRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _experiment_application.resume_lifecycle(
+      str(experiment_id), str(payload.expectedRevisionId),
+      payload.expectedLifecycleVersion, payload.resumeMode, payload.reason,
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
+@app.post("/api/backtest/experiments/{experiment_id}/commands/cancel")
+def cancel_experiment_v2(
+  experiment_id: UUID,
+  payload: ExperimentCancelCommandRequest,
+  request: Request,
+) -> Response:
+  try:
+    body, status_code = _experiment_application.cancel_lifecycle(
+      str(experiment_id), str(payload.expectedRevisionId),
+      payload.expectedLifecycleVersion, payload.reason,
+      _experiment_idempotency_key(request),
+      getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=body)
+  except ExperimentError as error:
+    _raise_experiment_error(error)
+
+
 @app.post("/api/backtest/experiments/{experiment_id}/cancel")
 def cancel_experiment(experiment_id: UUID, request: Request) -> Response:
   try:
+    record_legacy_lifecycle_call("internal.cancel")
     body, status_code = _experiment_application.cancel(
       str(experiment_id),
       _experiment_idempotency_key(request),
       getattr(request.state, "request_id", None),
     )
-    return JSONResponse(status_code=status_code, content=body)
+    return JSONResponse(
+      status_code=status_code,
+      content=body,
+      headers=_legacy_lifecycle_headers(str(experiment_id), "cancel"),
+    )
   except ExperimentError as error:
     _raise_experiment_error(error)
 
@@ -2383,6 +2558,7 @@ def _stable_error(status_code: int, code: str, message: str) -> HTTPException:
 def _idempotency_key(request: Request) -> str:
   value = request.headers.get("idempotency-key", "").strip()
   try:
+    record_legacy_lifecycle_call("internal.resume")
     return str(UUID(value))
   except (ValueError, AttributeError) as error:
     raise _stable_error(
@@ -3180,6 +3356,7 @@ def public_resume_experiment(
   request: Request,
 ) -> Response:
   api_key = _require_public_scope(request, "experiment:submit")
+  record_legacy_lifecycle_call("public_v1.resume")
   experiment_id_value = str(experiment_id)
   return _public_experiment_command(
     request,
@@ -3193,12 +3370,14 @@ def public_resume_experiment(
       request_id,
     ),
     experiment_id_value,
+    _legacy_lifecycle_headers(experiment_id_value, "resume"),
   )
 
 
 @app.post("/api/v1/experiments/{experiment_id}/cancel")
 def public_cancel_experiment(experiment_id: UUID, request: Request) -> Response:
   api_key = _require_public_scope(request, "experiment:cancel")
+  record_legacy_lifecycle_call("public_v1.cancel")
   experiment_id_value = str(experiment_id)
   return _public_experiment_command(
     request,
@@ -3206,6 +3385,70 @@ def public_cancel_experiment(experiment_id: UUID, request: Request) -> Response:
     "experiment.cancel",
     lambda idempotency_key, request_id: _experiment_application.cancel(
       experiment_id_value, idempotency_key, request_id,
+    ),
+    experiment_id_value,
+    _legacy_lifecycle_headers(experiment_id_value, "cancel"),
+  )
+
+
+@app.post("/api/v2/experiments/{experiment_id}/commands/pause")
+def public_pause_experiment_v2(
+  experiment_id: UUID,
+  payload: ExperimentPauseCommandRequest,
+  request: Request,
+) -> Response:
+  api_key = _require_public_scope(request, "experiment:submit")
+  experiment_id_value = str(experiment_id)
+  return _public_experiment_command(
+    request,
+    api_key,
+    "experiment.pause.v2",
+    lambda idempotency_key, request_id: _experiment_application.pause_lifecycle(
+      experiment_id_value, str(payload.expectedRevisionId),
+      payload.expectedLifecycleVersion, payload.reason,
+      idempotency_key, request_id,
+    ),
+    experiment_id_value,
+  )
+
+
+@app.post("/api/v2/experiments/{experiment_id}/commands/resume")
+def public_resume_experiment_v2(
+  experiment_id: UUID,
+  payload: ExperimentResumeCommandRequest,
+  request: Request,
+) -> Response:
+  api_key = _require_public_scope(request, "experiment:submit")
+  experiment_id_value = str(experiment_id)
+  return _public_experiment_command(
+    request,
+    api_key,
+    "experiment.resume.v2",
+    lambda idempotency_key, request_id: _experiment_application.resume_lifecycle(
+      experiment_id_value, str(payload.expectedRevisionId),
+      payload.expectedLifecycleVersion, payload.resumeMode, payload.reason,
+      idempotency_key, request_id,
+    ),
+    experiment_id_value,
+  )
+
+
+@app.post("/api/v2/experiments/{experiment_id}/commands/cancel")
+def public_cancel_experiment_v2(
+  experiment_id: UUID,
+  payload: ExperimentCancelCommandRequest,
+  request: Request,
+) -> Response:
+  api_key = _require_public_scope(request, "experiment:cancel")
+  experiment_id_value = str(experiment_id)
+  return _public_experiment_command(
+    request,
+    api_key,
+    "experiment.cancel.v2",
+    lambda idempotency_key, request_id: _experiment_application.cancel_lifecycle(
+      experiment_id_value, str(payload.expectedRevisionId),
+      payload.expectedLifecycleVersion, payload.reason,
+      idempotency_key, request_id,
     ),
     experiment_id_value,
   )

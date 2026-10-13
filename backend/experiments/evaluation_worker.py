@@ -10,7 +10,11 @@ import time
 from backend import settings
 from backend.experiments.errors import ExperimentError
 from backend.experiments.evaluation import complete_snapshot, evaluate, output_hash
-from backend.experiments.evaluation_repository import PostgresEvaluationRepository
+from backend.experiments.evaluation_dataset import OUTPUT_SCHEMA_VERSION, EvaluationDataset
+from backend.experiments.evaluation_repository import (
+  PostgresEvaluationRepository,
+  _v2_source_row,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -34,26 +38,38 @@ class EvaluationWorker:
       return False
     run_id = str(claimed.run["id"])
     try:
-      sources = self._repository.load_run_sources(claimed.run)
-      completeness = (
-        dict(claimed.run.get("completeness_snapshot") or {})
-        or complete_snapshot(int(claimed.run["execution_count"]))
-      )
-      output = evaluate(
-        dict(claimed.run["evaluation_spec"]),
-        dict(claimed.run["catalog_snapshot"]),
-        sources,
-        str(claimed.run["result_set_hash"]),
-        completeness,
-        str(claimed.run["pipeline_version"]),
-      )
+      if claimed.run.get("output_schema_version") == OUTPUT_SCHEMA_VERSION:
+        output = EvaluationDataset().evaluate_streaming(
+          claimed.run,
+          _v2_source_row,
+          lambda: self._repository.renew_run_lease(
+            run_id, claimed.attempt_token, self._lease_seconds,
+          ),
+        )
+      else:
+        sources = self._repository.load_run_sources(claimed.run)
+        completeness = (
+          dict(claimed.run.get("completeness_snapshot") or {})
+          or complete_snapshot(int(claimed.run["execution_count"]))
+        )
+        output = evaluate(
+          dict(claimed.run["evaluation_spec"]),
+          dict(claimed.run["catalog_snapshot"]),
+          sources,
+          str(claimed.run["result_set_hash"]),
+          completeness,
+          str(claimed.run["pipeline_version"]),
+        )
       self._repository.complete_run(
         run_id, claimed.attempt_token, output, output_hash(output),
       )
     except ExperimentError as error:
-      self._repository.fail_run(
-        run_id, claimed.attempt_token, error.code, str(error),
-      )
+      if error.code == "experiment.evaluation_cancel_requested":
+        self._repository.finish_cancelled_run(run_id, claimed.attempt_token)
+      else:
+        self._repository.fail_run(
+          run_id, claimed.attempt_token, error.code, str(error),
+        )
     except Exception:
       logger.exception("评价运行失败: %s", run_id)
       self._repository.fail_run(

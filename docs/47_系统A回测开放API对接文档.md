@@ -778,7 +778,7 @@ curl -sS "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9/vers
 - 创建一个新 Experiment 的 Revision 1；
 - 查询 Experiment 和 Trial；
 - 对已选择的失败 Trial 进行重试预览和确认；
-- 恢复或取消实验。
+- 暂停、继续、解除执行熔断或取消实验。
 
 当前不公开评价、报告导出、创建新 Revision、归档和物理清理接口。更换策略发布版本或发起新的研究目标时，应创建新的 Experiment。
 
@@ -797,6 +797,11 @@ curl -sS "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9/vers
 | `POST /api/v1/experiments/{experimentId}/retry-failed` | `experiment:submit` | 是 | 确认重试所选失败 Trial |
 | `POST /api/v1/experiments/{experimentId}/resume` | `experiment:submit` | 是 | 恢复可恢复的实验 |
 | `POST /api/v1/experiments/{experimentId}/cancel` | `experiment:cancel` | 是 | 取消实验及可取消的执行 |
+| `POST /api/v2/experiments/{experimentId}/commands/pause` | `experiment:submit` | 是 | 按生命周期版本暂停当前 Revision |
+| `POST /api/v2/experiments/{experimentId}/commands/resume` | `experiment:submit` | 是 | 继续用户暂停或解除执行熔断 |
+| `POST /api/v2/experiments/{experimentId}/commands/cancel` | `experiment:cancel` | 是 | 按生命周期版本取消当前 Revision |
+
+`/api/v1/.../resume` 和 `/api/v1/.../cancel` 是限期兼容桥，成功响应包含 `Deprecation`、`Sunset` 和 `Link`。新接入方必须使用 v2 命令；服务端持续记录 v1 调用量，只有公告期和连续零调用观察期均满足后才会删除桥接。
 
 ### 16.3 预览和创建
 
@@ -842,7 +847,7 @@ curl -sS "{BASE_URL}/api/v1/strategies/932a0ce2-9d8d-4060-8614-5df0adbbf8a9/vers
 }
 ```
 
-预览成功返回 `previewToken`、`expiresAt`、`specHash`、规范化定义、`plannedTrialCount`、预算摘要和门禁决定。只有 `limitDecision.allowed=true` 才能创建。预览不会创建 Experiment、Trial 或普通回测任务。
+预览成功返回 `previewToken`、`expiresAt`、`specHash`、规范化定义、`plannedTrialCount`、预算摘要和门禁决定。`plannedTrialCount` 是完整有限笛卡尔积的权威逻辑规模；预计 Bar 数和资源等级只用于提示，估算不可用时返回警告但不阻止创建。只有字段、单维度候选保护、运行前置条件或 `2^53 - 1` 跨端精确整数边界不满足时，`limitDecision.allowed` 才会为 `false`。预览只编译固定数量的首尾样例，不创建 Experiment、Trial 或普通回测任务。
 
 创建请求必须把预览时的完整定义放入 `experimentSpec`：
 
@@ -884,7 +889,7 @@ Trial 查询参数：
 | `revisionId` | 空 | 限定 Revision；省略时由服务端按实验查询语义返回 |
 | `status` | 空 | `pending`、`queued`、`running`、`cancelling`、`succeeded`、`failed` 或 `cancelled` |
 
-### 16.5 重试、恢复和取消
+### 16.5 重试与生命周期命令
 
 失败重试必须先预览选择，再确认执行。预览请求示例：
 
@@ -900,20 +905,23 @@ Trial 查询参数：
 
 确认重试时，在相同对象上增加预览返回的 `expectedSelectedTrialCount`、`expectedSelectionDigest`，以及可选 `reason`，并使用新的 `Idempotency-Key`。选择已变化时服务端拒绝执行，调用方应重新读取失败 Trial 并重新预览。
 
-恢复请求：
+v2 暂停或取消请求：
 
 ```json
 {
   "expectedRevisionId": "10000000-0000-4000-8000-000000000002",
-  "reason": "外部依赖恢复后继续运行"
+  "expectedLifecycleVersion": 3,
+  "reason": "参数配置需要调整"
 }
 ```
 
-取消接口没有 JSON 请求体，但仍必须提供新的 `Idempotency-Key`。重试、恢复和取消均保留既有 Trial、执行记录和结果，不会覆盖历史事实。
+v2 恢复请求还必须提供 `resumeMode`：`user_pause` 只继续用户主动暂停，`execution_circuit` 只解除执行熔断，二者不能互相替代。每次用户确认生成一个稳定 `Idempotency-Key`；网络结果不明确时必须复用原 Key。`expectedRevisionId` 或 `expectedLifecycleVersion` 冲突时返回 `409`，调用方应刷新详情并要求用户重新确认。
+
+暂停不取消已经排队或运行的普通回测，在途归零后进入 `paused`；继续后从原生成游标推进。取消可以从任意非终态发起，受理后可能先返回 `202` 与 `lifecycleState=cancelling`，最终才进入 `terminal/cancelled`。取消不可恢复，但既有成功结果、Trial、执行和审计全部保留，也不自动取消已经冻结的评价或导出。
 
 ### 16.6 容量、审计和建议调用流程
 
-公开入口不建立第二套调度器或容量池。它与前端入口共用按用户累计的实验计划额度、单实验 Trial 上限、在途额度、普通单次回测保留额度和现有 Worker。预览返回的门禁结果是是否允许创建的唯一依据；部署环境可调整额度，调用方不得把当前数值写死。
+公开入口不建立第二套调度器或容量池。完整有限网格保存在单个 Experiment Revision 中，不按 Trial 总数、用户计划总量或预计 Bar 总量设置业务准入配额，也不得由调用方截断、抽样或拆分。系统以实验、用户、全局三级滚动窗口分批生成 Trial，继续共用实际在途容量、普通单次回测保留额度和现有 Worker；动态容量收紧只降低推进速度。存储压力或必需容量信号过期会停止新生成/物化，但查询、取消、归档和清理仍可用。
 
 实验内核原子记录用户、请求 ID、幂等结果和资源变更；公开适配层尽力补充 API Key ID、操作类型、资源 ID 和是否幂等重放，不记录完整实验定义、策略源码或密钥明文。附加的 API Key 归因审计失败不会把已经成功创建的实验伪装成失败，服务端会保留错误日志供运维核查。
 
@@ -921,7 +929,7 @@ Trial 查询参数：
 
 1. 用 `strategy:read` 取得已发布策略版本和参数声明。
 2. 生成有限候选网格并调用实验预览。
-3. 检查 `limitDecision` 和 `plannedTrialCount`，保存预览返回值。
+3. 检查 `limitDecision`、权威 `plannedTrialCount`、估算提示和固定样例，保存预览返回值。
 4. 用新的 `Idempotency-Key` 创建实验；超时重试复用原 Key。
 5. 轮询实验详情和 Trial 列表，使用服务端返回的游标。
-6. 仅在明确需要时执行失败重试、恢复或取消；每个新命令使用新的幂等键。
+6. 仅在明确需要时执行失败重试或 v2 生命周期命令；一次确认期间复用同一幂等键，冲突后刷新版本并重新确认。

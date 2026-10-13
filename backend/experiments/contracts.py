@@ -170,6 +170,40 @@ class ExperimentResumeRequest(StrictModel):
     return normalized
 
 
+class ExperimentPauseCommandRequest(StrictModel):
+  expectedRevisionId: UUID
+  expectedLifecycleVersion: int = Field(ge=1)
+  reason: str = Field(min_length=1, max_length=500)
+
+  @field_validator("reason", mode="before")
+  @classmethod
+  def normalize_reason(cls, value: object) -> object:
+    return value.strip() if isinstance(value, str) else value
+
+
+class ExperimentResumeCommandRequest(StrictModel):
+  expectedRevisionId: UUID
+  expectedLifecycleVersion: int = Field(ge=1)
+  resumeMode: Literal["user_pause", "execution_circuit"]
+  reason: str = Field(default="", max_length=500)
+
+  @field_validator("reason", mode="before")
+  @classmethod
+  def normalize_reason(cls, value: object) -> object:
+    return value.strip() if isinstance(value, str) else value
+
+
+class ExperimentCancelCommandRequest(StrictModel):
+  expectedRevisionId: UUID
+  expectedLifecycleVersion: int = Field(ge=1)
+  reason: str = Field(min_length=1, max_length=500)
+
+  @field_validator("reason", mode="before")
+  @classmethod
+  def normalize_reason(cls, value: object) -> object:
+    return value.strip() if isinstance(value, str) else value
+
+
 class ExperimentLifecycleRequest(StrictModel):
   expectedRevisionId: UUID
   expectedSnapshotVersion: int = Field(ge=1)
@@ -427,6 +461,18 @@ class EvaluationSpecRequest(StrictModel):
 class EvaluationRunCreateRequest(StrictModel):
   evaluationSpecId: UUID
   forceRecompute: bool = False
+
+
+class EvaluationRunCancelRequest(StrictModel):
+  reason: str | None = Field(default=None, max_length=500)
+
+  @field_validator("reason")
+  @classmethod
+  def normalize_reason(cls, value: str | None) -> str | None:
+    if value is None:
+      return None
+    normalized = value.strip()
+    return normalized or None
 
 
 class EvaluationExportCreateRequest(StrictModel):

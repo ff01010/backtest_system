@@ -300,8 +300,9 @@ class PostgresExperimentRepository:
         if digest(preview["normalized_spec"]) != digest(normalized_spec):
           raise _preview_stale(["normalizedSpec"])
         source_row = _load_experiment_source(cur, owner_id, source)
-        planned_count = int(preview["planned_trial_count"])
-        _reserve_user_plan(cur, owner_id, planned_count)
+        _reserve_plan_for_current_epoch(
+          cur, owner_id, int(preview["planned_trial_count"]),
+        )
         response = _insert_experiment_graph(
           cur,
           owner_id=owner_id,
@@ -348,7 +349,9 @@ class PostgresExperimentRepository:
         _validate_revision_creation(
           graph, expected_revision_id, expected_snapshot_version,
         )
-        _reserve_user_plan(cur, owner_id, int(preview["planned_trial_count"]))
+        _reserve_plan_for_current_epoch(
+          cur, owner_id, int(preview["planned_trial_count"]),
+        )
         response = _insert_new_revision(
           cur, graph, normalized_spec, preview, request_id,
         )
@@ -389,18 +392,25 @@ class PostgresExperimentRepository:
             source_r.revision_no AS source_revision_no,
             r.id AS revision_id, r.revision_no, r.experiment_spec,
             r.spec_hash, r.planned_trial_count, r.resource_budget,
-            r.failure_policy,
+            r.failure_policy, r.lifecycle_state, r.lifecycle_version,
+            r.terminal_outcome, r.system_block_code,
+            r.system_block_message, rollout.contract_epoch,
+            storage.decision AS storage_decision,
             s.id AS stage_id, s.stage_type, s.generator_version,
             s.status AS stage_status, s.generated_trial_count,
             s.generation_cursor, s.trial_collection_digest,
             s.in_flight_count, s.terminal_count, s.succeeded_count,
             s.failed_count, s.cancelled_count,
+            s.execution_phase,
+            trial_counts.ready_count, trial_counts.queued_count,
             s.blocked_reason_code AS stage_reason_code,
             s.blocked_reason_message AS stage_reason_message,
             s.blocked_scope, s.blocked_at, s.consecutive_failure_count
           FROM backtest_experiment e
           JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
           JOIN backtest_experiment_stage s ON s.revision_id=r.id AND s.stage_index=0
+          CROSS JOIN backtest_experiment_rollout_state rollout
+          CROSS JOIN backtest_experiment_storage_pressure storage
           LEFT JOIN backtest_experiment_revision source_r
             ON source_r.id=e.source_revision_id
           LEFT JOIN backtest_experiment source_e
@@ -418,6 +428,16 @@ class PostgresExperimentRepository:
               ON execution.trial_id=related_trial.id
             WHERE related_revision.experiment_id=e.id
           ) related_runs ON true
+          LEFT JOIN LATERAL (
+            SELECT
+              count(*) FILTER (
+                WHERE trial.materialization_status='pending'
+                  AND trial.summary_status='pending'
+              ) AS ready_count,
+              count(*) FILTER (WHERE trial.summary_status='queued') AS queued_count
+            FROM backtest_experiment_trial trial
+            WHERE trial.stage_id=s.id
+          ) trial_counts ON true
           WHERE e.id=%s AND e.owner_user_id=%s
         """, (experiment_id, owner_id))
         row = cur.fetchone()
@@ -484,13 +504,24 @@ class PostgresExperimentRepository:
             source_r.id AS source_revision_id,
             source_r.revision_no AS source_revision_no,
             r.id AS revision_id, r.revision_no, r.experiment_spec,
-            r.planned_trial_count,
+            r.planned_trial_count, r.lifecycle_state, r.lifecycle_version,
+            r.terminal_outcome, r.system_block_code,
+            rollout.contract_epoch, storage.decision AS storage_decision,
             s.id AS stage_id, s.status AS stage_status,
             s.generated_trial_count, s.in_flight_count, s.terminal_count,
-            s.succeeded_count, s.failed_count, s.cancelled_count
+            s.succeeded_count, s.failed_count, s.cancelled_count,
+            s.execution_phase,
+            (SELECT count(*) FROM backtest_experiment_trial trial
+             WHERE trial.stage_id=s.id AND trial.summary_status='queued') AS queued_count,
+            (SELECT count(*) FROM backtest_experiment_trial trial
+             WHERE trial.stage_id=s.id
+               AND trial.materialization_status='pending'
+               AND trial.summary_status='pending') AS ready_count
           FROM backtest_experiment e
           JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
           JOIN backtest_experiment_stage s ON s.revision_id=r.id AND s.stage_index=0
+          CROSS JOIN backtest_experiment_rollout_state rollout
+          CROSS JOIN backtest_experiment_storage_pressure storage
           LEFT JOIN backtest_experiment_revision source_r
             ON source_r.id=e.source_revision_id
           LEFT JOIN backtest_experiment source_e
@@ -583,10 +614,13 @@ class PostgresExperimentRepository:
         _require_owned_experiment(cur, experiment_id, owner_id)
         cur.execute(f"""
           SELECT r.id AS revision_id, r.revision_no, r.status, r.spec_hash,
+            r.lifecycle_state, r.lifecycle_version, r.terminal_outcome,
+            r.system_block_code,
             r.planned_trial_count, r.terminal_at, r.created_at, r.updated_at,
             s.id AS stage_id, s.status AS stage_status,
             s.generated_trial_count, s.in_flight_count, s.terminal_count,
             s.succeeded_count, s.failed_count, s.cancelled_count,
+            s.execution_phase,
             e.current_revision_id
           FROM backtest_experiment_revision r
           JOIN backtest_experiment e ON e.id=r.experiment_id
@@ -857,6 +891,13 @@ class PostgresExperimentRepository:
         return CommandResult(response, 202)
 
   def materialize_next_trial(self, compiler: TrialCompiler) -> bool:
+    from backend.experiments.rollout import ContractEpoch, current_contract_epoch
+    from backend.experiments.storage_pressure import StoragePressureGate
+
+    epoch = current_contract_epoch()
+    if epoch >= ContractEpoch.LIFECYCLE_V2:
+      if not StoragePressureGate().evaluate().allows_new_work:
+        return False
     with _coordinator_session() as conn:
       with conn.cursor() as cur:
         candidate = _find_materialization_candidate(cur)
@@ -867,7 +908,9 @@ class PostgresExperimentRepository:
           return False
         gate = _materialization_gate(cur, locked)
         if not gate.allowed:
-          return _set_materialization_block(cur, locked, gate)
+          if epoch < ContractEpoch.ROLLING_WINDOW_V1:
+            return _set_materialization_block(cur, locked, gate)
+          return False
         if not _can_materialize(locked):
           return False
         template, assignment, dataset, seed = _materialization_inputs(locked)
@@ -877,6 +920,8 @@ class PostgresExperimentRepository:
         return True
 
   def refresh_next_capacity_block(self) -> bool:
+    from backend.experiments.rollout import ContractEpoch, current_contract_epoch
+
     with _coordinator_session() as conn:
       with conn.cursor() as cur:
         candidate = _find_capacity_block_candidate(cur)
@@ -885,7 +930,11 @@ class PostgresExperimentRepository:
         locked = _lock_capacity_block_graph(cur, dict(candidate))
         if locked is None:
           return False
-        gate = _materialization_gate(cur, locked)
+        gate = (
+          _materialization_gate(cur, locked)
+          if current_contract_epoch() < ContractEpoch.ROLLING_WINDOW_V1
+          else MaterializationGate(True)
+        )
         return _set_materialization_block(cur, locked, gate, touch=True)
 
   def reconcile_next_execution(self) -> bool:
@@ -1080,6 +1129,7 @@ class PostgresExperimentRepository:
           WHERE s.status='preparing'
             AND s.blocked_reason_code IS NULL
             AND r.cancel_requested_at IS NULL
+            AND r.generation_policy_version='legacy'
             AND (s.generation_lease_expires_at IS NULL OR s.generation_lease_expires_at < now())
           ORDER BY s.created_at, s.id
           FOR UPDATE OF s SKIP LOCKED
@@ -1190,8 +1240,8 @@ def _find_materialization_candidate(cur: Any) -> dict[str, Any] | None:
         WHERE s.owner_user_id=q.owner_user_id
           AND s.status IN ('queued', 'running')
           AND s.blocked_reason_code IS NULL
-          AND s.generated_trial_count=s.planned_trial_count
           AND s.in_flight_count < %s
+          AND r.lifecycle_state='active'
           AND r.cancel_requested_at IS NULL AND r.terminal_at IS NULL
           AND (
             t.materialization_status='pending'
@@ -1234,8 +1284,8 @@ def _lock_materialization_graph(
     WHERE s.owner_user_id=%s
       AND s.status IN ('queued', 'running')
       AND s.blocked_reason_code IS NULL
-      AND s.generated_trial_count=s.planned_trial_count
       AND s.in_flight_count < %s
+      AND r.lifecycle_state='active'
       AND r.cancel_requested_at IS NULL AND r.terminal_at IS NULL
       AND EXISTS (
         SELECT 1 FROM backtest_experiment_trial t
@@ -1312,8 +1362,8 @@ def _can_materialize(locked: dict[str, Any]) -> bool:
       < settings.EXPERIMENT_MAX_IN_FLIGHT_PER_USER
     and revision["cancel_requested_at"] is None
     and revision["terminal_at"] is None
+    and revision.get("lifecycle_state", "active") == "active"
     and stage["status"] in {"queued", "running"}
-    and int(stage["generated_trial_count"]) == int(stage["planned_trial_count"])
     and stage["blocked_reason_code"] is None
     and int(stage["in_flight_count"])
       < settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT
@@ -1348,7 +1398,7 @@ def _find_capacity_block_candidate(cur: Any) -> dict[str, Any] | None:
     SELECT s.id AS stage_id, s.owner_user_id, s.revision_id
     FROM backtest_experiment_stage s
     JOIN backtest_experiment_revision r ON r.id=s.revision_id
-    WHERE s.status IN ('queued', 'running')
+    WHERE s.status IN ('queued', 'running', 'generation_blocked')
       AND s.blocked_reason_code = ANY(%s)
       AND r.cancel_requested_at IS NULL AND r.terminal_at IS NULL
       AND EXISTS (
@@ -1394,9 +1444,10 @@ def _lock_capacity_block_graph(
 
 def _materialization_gate(cur: Any, locked: dict[str, Any]) -> MaterializationGate:
   effective_capacity, global_in_flight = _capacity_snapshot(cur)
-  budget_gate = _budget_capacity_gate(locked, effective_capacity)
-  if not budget_gate.allowed:
-    return budget_gate
+  if locked["revision"].get("generation_policy_version") == "legacy":
+    budget_gate = _budget_capacity_gate(locked, effective_capacity)
+    if not budget_gate.allowed:
+      return budget_gate
   manual_gate = _manual_capacity_gate(cur, locked)
   if not manual_gate.allowed:
     return manual_gate
@@ -1416,6 +1467,7 @@ def _budget_capacity_gate(
   locked: dict[str, Any],
   effective_capacity: int,
 ) -> MaterializationGate:
+  """rolling_window_v1 激活前保持旧冻结预算语义。"""
   budget = dict(locked["revision"].get("resource_budget") or {})
   estimate = dict(budget.get("estimate") or budget)
   frozen = dict(budget.get("capacityPolicy") or {})
@@ -1527,6 +1579,7 @@ def _set_materialization_block(
     return False
   _write_materialization_block(cur, locked, desired_code, desired_message)
   _audit_materialization_block(cur, locked, desired_code)
+  _rebuild_aggregate_status(cur, str(stage["id"]))
   return True
 
 
@@ -1773,7 +1826,7 @@ def _find_reconciliation_candidate(cur: Any) -> dict[str, Any] | None:
   cur.execute("""
     SELECT execution.id AS execution_id, execution.owner_user_id,
       execution.trial_id, trial.stage_id, stage.revision_id,
-      revision.experiment_id
+      revision.experiment_id, revision.generation_policy_version
     FROM backtest_experiment_trial_execution execution
     JOIN backtest_experiment_trial trial ON trial.id=execution.trial_id
     JOIN backtest_experiment_stage stage ON stage.id=trial.stage_id
@@ -1796,6 +1849,12 @@ def _lock_reconciliation_graph(
   cur: Any,
   candidate: dict[str, Any],
 ) -> dict[str, Any] | None:
+  if candidate.get("generation_policy_version") == "rolling_window_v1":
+    from backend.experiments.rolling_window import _lock_ledgers
+
+    _lock_ledgers(
+      cur, str(candidate["owner_user_id"]), str(candidate["stage_id"]),
+    )
   cur.execute(
     "SELECT * FROM backtest_experiment_user_quota WHERE owner_user_id=%s FOR UPDATE",
     (candidate["owner_user_id"],),
@@ -1922,12 +1981,29 @@ def _finish_trial_execution(
   selected = execution["id"] if status == "succeeded" else trial.get("selected_execution_id")
   summary_status = "pending" if retry_scheduled else status
   retry_at = _automatic_retry_at(locked) if retry_scheduled else None
-  cur.execute("""
-    UPDATE backtest_experiment_trial
-    SET active_execution_id=NULL, selected_execution_id=%s,
-      summary_status=%s, retry_not_before=%s, updated_at=now()
-    WHERE id=%s AND active_execution_id=%s
-  """, (selected, summary_status, retry_at, trial["id"], execution["id"]))
+  rolling_terminal = (
+    locked["revision"].get("generation_policy_version") == "rolling_window_v1"
+    and not retry_scheduled
+  )
+  if rolling_terminal:
+    cur.execute("""
+      UPDATE backtest_experiment_trial
+      SET selected_execution_id=%s, updated_at=now()
+      WHERE id=%s AND active_execution_id=%s
+    """, (selected, trial["id"], execution["id"]))
+    from backend.experiments.rolling_window import settle_trial_in_transaction
+
+    settle_trial_in_transaction(
+      cur, str(trial["id"]), status,
+      f"execution-terminal:{execution['id']}", datetime.now(timezone.utc),
+    )
+  else:
+    cur.execute("""
+      UPDATE backtest_experiment_trial
+      SET active_execution_id=NULL, selected_execution_id=%s,
+        summary_status=%s, retry_not_before=%s, updated_at=now()
+      WHERE id=%s AND active_execution_id=%s
+    """, (selected, summary_status, retry_at, trial["id"], execution["id"]))
   cur.execute("""
     UPDATE backtest_experiment_user_quota
     SET experiment_in_flight_count=GREATEST(0,experiment_in_flight_count-1),
@@ -2090,10 +2166,12 @@ def _open_execution_circuit(
   """, (message, locked["stage"]["id"]))
   cur.execute("""
     UPDATE backtest_experiment_revision
-    SET blocked_reason_code='experiment.execution_blocked',
+    SET system_block_code='execution_circuit',
+      system_block_message=%s,
+      blocked_reason_code='experiment.execution_blocked',
       blocked_reason_message=%s, updated_at=now()
     WHERE id=%s
-  """, (message, locked["revision"]["id"]))
+  """, (message, message, locked["revision"]["id"]))
   cur.execute("""
     UPDATE backtest_experiment
     SET blocked_reason_code='experiment.execution_blocked',
@@ -2152,13 +2230,52 @@ def _sync_active_execution(cur: Any, locked: dict[str, Any], status: str) -> Non
 
 
 def _rebuild_aggregate_status(cur: Any, stage_id: str) -> str:
+  from backend.experiments.lifecycle import project_legacy_status
+
   graph = _aggregate_graph(cur, stage_id)
-  facts = _aggregate_facts(cur, graph["stage"])
-  status = derive_aggregate_status(facts)
+  facts = _aggregate_facts(
+    cur,
+    graph["stage"],
+    cancel_requested=graph["revision"].get("cancel_requested_at") is not None,
+  )
+  derived_status = derive_aggregate_status(facts)
+  revision = graph["revision"]
+  lifecycle_state = str(revision.get("lifecycle_state") or "active")
+  in_flight = facts.queued + facts.running + facts.cancelling
+  terminal_outcome = None
+  if lifecycle_state == "pausing" and in_flight == 0:
+    lifecycle_state = "paused"
+  if revision.get("cancel_requested_at") is not None:
+    if facts.non_terminal == 0:
+      lifecycle_state = "terminal"
+      terminal_outcome = derived_status
+    else:
+      lifecycle_state = "cancelling"
+  elif derived_status in {"completed", "partially_completed", "failed", "cancelled"}:
+    lifecycle_state = "terminal"
+    terminal_outcome = derived_status
+  if lifecycle_state == "terminal":
+    execution_phase = "settled"
+  elif graph["revision"].get("system_block_code") or graph["stage"].get("blocked_reason_code"):
+    execution_phase = "blocked"
+  elif facts.running + facts.cancelling > 0:
+    execution_phase = "running"
+  elif facts.pending + facts.queued > 0:
+    execution_phase = "queued"
+  elif facts.generated < facts.planned:
+    execution_phase = "preparing"
+  else:
+    execution_phase = "queued"
+  status = project_legacy_status(
+    lifecycle_state, execution_phase,
+    graph["revision"].get("system_block_code"), terminal_outcome,
+  )
   validate_status_transition(str(graph["stage"]["status"]), status)
   validate_status_transition(str(graph["revision"]["status"]), status)
   validate_status_transition(str(graph["experiment"]["status"]), status)
-  _write_aggregate_facts(cur, graph, facts, status)
+  _write_aggregate_facts(
+    cur, graph, facts, status, lifecycle_state, execution_phase, terminal_outcome,
+  )
   return status
 
 
@@ -2168,7 +2285,10 @@ def _aggregate_graph(cur: Any, stage_id: str) -> dict[str, dict[str, Any]]:
       r.id AS revision_id, r.status AS revision_status,
       r.owner_user_id, r.experiment_id AS parent_experiment_id,
       r.planned_trial_count AS revision_planned_trial_count,
-      r.cancel_requested_at, r.terminal_at, r.plan_quota_released_at,
+      r.cancel_requested_at, r.terminal_at, r.lifecycle_state,
+      r.lifecycle_version, r.terminal_outcome,
+      r.generation_policy_version, r.plan_quota_released_at,
+      r.system_block_code,
       s.*
     FROM backtest_experiment_stage s
     JOIN backtest_experiment_revision r ON r.id=s.revision_id
@@ -2187,13 +2307,23 @@ def _aggregate_graph(cur: Any, stage_id: str) -> dict[str, dict[str, Any]]:
       "planned_trial_count": row["revision_planned_trial_count"],
       "cancel_requested_at": row["cancel_requested_at"],
       "terminal_at": row["terminal_at"],
+      "lifecycle_state": row["lifecycle_state"],
+      "lifecycle_version": row["lifecycle_version"],
+      "terminal_outcome": row["terminal_outcome"],
+      "generation_policy_version": row["generation_policy_version"],
       "plan_quota_released_at": row["plan_quota_released_at"],
+      "system_block_code": row["system_block_code"],
     },
     "stage": row,
   }
 
 
-def _aggregate_facts(cur: Any, stage: dict[str, Any]) -> AggregateFacts:
+def _aggregate_facts(
+  cur: Any,
+  stage: dict[str, Any],
+  *,
+  cancel_requested: bool,
+) -> AggregateFacts:
   cur.execute("""
     SELECT
       count(*) FILTER (WHERE summary_status='pending') AS pending,
@@ -2218,7 +2348,7 @@ def _aggregate_facts(cur: Any, stage: dict[str, Any]) -> AggregateFacts:
     succeeded=int(counts["succeeded"] or 0),
     failed=int(counts["failed"] or 0),
     cancelled=cancelled,
-    cancel_requested=stage.get("cancel_requested_at") is not None,
+    cancel_requested=cancel_requested,
   )
 
 
@@ -2227,6 +2357,9 @@ def _write_aggregate_facts(
   graph: dict[str, dict[str, Any]],
   facts: AggregateFacts,
   status: str,
+  lifecycle_state: str,
+  execution_phase: str,
+  terminal_outcome: str | None,
 ) -> None:
   stage = graph["stage"]
   revision = graph["revision"]
@@ -2235,25 +2368,37 @@ def _write_aggregate_facts(
     UPDATE backtest_experiment_stage
     SET status=%s, in_flight_count=%s, terminal_count=%s,
       succeeded_count=%s, failed_count=%s, cancelled_count=%s,
+      execution_phase=%s,
       updated_at=now(), row_version=row_version+1
     WHERE id=%s
   """, (
     status, in_flight, facts.terminal, facts.succeeded,
-    facts.failed, facts.cancelled, stage["id"],
+    facts.failed, facts.cancelled, execution_phase, stage["id"],
   ))
-  terminal = status in {"completed", "partially_completed", "failed", "cancelled"}
-  release_plan = terminal and revision.get("plan_quota_released_at") is None
+  terminal = lifecycle_state == "terminal"
+  release_plan = (
+    terminal
+    and revision.get("generation_policy_version") == "legacy"
+    and revision.get("plan_quota_released_at") is None
+  )
   cur.execute("""
     UPDATE backtest_experiment_revision
     SET status=%s,
       terminal_at=CASE WHEN %s THEN COALESCE(terminal_at,now()) ELSE terminal_at END,
+      lifecycle_state=%s,
+      lifecycle_version=lifecycle_version + CASE
+        WHEN lifecycle_state<>%s THEN 1 ELSE 0 END,
+      terminal_outcome=%s,
       plan_quota_released_at=CASE
         WHEN %s THEN COALESCE(plan_quota_released_at,now())
         ELSE plan_quota_released_at
       END,
       updated_at=now()
     WHERE id=%s
-  """, (status, terminal, terminal, revision["id"]))
+  """, (
+    status, terminal, lifecycle_state, lifecycle_state,
+    terminal_outcome, release_plan, revision["id"],
+  ))
   cur.execute("""
     UPDATE backtest_experiment
     SET status=%s, updated_at=now(), row_version=row_version+1
@@ -2288,6 +2433,7 @@ def _find_aggregate_repair_candidate(cur: Any) -> dict[str, Any] | None:
       GROUP BY stage_id
     ), facts AS (
       SELECT s.*, r.status AS revision_status, r.cancel_requested_at,
+        r.lifecycle_state, r.terminal_outcome, r.system_block_code,
         e.status AS experiment_status, q.experiment_in_flight_count,
         COALESCE(c.pending,0) AS actual_pending,
         COALESCE(c.queued,0) AS actual_queued,
@@ -2311,6 +2457,16 @@ def _find_aggregate_repair_candidate(cur: Any) -> dict[str, Any] | None:
         actual_succeeded + actual_failed + actual_cancelled AS actual_terminal,
         actual_queued + actual_running + actual_cancelling AS actual_in_flight,
         CASE
+          WHEN lifecycle_state='terminal' AND terminal_outcome IS NOT NULL
+            THEN terminal_outcome
+          WHEN lifecycle_state='cancelling' THEN 'cancelling'
+          WHEN lifecycle_state='paused' THEN 'generation_blocked'
+          WHEN lifecycle_state='pausing' AND execution_phase IN ('queued','running')
+            THEN execution_phase
+          WHEN system_block_code IS NOT NULL
+            OR blocked_reason_code IS NOT NULL
+            OR execution_phase='blocked'
+            THEN 'generation_blocked'
           WHEN cancel_requested_at IS NOT NULL
             AND actual_succeeded + actual_failed + actual_cancelled < planned_trial_count
             THEN 'cancelling'
@@ -2348,6 +2504,7 @@ def _find_aggregate_repair_candidate(cur: Any) -> dict[str, Any] | None:
 
 
 def _repair_user_quota(cur: Any, owner_id: str) -> None:
+  rolling_active = _generation_policy(cur) == "rolling_window_v1"
   cur.execute("""
     SELECT
       (SELECT count(*) FROM backtest_experiment_trial_execution execution
@@ -2355,16 +2512,22 @@ def _repair_user_quota(cur: Any, owner_id: str) -> None:
         AS in_flight,
       (SELECT COALESCE(sum(planned_trial_count),0)
        FROM backtest_experiment_revision revision
-       WHERE revision.owner_user_id=%s AND revision.plan_quota_released_at IS NULL)
-        AS planned
+       WHERE revision.owner_user_id=%s
+         AND revision.plan_quota_released_at IS NULL
+         AND revision.generation_policy_version='legacy') AS planned
   """, (owner_id, owner_id))
   facts = cur.fetchone()
   cur.execute("""
     UPDATE backtest_experiment_user_quota
-    SET experiment_in_flight_count=%s, reserved_planned_trial_count=%s,
+    SET experiment_in_flight_count=%s,
+      reserved_planned_trial_count=CASE
+        WHEN %s THEN reserved_planned_trial_count ELSE %s END,
       row_version=row_version+1, updated_at=now()
     WHERE owner_user_id=%s
-  """, (int(facts["in_flight"]), int(facts["planned"]), owner_id))
+  """, (
+    int(facts["in_flight"]), rolling_active,
+    int(facts["planned"]), owner_id,
+  ))
 
 
 def _actual_data_hash(result: Any, market_snapshot: Any) -> str | None:
@@ -2458,6 +2621,11 @@ def _experiment_list_item(row: dict[str, Any]) -> dict[str, Any]:
     "currentRevisionId": str(row["revision_id"]),
     "revisionNo": int(row["revision_no"]),
     "status": row["status"],
+    "lifecycleState": row.get("lifecycle_state", "active"),
+    "lifecycleVersion": int(row.get("lifecycle_version") or 1),
+    "executionPhase": row.get("execution_phase", "preparing"),
+    "systemBlockCode": _project_system_block(row),
+    "terminalOutcome": row.get("terminal_outcome"),
     "reason": _row_reason(row),
     "runPath": str(spec["runTemplateSnapshot"].get("runPath") or "unknown"),
     "scopeType": str(spec["runTemplateSnapshot"].get("scopeType") or "unknown"),
@@ -2467,11 +2635,10 @@ def _experiment_list_item(row: dict[str, Any]) -> dict[str, Any]:
     "plannedTrialCount": int(row["planned_trial_count"]),
     "generatedTrialCount": int(row["generated_trial_count"]),
     "materializedTrialCount": int(row["terminal_count"]) + int(row["in_flight_count"]),
-    "queuedTrialCount": max(
-      0,
-      int(row["planned_trial_count"])
-        - int(row["terminal_count"])
-        - int(row["in_flight_count"]),
+    "readyTrialCount": int(row.get("ready_count") or 0),
+    "queuedTrialCount": int(row.get("queued_count") or 0),
+    "remainingLogicalTrialCount": max(
+      0, int(row["planned_trial_count"]) - int(row["generated_trial_count"]),
     ),
     "runningTrialCount": int(row["in_flight_count"]),
     "succeededTrialCount": int(row["succeeded_count"]),
@@ -2486,6 +2653,20 @@ def _experiment_list_item(row: dict[str, Any]) -> dict[str, Any]:
     ),
     "purgeJobId": str(row["purge_job_id"]) if row.get("purge_job_id") else None,
   }
+
+
+def _project_system_block(row: dict[str, Any]) -> str | None:
+  epoch = row.get("contract_epoch")
+  decision = row.get("storage_decision")
+  if epoch in {"lifecycle_v2", "evaluation_v2", "rolling_window_v1"}:
+    if not settings.EXPERIMENTS_ENABLED or not settings.EXPERIMENT_BAR_ENABLED:
+      return "automation_disabled"
+    if decision == "pressured":
+      return "storage_pressure"
+    if decision == "unknown":
+      return "storage_signal_unknown"
+  value = row.get("system_block_code")
+  return str(value) if value else None
 
 
 def _admin_archived_experiment_list_item(row: dict[str, Any]) -> dict[str, Any]:
@@ -2511,6 +2692,11 @@ def _revision_list_item(row: dict[str, Any]) -> dict[str, Any]:
     "revisionNo": int(row["revision_no"]),
     "current": str(row["revision_id"]) == str(row["current_revision_id"]),
     "status": row["status"],
+    "lifecycleState": row.get("lifecycle_state", "active"),
+    "lifecycleVersion": int(row.get("lifecycle_version") or 1),
+    "executionPhase": row.get("execution_phase", "preparing"),
+    "systemBlockCode": _project_system_block(row),
+    "terminalOutcome": row.get("terminal_outcome"),
     "specHash": row["spec_hash"],
     "stage": {
       "stageId": str(row["stage_id"]),
@@ -2764,11 +2950,26 @@ def _load_preview_for_update(cur: Any, owner_id: str, token: str) -> dict[str, A
   return dict(row) if row else None
 
 
-def _reserve_user_plan(cur: Any, owner_id: str, planned_count: int) -> None:
+def _ensure_user_runtime_quota(cur: Any, owner_id: str) -> None:
   cur.execute("""
     INSERT INTO backtest_experiment_user_quota (owner_user_id)
     VALUES (%s) ON CONFLICT (owner_user_id) DO NOTHING
   """, (owner_id,))
+
+
+def _reserve_plan_for_current_epoch(
+  cur: Any,
+  owner_id: str,
+  planned_count: int,
+) -> None:
+  if _generation_policy(cur) == "rolling_window_v1":
+    _ensure_user_runtime_quota(cur, owner_id)
+    return
+  _reserve_user_plan(cur, owner_id, planned_count)
+
+
+def _reserve_user_plan(cur: Any, owner_id: str, planned_count: int) -> None:
+  _ensure_user_runtime_quota(cur, owner_id)
   cur.execute("""
     SELECT reserved_planned_trial_count
     FROM backtest_experiment_user_quota
@@ -2966,6 +3167,20 @@ def _lock_retry_graph(
   selection: dict[str, Any],
 ) -> dict[str, Any]:
   cur.execute("""
+    SELECT s.id AS stage_id, r.generation_policy_version
+    FROM backtest_experiment e
+    JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
+    JOIN backtest_experiment_stage s ON s.revision_id=r.id AND s.stage_index=0
+    WHERE e.id=%s AND e.owner_user_id=%s
+  """, (experiment_id, owner_id))
+  preflight = cur.fetchone()
+  if preflight is None:
+    raise ExperimentError("experiment.not_found", "实验不存在", 404)
+  if preflight["generation_policy_version"] == "rolling_window_v1":
+    from backend.experiments.rolling_window import _lock_ledgers
+
+    _lock_ledgers(cur, owner_id, str(preflight["stage_id"]))
+  cur.execute("""
     SELECT quota.*, app_user.status AS user_status
     FROM backtest_experiment_user_quota quota
     JOIN app_user ON app_user.id=quota.owner_user_id
@@ -3013,13 +3228,16 @@ def _prepare_retry_revision(cur: Any, graph: dict[str, Any]) -> None:
   stage = graph["stage"]
   if revision.get("cancel_requested_at") is not None:
     raise ExperimentError("experiment.command_invalid", "已取消修订不能重试", 409)
-  if stage.get("blocked_reason_code"):
+  if revision.get("system_block_code") or stage.get("blocked_reason_code"):
     raise ExperimentError(
       "experiment.command_invalid", "请先解除当前执行阻塞再重试失败项", 409,
     )
   if graph["quota"].get("user_status") != "active" or graph["unavailable_assets"]:
     raise ExperimentError("experiment.retry_validation_failed", "当前权限或冻结资产不可用", 409)
-  if revision.get("terminal_at") is not None:
+  if (
+    revision.get("generation_policy_version") == "legacy"
+    and revision.get("terminal_at") is not None
+  ):
     planned = int(revision["planned_trial_count"])
     _reserve_user_plan(cur, str(revision["owner_user_id"]), planned)
     graph["quota"]["reserved_planned_trial_count"] += planned
@@ -3031,7 +3249,12 @@ def _mark_revision_retrying(cur: Any, graph: dict[str, Any]) -> None:
   stage = graph["stage"]
   cur.execute("""
     UPDATE backtest_experiment_revision
-    SET status='running', terminal_at=NULL, plan_quota_released_at=NULL,
+    SET status='running', terminal_at=NULL,
+      lifecycle_state='active', terminal_outcome=NULL,
+      lifecycle_version=lifecycle_version+1,
+      plan_quota_released_at=CASE
+        WHEN generation_policy_version='legacy' THEN NULL
+        ELSE plan_quota_released_at END,
       updated_at=now()
     WHERE id=%s
   """, (revision["id"],))
@@ -3057,14 +3280,15 @@ def _validate_retry_capacity(
   quota = graph["quota"]
   stage = graph["stage"]
   effective_capacity, global_in_flight = _capacity_snapshot(cur)
-  budget_gate = _budget_capacity_gate(graph, effective_capacity)
-  if not budget_gate.allowed:
-    raise ExperimentError(
-      budget_gate.code or "experiment.capacity_blocked",
-      budget_gate.message or "当前容量不足",
-      409,
-      retryable=True,
-    )
+  if graph["revision"].get("generation_policy_version") == "legacy":
+    budget_gate = _budget_capacity_gate(graph, effective_capacity)
+    if not budget_gate.allowed:
+      raise ExperimentError(
+        budget_gate.code or "experiment.capacity_blocked",
+        budget_gate.message or "当前容量不足",
+        409,
+        retryable=True,
+      )
   manual_gate = _manual_capacity_gate(cur, graph)
   if not manual_gate.allowed:
     raise ExperimentError(
@@ -3108,6 +3332,20 @@ def _create_manual_retry_executions(
 ) -> list[dict[str, Any]]:
   executions: list[dict[str, Any]] = []
   for trial in graph["trials"]:
+    if graph["revision"].get("generation_policy_version") == "rolling_window_v1":
+      from backend.experiments.rolling_window import reopen_trial_in_transaction
+
+      decision = reopen_trial_in_transaction(
+        cur, str(trial["id"]),
+        f"manual-retry:{graph['selection_digest']}:{trial['id']}",
+      )
+      if not decision.allowed:
+        raise ExperimentError(
+          "experiment.capacity_blocked",
+          "滚动窗口暂无重试容量，请稍后重试",
+          409,
+          retryable=True,
+        )
     locked = {**graph, "trial": trial}
     template, assignment, dataset, seed = _materialization_inputs(locked)
     payload = compiler.compile_request(template, assignment, dataset, seed)
@@ -3398,24 +3636,45 @@ def _insert_revision(
   normalized_spec: dict[str, Any],
   preview: dict[str, Any],
 ) -> None:
+  policy = _generation_policy(cur)
+  resource_policy = (
+    {"admissionPolicy": normalized_spec["admissionPolicy"]}
+    if policy == "rolling_window_v1"
+    else {"capacityPolicy": normalized_spec["capacityPolicy"]}
+  )
   cur.execute("""
     INSERT INTO backtest_experiment_revision (
       id, experiment_id, owner_user_id, revision_no, experiment_spec,
       spec_hash, run_template_digest, dataset_snapshot_digest,
       canonicalization_version, budget_version, resource_budget,
-      determinism, planned_trial_count, failure_policy, status
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'preparing')
+      determinism, planned_trial_count, failure_policy, status,
+      generation_policy_version
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'preparing',%s)
   """, (
     revision_id, experiment_id, owner_id, revision_no, Jsonb(normalized_spec),
     preview["spec_hash"], preview["run_template_digest"],
     preview["dataset_snapshot_digest"], normalized_spec["canonicalizationVersion"],
     preview["budget_version"], Jsonb({
       "estimate": normalized_spec["resourceEstimate"],
-      "capacityPolicy": normalized_spec["capacityPolicy"],
+      **resource_policy,
     }),
     Jsonb(normalized_spec["determinism"]), preview["planned_trial_count"],
-    Jsonb(normalized_spec["failurePolicy"]),
+    Jsonb(normalized_spec["failurePolicy"]), policy,
   ))
+
+
+def _generation_policy(cur: Any) -> str:
+  cur.execute("""
+    SELECT contract_epoch FROM backtest_experiment_rollout_state WHERE singleton
+  """)
+  row = cur.fetchone()
+  if row is None:
+    raise state_store.DatabaseError("缺少自动化实验语义纪元单例行")
+  return (
+    "rolling_window_v1"
+    if row["contract_epoch"] == "rolling_window_v1"
+    else "legacy"
+  )
 
 
 def _insert_stage(
@@ -3499,6 +3758,14 @@ def _detail_response(row: dict[str, Any]) -> dict[str, Any]:
     "description": row["description"],
     "source": _experiment_source_response(row),
     "status": row["status"],
+    "lifecycleState": row.get("lifecycle_state", "active"),
+    "lifecycleVersion": int(row.get("lifecycle_version") or 1),
+    "lifecycleCommandsAvailable": row.get("contract_epoch") in {
+      "lifecycle_v2", "evaluation_v2", "rolling_window_v1",
+    },
+    "executionPhase": row.get("execution_phase", "preparing"),
+    "systemBlockCode": _project_system_block(row),
+    "terminalOutcome": row.get("terminal_outcome"),
     "snapshotVersion": int(row["row_version"]),
     "relatedBacktestRuns": {
       "totalCount": int(row.get("related_run_count") or 0),
@@ -3530,11 +3797,10 @@ def _detail_response(row: dict[str, Any]) -> dict[str, Any]:
       "succeededTrialCount": int(row.get("succeeded_count") or 0),
       "failedTrialCount": int(row.get("failed_count") or 0),
       "cancelledTrialCount": int(row.get("cancelled_count") or 0),
-      "queuedTrialCount": max(
-        0,
-        int(row["planned_trial_count"])
-          - int(row.get("terminal_count") or 0)
-          - int(row.get("in_flight_count") or 0),
+      "readyTrialCount": int(row.get("ready_count") or 0),
+      "queuedTrialCount": int(row.get("queued_count") or 0),
+      "remainingLogicalTrialCount": max(
+        0, int(row["planned_trial_count"]) - int(row["generated_trial_count"]),
       ),
     },
     "resourceBudget": row["resource_budget"],
@@ -4311,7 +4577,8 @@ def _validate_resume_gate(cur: Any, graph: dict[str, Any]) -> None:
 def _clear_parent_block(cur: Any, revision: dict[str, Any]) -> None:
   cur.execute("""
     UPDATE backtest_experiment_revision
-    SET blocked_reason_code=NULL, blocked_reason_message=NULL, updated_at=now()
+    SET system_block_code=NULL, system_block_message=NULL,
+      blocked_reason_code=NULL, blocked_reason_message=NULL, updated_at=now()
     WHERE id=%s
   """, (revision["id"],))
   cur.execute("""

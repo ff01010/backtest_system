@@ -32,15 +32,28 @@ class SingleBarResourceEstimator:
     date_scenario_count: int,
   ) -> dict[str, Any]:
     timeframe = str(template.snapshot["fixedStructure"]["timeframe"])
-    bars_per_day = _bars_per_day(timeframe)
-    scenario_bars = [_scenario_bars(item, bars_per_day) for item in dataset_snapshots]
-    if (
-      date_scenario_count <= 0
-      or len(scenario_bars) != date_scenario_count
-      or planned_trial_count <= 0
-      or planned_trial_count % date_scenario_count != 0
-    ):
-      raise _unavailable_estimate()
+    try:
+      bars_per_day = _bars_per_day(timeframe)
+      scenario_bars = [_scenario_bars(item, bars_per_day) for item in dataset_snapshots]
+      if (
+        date_scenario_count <= 0
+        or len(scenario_bars) != date_scenario_count
+        or planned_trial_count <= 0
+        or planned_trial_count % date_scenario_count != 0
+      ):
+        raise _unavailable_estimate()
+    except ExperimentError:
+      return {
+        "estimatorVersion": self.version,
+        "runType": "standard_bar",
+        "timeframe": timeframe,
+        "estimateStatus": "unavailable",
+        "estimatedBarCount": None,
+        "estimatedBarCountExact": None,
+        "maxBarsPerTrial": None,
+        "resourceClass": "unknown",
+        "confidence": "unavailable",
+      }
     repeat_count = planned_trial_count // date_scenario_count
     estimated_bars = sum(scenario_bars) * repeat_count
     resource_class = "light"
@@ -52,7 +65,9 @@ class SingleBarResourceEstimator:
       "estimatorVersion": self.version,
       "runType": "standard_bar",
       "timeframe": timeframe,
-      "estimatedBarCount": estimated_bars,
+      "estimateStatus": "available",
+      "estimatedBarCount": estimated_bars if estimated_bars <= 2**53 - 1 else None,
+      "estimatedBarCountExact": str(estimated_bars),
       "maxBarsPerTrial": max(scenario_bars, default=0),
       "resourceClass": resource_class,
       "confidence": "coverage_metadata",

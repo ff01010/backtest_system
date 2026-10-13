@@ -15,6 +15,10 @@ from psycopg.types.json import Jsonb
 from backend import settings
 from backend.experiments.canonicalization import digest
 from backend.experiments.errors import ExperimentError
+from backend.experiments.evaluation_dataset import (
+  OUTPUT_SCHEMA_VERSION,
+  EvaluationDataset,
+)
 from backend.experiments.repository import (
   CommandResult,
   _load_idempotency,
@@ -62,6 +66,7 @@ class PostgresEvaluationExportRepository:
         _assert_worker_available(cur)
         run = _load_succeeded_run(cur, evaluation_run_id, owner_id)
         _lock_experiment_for_write(cur, str(run["experiment_id"]), owner_id)
+        _assert_export_creation_allowed(cur, str(run["revision_id"]))
         validate_columns(dict(run["output_snapshot"]), columns)
         response = _insert_export(
           cur, run, export_format, columns, locale, request_hash, request_id,
@@ -175,6 +180,7 @@ class PostgresEvaluationExportRepository:
         _assert_worker_available(cur)
         run = _load_succeeded_run(cur, str(original["evaluation_run_id"]), owner_id)
         _lock_experiment_for_write(cur, str(run["experiment_id"]), owner_id)
+        _assert_export_creation_allowed(cur, str(run["revision_id"]))
         if run["output_hash"] != original["output_hash"]:
           raise ExperimentError(
             "experiment.export_source_changed", "评价输出摘要已变化", 409,
@@ -478,6 +484,20 @@ def _assert_worker_available(cur: Any) -> None:
     )
 
 
+def _assert_export_creation_allowed(cur: Any, revision_id: str) -> None:
+  cur.execute(
+    "SELECT lifecycle_state FROM backtest_experiment_revision WHERE id=%s",
+    (revision_id,),
+  )
+  revision = cur.fetchone()
+  if revision is None or revision["lifecycle_state"] == "cancelling":
+    raise ExperimentError(
+      "experiment.evaluation_source_invalid",
+      "取消收敛中的实验不能创建或重试评价导出",
+      409,
+    )
+
+
 def _load_succeeded_run(cur: Any, run_id: str, owner_id: str) -> dict[str, Any]:
   cur.execute("""
     SELECT run.*, spec.version_no AS spec_version_no, spec.name AS spec_name
@@ -541,7 +561,7 @@ def _insert_export(
     run["revision_id"], run["owner_user_id"], retry_of_export_id,
     export_format, Jsonb(columns), locale, run["output_hash"],
     run["result_set_hash"], Jsonb(versions), request_hash,
-    len(list(output.get("rows") or [])),
+    _output_row_count(output),
   ))
   row = {
     "id": export_id,
@@ -555,7 +575,7 @@ def _insert_export(
     "output_hash": run["output_hash"],
     "status": "queued",
     "progress_completed": 0,
-    "progress_total": len(list(output.get("rows") or [])),
+    "progress_total": _output_row_count(output),
     "attempt_count": 0,
     "created_at": datetime.now(timezone.utc),
   }
@@ -715,6 +735,10 @@ def _source_snapshot(row: dict[str, Any]) -> dict[str, Any]:
       "experiment.export_source_hash_mismatch", "评价导出冻结来源摘要不一致", 409,
     )
   experiment_spec = dict(row.get("experiment_spec") or {})
+  if output.get("schemaVersion") == OUTPUT_SCHEMA_VERSION:
+    output["rows"] = EvaluationDataset().iter_persisted_output_rows(
+      str(row["evaluation_run_id"]),
+    )
   template = dict(experiment_spec.get("runTemplateSnapshot") or {})
   return {
     "output": output,
@@ -724,6 +748,12 @@ def _source_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     "assetVersions": _safe_assets(template),
     "evidence": _evidence(row, output),
   }
+
+
+def _output_row_count(output: dict[str, Any]) -> int:
+  if output.get("schemaVersion") == OUTPUT_SCHEMA_VERSION:
+    return int(output.get("matchedRowCount") or 0)
+  return len(list(output.get("rows") or []))
 
 
 def _safe_experiment_summary(spec: dict[str, Any]) -> dict[str, Any]:

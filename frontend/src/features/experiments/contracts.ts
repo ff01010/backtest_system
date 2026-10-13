@@ -91,8 +91,10 @@ export type ExperimentPreview = {
   dimensionCounts: Record<string, number>;
   dimensionNormalization: Record<string, { submitted: number; normalized: number }>;
   resourceEstimate: {
-    estimatedBarCount: number;
-    maxBarsPerTrial: number;
+    estimateStatus?: 'available' | 'unavailable';
+    estimatedBarCount: number | null;
+    estimatedBarCountExact?: string | null;
+    maxBarsPerTrial: number | null;
     resourceClass: string;
     confidence: string;
   };
@@ -156,6 +158,12 @@ export type ExperimentListItem = {
   currentRevisionId: string;
   revisionNo: number;
   status: ExperimentStatus;
+  lifecycleState?: ExperimentLifecycleState;
+  lifecycleVersion?: number;
+  lifecycleCommandsAvailable?: boolean;
+  executionPhase?: ExperimentExecutionPhase;
+  systemBlockCode?: string | null;
+  terminalOutcome?: ExperimentTerminalOutcome;
   reason: { code: string; message: string } | null;
   runPath: string;
   scopeType: string;
@@ -164,6 +172,8 @@ export type ExperimentListItem = {
   fillModel: string;
   plannedTrialCount: number;
   generatedTrialCount: number;
+  readyTrialCount?: number;
+  remainingLogicalTrialCount?: number;
   materializedTrialCount: number;
   queuedTrialCount: number;
   runningTrialCount: number;
@@ -206,7 +216,7 @@ export type ExperimentPurge = {
   purgeId: string;
   experimentId: string;
   revisionId: string;
-  status: 'queued' | 'running' | 'succeeded' | 'failed';
+  status: 'queued' | 'running' | 'cancel_requested' | 'succeeded' | 'failed' | 'cancelled';
   phase: string;
   scopeDigest: string;
   scopeCounts: Record<string, number>;
@@ -317,6 +327,12 @@ export type ExperimentDetail = {
   description: string;
   source: ExperimentSourceSummary | null;
   status: ExperimentStatus;
+  lifecycleState?: ExperimentLifecycleState;
+  lifecycleVersion?: number;
+  lifecycleCommandsAvailable?: boolean;
+  executionPhase?: ExperimentExecutionPhase;
+  systemBlockCode?: string | null;
+  terminalOutcome?: ExperimentTerminalOutcome;
   snapshotVersion: number;
   relatedBacktestRuns?: {
     totalCount: number;
@@ -342,7 +358,9 @@ export type ExperimentDetail = {
     succeededTrialCount: number;
     failedTrialCount: number;
     cancelledTrialCount: number;
+    readyTrialCount?: number;
     queuedTrialCount: number;
+    remainingLogicalTrialCount?: number;
   };
   resourceBudget: Record<string, unknown>;
   failurePolicy: Record<string, unknown>;
@@ -376,6 +394,38 @@ export type ExperimentDetail = {
   purgeJobId: string | null;
   createdAt: string;
   updatedAt: string;
+};
+
+export type ExperimentLifecycleState =
+  | 'active'
+  | 'pausing'
+  | 'paused'
+  | 'cancelling'
+  | 'terminal';
+
+export type ExperimentExecutionPhase =
+  | 'preparing'
+  | 'queued'
+  | 'running'
+  | 'blocked'
+  | 'settled';
+
+export type ExperimentTerminalOutcome =
+  | 'completed'
+  | 'partially_completed'
+  | 'failed'
+  | 'cancelled'
+  | null;
+
+export type ExperimentLifecycleCommandResult = {
+  experimentId: string;
+  revisionId?: string;
+  lifecycleState?: ExperimentLifecycleState;
+  lifecycleVersion?: number;
+  terminalOutcome?: ExperimentTerminalOutcome;
+  status: ExperimentStatus;
+  acceptedAt?: string;
+  replayed?: boolean;
 };
 
 export type ExperimentBacktestRun = {
@@ -559,7 +609,9 @@ export type EvaluationRun = {
   adapterVersion: string;
   metricCatalogVersion: string;
   dimensionCatalogVersion: string;
-  executionCount: number;
+  executionCount: number | null;
+  executionCountExact?: string;
+  outputSchemaVersion?: 'evaluation_output_v1' | 'evaluation_output_v2';
   completeness: EvaluationCompletenessSnapshot;
   resultSetHash: string;
   outputHash: string | null;
@@ -571,7 +623,7 @@ export type EvaluationRun = {
 };
 
 export type EvaluationRunDetail = EvaluationRun & {
-  executionSet: Array<{
+  executionSet: null | Array<{
     stageId: string;
     stageIndex: number;
     stageType: string;
@@ -603,11 +655,12 @@ export type EvaluationRunDetail = EvaluationRun & {
       trialExecutionId?: string;
       runId?: string;
       stageId?: string;
-      stageIndex: number;
-      trialIndex: number;
+      stageIndex?: number;
+      trialIndex?: number;
       resultHash?: string;
       startDate?: string | null;
       groupKey?: string;
+      groupId?: string;
       memberCount?: number;
       members?: Array<{
         trialId: string;
@@ -623,6 +676,14 @@ export type EvaluationRunDetail = EvaluationRun & {
       unsupportedReasons: Record<string, string>;
     }>;
     visualizations?: Array<Record<string, unknown>>;
+    resultPage?: string;
+    groupResultPage?: string | null;
+  };
+  dataset?: {
+    digest: string;
+    digestVersion: string;
+    executionCount: number | null;
+    executionCountExact: string;
   };
   spec: EvaluationSpecPayload;
 };
@@ -651,11 +712,63 @@ export type EvaluationCompletenessSnapshot = {
     stageId: string;
     stageIndex: number;
     trialId: string | null;
+    trialIndex?: number;
+    startTrialIndex?: number;
+    endTrialIndexExclusive?: number;
+    count?: number;
+    status: 'failed' | 'cancelled' | 'missing';
+    materializationStatus: string;
+    error: Record<string, unknown> | null;
+  }>;
+  exceptionPage?: string;
+};
+
+export type EvaluationResultPage = {
+  items: Array<{
+    ordinal: string;
+    groupId?: string;
+    trialExecutionId?: string;
+    runId?: string;
+    stageId?: string;
+    stageIndex?: number;
+    trialId?: string;
+    trialIndex?: number;
+    startDate?: string | null;
+    groupKey?: unknown[];
+    memberCount?: string;
+    rankingKey?: unknown[];
+    values: Record<string, string | number | null>;
+    unsupportedReasons?: Record<string, string>;
+  }>;
+  nextCursor: string | null;
+};
+
+export type EvaluationExceptionPage = {
+  items: Array<{
+    ordinal: string;
+    stageId: string;
+    stageIndex: number;
+    trialId: string;
     trialIndex: number;
     status: 'failed' | 'cancelled' | 'missing';
     materializationStatus: string;
     error: Record<string, unknown> | null;
   }>;
+  nextCursor: string | null;
+};
+
+export type EvaluationGroupMemberPage = {
+  items: Array<{
+    ordinal: string;
+    trialExecutionId: string;
+    runId: string;
+    stageId: string;
+    stageIndex: number;
+    trialId: string;
+    trialIndex: number;
+    startDate?: string | null;
+  }>;
+  nextCursor: string | null;
 };
 
 export type EvaluationExportFormat = 'csv' | 'xlsx' | 'report';

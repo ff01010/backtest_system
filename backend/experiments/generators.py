@@ -13,7 +13,7 @@ from backend.experiments.errors import ExperimentError
 from backend.experiments.resolvers import ResolvedRunTemplate
 
 
-MAX_PLANNED_TRIAL_COUNT = 2**63 - 1
+MAX_PLANNED_TRIAL_COUNT = 2**53 - 1
 
 
 @dataclass(frozen=True)
@@ -302,9 +302,17 @@ def _unique_scenarios(values: list[dict[str, Any]], label: str) -> list[dict[str
 def _safe_product(counts: Iterable[int]) -> int:
   result = 1
   for count in counts:
-    result *= int(count)
-    if result > MAX_PLANNED_TRIAL_COUNT:
-      raise _invalid("组合数量溢出，请缩小搜索空间")
+    normalized = int(count)
+    if normalized <= 0 or result > MAX_PLANNED_TRIAL_COUNT // normalized:
+      raise ExperimentError(
+        "experiment.validation_failed",
+        "组合数量超过 JSON/TypeScript 跨端精确整数边界",
+        details={
+          "maxExactPlannedTrialCount": MAX_PLANNED_TRIAL_COUNT,
+          "boundaryType": "cross_client_exact_integer",
+        },
+      )
+    result *= normalized
   return result
 
 

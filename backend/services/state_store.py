@@ -314,6 +314,26 @@ def activate_deployment_without_notice(
       return dict(cur.fetchone()["result"])
 
 
+def activate_experiment_contract_epoch(
+  expected_epoch: str,
+  target_epoch: str,
+  build_id: str,
+  actor: str,
+  detail: dict[str, Any],
+) -> str:
+  """使用受限发布角色对实验语义纪元执行单步 CAS。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT app.activate_experiment_contract_epoch(
+          %s, %s, %s, %s, %s
+        ) AS result
+      """, (
+        expected_epoch, target_epoch, build_id, actor, Jsonb(detail),
+      ))
+      return str(cur.fetchone()["result"])
+
+
 def rollback_deployment(
   build_id: str, client_version: int, deployment_id: str,
   expected_generation: int, release_id: str | None,
