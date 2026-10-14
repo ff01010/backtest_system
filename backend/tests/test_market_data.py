@@ -117,24 +117,46 @@ def test_all_exchanges_use_only_history_dev(symbol: str, monkeypatch: pytest.Mon
   assert all("qmt_history_dev" in query for query in queries)
 
 
-@pytest.mark.parametrize(("timeframe", "source_period", "derivation"), [
-  ("1m", "1m", None),
-  ("3m", "1m", "3m-from-1m-v1"),
-  ("5m", "5m", None),
-  ("15m", "15m", None),
-  ("30m", "30m", None),
-  ("45m", "1m", "45m-from-1m-v1"),
-  ("60m", "1h", None),
-  ("1d", "1d", None),
+@pytest.mark.parametrize(("timeframe", "source_period"), [
+  ("1m", "1m"),
+  ("5m", "5m"),
+  ("15m", "15m"),
+  ("30m", "30m"),
+  ("60m", "1h"),
+  ("1d", "1d"),
 ])
 def test_source_candidates_only_include_history_dev(
   timeframe: str,
   source_period: str,
-  derivation: str | None,
 ) -> None:
   assert market_data._source_candidates(timeframe) == (
-    market_data._SourceCandidate("history_dev", source_period, derivation),
+    market_data._SourceCandidate("history_dev", source_period),
   )
+
+
+@pytest.mark.parametrize("timeframe", ["3m", "45m"])
+def test_source_candidates_reject_derived_timeframes(timeframe: str) -> None:
+  assert market_data._source_candidates(timeframe) == ()
+
+  with pytest.raises(market_data.MarketDataError, match="暂不支持周期"):
+    market_data.resolve_backtest_data(
+      "688981.SH", timeframe, "2026-09-11", "2026-09-11", ["2026-09-11"],
+    )
+
+
+@pytest.mark.parametrize("timeframe", ["3m", "45m"])
+def test_unified_bar_entrypoints_reject_retired_derived_timeframes(timeframe: str) -> None:
+  with pytest.raises(BacktestFault) as standard_error:
+    bar_data.load_bars_with_snapshot(
+      "688981.SH", timeframe, "2026-09-11", "2026-09-11",
+    )
+  with pytest.raises(BacktestFault) as l2_error:
+    bar_data.load_normalized_bars_with_snapshot(
+      "688981.SH", timeframe, "2026-09-11", "2026-09-11",
+    )
+
+  assert standard_error.value.code == "backtest.timeframe_unsupported"
+  assert l2_error.value.code == "backtest.timeframe_unsupported"
 
 
 @pytest.mark.parametrize(("timeframe", "source_period", "table"), [
@@ -300,20 +322,6 @@ def test_incomplete_history_coverage_rejects_backtest(monkeypatch: pytest.Monkey
 
   with pytest.raises(market_data.MarketDataError, match="区间内无完整 QMT 行情"):
     market_data.ensure_cached("920001.BJ", "1m", "20260911", "20260911")
-
-
-def test_bj_supports_platform_derived_timeframes(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", lambda _: [
-    {"trade_date": "2026-09-11", "status": "complete"},
-  ])
-
-  resolution = market_data.resolve_backtest_data(
-    "920001.BJ", "45m", "20260911", "20260911", ["2026-09-11"],
-  )
-
-  assert resolution.source_period == "1m"
-  assert resolution.derivation == "45m-from-1m-v1"
-  assert resolution.source == "history_dev"
 
 
 def test_incomplete_qmt_coverage_rejects_backtest(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -638,46 +646,6 @@ def test_load_backtest_bars_batches_non_minute_source_by_forty_dates(
 
   assert len(frame) == 2
   assert [query.count("toDate(") for query in queries] == [40, 1]
-
-
-@pytest.mark.parametrize("timeframe", ["3m", "45m"])
-def test_derived_periods_use_minute_source_batch_size(
-  timeframe: str,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  formal_dates = tuple(
-    f"2026-01-{day:02d}" for day in range(1, 12)
-  )
-  resolution = market_data.BacktestDataResolution(
-    timeframe=timeframe,
-    source_period="1m",
-    derivation=f"{timeframe}-from-1m-v1",
-    formal_dates=formal_dates,
-    warmup_dates=(),
-    available_warmup_days=0,
-    source="history_dev",
-  )
-  queries: list[str] = []
-
-  def query_rows(query: str) -> list[dict[str, object]]:
-    queries.append(query)
-    day = 1 if len(queries) == 1 else 11
-    timestamp = datetime(2026, 1, day, 9, 30, tzinfo=_TIMEZONE)
-    return [{
-      "time": int(timestamp.timestamp() * 1000),
-      "open": 10.0,
-      "high": 11.0,
-      "low": 9.0,
-      "close": 10.5,
-      "volume": 100,
-    }]
-
-  monkeypatch.setattr(market_data.clickhouse_client, "query_rows", query_rows)
-
-  frame, _ = market_data.load_backtest_bars("688981.SH", resolution)
-
-  assert len(frame) == 2
-  assert [query.count("toDate(") for query in queries] == [10, 1]
 
 
 def test_load_backtest_bars_counts_warmup_across_batches(
@@ -1116,28 +1084,6 @@ def test_qmt_normalized_bar_wraps_invalid_source_row() -> None:
 
   assert raised.value.code == "data.l2_bar_invalid"
   assert raised.value.context == {"symbol": "688981.SH", "timeframe": "1m"}
-
-
-def test_15m_aggregation_uses_qmt_right_closed_opening_window() -> None:
-  start = datetime(2026, 7, 30, 9, 30, tzinfo=_TIMEZONE)
-  rows = []
-  for offset in range(16):
-    value = float(offset + 1)
-    timestamp = start + timedelta(minutes=offset)
-    rows.append({
-      "qmt_index": timestamp.strftime("%Y%m%d%H%M00"),
-      "time": int(timestamp.timestamp() * 1000), "open": value, "high": value + 0.1,
-      "low": value - 0.1, "close": value, "volume": 10,
-    })
-
-  frame = market_data._rows_to_frame(rows)
-  result = market_data._aggregate_minutes(frame, 15)
-
-  assert result.to_dict("records") == [{
-    "_bucket": pd.Timestamp("2026-07-30 09:45:00", tz="Asia/Shanghai"),
-    "open": 1.0, "high": 16.1, "low": 0.9, "close": 16.0, "volume": 160,
-    "time": "202607300945",
-  }]
 
 
 def test_daily_resolution_uses_published_daily_bars_for_warmup(monkeypatch: pytest.MonkeyPatch) -> None:

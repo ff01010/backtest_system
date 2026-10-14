@@ -24,6 +24,7 @@ def load_bars_with_snapshot(
   end_date: str,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
   """一次任务只选择一个 Bar 来源，禁止跨来源拼接。"""
+  _require_supported_timeframe(timeframe, l2=False)
   mapped = _load_mapped_bars(symbol, timeframe, start_date, end_date)
   if mapped is not None:
     bars, snapshot = mapped
@@ -53,6 +54,7 @@ def load_normalized_bars_with_snapshot(
   end_date: str,
 ) -> tuple[list[NormalizedBar], dict[str, Any]]:
   """供 L2 回放使用，与标准回测保持完全相同的来源优先级。"""
+  _require_supported_timeframe(timeframe, l2=True)
   mapped = _load_mapped_bars(symbol, timeframe, start_date, end_date)
   if mapped is not None:
     return mapped
@@ -61,6 +63,20 @@ def load_normalized_bars_with_snapshot(
     frame, snapshot = qmt
     return _qmt_normalized_bars(symbol, timeframe, frame), snapshot
   return _load_temporary_bars(symbol, timeframe, start_date, end_date)
+
+
+def _require_supported_timeframe(timeframe: str, l2: bool) -> None:
+  valid = (
+    settings.validate_l2_backtest_timeframe(timeframe)
+    if l2
+    else settings.validate_backtest_timeframe(timeframe)
+  )
+  if not valid:
+    raise BacktestFault(
+      "backtest.timeframe_unsupported",
+      f"当前回测引擎不支持 {timeframe}",
+      {"timeframe": timeframe},
+    )
 
 
 def _load_mapped_bars(

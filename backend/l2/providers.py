@@ -634,7 +634,7 @@ class VersionedBarCache:
 class TemporaryQuoteBarProvider:
   """在 ClickHouse 按交易时段聚合 3 秒快照，并缓存历史交易日结果。"""
 
-  _PERIOD_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "45m": 2700, "60m": 3600, "1d": 14_400}
+  _PERIOD_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "60m": 3600, "1d": 14_400}
 
   def __init__(
     self,

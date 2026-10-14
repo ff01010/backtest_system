@@ -22,6 +22,7 @@ _CANONICAL_FIELDS = (
   "signalId", "instrument", "timeframe", "signalTime", "availableAt", "effectiveAt", "sequence",
   "predictedLabelId", "action", "modelVersionId", "sourceHash", "diagnostic",
 )
+# 兼容既有研究信号数据集；该顺序不代表当前可选回测周期。
 _TIMEFRAME_ORDER = ("1m", "3m", "5m", "15m", "30m", "45m", "60m", "1d")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 

@@ -144,6 +144,27 @@ def test_public_request_rejects_unpublished_config(monkeypatch: pytest.MonkeyPat
     api_app._build_public_backtest_request(payload)
 
 
+@pytest.mark.parametrize("timeframe", ["3m", "45m"])
+def test_public_request_rejects_retired_derived_timeframe(
+  timeframe: str,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  config = _config()
+  config["timeframe"] = timeframe
+  monkeypatch.setattr(api_app.state_store, "get_strategy_config", lambda _: config)
+  monkeypatch.setattr(api_app.state_store, "get_strategy_script", lambda _: {
+    "id": config["scriptId"],
+    "name": "测试策略",
+    "description": "",
+    "code": "def on_bar(bar, state):\n  return []\n",
+    "entryType": "on_bar",
+  })
+  payload = schemas.PublicBacktestCreateRequest(config_id=str(config["id"]))
+
+  with pytest.raises(HTTPException, match=f"当前回测引擎不支持 {timeframe}"):
+    api_app._build_public_backtest_request(payload)
+
+
 def test_public_request_hash_is_stable_and_changes_with_override() -> None:
   first = schemas.PublicBacktestCreateRequest(
     config_id="00000000-0000-0000-0000-000000000007",
@@ -197,6 +218,28 @@ def test_public_run_payload_exposes_overlay_result_contract() -> None:
   assert payload["strategy_category"] == "core_position_overlay"
   assert payload["overlay_settlement_policy"] == "cross_day_carry"
   assert payload["result_schema_version"] == 3
+
+
+def test_public_run_payload_preserves_retired_timeframe_for_history_read() -> None:
+  payload = api_app._public_run_payload({
+    "id": "run-legacy",
+    "displayNo": 18,
+    "configId": "config-legacy",
+    "symbol": "688981.SH",
+    "timeframe": "3m",
+    "fillModel": "bar_next_open",
+    "status": "succeeded",
+    "startDate": "2026-08-01",
+    "endDate": "2026-08-31",
+    "summaryJson": {"totalReturn": 0.01},
+    "paramsJson": {},
+    "resultJson": {},
+    "createdAt": "2026-09-01T00:00:00+00:00",
+    "finishedAt": "2026-09-01T00:01:00+00:00",
+  })
+
+  assert payload["timeframe"] == "3m"
+  assert payload["status"] == "succeeded"
 
 
 def test_backtest_submission_rejects_unavailable_runner(monkeypatch: pytest.MonkeyPatch) -> None:

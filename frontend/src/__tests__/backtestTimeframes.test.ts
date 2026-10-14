@@ -3,6 +3,7 @@ import {
   BACKTEST_TIMEFRAMES,
   buildDataRangeMetadata,
   buildTimeframeAvailabilityCacheKey,
+  getUnsupportedBacktestTimeframeError,
   normalizeApiDate,
   resolveRangeAvailability,
 } from '../components/BacktestPage';
@@ -11,8 +12,16 @@ import type { DataStatus } from '../types';
 describe('backtest timeframe metadata', () => {
   it('固定展示平台支持周期，不混入日期范围可用性', () => {
     expect(BACKTEST_TIMEFRAMES).toEqual([
-      '1m', '3m', '5m', '15m', '30m', '45m', '60m', '1d',
+      '1m', '5m', '15m', '30m', '60m', '1d',
     ]);
+  });
+
+  it('旧派生周期保留原值并提示用户主动更换', () => {
+    expect(getUnsupportedBacktestTimeframeError('3m')).toBe(
+      '回测周期 3m 已停止支持，请改用数据库原生周期后重新保存策略',
+    );
+    expect(getUnsupportedBacktestTimeframeError('45m')).toContain('已停止支持');
+    expect(getUnsupportedBacktestTimeframeError('5m')).toBeNull();
   });
 
   it('只展示元数据中的可回测起止日期，不解释区间缺口', () => {

@@ -35,9 +35,12 @@ def test_missing_requested_timeframe_returns_none(tmp_path: Path, monkeypatch) -
 
 
 def test_backtest_timeframes_are_explicit() -> None:
+  assert settings.BACKTEST_TIMEFRAMES == ("1m", "5m", "15m", "30m", "60m", "1d")
   assert settings.validate_backtest_timeframe("1m")
   assert settings.validate_backtest_timeframe("5m")
   assert not settings.validate_backtest_timeframe("2m")
+  assert not settings.validate_backtest_timeframe("3m")
+  assert not settings.validate_backtest_timeframe("45m")
 
 
 def test_quote_prefetch_size_has_safe_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -128,10 +131,11 @@ def test_observability_rejects_unsafe_compose_project(monkeypatch: pytest.Monkey
     settings.validate_observability_configuration()
 
 
-def test_l2_strategy_config_accepts_derived_l2_timeframe() -> None:
-  assert settings.validate_l2_backtest_timeframe("3m")
-  assert settings.validate_backtest_timeframe("3m")
-  assert not settings.validate_l2_backtest_timeframe("2m")
+def test_l2_strategy_config_uses_same_native_timeframes() -> None:
+  assert settings.L2_BACKTEST_TIMEFRAMES == settings.BACKTEST_TIMEFRAMES
+  assert settings.validate_l2_backtest_timeframe("1m")
+  assert not settings.validate_l2_backtest_timeframe("3m")
+  assert not settings.validate_l2_backtest_timeframe("45m")
 
 
 def test_backtest_timeframe_availability_uses_database_cache(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -75,11 +75,11 @@ KLINE_ROOT = os.getenv("TREND_GRID_KLINE_ROOT", "./runtime/kline")
 # 信号数据根目录。
 SIGNAL_ROOT = os.getenv("TREND_GRID_SIGNAL_ROOT", "./runtime/signals")
 
-# 支持的 K 线周期：部分周期由 1m/5m 拟合生成。
-TIMEFRAMES = ["1m", "2m", "3m", "4m", "5m", "10m", "15m", "30m", "45m", "60m", "1d"]
+# 数据库原生 K 线周期；平台不再在运行时派生额外周期。
+TIMEFRAMES = ["1m", "5m", "15m", "30m", "60m", "1d"]
 
 # 两种回测模式共用统一 Bar 周期；L2 模式额外校验十档快照和必要的逐笔成交。
-BAR_RUN_TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "45m", "60m", "1d")
+BAR_RUN_TIMEFRAMES = ("1m", "5m", "15m", "30m", "60m", "1d")
 BACKTEST_TIMEFRAMES = BAR_RUN_TIMEFRAMES
 L2_BACKTEST_TIMEFRAMES = BAR_RUN_TIMEFRAMES
 
