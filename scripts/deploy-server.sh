@@ -8,6 +8,8 @@ clickhouse_compose_file="$project_root/deploy/compose.clickhouse.yml"
 submission_gate_dir="$project_root/deploy/submission-gate"
 deploy_lock_file="/tmp/quant-backtest-deploy.lock"
 script_args=("$@")
+env_defaults_changed=false
+env_backup_file="${env_file}.backup-before-managed-update"
 
 # 让 flock 父进程持有整段发布锁，脚本更新后可在同一把锁内安全重启。
 if [[ "${QUANT_DEPLOY_LOCK_HELD:-}" != "1" ]]; then
@@ -31,6 +33,95 @@ fi
 fail() {
   echo "发布终止：$1" >&2
   exit 1
+}
+
+env_key_count() {
+  local name="$1"
+  grep -Ec "^${name}=" "$env_file" || true
+}
+
+append_auth_session_env_defaults() {
+  local name count temp_file
+  local added_names=()
+  for name in TREND_GRID_AUTH_SESSION_IDLE_HOURS \
+    TREND_GRID_AUTH_SESSION_MAX_DAYS \
+    TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS; do
+    count="$(env_key_count "$name")"
+    [[ "$count" -le 1 ]] || fail "deploy/.env 中的 ${name} 存在重复定义"
+  done
+  if [[ "$(env_key_count TREND_GRID_AUTH_SESSION_IDLE_HOURS)" == "1" \
+    && "$(env_key_count TREND_GRID_AUTH_SESSION_MAX_DAYS)" == "1" \
+    && "$(env_key_count TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS)" == "1" ]]; then
+    return
+  fi
+  cp --preserve=mode "$env_file" "$env_backup_file" \
+    || fail "无法备份 deploy/.env"
+  temp_file="$(mktemp "${env_file}.tmp.XXXXXX")"
+  cp --preserve=mode "$env_file" "$temp_file" || {
+    rm -f "$temp_file"
+    fail "无法创建 deploy/.env 临时副本"
+  }
+  if [[ "$(env_key_count TREND_GRID_AUTH_SESSION_IDLE_HOURS)" == "0" ]]; then
+    printf '\n# 用户连续无操作达到该时长后，会话失效并要求重新登录。\nTREND_GRID_AUTH_SESSION_IDLE_HOURS=24\n' >> "$temp_file"
+    added_names+=(TREND_GRID_AUTH_SESSION_IDLE_HOURS)
+  fi
+  if [[ "$(env_key_count TREND_GRID_AUTH_SESSION_MAX_DAYS)" == "0" ]]; then
+    printf '\n# 单次登录的最长有效天数；即使持续操作，达到该期限后也必须重新登录。\nTREND_GRID_AUTH_SESSION_MAX_DAYS=7\n' >> "$temp_file"
+    added_names+=(TREND_GRID_AUTH_SESSION_MAX_DAYS)
+  fi
+  if [[ "$(env_key_count TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS)" == "0" ]]; then
+    printf '\n# 最近活动时间的最小写入间隔，用于减少高频接口轮询造成的数据库写入。\nTREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS=300\n' >> "$temp_file"
+    added_names+=(TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS)
+  fi
+  mv "$temp_file" "$env_file" || {
+    rm -f "$temp_file"
+    fail "无法原子更新 deploy/.env"
+  }
+  env_defaults_changed=true
+  echo "发布配置已增量新增变量：${added_names[*]}；原配置已备份至 ${env_backup_file}"
+}
+
+read_bounded_env_int() {
+  local name="$1" minimum="$2" maximum="$3" value
+  [[ "$(env_key_count "$name")" == "1" ]] || {
+    echo "deploy/.env 中的 ${name} 必须且只能定义一次" >&2
+    return 1
+  }
+  value="$(grep -E "^${name}=" "$env_file" | cut -d= -f2-)"
+  value="${value//[[:space:]]/}"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -ge "$minimum" && "$value" -le "$maximum" ]] || {
+    echo "deploy/.env 中的 ${name} 不在允许范围" >&2
+    return 1
+  }
+  echo "$value"
+}
+
+validate_auth_session_env() {
+  local idle_hours max_days touch_seconds
+  idle_hours="$(read_bounded_env_int TREND_GRID_AUTH_SESSION_IDLE_HOURS 1 72)" || return 1
+  max_days="$(read_bounded_env_int TREND_GRID_AUTH_SESSION_MAX_DAYS 1 30)" || return 1
+  touch_seconds="$(read_bounded_env_int TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS 60 3600)" || return 1
+  [[ "$((max_days * 24))" -gt "$idle_hours" ]] || {
+    echo "登录会话最长有效期必须大于空闲超时时间" >&2
+    return 1
+  }
+  [[ "$touch_seconds" -lt "$((idle_hours * 3600))" ]] || {
+    echo "登录会话活动写入间隔必须小于空闲超时时间" >&2
+    return 1
+  }
+}
+
+restore_env_defaults_backup() {
+  local temp_file
+  [[ "$env_defaults_changed" == "true" && -f "$env_backup_file" ]] || return
+  temp_file="$(mktemp "${env_file}.restore.XXXXXX")"
+  cp --preserve=mode "$env_backup_file" "$temp_file" \
+    && mv "$temp_file" "$env_file" || {
+      rm -f "$temp_file"
+      fail "配置校验失败且 deploy/.env 自动恢复失败"
+    }
+  env_defaults_changed=false
+  echo "配置校验失败，已从备份恢复 deploy/.env" >&2
 }
 
 close_submission_gate() {
@@ -432,6 +523,11 @@ if [[ "$script_digest_before" != "$script_digest_after" \
     bash "$project_root/scripts/deploy-server.sh" "${script_args[@]}"
 fi
 
+append_auth_session_env_defaults
+if ! validate_auth_session_env; then
+  restore_env_defaults_backup
+  fail "登录会话配置校验失败"
+fi
 require_release_database_password
 APPLICATION_BUILD_ID="$(git rev-parse HEAD)"
 CLIENT_COMPATIBILITY_VERSION="$(read_client_compatibility_version)"
@@ -444,7 +540,11 @@ compose=(docker compose --env-file "$env_file" -f "$compose_file" -f "$clickhous
 bar_runner_replicas="$(read_runner_replicas TREND_GRID_BAR_RUNNER_REPLICAS)"
 l2_runner_replicas="$(read_runner_replicas TREND_GRID_L2_RUNNER_REPLICAS)"
 validate_clickhouse_network
-"${compose[@]}" config >/dev/null || fail "Docker Compose 配置校验失败"
+if ! "${compose[@]}" config >/dev/null; then
+  restore_env_defaults_backup
+  fail "Docker Compose 配置校验失败"
+fi
+env_defaults_changed=false
 # 不依赖业务迁移的日志服务先预检，避免其故障发生在停服之后。
 observability_preflight_ready=false
 if "${compose[@]}" up -d --build docker-socket-proxy loki alloy \

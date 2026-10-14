@@ -149,4 +149,36 @@ describe('API security context', () => {
       requestId: 'req_body',
     } satisfies Partial<InstanceType<typeof ApiResponseError>>);
   });
+
+  it('notifies the application once when an authenticated API request returns 401', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(JSON.stringify({
+      detail: '登录已失效，请重新登录',
+    }), { status: 401, headers: { 'Content-Type': 'application/json' } })));
+    const {
+      AUTH_SESSION_EXPIRED_EVENT,
+      fetchBacktestResourceStatus,
+    } = await import('../api/client');
+    const listener = vi.fn();
+    window.addEventListener(AUTH_SESSION_EXPIRED_EVENT, listener);
+
+    await expect(fetchBacktestResourceStatus()).rejects.toMatchObject({ status: 401 });
+    await expect(fetchBacktestResourceStatus()).rejects.toMatchObject({ status: 401 });
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    window.removeEventListener(AUTH_SESSION_EXPIRED_EVENT, listener);
+  });
+
+  it('does not report a failed login as an expired existing session', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      detail: '用户名或密码错误',
+    }), { status: 401, headers: { 'Content-Type': 'application/json' } })));
+    const { AUTH_SESSION_EXPIRED_EVENT, login } = await import('../api/client');
+    const listener = vi.fn();
+    window.addEventListener(AUTH_SESSION_EXPIRED_EVENT, listener);
+
+    await expect(login('researcher', 'wrong-password')).rejects.toMatchObject({ status: 401 });
+
+    expect(listener).not.toHaveBeenCalled();
+    window.removeEventListener(AUTH_SESSION_EXPIRED_EVENT, listener);
+  });
 });

@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import hashlib
 from pathlib import Path
 from threading import Lock
@@ -82,12 +83,68 @@ def test_authenticate_stores_only_session_and_csrf_digests(
   assert isinstance(params, tuple)
   assert params[2] == hashlib.sha256(session_token.encode("utf-8")).hexdigest()
   assert params[3] == hashlib.sha256(csrf_token.encode("utf-8")).hexdigest()
+  expires_at = params[4]
+  assert isinstance(expires_at, datetime)
+  remaining = expires_at - datetime.now(timezone.utc)
+  assert auth.SESSION_MAX_LIFETIME - timedelta(seconds=2) <= remaining
+  assert remaining <= auth.SESSION_MAX_LIFETIME
   assert session_token not in params
   assert csrf_token not in params
   audit_insert = next(call for call in connection.cursor_instance.calls if "INSERT INTO audit_log" in call[0])
   audit_params = audit_insert[1]
   assert isinstance(audit_params, tuple)
   assert audit_params[-1].obj == {"requestId": "req_test"}
+
+
+def test_session_lookup_enforces_idle_timeout_and_throttles_activity_write(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  class Cursor:
+    def __init__(self) -> None:
+      self.calls: list[tuple[str, object]] = []
+
+    def __enter__(self) -> "Cursor":
+      return self
+
+    def __exit__(self, *args: object) -> None:
+      return None
+
+    def execute(self, sql: str, params: object = None) -> None:
+      self.calls.append((sql, params))
+
+    def fetchone(self) -> dict[str, object]:
+      return {
+        "id": "00000000-0000-0000-0000-000000000123",
+        "username": "researcher",
+        "display_name": "研究员",
+        "role": "user",
+      }
+
+  class Connection:
+    def __init__(self) -> None:
+      self.cursor_instance = Cursor()
+
+    def cursor(self) -> Cursor:
+      return self.cursor_instance
+
+  connection = Connection()
+
+  @contextmanager
+  def system_db():
+    yield connection
+
+  monkeypatch.setattr(auth, "_system_db", system_db)
+
+  assert auth.get_user_by_token("session-token") is not None
+
+  select_sql, select_params = connection.cursor_instance.calls[0]
+  touch_sql, touch_params = connection.cursor_instance.calls[1]
+  assert "s.last_seen_at > now() - %s" in select_sql
+  assert isinstance(select_params, tuple)
+  assert select_params[1] == auth.SESSION_IDLE_TIMEOUT
+  assert "last_seen_at <= now() - %s" in touch_sql
+  assert isinstance(touch_params, tuple)
+  assert touch_params[1] == auth.SESSION_TOUCH_INTERVAL
 
 
 def test_concurrent_csrf_rotation_keeps_both_returned_tokens_temporarily_valid(

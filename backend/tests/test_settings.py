@@ -98,6 +98,34 @@ def test_read_http_origins_rejects_path(monkeypatch: pytest.MonkeyPatch) -> None
     settings._read_http_origins("TEST_CSRF_TRUSTED_ORIGINS", ())
 
 
+def test_auth_session_defaults_balance_daily_use_and_absolute_expiry() -> None:
+  assert settings.AUTH_SESSION_IDLE_HOURS == 24
+  assert settings.AUTH_SESSION_MAX_DAYS == 7
+  assert settings.AUTH_SESSION_TOUCH_INTERVAL_SECONDS == 300
+  settings.validate_auth_configuration()
+
+
+def test_auth_session_rejects_absolute_expiry_not_longer_than_idle_timeout(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "AUTH_SESSION_IDLE_HOURS", 48)
+  monkeypatch.setattr(settings, "AUTH_SESSION_MAX_DAYS", 2)
+
+  with pytest.raises(ValueError, match="最长有效期必须大于空闲超时时间"):
+    settings.validate_auth_configuration()
+
+
+def test_auth_session_rejects_touch_interval_not_shorter_than_idle_timeout(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "AUTH_SESSION_IDLE_HOURS", 1)
+  monkeypatch.setattr(settings, "AUTH_SESSION_MAX_DAYS", 7)
+  monkeypatch.setattr(settings, "AUTH_SESSION_TOUCH_INTERVAL_SECONDS", 3600)
+
+  with pytest.raises(ValueError, match="活动写入间隔必须小于空闲超时时间"):
+    settings.validate_auth_configuration()
+
+
 def test_research_reporting_requires_target_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setattr(settings, "BACKTEST_INSTANCE_ID", "server")
   monkeypatch.setattr(settings, "RESEARCH_RESULT_REPORT_ENABLED", True)

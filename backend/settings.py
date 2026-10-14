@@ -247,6 +247,23 @@ def default_fee_profile() -> dict[str, float]:
 
 # 当前部署尚未配置 HTTPS，默认关闭 Secure 以保证同源 HTTP 登录可用。
 AUTH_COOKIE_SECURE = os.getenv("TREND_GRID_AUTH_COOKIE_SECURE", "false").lower() == "true"
+AUTH_SESSION_IDLE_HOURS = _read_bounded_int(
+  "TREND_GRID_AUTH_SESSION_IDLE_HOURS", 24, 1, 72,
+)
+AUTH_SESSION_MAX_DAYS = _read_bounded_int(
+  "TREND_GRID_AUTH_SESSION_MAX_DAYS", 7, 1, 30,
+)
+AUTH_SESSION_TOUCH_INTERVAL_SECONDS = _read_bounded_int(
+  "TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS", 300, 60, 3600,
+)
+
+
+def validate_auth_configuration() -> None:
+  """拒绝期限关系无效的会话策略。"""
+  if AUTH_SESSION_MAX_DAYS * 24 <= AUTH_SESSION_IDLE_HOURS:
+    raise ValueError("登录会话最长有效期必须大于空闲超时时间")
+  if AUTH_SESSION_TOUCH_INTERVAL_SECONDS >= AUTH_SESSION_IDLE_HOURS * 3600:
+    raise ValueError("登录会话活动写入间隔必须小于空闲超时时间")
 
 # 同源请求始终允许；这里仅列出本地开发代理等额外可信浏览器来源。
 CSRF_TRUSTED_ORIGINS = _read_http_origins(

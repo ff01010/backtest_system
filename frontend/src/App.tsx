@@ -20,6 +20,7 @@ import {
   fetchStrategies,
   createResearchAuthorizationCode,
   logout,
+  AUTH_SESSION_EXPIRED_EVENT,
 } from './api/client';
 import type { SessionUser } from './api/client';
 import { useUrlState } from './hooks/useUrlState';
@@ -444,15 +445,37 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
 export default function App() {
   const [currentUser, setCurrentUser] = useState<SessionUser | null>(null);
   const [checkingSession, setCheckingSession] = useState(true);
+  const [loginNotice, setLoginNotice] = useState('');
 
   useEffect(() => {
-    fetchCurrentUser().then(setCurrentUser).catch(() => setCurrentUser(null)).finally(() => setCheckingSession(false));
+    let mounted = true;
+    const handleSessionExpired = () => {
+      setCurrentUser(null);
+      setLoginNotice('登录已过期，请重新登录。');
+      setCheckingSession(false);
+    };
+    window.addEventListener(AUTH_SESSION_EXPIRED_EVENT, handleSessionExpired);
+    void fetchCurrentUser()
+      .then((user) => {
+        if (mounted) setCurrentUser(user);
+      })
+      .catch(() => {
+        if (mounted) setCurrentUser(null);
+      })
+      .finally(() => {
+        if (mounted) setCheckingSession(false);
+      });
+    return () => {
+      mounted = false;
+      window.removeEventListener(AUTH_SESSION_EXPIRED_EVENT, handleSessionExpired);
+    };
   }, []);
 
   const handleLogout = async () => {
     try {
       await logout();
     } finally {
+      setLoginNotice('');
       setCurrentUser(null);
     }
   };
@@ -460,6 +483,14 @@ export default function App() {
   if (checkingSession) {
     return <div style={{ height: '100vh', display: 'grid', placeItems: 'center', background: 'var(--canvas)', color: 'var(--text-muted)' }}>正在检查登录状态…</div>;
   }
-  if (!currentUser) return <LoginPage onLogin={setCurrentUser} />;
+  if (!currentUser) return (
+    <LoginPage
+      notice={loginNotice}
+      onLogin={(user) => {
+        setLoginNotice('');
+        setCurrentUser(user);
+      }}
+    />
+  );
   return <Workspace currentUser={currentUser} onLogout={() => { void handleLogout(); }} />;
 }

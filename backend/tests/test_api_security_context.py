@@ -227,6 +227,27 @@ def test_validation_error_through_asgi_has_matching_request_id_header_and_body()
   assert body["detail"] == "请求参数不符合接口约束"
 
 
+def test_login_cookie_uses_configured_absolute_session_lifetime(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(
+    auth,
+    "authenticate",
+    lambda *_args: ("session-token", USER, "csrf-token"),
+  )
+
+  status, headers, body = _invoke_app(
+    "/api/auth/login",
+    "POST",
+    json.dumps({"username": "researcher", "password": "password"}).encode("utf-8"),
+  )
+
+  assert status == 200
+  assert body["user"]["username"] == "cookie-user"
+  max_age = int(auth.SESSION_MAX_LIFETIME.total_seconds())
+  assert f"Max-Age={max_age}" in headers["set-cookie"]
+
+
 def test_experiment_preview_rejects_untrusted_trial_count_with_stable_error(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:

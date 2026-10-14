@@ -142,6 +142,9 @@ http://localhost:<APP_HTTP_PORT>
 | `APP_HTTP_PORT` | 前端对宿主机公开的 HTTP 端口。 |
 | `POSTGRES_*`、`APP_DB_*` | PostgreSQL 引导账号和应用账号。两套密码应不同。 |
 | `TREND_GRID_CLICKHOUSE_*` | 后端访问共享 ClickHouse 的地址和凭据。 |
+| `TREND_GRID_AUTH_SESSION_IDLE_HOURS` | 浏览器登录会话的连续无操作超时，默认 24 小时。 |
+| `TREND_GRID_AUTH_SESSION_MAX_DAYS` | 单次登录的绝对最长有效期，默认 7 天。 |
+| `TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS` | 最近活动时间的最小写入间隔，默认 300 秒。 |
 | `TREND_GRID_HOST_KLINE_ROOT` | 旧 CSV 兼容挂载；当前回测不依赖其中的数据。 |
 | `TREND_GRID_HOST_SIGNAL_ROOT` | 外部信号 CSV 的只读挂载目录。 |
 

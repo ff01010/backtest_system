@@ -30,9 +30,11 @@ import type {
 
 const BASE = '/api';
 const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+export const AUTH_SESSION_EXPIRED_EVENT = 'quant-backtest:auth-session-expired';
 
 let csrfToken: string | null = null;
 let csrfRefreshPromise: Promise<string> | null = null;
+let sessionExpiryNotified = false;
 
 export class BacktestRequestError extends Error {
   detail: BacktestErrorDetail;
@@ -74,11 +76,26 @@ async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promi
   if (WRITE_METHODS.has(method) && csrfToken && !headers.has('X-CSRF-Token')) {
     headers.set('X-CSRF-Token', csrfToken);
   }
-  return fetch(input, {
+  const response = await fetch(input, {
     ...init,
     credentials: init.credentials ?? 'include',
     headers,
   });
+  const rawUrl = input instanceof Request ? input.url : String(input);
+  const path = new URL(rawUrl, window.location.origin).pathname;
+  const isSessionBootstrap = path === `${BASE}/auth/me` || path === `${BASE}/auth/login`;
+  const isExplicitLogout = path === `${BASE}/auth/logout`;
+  if (
+    response.status === 401
+    && !isSessionBootstrap
+    && !isExplicitLogout
+    && !sessionExpiryNotified
+  ) {
+    csrfToken = null;
+    sessionExpiryNotified = true;
+    window.dispatchEvent(new Event(AUTH_SESSION_EXPIRED_EVENT));
+  }
+  return response;
 }
 
 export async function fetchJson<T>(url: string): Promise<T> {
@@ -446,12 +463,14 @@ export async function login(username: string, password: string): Promise<Session
     { username, password },
   );
   csrfToken = data.csrfToken;
+  sessionExpiryNotified = false;
   return data.user;
 }
 
 export async function fetchCurrentUser(): Promise<SessionUser> {
   const data = await fetchJson<{ user: SessionUser }>(`${BASE}/auth/me`);
   await refreshCsrfToken();
+  sessionExpiryNotified = false;
   return data.user;
 }
 
@@ -460,6 +479,7 @@ export async function logout(): Promise<void> {
     await sendJson<{ ok: boolean }>(`${BASE}/auth/logout`, 'POST', {});
   } finally {
     csrfToken = null;
+    sessionExpiryNotified = false;
   }
 }
 

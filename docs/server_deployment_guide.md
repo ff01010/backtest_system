@@ -72,6 +72,8 @@ cd /opt/projects/quant_backtest_platform_git
 chmod 600 deploy/.env
 ```
 
+正式发布脚本会对登录会话的非敏感配置执行幂等增量补充：只在变量缺失时连同中文说明追加安全默认值，已有变量保持原值，重复定义会阻止发布。修改前的文件保存在 `deploy/.env.backup-before-managed-update`，Docker Compose 配置校验失败时自动恢复。脚本不会用 `.env.example` 覆盖服务器私有 `.env`，也不会自动填写密码、Token 或其他密钥。
+
 当前需要确认的配置项：
 
 ```dotenv

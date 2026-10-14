@@ -1149,6 +1149,7 @@ def startup():
   global _verified_runtime_capabilities
   _verified_runtime_capabilities = run_runtime_deep_probe()
   settings.validate_public_api_configuration()
+  settings.validate_auth_configuration()
   settings.validate_research_integration_configuration()
   settings.validate_application_build_configuration()
   settings.validate_observability_configuration()
@@ -1307,7 +1308,7 @@ def login(
   response.set_cookie(
     auth.SESSION_COOKIE,
     token,
-    max_age=int(auth.SESSION_LIFETIME.total_seconds()),
+    max_age=int(auth.SESSION_MAX_LIFETIME.total_seconds()),
     httponly=True,
     samesite="lax",
     secure=settings.AUTH_COOKIE_SECURE,
@@ -1396,7 +1397,7 @@ def exchange_research_authorization_code(
   now = datetime.now(timezone.utc)
   issued_at = format_epoch_as_shanghai(now.timestamp())
   expires_at = format_epoch_as_shanghai(
-    (now + auth.SESSION_LIFETIME).timestamp(),
+    (now + auth.RESEARCH_IDENTITY_LIFETIME).timestamp(),
   )
   return {
     "backtestUserId": user.id,
