@@ -9,6 +9,9 @@ import pytest
 from backend import release_manifest
 
 
+pytestmark = pytest.mark.external_tool
+
+
 def _git(repo: Path, *args: str) -> str:
   result = subprocess.run(
     ["git", *args], cwd=repo, check=True, capture_output=True, text=True,

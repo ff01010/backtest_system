@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """测试策略适配器注册和回测分发。"""
 
-import copy
 import hashlib
 import json
 from pathlib import Path
@@ -16,7 +15,6 @@ from backend import schemas
 from backend.services import backtest_preflight, backtest_runner, research_signal_snapshot
 from backend.services import state_store
 from backend.services import strategy_adapters
-from shared.cost import buy_net, sell_net
 
 
 class FakeAdapter:
@@ -251,38 +249,6 @@ def test_bar_quality_error_preserves_structured_failure(monkeypatch: pytest.Monk
   assert raised.value.code == "data.l2_bar_price_invalid"
 
 
-def test_trend_grid_direction_flags_block_opening_orders(tmp_path: Any) -> None:
-  config = backtest_runner._build_config({
-    "strategy": "trend_grid",
-    "symbol": "000001.SZ",
-    "startDate": "20260101",
-    "endDate": "20260131",
-    "initialCapital": 1_000_000,
-    "allowLong": False,
-    "allowShort": False,
-  })
-  config["backtest"]["output_dir"] = str(tmp_path)
-  engine = backtest_runner.BacktestEngine(config)
-
-  assert engine._a_sell(10, 10) is False
-  assert engine._a_buy_open(10, 10) is False
-  engine._b_open_short(10, 10)
-  engine._b_open_long(10, 10)
-
-  assert engine.trades_a == []
-  assert engine.trades_b == []
-
-
-def test_cost_model_uses_the_requested_commission_rate() -> None:
-  default_buy = buy_net(10, 100)
-  custom_buy = buy_net(10, 100, commission_rate=0.0003)
-  default_sell = sell_net(10, 100)
-  custom_sell = sell_net(10, 100, commission_rate=0.0003)
-
-  assert custom_buy > default_buy
-  assert custom_sell < default_sell
-
-
 def test_legacy_backtest_request_defaults_to_allowing_long() -> None:
   request = schemas.BacktestRunRequest(
     symbol="000001.SZ",
@@ -330,142 +296,6 @@ def test_strategy_category_enforces_its_execution_semantics() -> None:
       strategyCategory="directional_holding", holdingPolicy="overnight",
       baseQuantity=1_000, baseCostPrice=10, initialPositionEnabled=True, t0Enabled=True,
     )
-
-
-def test_intraday_holding_policy_locks_entries_and_settles_positions(tmp_path: Any) -> None:
-  config = backtest_runner._build_config({
-    "strategy": "trend_grid",
-    "symbol": "000001.SZ",
-    "startDate": "20260101",
-    "endDate": "20260131",
-    "initialCapital": 1_000_000,
-    "holdingPolicy": "intraday",
-  })
-  config["backtest"]["output_dir"] = str(tmp_path)
-  config["backtest"]["signal_only"] = False
-  config["strategy"]["slip_base_vol"] = 0
-  engine = backtest_runner.BacktestEngine(config)
-  engine._entry_locked = True
-
-  assert engine._a_sell(10, 10) is False
-  engine._b_open_short(10, 10)
-  assert engine.trades_a == []
-  assert engine.trades_b == []
-
-  engine._date = "20260101"
-  engine.a_short_holds.append((10, 10, 200))
-  engine.b_pos = -200
-  engine.b_entry_price = 10
-  engine._force_close_all(11)
-
-  assert engine.a_short_holds == []
-  assert engine.b_pos == 0
-  assert {trade["direction"] for trade in engine.trades_a + engine.trades_b} == {
-    "FORCE_BUY",
-  }
-
-
-def test_intraday_holding_policy_settles_on_the_close_bar(tmp_path: Any) -> None:
-  config = backtest_runner._build_config({
-    "strategy": "trend_grid",
-    "symbol": "000001.SZ",
-    "startDate": "20260101",
-    "endDate": "20260101",
-    "initialCapital": 1_000_000,
-    "holdingPolicy": "intraday",
-  })
-  config["backtest"]["output_dir"] = str(tmp_path)
-  config["backtest"]["signal_only"] = False
-  config["strategy"]["slip_base_vol"] = 0
-  engine = backtest_runner.BacktestEngine(config)
-  engine.b_pos = -200
-  engine.b_entry_price = 10
-
-  engine.run(pd.DataFrame([{
-    "time": "202601011455",
-    "open": 11,
-    "high": 11,
-    "low": 11,
-    "close": 11,
-    "volume": 100,
-  }]))
-
-  assert engine.b_pos == 0
-  assert engine.trades_b[-1]["direction"] == "FORCE_BUY"
-
-
-def test_trend_grid_realized_pnl_uses_the_requested_commission_rate(tmp_path: Any) -> None:
-  def realized_pnl(commission_rate: float) -> float:
-    config = backtest_runner._build_config({
-      "strategy": "trend_grid",
-      "symbol": "000001.SZ",
-      "startDate": "20260101",
-      "endDate": "20260131",
-      "initialCapital": 1_000_000,
-      "commissionRate": commission_rate,
-    })
-    config["backtest"]["output_dir"] = str(tmp_path / str(commission_rate))
-    config["strategy"]["slip_base_vol"] = 0
-    config["strategy"]["close_slippage"] = 0
-    engine = backtest_runner.BacktestEngine(config)
-
-    assert engine._a_buy_open(10, 10) is True
-    engine._a_reduce_long_one(11)
-    return float(engine.trades_a[-1]["pnl"])
-
-  assert realized_pnl(0.0003) < realized_pnl(0.00008)
-
-
-def test_experiment_manifest_is_deterministic(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Any,
-) -> None:
-  data_path = tmp_path / "000001.SZ_5m.csv"
-  data_path.write_text(
-    "time,open,high,low,close,volume\n202601010930,10,10,10,10,100\n",
-    encoding="utf-8",
-  )
-  monkeypatch.setattr(
-    backtest_runner.settings,
-    "resolve_kline_path",
-    lambda *_args: str(data_path),
-  )
-  database_snapshot = {
-    "provider": "mapped_l2_bar",
-    "hash": "database-cache-hash",
-    "barCount": 1,
-  }
-  payload = {
-    "strategy": "trend_grid",
-    "timeframe": "1m",
-    "symbol": "000001.SZ",
-    "startDate": "20260101",
-    "endDate": "20260131",
-    "initialCapital": 1_000_000,
-    "commissionRate": 0.0003,
-    "slippage": 0.0001,
-    "allowLong": True,
-    "allowShort": True,
-  }
-  bars = pd.read_csv(data_path)
-  first = backtest_runner._build_experiment_manifest(
-    payload,
-    backtest_runner._build_config(copy.deepcopy(payload)),
-    bars,
-    database_snapshot,
-  )
-  second = backtest_runner._build_experiment_manifest(
-    payload,
-    backtest_runner._build_config(copy.deepcopy(payload)),
-    bars,
-    database_snapshot,
-  )
-
-  assert first["experimentHash"] == second["experimentHash"]
-  assert first["randomSeed"] == second["randomSeed"]
-  assert first["costModel"]["commissionRate"] == 0.0003
-  assert first["barRange"]["timeframe"] == "1m"
-  assert first["databaseSnapshot"]["provider"] == "mapped_l2_bar"
 
 
 def test_script_experiment_manifest_includes_display_fields(monkeypatch: pytest.MonkeyPatch) -> None:

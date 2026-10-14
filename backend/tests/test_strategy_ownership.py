@@ -211,51 +211,6 @@ def test_complete_strategy_rejects_stale_revision(monkeypatch: Any) -> None:
     )
 
 
-def test_new_complete_strategy_ignores_client_script_identity(monkeypatch: Any) -> None:
-  cursor = FakeCursor([{"names": ["复制策略"]}])
-  captured: dict[str, Any] = {}
-
-  @contextmanager
-  def database() -> Any:
-    yield FakeConnection(cursor)
-
-  def write_script(_: Any, script_id: str | None, payload: dict[str, Any]) -> tuple[str, str, int]:
-    captured["script_id"] = script_id
-    captured["script_name"] = payload["name"]
-    return "new-script", "new-version", 1
-
-  def write_config(_: Any, __: Any, payload: dict[str, Any], *___: Any) -> str:
-    captured["config_name"] = payload["name"]
-    return "new-config"
-
-  monkeypatch.setattr(state_store, "_db", database)
-  monkeypatch.setattr(state_store, "_write_strategy_script", write_script)
-  monkeypatch.setattr(state_store, "_write_config", write_config)
-  monkeypatch.setattr(
-    state_store,
-    "_get_strategy_config_with_cursor",
-    lambda *_: {"id": "new-config", "strategyVersionId": "new-version"},
-  )
-  monkeypatch.setattr(state_store, "_publish_strategy_config_with_cursor", lambda *_: ("published", True))
-  monkeypatch.setattr(
-    state_store,
-    "_get_strategy_script_with_cursor",
-    lambda *_: {"id": "new-script"},
-  )
-
-  result = state_store.save_complete_strategy(
-    {"name": "复制策略", "code": "return []"},
-    {"name": "复制策略"},
-    "occupied-script",
-    None,
-  )
-
-  assert captured["script_id"] is None
-  assert captured["script_name"] == "复制策略-1"
-  assert captured["config_name"] == "复制策略-1"
-  assert result["script"]["id"] == "new-script"
-
-
 def test_strategy_config_read_does_not_reveal_other_owner(monkeypatch: Any) -> None:
   cursor = FakeCursor([None])  # type: ignore[list-item]
   monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")

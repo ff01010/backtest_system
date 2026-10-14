@@ -59,8 +59,13 @@ def test_start_worker_uses_independent_runner_module(monkeypatch: Any) -> None:
   )]
 
 
-def test_stop_workers_terminates_then_kills_stuck_processes() -> None:
+def test_stop_workers_terminates_then_kills_stuck_processes(monkeypatch: Any) -> None:
   worker = FakeWorker()
+  monkeypatch.setattr(
+    runner_supervisor,
+    "_signal_worker_group",
+    lambda target, force=False: target.kill() if force else target.terminate(),
+  )
 
   runner_supervisor._stop_workers([worker])  # type: ignore[list-item]
 

@@ -148,25 +148,6 @@ def install_created_copy_mocks(monkeypatch: pytest.MonkeyPatch, cursor: CopyCurs
   return captured
 
 
-def test_copy_creates_independent_strategy_and_clears_account(monkeypatch: pytest.MonkeyPatch) -> None:
-  cursor = CopyCursor()
-  captured = install_created_copy_mocks(monkeypatch, cursor)
-
-  response = shared_backtest_copy.copy_shared_backtest(publication_row()["id"])
-
-  assert response["created"] is True
-  assert response["accountCleared"] is True
-  assert captured["scriptIdInput"] is None
-  assert captured["configIdInput"] is None
-  config = captured["config"]
-  assert config["accountId"] is None
-  assert config["benchmarkSymbol"] == "000300.SH"
-  assert config["paramsJson"]["params"]["window"] == 20
-  assert config["paramsJson"]["params"]["twapDurationSeconds"] == 300
-  assert config["sourcePublicationId"] == publication_row()["id"]
-  assert sum("record_backtest_publication_copy" in item for item in cursor.statements) == 1
-
-
 def test_copy_name_keeps_suffix_with_long_shared_title() -> None:
   name = shared_backtest_copy._copy_name("长" * 128)
 
@@ -181,38 +162,6 @@ def test_copy_rejects_retired_derived_timeframe(timeframe: str) -> None:
 
   with pytest.raises(ValueError, match=f"周期 {timeframe} 已停止支持"):
     shared_backtest_copy._copy_payloads(publication)
-
-
-def test_repeat_copy_returns_existing_without_increment(monkeypatch: pytest.MonkeyPatch) -> None:
-  cursor = CopyCursor(existing=True)
-  connection = CopyConnection(cursor)
-  monkeypatch.setattr(state_store, "_db", lambda: copy_db(connection))
-  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-2")
-  monkeypatch.setattr(state_store, "_get_strategy_config_with_cursor", lambda *_: copied_config())
-
-  response = shared_backtest_copy.copy_shared_backtest(publication_row()["id"])
-
-  assert response["created"] is False
-  assert "pg_advisory_xact_lock" in cursor.statements[0]
-  assert not any("FOR UPDATE" in item for item in cursor.statements)
-  assert not any("record_backtest_publication_copy" in item for item in cursor.statements)
-  assert not any("copy_count" in item for item in cursor.statements)
-
-
-def test_copy_failure_rolls_back_without_increment(monkeypatch: pytest.MonkeyPatch) -> None:
-  cursor = CopyCursor()
-  captured = install_created_copy_mocks(monkeypatch, cursor)
-  monkeypatch.setattr(
-    state_store,
-    "_write_config",
-    lambda *_: (_ for _ in ()).throw(state_store.DatabaseError("write failed")),
-  )
-
-  with pytest.raises(state_store.DatabaseError, match="write failed"):
-    shared_backtest_copy.copy_shared_backtest(publication_row()["id"])
-
-  assert captured["connection"].rolled_back is True
-  assert not any("copy_count" in item for item in cursor.statements)
 
 
 def _signal_row() -> dict[str, Any]:

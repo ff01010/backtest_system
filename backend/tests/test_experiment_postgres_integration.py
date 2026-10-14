@@ -54,10 +54,13 @@ from backend.tests.test_experiment_execution import (
 )
 
 
-pytestmark = pytest.mark.skipif(
-  os.getenv("RUN_EXPERIMENT_DB_INTEGRATION") != "1",
-  reason="需要已迁移的隔离 PostgreSQL",
-)
+pytestmark = [
+  pytest.mark.integration,
+  pytest.mark.skipif(
+    os.getenv("RUN_EXPERIMENT_DB_INTEGRATION") != "1",
+    reason="需要已迁移的隔离 PostgreSQL",
+  ),
+]
 
 OWNER = CurrentUser(
   id="10000000-0000-4000-8000-000000000001",

@@ -1,0 +1,79 @@
+name: quant-backtest-tests
+
+services:
+  postgres-test:
+    image: postgres:17.4-alpine
+    restart: "no"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test-postgres-password
+      POSTGRES_DB: postgres
+      APP_DB_NAME: quant_backtest_test
+      APP_DB_USER: quant_backtest_test_app
+      APP_DB_PASSWORD: test-app-password
+      RELEASE_DB_PASSWORD: test-release-password
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./test-db-init.sql:/docker-entrypoint-initdb.d/010-test-db-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d quant_backtest_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  migrate-test:
+    image: postgres:17.4-alpine
+    restart: "no"
+    environment:
+      PGHOST: postgres-test
+      PGPORT: "5432"
+      PGDATABASE: quant_backtest_test
+      PGUSER: postgres
+      PGPASSWORD: test-postgres-password
+      APP_DB_USER: quant_backtest_test_app
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    volumes:
+      - ../db/migrations:/migrations:ro
+    command:
+      - sh
+      - -ec
+      - |
+        for file in /migrations/*.sql; do
+          psql -v ON_ERROR_STOP=1 --set=app_db_user="$${APP_DB_USER}" \
+            -c 'SET ROLE quant_backtest_owner' \
+            -f "$$file"
+        done
+
+  backend-tests:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      target: test
+      args:
+        APPLICATION_BUILD_ID: test
+        CLIENT_COMPATIBILITY_VERSION: "1"
+    restart: "no"
+    working_dir: /workspace
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUN_EXPERIMENT_DB_INTEGRATION: "1"
+      TREND_GRID_DATABASE_URL: postgresql://quant_backtest_test_app:test-app-password@postgres-test:5432/quant_backtest_test
+      EXPERIMENT_TEST_ADMIN_DATABASE_URL: postgresql://postgres:test-postgres-password@postgres-test:5432/quant_backtest_test
+    depends_on:
+      migrate-test:
+        condition: service_completed_successfully
+    volumes:
+      - ..:/workspace:ro
+    command:
+      - python
+      - -m
+      - pytest
+      - -q
+      - -p
+      - no:cacheprovider
+      - -m
+      - not external_tool
+      - backend/tests

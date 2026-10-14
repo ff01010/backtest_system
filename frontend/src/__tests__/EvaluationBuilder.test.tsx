@@ -199,6 +199,10 @@ async function selectFirstReport(): Promise<void> {
     await screen.findByRole('combobox', { name: '选择评价报告' }),
     { target: { value: DETAIL.evaluationRunId } },
   );
+  await waitFor(() => expect(fetchEvaluationRun).toHaveBeenCalledWith(
+    'experiment-1', DETAIL.evaluationRunId,
+  ));
+  await waitFor(() => expect(fetchEvaluationExports).toHaveBeenCalledTimes(1));
 }
 
 beforeEach(() => {
@@ -293,6 +297,9 @@ describe('EvaluationBuilder', () => {
     fireEvent.click(await screen.findByRole('button', { name: '创建导出' }));
 
     await waitFor(() => expect(createEvaluationExport).toHaveBeenCalledTimes(1));
+    expect((await screen.findByRole(
+      'button', { name: '创建导出' },
+    ) as HTMLButtonElement).disabled).toBe(false);
     expect(createEvaluationExport).toHaveBeenCalledWith(
       'evaluation-run-1',
       'xlsx',
@@ -346,6 +353,9 @@ describe('EvaluationBuilder', () => {
     fireEvent.click(createButton);
 
     await waitFor(() => expect(createEvaluationExport).toHaveBeenCalledTimes(2));
+    expect((await screen.findByRole(
+      'button', { name: '创建导出' },
+    ) as HTMLButtonElement).disabled).toBe(false);
     expect(vi.mocked(createEvaluationExport).mock.calls[0][4]).toBe(
       vi.mocked(createEvaluationExport).mock.calls[1][4],
     );
