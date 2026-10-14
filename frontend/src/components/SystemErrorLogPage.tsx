@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import {
   fetchBacktestResourceStatus,
   fetchBacktestRunDiagnostics,
@@ -31,7 +32,11 @@ function toIso(value: string): string | undefined {
   return value ? new Date(value).toISOString() : undefined;
 }
 
-export default function SystemErrorLogPage() {
+interface SystemErrorLogPageProps {
+  headerNavigation?: ReactNode;
+}
+
+export default function SystemErrorLogPage({ headerNavigation }: SystemErrorLogPageProps) {
   const [items, setItems] = useState<SystemErrorLogEntry[]>([]);
   const [runtimeStats, setRuntimeStats] = useState<StrategyRuntimeErrorStat[]>([]);
   const [users, setUsers] = useState<ManagedUser[]>([]);
@@ -126,20 +131,23 @@ export default function SystemErrorLogPage() {
   return (
     <section style={pageStyle}>
       <div style={contentStyle}>
-        <header style={headerStyle}>
+        <header className="system-management-page-header" style={headerStyle}>
           <div>
             <div style={eyebrowStyle}>BACKTEST OBSERVABILITY</div>
             <h2 style={{ margin: '5px 0 4px', color: 'var(--text)' }}>回测监控与诊断</h2>
             <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>监控回测调度容量、执行器与队列状态，并查询系统错误及单任务执行时间线。</p>
           </div>
-          <button
-            type="button"
-            disabled={loading || resourceLoading}
-            onClick={() => void Promise.all([refreshLogs(), refreshResources()])}
-            style={buttonStyle}
-          >
-            {loading || resourceLoading ? '读取中…' : '刷新全部'}
-          </button>
+          <div className="system-management-page-actions">
+            {headerNavigation}
+            <button
+              type="button"
+              disabled={loading || resourceLoading}
+              onClick={() => void Promise.all([refreshLogs(), refreshResources()])}
+              style={buttonStyle}
+            >
+              {loading || resourceLoading ? '读取中…' : '刷新全部'}
+            </button>
+          </div>
         </header>
 
         <BacktestResourceStatusPanel

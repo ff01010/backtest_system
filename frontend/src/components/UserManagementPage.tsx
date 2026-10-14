@@ -1,10 +1,15 @@
 import { useEffect, useState } from 'react';
+import type { ReactNode } from 'react';
 import { createUser, deleteUser, fetchUserPage, resetUserPassword, updateUser } from '../api/client';
 import type { ManagedUser } from '../api/client';
 
 const PAGE_SIZE = 20;
 
-export default function UserManagementPage() {
+interface UserManagementPageProps {
+  headerNavigation?: ReactNode;
+}
+
+export default function UserManagementPage({ headerNavigation }: UserManagementPageProps) {
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [error, setError] = useState('');
   const [draft, setDraft] = useState({ username: '', displayName: '', password: '', role: 'user' });
@@ -74,10 +79,15 @@ export default function UserManagementPage() {
   return (
     <section style={{ padding: 28, overflow: 'auto', height: '100%', background: 'var(--canvas)' }}>
       <div style={{ maxWidth: 1100, margin: '0 auto' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', marginBottom: 20 }}>
-          <div><div style={{ color: 'var(--accent)', fontSize: 12, letterSpacing: 1.5, fontWeight: 750 }}>ACCESS CONTROL</div><h2 style={{ marginTop: 5, color: 'var(--text)' }}>人员与权限管理</h2></div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <span style={{ color: 'var(--text-muted)' }}>仅管理员可创建、禁用、重置及删除账号</span>          </div>
+        <div className="system-management-page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', gap: 18, marginBottom: 20 }}>
+          <div>
+            <div style={{ color: 'var(--accent)', fontSize: 12, letterSpacing: 1.5, fontWeight: 750 }}>ACCESS CONTROL</div>
+            <h2 style={{ margin: '5px 0 4px', color: 'var(--text)' }}>人员与权限管理</h2>
+            <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>创建和维护系统账号、角色与访问状态，仅管理员可操作。</p>
+          </div>
+          <div className="system-management-page-actions">
+            {headerNavigation}
+          </div>
         </div>
         <form onSubmit={addUser} style={panelStyle}>
           <strong style={{ color: 'var(--text)' }}>创建人员</strong>
