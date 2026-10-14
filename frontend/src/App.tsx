@@ -4,8 +4,7 @@ import KlineChart from './components/KlineChart';
 import StatusBar from './components/StatusBar';
 import BacktestPage from './components/BacktestPage';
 import LoginPage from './components/LoginPage';
-import SystemErrorLogPage from './components/SystemErrorLogPage';
-import UserManagementPage from './components/UserManagementPage';
+import SystemManagementPage from './components/SystemManagementPage';
 import ApiKeyPage from './components/ApiKeyPage';
 import SharedBacktestPage from './components/SharedBacktestPage';
 import ReleaseNotificationManager from './components/ReleaseNotificationManager';
@@ -44,7 +43,7 @@ async function enterResearchCenter(): Promise<void> {
 
 function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogout: () => void }) {
   const [urlParams, setUrlParams] = useUrlState();
-  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'experiments' | 'sharedBacktests' | 'apiKeys' | 'users' | 'systemErrors'>(
+  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'experiments' | 'sharedBacktests' | 'apiKeys' | 'system'>(
     urlParams.workspace === 'experiments' ? 'experiments' : 'backtest',
   );
   const [experimentSubject, setExperimentSubject] = useState<ExperimentSubjectRef | null>(() => (
@@ -222,8 +221,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
           { key: 'sharedBacktests' as const, label: '策略广场' },
           { key: 'signals' as const, label: '信号可视化' },
           { key: 'apiKeys' as const, label: 'API Key' },
-          ...(currentUser.role === 'admin' ? [{ key: 'users' as const, label: '人员管理' }] : []),
-          ...(currentUser.role === 'admin' ? [{ key: 'systemErrors' as const, label: '回测诊断日志' }] : []),
+          ...(currentUser.role === 'admin' ? [{ key: 'system' as const, label: '系统管理' }] : []),
         ].map((item) => {
           const active = activePage === item.key;
           return (
@@ -432,12 +430,8 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
         />
       )}
 
-      {activePage === 'users' && (
-        <UserManagementPage />
-      )}
-
-      {activePage === 'systemErrors' && (
-        <SystemErrorLogPage />
+      {activePage === 'system' && (
+        <SystemManagementPage />
       )}
 
       {activePage === 'apiKeys' && (

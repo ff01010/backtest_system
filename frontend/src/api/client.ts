@@ -295,6 +295,29 @@ export interface ManagedUserPage {
   total: number;
 }
 
+export interface BacktestRunnerResourceStatus {
+  healthy: number;
+  errors: number;
+  queued: number;
+  oldestQueuedSeconds: number | null;
+}
+
+export interface BacktestResourceStatus {
+  baseLimit: number;
+  burstLimit: number;
+  effectiveLimit: number;
+  overrideLimit: number | null;
+  overrideExpiresAt: string | null;
+  activeCount: number;
+  barActiveCount: number;
+  l2ActiveCount: number;
+  runnerStatus: 'ok' | 'degraded';
+  runners: {
+    bar: BacktestRunnerResourceStatus;
+    l2: BacktestRunnerResourceStatus;
+  };
+}
+
 export interface SystemErrorLogEntry {
   id: number;
   runId: string;
@@ -504,6 +527,10 @@ export async function deleteUser(userId: string): Promise<{ action: 'deleted' | 
     throw new Error(`API ${res.status}: ${await res.text()}`);
   }
   return res.json();
+}
+
+export async function fetchBacktestResourceStatus(): Promise<BacktestResourceStatus> {
+  return fetchNoStoreJson<BacktestResourceStatus>(`${BASE}/admin/backtest-capacity`);
 }
 
 export async function fetchSystemErrorLogs(filters: {

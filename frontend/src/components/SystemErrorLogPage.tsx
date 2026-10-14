@@ -1,16 +1,19 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  fetchBacktestResourceStatus,
   fetchBacktestRunDiagnostics,
   fetchStrategyRuntimeErrorStats,
   fetchSystemErrorLogs,
   fetchUsers,
 } from '../api/client';
 import type {
+  BacktestResourceStatus,
   BacktestRunDiagnostics,
   ManagedUser,
   StrategyRuntimeErrorStat,
   SystemErrorLogEntry,
 } from '../api/client';
+import BacktestResourceStatusPanel from './BacktestResourceStatusPanel';
 
 interface Filters {
   userId: string;
@@ -38,8 +41,13 @@ export default function SystemErrorLogPage() {
   const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [resourceStatus, setResourceStatus] = useState<BacktestResourceStatus | null>(null);
+  const [resourceLoading, setResourceLoading] = useState(false);
+  const [resourceError, setResourceError] = useState('');
+  const [resourceUpdatedAt, setResourceUpdatedAt] = useState<Date | null>(null);
+  const resourceRequestIdRef = useRef(0);
 
-  const refresh = async () => {
+  const refreshLogs = async () => {
     setLoading(true);
     try {
       const timeFilters = {
@@ -69,10 +77,35 @@ export default function SystemErrorLogPage() {
     }
   };
 
+  const refreshResources = useCallback(async (showLoading = true) => {
+    const requestId = ++resourceRequestIdRef.current;
+    if (showLoading) setResourceLoading(true);
+    try {
+      const nextStatus = await fetchBacktestResourceStatus();
+      if (requestId !== resourceRequestIdRef.current) return;
+      setResourceStatus(nextStatus);
+      setResourceUpdatedAt(new Date());
+      setResourceError('');
+    } catch (reason) {
+      if (requestId !== resourceRequestIdRef.current) return;
+      setResourceError(reason instanceof Error ? reason.message : '无法读取回测资源状态');
+    } finally {
+      if (requestId === resourceRequestIdRef.current) setResourceLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void fetchUsers().then(setUsers).catch(() => {});
-    void refresh();
-  }, []);
+    void refreshLogs();
+    void refreshResources();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshResources(false);
+    }, 5000);
+    return () => {
+      window.clearInterval(timer);
+      resourceRequestIdRef.current += 1;
+    };
+  }, [refreshResources]);
 
   const selected = items.find((item) => item.id === selectedId) || null;
 
@@ -95,12 +128,27 @@ export default function SystemErrorLogPage() {
       <div style={contentStyle}>
         <header style={headerStyle}>
           <div>
-            <div style={eyebrowStyle}>SYSTEM OBSERVABILITY</div>
-            <h2 style={{ margin: '5px 0 4px', color: 'var(--text)' }}>回测诊断日志</h2>
-            <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>记录系统错误和需维护的数据异常；策略脚本错误仍在策略回测页展示。</p>
+            <div style={eyebrowStyle}>BACKTEST OBSERVABILITY</div>
+            <h2 style={{ margin: '5px 0 4px', color: 'var(--text)' }}>回测监控与诊断</h2>
+            <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>监控回测调度容量、执行器与队列状态，并查询系统错误及单任务执行时间线。</p>
           </div>
-          <button type="button" disabled={loading} onClick={() => void refresh()} style={buttonStyle}>{loading ? '读取中…' : '刷新日志'}</button>
+          <button
+            type="button"
+            disabled={loading || resourceLoading}
+            onClick={() => void Promise.all([refreshLogs(), refreshResources()])}
+            style={buttonStyle}
+          >
+            {loading || resourceLoading ? '读取中…' : '刷新全部'}
+          </button>
         </header>
+
+        <BacktestResourceStatusPanel
+          status={resourceStatus}
+          loading={resourceLoading}
+          error={resourceError}
+          updatedAt={resourceUpdatedAt}
+          onRefresh={() => void refreshResources()}
+        />
 
         <div style={filterStyle}>
           <label style={fieldStyle}>使用者<select value={filters.userId} onChange={(event) => setFilters({ ...filters, userId: event.target.value })} style={inputStyle}>
@@ -110,7 +158,7 @@ export default function SystemErrorLogPage() {
           <label style={fieldStyle}>错误代码<input value={filters.errorCode} onChange={(event) => setFilters({ ...filters, errorCode: event.target.value })} placeholder="如 clickhouse.host_unresolved" style={inputStyle} /></label>
           <label style={fieldStyle}>开始时间<input type="datetime-local" value={filters.fromTime} onChange={(event) => setFilters({ ...filters, fromTime: event.target.value })} style={inputStyle} /></label>
           <label style={fieldStyle}>结束时间<input type="datetime-local" value={filters.toTime} onChange={(event) => setFilters({ ...filters, toTime: event.target.value })} style={inputStyle} /></label>
-          <button type="button" onClick={() => void refresh()} style={{ ...buttonStyle, alignSelf: 'end' }}>筛选</button>
+          <button type="button" onClick={() => void refreshLogs()} style={{ ...buttonStyle, alignSelf: 'end' }}>筛选</button>
           <button type="button" onClick={() => { setFilters(emptyFilters); }} style={secondaryButtonStyle}>重置</button>
         </div>
 

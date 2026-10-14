@@ -1556,7 +1556,13 @@ def admin_strategy_runtime_errors(
 @app.get("/api/admin/backtest-capacity")
 def admin_backtest_capacity(request: Request):
   _require_admin(request)
-  return state_store.get_backtest_scheduler_capacity()
+  capacity = state_store.get_backtest_scheduler_capacity()
+  runner_health = state_store.get_backtest_runner_health()
+  return {
+    **capacity,
+    "runnerStatus": runner_health["status"],
+    "runners": runner_health["runners"],
+  }
 
 
 @app.put("/api/admin/backtest-capacity")

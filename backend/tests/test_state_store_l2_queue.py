@@ -111,6 +111,42 @@ def test_runner_availability_accepts_visible_healthy_heartbeat(monkeypatch: Any)
   assert state_store.has_healthy_backtest_runner("l2") is True
 
 
+def test_runner_health_reports_queue_age_for_each_job_kind(monkeypatch: Any) -> None:
+  cursor = FakeCursor(None, rows=[
+    {
+      "job_kind": "bar", "healthy_count": 16, "error_count": 0,
+      "queued_count": 3, "oldest_queued_seconds": 83,
+    },
+    {
+      "job_kind": "l2", "healthy_count": 15, "error_count": 1,
+      "queued_count": 0, "oldest_queued_seconds": None,
+    },
+  ])
+  connection = FakeConnection(cursor)
+  monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
+
+  result = state_store.get_backtest_runner_health()
+
+  assert result == {
+    "status": "ok",
+    "runners": {
+      "bar": {
+        "healthy": 16, "errors": 0, "queued": 3,
+        "oldestQueuedSeconds": 83,
+      },
+      "l2": {
+        "healthy": 15, "errors": 1, "queued": 0,
+        "oldestQueuedSeconds": None,
+      },
+    },
+  }
+  query, params = cursor.commands[0]
+  assert "oldest_queued_seconds" in query
+  assert "now() - min(created_at)" in query
+  assert params is not None
+  assert len(params) == 12
+
+
 def test_runner_health_read_policy_does_not_relax_writes() -> None:
   migration_path = Path(__file__).resolve().parents[2] / "db" / "migrations" / (
     "024_backtest_runner_health_read_policy.sql"

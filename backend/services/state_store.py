@@ -2132,7 +2132,15 @@ def get_backtest_runner_health() -> dict[str, Any]:
                   WHERE status='queued' AND runtime_version=%s AND capability_digest=%s)
             ELSE (SELECT count(*) FROM l2_backtest_job
                   WHERE status='queued' AND runtime_version=%s AND capability_digest=%s)
-          END AS queued_count
+          END AS queued_count,
+          CASE WHEN kinds.job_kind='bar'
+            THEN (SELECT EXTRACT(EPOCH FROM (now() - min(created_at)))::bigint
+                  FROM bar_backtest_job
+                  WHERE status='queued' AND runtime_version=%s AND capability_digest=%s)
+            ELSE (SELECT EXTRACT(EPOCH FROM (now() - min(created_at)))::bigint
+                  FROM l2_backtest_job
+                  WHERE status='queued' AND runtime_version=%s AND capability_digest=%s)
+          END AS oldest_queued_seconds
         FROM kinds
         LEFT JOIN backtest_runner_health health
           ON health.job_kind=kinds.job_kind
@@ -2148,6 +2156,10 @@ def get_backtest_runner_health() -> dict[str, Any]:
         RUNTIME_CAPABILITY_DIGEST,
         SCRIPT_RUNTIME_VERSION,
         RUNTIME_CAPABILITY_DIGEST,
+        SCRIPT_RUNTIME_VERSION,
+        RUNTIME_CAPABILITY_DIGEST,
+        SCRIPT_RUNTIME_VERSION,
+        RUNTIME_CAPABILITY_DIGEST,
       ))
       rows = cur.fetchall()
   runners = {
@@ -2155,6 +2167,10 @@ def get_backtest_runner_health() -> dict[str, Any]:
       "healthy": int(row["healthy_count"]),
       "errors": int(row["error_count"]),
       "queued": int(row["queued_count"]),
+      "oldestQueuedSeconds": (
+        max(0, int(row["oldest_queued_seconds"]))
+        if row.get("oldest_queued_seconds") is not None else None
+      ),
     }
     for row in rows
   }
