@@ -167,3 +167,35 @@ def test_web_catalog_strategy_keeps_existing_entry_type_compatibility(
 
   assert result["config"]["id"] == "config-1"
   assert captured["script"]["entryType"] == "catalog:trend_follow"
+
+
+def test_create_strategy_rejects_existing_identity() -> None:
+  command = _command()
+  command = strategy_lifecycle.StrategySaveCommand(
+    **{**command.__dict__, "config_id": "config-1"},
+  )
+
+  with pytest.raises(
+    strategy_lifecycle.StrategyLifecycleError,
+    match="不能携带已有策略身份",
+  ):
+    strategy_lifecycle.create_strategy(command)
+
+
+def test_update_strategy_uses_config_identity_and_revision(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  captured: list[str | int | None] = []
+
+  def save(command: strategy_lifecycle.StrategySaveCommand) -> dict[str, Any]:
+    captured.extend([
+      command.config_id, command.script_id, command.expected_revision,
+    ])
+    return {"config": {"id": command.config_id}, "script": {"id": "script-1"}}
+
+  monkeypatch.setattr(strategy_lifecycle, "save_strategy", save)
+
+  result = strategy_lifecycle.update_strategy("config-1", 3, _command())
+
+  assert result["config"]["id"] == "config-1"
+  assert captured == ["config-1", None, 3]

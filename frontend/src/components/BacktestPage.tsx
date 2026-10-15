@@ -29,11 +29,13 @@ import {
   fetchResearchSignalDatasets,
   fetchStrategyParameterSchema,
   fetchStrategySource,
-  fetchStrategyConfigs,
-  fetchStrategyConfigVersions,
+  fetchCompleteStrategy,
+  fetchStrategyConfigPage,
+  fetchStrategyConfigVersionPage,
   BacktestRequestError,
   runBacktest,
-  saveCompleteStrategy,
+  createCompleteStrategy,
+  updateCompleteStrategy,
   publishBacktestRun,
   setBacktestRunFavorite,
   updateBacktestRunMeta,
@@ -56,6 +58,7 @@ import type {
   EquityPoint,
   InstrumentItem,
   StrategyConfig,
+  StrategyConfigSummary,
   StrategyParameterSchema,
   StrategyConfigVersion,
   StrategySource,
@@ -85,6 +88,7 @@ import { useSignalDetailExports } from '../hooks/useSignalDetailExports';
 import BacktestTabs from './BacktestTabs';
 import InstrumentSearchField from './InstrumentSearchField';
 import SignalDetailExportDrawer from './SignalDetailExportDrawer';
+import StrategyConfigSelector from './StrategyConfigSelector';
 import StrategyGuideDrawer from './StrategyGuideDrawer';
 
 import BacktestDateRangePicker, { type RangeAvailability } from './BacktestDateRangePicker';
@@ -134,6 +138,34 @@ const fieldStyle = {
   padding: '0 10px',
   fontSize: typography.base,
 } as const;
+
+type StrategyDraftMode = 'editing' | 'new' | 'copy';
+
+function strategyConfigSummary(config: StrategyConfig): StrategyConfigSummary {
+  const params = config.paramsJson.params;
+  const fillModel = params && typeof params === 'object'
+    && typeof (params as Record<string, unknown>).fillModel === 'string'
+    ? String((params as Record<string, unknown>).fillModel)
+    : 'bar_next_open';
+  return {
+    id: config.id,
+    name: config.name,
+    scriptId: config.scriptId || '',
+    strategyVersionId: config.strategyVersionId || '',
+    scriptVersionNo: config.scriptVersionNo,
+    versionNo: config.versionNo,
+    revision: config.revision,
+    strategy: config.strategy,
+    mode: config.mode,
+    symbol: config.symbol,
+    timeframe: config.timeframe,
+    fillModel,
+    enabled: config.enabled,
+    published: config.published,
+    publishedVersionId: config.publishedVersionId,
+    updatedAt: config.updatedAt,
+  };
+}
 
 const SELECTABLE_HISTORY_RUN_STATUSES = new Set([
   'ok', 'succeeded', 'error', 'failed', 'cancelled',
@@ -1388,7 +1420,16 @@ export default function BacktestPage({
   const [strategyParameterSchema, setStrategyParameterSchema] = useState<StrategyParameterSchema | null>(null);
   const [strategySchemaError, setStrategySchemaError] = useState('');
   const [loadingStrategySchema, setLoadingStrategySchema] = useState(false);
-  const [strategyConfigs, setStrategyConfigs] = useState<StrategyConfig[]>([]);
+  const [strategyConfigs, setStrategyConfigs] = useState<StrategyConfigSummary[]>([]);
+  const [selectedConfig, setSelectedConfig] = useState<StrategyConfig | null>(null);
+  const [strategyConfigTotal, setStrategyConfigTotal] = useState(0);
+  const [strategyConfigNextCursor, setStrategyConfigNextCursor] = useState<string | null>(null);
+  const [strategyConfigQuery, setStrategyConfigQuery] = useState('');
+  const [strategyConfigLoading, setStrategyConfigLoading] = useState(false);
+  const [strategyConfigLoadingMore, setStrategyConfigLoadingMore] = useState(false);
+  const [strategyConfigError, setStrategyConfigError] = useState('');
+  const strategyConfigRequestIdRef = useRef(0);
+  const strategyDetailRequestIdRef = useRef(0);
   const [researchSignalDatasets, setResearchSignalDatasets] = useState<ResearchSignalDataset[]>([]);
   const [researchSignalLoadError, setResearchSignalLoadError] = useState('');
   const [loadingResearchSignals, setLoadingResearchSignals] = useState(false);
@@ -1396,6 +1437,8 @@ export default function BacktestPage({
   const [strategySource, setStrategySource] = useState<StrategySource | null>(null);
   const [strategySourceError, setStrategySourceError] = useState('');
   const [configVersions, setConfigVersions] = useState<StrategyConfigVersion[]>([]);
+  const [configVersionNextCursor, setConfigVersionNextCursor] = useState<string | null>(null);
+  const [configVersionsOpen, setConfigVersionsOpen] = useState(false);
   const [backtestRuns, setBacktestRuns] = useState<BacktestRunHistory[]>([]);
   const [historyRunDetails, setHistoryRunDetails] = useState<Record<string, BacktestRunHistory>>({});
   const [historySelection, setHistorySelection] = useState(emptyBacktestRunSelection);
@@ -1433,11 +1476,13 @@ export default function BacktestPage({
   const [deletingHistorySelection, setDeletingHistorySelection] = useState(false);
   const [selectedScriptId, setSelectedScriptId] = useState<string>('');
   const [selectedConfigId, setSelectedConfigId] = useState<string>('');
+  const [strategyDraftMode, setStrategyDraftMode] = useState<StrategyDraftMode>('new');
   const lastRequestedConfigIdRef = useRef<string | null>(null);
   const [versionDirty, setVersionDirty] = useState(false);
   const [experimentDirty, setExperimentDirty] = useState(false);
   const [savedStrategyParams, setSavedStrategyParams] = useState<Record<string, BacktestParamValue>>({});
   const [strategySavePending, setStrategySavePending] = useState(false);
+  const strategySaveSubmissionRef = useRef(false);
   const strategySaveActionRef = useRef<() => Promise<string | null>>(async () => null);
   const [publishedFingerprint, setPublishedFingerprint] = useState('');
   const [publishedExperimentFingerprint, setPublishedExperimentFingerprint] = useState('');
@@ -1593,7 +1638,6 @@ export default function BacktestPage({
   }, [instruments]);
 
   useEffect(() => {
-    refreshStrategyAssets();
     const signalDatasetId = new URLSearchParams(window.location.search).get('signalDatasetId');
     if (signalDatasetId) setSelectedSignalDatasetId(signalDatasetId);
     setLoadingResearchSignals(true);
@@ -1613,6 +1657,36 @@ export default function BacktestPage({
       })
       .finally(() => setLoadingResearchSignals(false));
   }, []);
+
+  useEffect(() => {
+    const requestId = ++strategyConfigRequestIdRef.current;
+    setStrategyConfigLoading(true);
+    setStrategyConfigLoadingMore(false);
+    setStrategyConfigError('');
+    const timer = window.setTimeout(() => {
+      fetchStrategyConfigPage({ limit: 50, query: strategyConfigQuery })
+        .then((page) => {
+          if (requestId !== strategyConfigRequestIdRef.current) return;
+          setStrategyConfigs(page.items);
+          setStrategyConfigNextCursor(page.nextCursor);
+          setStrategyConfigTotal(page.total);
+        })
+        .catch((loadError: unknown) => {
+          if (requestId !== strategyConfigRequestIdRef.current) return;
+          setStrategyConfigs([]);
+          setStrategyConfigNextCursor(null);
+          setStrategyConfigError(
+            loadError instanceof Error ? loadError.message : '加载策略资产失败',
+          );
+        })
+        .finally(() => {
+          if (requestId === strategyConfigRequestIdRef.current) {
+            setStrategyConfigLoading(false);
+          }
+        });
+    }, strategyConfigQuery.trim() ? 250 : 0);
+    return () => window.clearTimeout(timer);
+  }, [strategyConfigQuery]);
 
   useEffect(() => {
     historyRequestIdRef.current += 1;
@@ -1816,20 +1890,27 @@ export default function BacktestPage({
   }, [holdingStartDate, holdingEndDate, holdingStatusFilter, holdingPageSize, result]);
 
   useEffect(() => {
-    if (!selectedConfigId) {
+    if (!selectedConfigId || !configVersionsOpen) {
       setConfigVersions([]);
+      setConfigVersionNextCursor(null);
       return;
     }
     let cancelled = false;
-    fetchStrategyConfigVersions(selectedConfigId)
-      .then((versions) => {
-        if (!cancelled) setConfigVersions(versions);
+    fetchStrategyConfigVersionPage(selectedConfigId)
+      .then((page) => {
+        if (!cancelled) {
+          setConfigVersions(page.items);
+          setConfigVersionNextCursor(page.nextCursor);
+        }
       })
       .catch(() => {
-        if (!cancelled) setConfigVersions([]);
+        if (!cancelled) {
+          setConfigVersions([]);
+          setConfigVersionNextCursor(null);
+        }
       });
     return () => { cancelled = true; };
-  }, [selectedConfigId]);
+  }, [selectedConfigId, configVersionsOpen]);
 
   useEffect(() => {
     if (backtestRuns.length === 0) {
@@ -1921,9 +2002,53 @@ export default function BacktestPage({
     }
   };
 
-  const refreshStrategyAssets = async () => {
-    const configs = await fetchStrategyConfigs();
-    setStrategyConfigs(configs);
+  const loadMoreStrategyAssets = async () => {
+    if (!strategyConfigNextCursor || strategyConfigLoadingMore) return;
+    const requestId = strategyConfigRequestIdRef.current;
+    setStrategyConfigLoadingMore(true);
+    setStrategyConfigError('');
+    try {
+      const page = await fetchStrategyConfigPage({
+        limit: 50,
+        cursor: strategyConfigNextCursor,
+        query: strategyConfigQuery,
+      });
+      if (requestId !== strategyConfigRequestIdRef.current) return;
+      setStrategyConfigs((current) => {
+        const merged = new Map(current.map((item) => [item.id, item]));
+        page.items.forEach((item) => merged.set(item.id, item));
+        return [...merged.values()];
+      });
+      setStrategyConfigNextCursor(page.nextCursor);
+      setStrategyConfigTotal(page.total);
+    } catch (loadError) {
+      if (requestId === strategyConfigRequestIdRef.current) {
+        setStrategyConfigError(
+          loadError instanceof Error ? loadError.message : '加载更多策略失败',
+        );
+      }
+    } finally {
+      if (requestId === strategyConfigRequestIdRef.current) {
+        setStrategyConfigLoadingMore(false);
+      }
+    }
+  };
+
+  const loadMoreConfigVersions = async () => {
+    if (!selectedConfigId || !configVersionNextCursor) return;
+    try {
+      const page = await fetchStrategyConfigVersionPage(
+        selectedConfigId, 50, configVersionNextCursor,
+      );
+      setConfigVersions((current) => {
+        const merged = new Map(current.map((item) => [item.id, item]));
+        page.items.forEach((item) => merged.set(item.id, item));
+        return [...merged.values()];
+      });
+      setConfigVersionNextCursor(page.nextCursor);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : '加载版本历史失败');
+    }
   };
 
   const refreshBacktestRuns = async (targetPage = historyPage) => {
@@ -2023,7 +2148,11 @@ export default function BacktestPage({
     }));
     const normalizedParams = normalizeSavedBacktestParams(savedParams, nextSavedStrategyParams);
     setSelectedConfigId(config.id);
+    setSelectedConfig(config);
+    setStrategyDraftMode('editing');
     setConfigVersions([]);
+    setConfigVersionNextCursor(null);
+    setConfigVersionsOpen(false);
     setPublishedFingerprint('');
     setConfigName(config.name);
     setSelectedSymbol(config.symbol);
@@ -2077,15 +2206,15 @@ export default function BacktestPage({
       .finally(() => {
         if (!cancelled) setLoadingResearchSignals(false);
       });
-    fetchStrategyConfigs()
-      .then((configs) => {
+    fetchCompleteStrategy(requestedConfigId)
+      .then((requested) => {
         if (cancelled) return;
-        setStrategyConfigs(configs);
-        const requested = configs.find((item) => item.id === requestedConfigId);
-        if (!requested) {
-          setError('复制的策略当前不可用');
-          return;
-        }
+        const summary = strategyConfigSummary(requested);
+        setStrategyConfigs((current) => (
+          current.some((item) => item.id === summary.id)
+            ? current.map((item) => item.id === summary.id ? summary : item)
+            : [summary, ...current]
+        ));
         lastRequestedConfigIdRef.current = requestedConfigId;
         applyStrategyConfig(requested);
       })
@@ -2355,21 +2484,38 @@ export default function BacktestPage({
     if (account) applyAccount(account);
   };
 
-  const handleConfigSelect = (value: string) => {
+  const handleConfigSelect = async (value: string) => {
     if (!value) {
+      strategyDetailRequestIdRef.current += 1;
       setSelectedConfigId('');
+      setSelectedConfig(null);
+      setStrategyDraftMode('new');
       setConfigName('');
       return;
     }
-    const config = strategyConfigs.find((item) => item.id === value);
-    if (config) applyStrategyConfig(config);
+    const requestId = ++strategyDetailRequestIdRef.current;
+    setStrategyConfigError('');
+    try {
+      const config = await fetchCompleteStrategy(value);
+      if (requestId !== strategyDetailRequestIdRef.current) return;
+      applyStrategyConfig(config);
+    } catch (loadError) {
+      if (requestId !== strategyDetailRequestIdRef.current) return;
+      setStrategyConfigError(
+        loadError instanceof Error ? loadError.message : '加载策略详情失败',
+      );
+      setError(loadError instanceof Error ? loadError.message : '加载策略详情失败');
+    }
   };
 
   const handleNewStrategy = () => {
     setSelectedConfigId('');
+    setSelectedConfig(null);
+    setStrategyDraftMode('new');
     setSelectedScriptId('');
     setConfigName('');
     setConfigVersions([]);
+    setConfigVersionsOpen(false);
     setPublishedFingerprint('');
     setPublishedExperimentFingerprint('');
     setVersionDirty(false);
@@ -2385,16 +2531,13 @@ export default function BacktestPage({
   const handleCopyStrategy = () => {
     if (!hasSelectedConfig) return;
     const sourceName = configName.trim() || scriptForm.name.trim() || '未命名策略';
-    const existingNames = new Set(strategyConfigs.map((item) => item.name));
-    let copyNumber = 1;
-    let copiedName = `${sourceName} 副本`;
-    while (existingNames.has(copiedName)) {
-      copyNumber += 1;
-      copiedName = `${sourceName} 副本 ${copyNumber}`;
-    }
+    const copiedName = `${sourceName} 副本`;
     setSelectedConfigId('');
+    setSelectedConfig(null);
+    setStrategyDraftMode('copy');
     setSelectedScriptId('');
     setConfigVersions([]);
+    setConfigVersionsOpen(false);
     setConfigName(copiedName);
     setScriptForm((previous) => ({ ...previous, name: copiedName }));
     setPublishedFingerprint('');
@@ -2406,7 +2549,7 @@ export default function BacktestPage({
   };
 
   const handleSaveConfig = async (): Promise<string | null> => {
-
+    if (strategySaveSubmissionRef.current) return null;
     setError('');
     setStatus('');
     if (unsupportedTimeframeError) {
@@ -2428,6 +2571,7 @@ export default function BacktestPage({
       setError('自定义脚本策略必须选择或新建一个 on_bar 策略代码');
       return null;
     }
+    strategySaveSubmissionRef.current = true;
     setStrategySavePending(true);
     try {
       const isCustomScript = isCustomScriptStrategy(selectedStrategy);
@@ -2452,23 +2596,46 @@ export default function BacktestPage({
         ),
         publish: false,
       };
-      const currentConfig = strategyConfigs.find((item) => item.id === selectedConfigId);
-      const targetConfigId = hasSelectedConfig ? selectedConfigId : null;
-      const { config } = await saveCompleteStrategy(
-        scriptPayload,
-        configPayload,
-        hasSelectedConfig ? selectedScriptId : null,
-        targetConfigId,
-        currentConfig?.revision ?? null,
+      const { config } = strategyDraftMode === 'editing' && selectedConfigId
+        ? await updateCompleteStrategy(
+          selectedConfigId,
+          scriptPayload,
+          configPayload,
+          selectedConfig?.revision ?? 0,
+        )
+        : await createCompleteStrategy(scriptPayload, configPayload);
+      const summary = strategyConfigSummary(config);
+      const queryValue = strategyConfigQuery.trim().toLocaleLowerCase();
+      const previousSummary = selectedConfig
+        ? strategyConfigSummary(selectedConfig)
+        : strategyConfigs.find((item) => item.id === summary.id) || null;
+      const previousMatchesQuery = previousSummary != null && (
+        !queryValue || previousSummary.name.toLocaleLowerCase().includes(queryValue)
       );
-      await refreshStrategyAssets();
+      const matchesQuery = !queryValue
+        || summary.name.toLocaleLowerCase().includes(queryValue);
+      setStrategyConfigs((current) => {
+        const exists = current.some((item) => item.id === summary.id);
+        if (!matchesQuery) return current.filter((item) => item.id !== summary.id);
+        return exists
+          ? current.map((item) => item.id === summary.id ? summary : item)
+          : [summary, ...current];
+      });
+      if (strategyDraftMode !== 'editing' && matchesQuery) {
+        setStrategyConfigTotal((current) => current + 1);
+      } else if (strategyDraftMode === 'editing' && previousMatchesQuery !== matchesQuery) {
+        setStrategyConfigTotal((current) => Math.max(
+          0, current + (matchesQuery ? 1 : -1),
+        ));
+      }
       applyStrategyConfig(config);
-      setStatus(`已保存策略 ${config.name}`);
+      setStatus(`已保存策略 ${config.name}（完整版本 V${config.versionNo}）`);
       return config.id;
     } catch (e) {
       setError(e instanceof Error ? e.message : '保存策略失败');
       return null;
     } finally {
+      strategySaveSubmissionRef.current = false;
       setStrategySavePending(false);
     }
   };
@@ -2481,10 +2648,23 @@ export default function BacktestPage({
     setStatus('');
     try {
       await deleteStrategyConfig(selectedConfigId);
-      await refreshStrategyAssets();
+      const archivedSummary = strategyConfigs.find((item) => item.id === selectedConfigId)
+        || (selectedConfig ? strategyConfigSummary(selectedConfig) : null);
+      setStrategyConfigs((current) => current.filter((item) => item.id !== selectedConfigId));
+      const queryValue = strategyConfigQuery.trim().toLocaleLowerCase();
+      const archivedMatchesQuery = archivedSummary != null && (
+        !queryValue || archivedSummary.name.toLocaleLowerCase().includes(queryValue)
+      );
+      if (archivedMatchesQuery) {
+        setStrategyConfigTotal((current) => Math.max(0, current - 1));
+      }
       setSelectedConfigId('');
+      setSelectedConfig(null);
+      setStrategyDraftMode('new');
       setSelectedScriptId('');
       setConfigVersions([]);
+      setConfigVersionNextCursor(null);
+      setConfigVersionsOpen(false);
       setConfigName('');
       setPublishedFingerprint('');
       setPublishedExperimentFingerprint('');
@@ -3046,8 +3226,26 @@ export default function BacktestPage({
     { id: 'positions' as WorkbenchPanel, label: '持仓收益', icon: Database },
     { id: 'history' as WorkbenchPanel, label: '历史回测', icon: History },
   ];
-  const activeConfig = strategyConfigs.find((item) => item.id === selectedConfigId);
+  const activeConfig = selectedConfig;
+  const selectedConfigSummary = strategyConfigs.find((item) => item.id === selectedConfigId)
+    || (selectedConfig ? strategyConfigSummary(selectedConfig) : null);
   const configNameById = new Map(strategyConfigs.map((item) => [item.id, item.name]));
+  const renderStrategySelector = () => (
+    <StrategyConfigSelector
+      value={selectedConfigId}
+      selected={selectedConfigSummary}
+      items={strategyConfigs}
+      total={strategyConfigTotal}
+      query={strategyConfigQuery}
+      loading={strategyConfigLoading}
+      loadingMore={strategyConfigLoadingMore}
+      error={strategyConfigError}
+      hasMore={strategyConfigNextCursor != null}
+      onQueryChange={setStrategyConfigQuery}
+      onSelect={(configId) => { void handleConfigSelect(configId); }}
+      onLoadMore={() => { void loadMoreStrategyAssets(); }}
+    />
+  );
   const selectedHistoryRun = backtestRuns.find((item) => item.id === selectedHistoryRunId)
     || historyRunDetails[selectedHistoryRunId]
     || null;
@@ -3651,18 +3849,7 @@ export default function BacktestPage({
             <span style={{ color: '#64748b', fontSize: 12, whiteSpace: 'nowrap' }}>
               策略方案
             </span>
-            <select
-              value={selectedConfigId}
-              onChange={(e) => handleConfigSelect(e.target.value)}
-              style={fieldStyle}
-            >
-              <option value="">未选择策略方案</option>
-              {strategyConfigs.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
+            {renderStrategySelector()}
           </label>
           <div style={{
             minWidth: 0,
@@ -3815,7 +4002,7 @@ export default function BacktestPage({
                 <div style={{ color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
                   <div>名称：{activeConfig?.name || configName || '未选择策略方案'}</div>
                   <div>模式：回测</div>
-                  <div>脚本版本：{activeConfig ? `v${activeConfig.scriptVersionNo}` : '未绑定'}</div>
+                  <div>完整版本：{activeConfig ? `V${activeConfig.versionNo}` : '未绑定'}</div>
                   {activeConfig?.sharedSource && (
                     <div>
                       来源：{activeConfig.sharedSource.title} · 原作者 {activeConfig.sharedSource.authorName}
@@ -3976,7 +4163,7 @@ export default function BacktestPage({
                 <div>历史回测：{historyTotal}</div>
                 <div>当前方案：{activeConfig?.name || '未选择'}</div>
                 <div>方案版本：{configVersions.length}</div>
-                <div>当前脚本版本：{activeConfig?.scriptVersionNo ?? '未选择'}</div>
+                <div>当前完整版本：{activeConfig?.versionNo ?? '未选择'}</div>
               </div>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff' }}>
                 <div style={{ color: '#0f172a', fontSize: 13, fontWeight: 700, marginBottom: 10 }}>
@@ -4022,8 +4209,8 @@ export default function BacktestPage({
           {activePanel === 'logs' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <div style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#334155', fontSize: 13, lineHeight: 1.7 }}>
-                <div>已保存策略：{strategyConfigs.length}</div>
-                <div>独立脚本：{strategyConfigs.length}</div>
+                <div>已保存策略：{strategyConfigTotal}</div>
+                <div>独立脚本：{strategyConfigTotal}</div>
                 <div>当前回测：{result ? formatRunReference(result.displayNo) : '暂无'}</div>
               </div>
               <div style={{ color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
@@ -4088,22 +4275,11 @@ export default function BacktestPage({
                 }}>
                   <div className="strategy-panel-heading">
                     <span>策略资产</span>
-                    <span>{strategyConfigs.length} 个方案</span>
+                    <span>{strategyConfigTotal} 个方案</span>
                   </div>
                   <label>
                     <div style={labelStyle}>策略方案</div>
-                    <select
-                      value={selectedConfigId}
-                      onChange={(e) => handleConfigSelect(e.target.value)}
-                      style={fieldStyle}
-                    >
-                      <option value="">未选择策略方案</option>
-                      {strategyConfigs.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.name}
-                        </option>
-                      ))}
-                    </select>
+                    {renderStrategySelector()}
                   </label>
                   <input
                     value={configName}
@@ -4152,6 +4328,7 @@ export default function BacktestPage({
                     </button>
                     <button
                       onClick={handleSaveConfig}
+                      disabled={strategySavePending}
                       style={{
                         height: 34,
                         borderRadius: 4,
@@ -4162,11 +4339,12 @@ export default function BacktestPage({
                         alignItems: 'center',
                         justifyContent: 'center',
                         gap: 6,
-                        cursor: 'pointer',
+                        cursor: strategySavePending ? 'wait' : 'pointer',
+                        opacity: strategySavePending ? 0.7 : 1,
                       }}
                     >
                       <Save size={14} />
-                      保存策略
+                      {strategySavePending ? '正在保存…' : '保存策略'}
                     </button>
                     <button
                       onClick={handleDeleteConfig}
@@ -4184,6 +4362,36 @@ export default function BacktestPage({
                       归档策略
                     </button>
                   </div>
+                  {hasSelectedConfig && (
+                    <details
+                      open={configVersionsOpen}
+                      onToggle={(event) => setConfigVersionsOpen(event.currentTarget.open)}
+                      style={{ ...panelStyle, padding: '8px 10px', background: '#fff' }}
+                    >
+                      <summary style={{ cursor: 'pointer', color: '#334155', fontSize: 12 }}>
+                        完整版本 V{activeConfig?.versionNo ?? '—'}
+                      </summary>
+                      <div style={{ display: 'grid', gap: 6, marginTop: 8 }}>
+                        {configVersions.map((version) => (
+                          <div key={version.id} style={{ color: '#64748b', fontSize: 11 }}>
+                            V{version.versionNo} · {version.createdAt}
+                          </div>
+                        ))}
+                        {configVersions.length === 0 && (
+                          <span style={{ color: '#64748b', fontSize: 11 }}>正在读取版本历史…</span>
+                        )}
+                        {configVersionNextCursor && (
+                          <button
+                            type="button"
+                            onClick={() => { void loadMoreConfigVersions(); }}
+                            style={{ border: 0, background: 'transparent', color: '#0f766e', cursor: 'pointer' }}
+                          >
+                            加载更多版本
+                          </button>
+                        )}
+                      </div>
+                    </details>
+                  )}
                   <div className="strategy-asset-note" style={{ ...panelStyle, padding: 12, background: '#ffffff', color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
                     保存会同时更新代码和参数，并生成不可变版本。每次回测都绑定当时的精确版本。
                   </div>
@@ -5927,18 +6135,7 @@ export default function BacktestPage({
 
             <label>
               <div style={labelStyle}>策略</div>
-              <select
-                value={selectedConfigId}
-                onChange={(e) => handleConfigSelect(e.target.value)}
-                style={fieldStyle}
-              >
-                <option value="">未选择策略方案</option>
-                {strategyConfigs.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name}
-                  </option>
-                ))}
-              </select>
+              {renderStrategySelector()}
             </label>
 
             <input

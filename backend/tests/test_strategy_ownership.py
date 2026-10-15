@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,6 +20,11 @@ class FakeCursor:
 
   def fetchone(self) -> dict[str, Any]:
     return self.rows.pop(0)
+
+  def fetchall(self) -> list[dict[str, Any]]:
+    rows = list(self.rows)
+    self.rows.clear()
+    return rows
 
   def __enter__(self) -> FakeCursor:
     return self
@@ -191,8 +198,43 @@ def test_config_snapshot_binds_exact_script_version() -> None:
   assert snapshot["paramsJson"]["scriptSnapshot"]["signalRequired"] is True
 
 
-def test_complete_strategy_rejects_stale_revision(monkeypatch: Any) -> None:
-  cursor = FakeCursor([{"strategy_id": "script-1", "revision": 4}])
+def test_strategy_asset_cursor_round_trip_and_rejects_invalid_value() -> None:
+  updated_at = datetime(2026, 10, 15, 8, 30, tzinfo=timezone.utc)
+  config_id = "11111111-1111-4111-8111-111111111111"
+
+  cursor = state_store._encode_strategy_config_cursor(updated_at, config_id)
+
+  assert state_store._decode_strategy_config_cursor(cursor) == (updated_at, config_id)
+  with pytest.raises(ValueError, match="无效"):
+    state_store._decode_strategy_config_cursor("%%%not-a-cursor%%")
+
+
+def test_strategy_asset_page_returns_summaries_without_source_or_full_params(
+  monkeypatch: Any,
+) -> None:
+  updated_at = datetime(2026, 10, 15, 8, 30, tzinfo=timezone.utc)
+  cursor = FakeCursor([
+    {"value": 1},
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "策略 A",
+      "strategy_id": "22222222-2222-4222-8222-222222222222",
+      "strategy_version_id": "33333333-3333-4333-8333-333333333333",
+      "script_version_no": 7,
+      "published_version_id": "44444444-4444-4444-8444-444444444444",
+      "version_no": 2,
+      "revision": 3,
+      "strategy_key": "user_script",
+      "mode": "backtest",
+      "symbol": "688981",
+      "exchange": "SH",
+      "timeframe": "5m",
+      "fill_model": "bar_next_open",
+      "enabled": True,
+      "published": True,
+      "updated_at": updated_at,
+    },
+  ])
 
   @contextmanager
   def database() -> Any:
@@ -200,6 +242,95 @@ def test_complete_strategy_rejects_stale_revision(monkeypatch: Any) -> None:
 
   monkeypatch.setattr(state_store, "_db", database)
   monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  page = state_store.list_strategy_config_summaries(50, None, "策略")
+
+  assert page["total"] == 1
+  assert page["items"][0]["versionNo"] == 2
+  assert "code" not in page["items"][0]
+  assert "paramsJson" not in page["items"][0]
+  list_sql = cursor.statements[1]
+  assert "source_code" not in list_sql
+  assert "c.params," not in list_sql
+
+
+def test_missing_complete_version_is_published_before_update(monkeypatch: Any) -> None:
+  events: list[str] = []
+  old_config = {
+    "id": "config-1", "scriptId": "script-1", "revision": 2, "versionNo": 0,
+  }
+  saved_config = {
+    "id": "config-1", "scriptId": "script-1", "revision": 3, "versionNo": 2,
+  }
+  reads = iter([old_config, saved_config, saved_config])
+  monkeypatch.setattr(
+    state_store, "_get_strategy_config_with_cursor", lambda *_args, **_kwargs: next(reads),
+  )
+  monkeypatch.setattr(
+    state_store,
+    "_publish_strategy_config_with_cursor",
+    lambda *_args: (events.append("publish"), ("version-1", True))[1],
+  )
+  monkeypatch.setattr(state_store, "_resolve_unique_strategy_name", lambda *_args: "策略 A")
+  monkeypatch.setattr(
+    state_store,
+    "_write_strategy_script",
+    lambda *_args: (events.append("script"), ("script-1", "code-version-2", 2))[1],
+  )
+  monkeypatch.setattr(
+    state_store,
+    "_write_config",
+    lambda *_args: (events.append("config"), "config-1")[1],
+  )
+  monkeypatch.setattr(
+    state_store, "_get_strategy_script_with_cursor", lambda *_args: {"id": "script-1"},
+  )
+
+  result = state_store.save_complete_strategy_in_transaction(
+    object(),
+    {"name": "策略 A", "code": "def on_bar(bar, state):\n  return []"},
+    {"name": "策略 A"},
+    "script-1",
+    "config-1",
+    expected_revision=2,
+  )
+
+  assert result["config"]["versionNo"] == 2
+  assert events == ["publish", "script", "config", "publish"]
+
+
+def test_complete_version_baseline_migration_is_append_only_and_idempotent() -> None:
+  migration = Path(
+    "db/migrations/057_strategy_complete_version_baseline.sql",
+  ).read_text(encoding="utf-8")
+
+  assert "WHERE NOT EXISTS" in migration
+  assert "ON CONFLICT (config_id, version_no) DO NOTHING" in migration
+  assert "'scriptSnapshot'" in migration
+  assert "'scriptCodeHash'" in migration
+  assert "UPDATE strategy_config" not in migration
+  assert "backtest_run" not in migration
+
+
+def test_complete_strategy_rejects_stale_revision(monkeypatch: Any) -> None:
+  cursor = FakeCursor([])
+
+  @contextmanager
+  def database() -> Any:
+    yield FakeConnection(cursor)
+
+  monkeypatch.setattr(state_store, "_db", database)
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+  monkeypatch.setattr(
+    state_store,
+    "_get_strategy_config_with_cursor",
+    lambda *_args, **_kwargs: {
+      "id": "config-1",
+      "scriptId": "script-1",
+      "revision": 4,
+      "versionNo": 1,
+    },
+  )
 
   with pytest.raises(state_store.ConflictError, match="其他会话"):
     state_store.save_complete_strategy(

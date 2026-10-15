@@ -63,16 +63,20 @@ describe('API security context', () => {
     vi.stubGlobal('fetch', fetchMock);
     const {
       cancelBacktestRun,
+      createCompleteStrategy,
       createSignalDetailExport,
       createStrategyScript,
       login,
       logout,
       publishBacktestRun,
       runBacktest,
+      updateCompleteStrategy,
     } = await import('../api/client');
 
     await login('researcher', 'password');
     await createStrategyScript({} as never);
+    await createCompleteStrategy({} as never, {} as never);
+    await updateCompleteStrategy('config-1', {} as never, {} as never, 4);
     await runBacktest({} as never);
     await cancelBacktestRun('run-1');
     await publishBacktestRun('run-1', { title: '共享', description: '', tags: [] });
@@ -82,6 +86,8 @@ describe('API security context', () => {
     const writeCalls = fetchMock.mock.calls.slice(1);
     expect(writeCalls.map(([input]) => String(input))).toEqual([
       '/api/strategy-scripts',
+      '/api/complete-strategies',
+      '/api/complete-strategies/config-1',
       '/api/backtest/run',
       '/api/backtest/runs/run-1/cancel',
       '/api/backtest/runs/run-1/publication',
@@ -91,6 +97,11 @@ describe('API security context', () => {
     for (const [, init] of writeCalls) {
       expect(new Headers(init?.headers).get('X-CSRF-Token')).toBe('shared-csrf-token');
     }
+    expect(writeCalls[1][1]?.method).toBe('POST');
+    expect(writeCalls[2][1]?.method).toBe('PUT');
+    expect(JSON.parse(String(writeCalls[2][1]?.body))).toMatchObject({
+      expectedRevision: 4,
+    });
   });
 
   it('initializes an old session once during concurrent page refreshes', async () => {

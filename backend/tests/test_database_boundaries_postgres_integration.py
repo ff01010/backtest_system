@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 import os
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -55,6 +56,12 @@ QUEUE_B = CurrentUser(
   display_name="Boundary Queue B",
   role="user",
 )
+BASELINE = CurrentUser(
+  id="20000000-0000-4000-8000-000000000006",
+  username="boundary-baseline",
+  display_name="Boundary Baseline",
+  role="user",
+)
 ADMIN = CurrentUser(
   id="00000000-0000-0000-0000-000000000001",
   username="local-system",
@@ -85,7 +92,7 @@ def _admin_connection() -> psycopg.Connection[Any]:
 def database_facts() -> Iterator[None]:
   with _admin_connection() as conn:
     with conn.cursor() as cur:
-      for user in (WRITER, SOURCE, RECIPIENT, QUEUE_A, QUEUE_B):
+      for user in (WRITER, SOURCE, RECIPIENT, QUEUE_A, QUEUE_B, BASELINE):
         cur.execute("""
           INSERT INTO app_user (
             id, username, display_name, password_hash, role, status
@@ -464,3 +471,71 @@ def test_shared_copy_failure_rolls_back_strategy_and_relation() -> None:
     "copy_rows": 0,
     "rolled_back_scripts": 0,
   }
+
+
+def test_complete_version_migration_and_update_preserve_real_baselines() -> None:
+  script_payload, config_payload = _strategy_payloads("完整版本基线")
+  saved = _as_user(
+    BASELINE,
+    lambda: state_store.save_complete_strategy(
+      script_payload, config_payload, None, None,
+    ),
+  )
+  original_config = saved["config"]
+  config_id = original_config["id"]
+  script_id = original_config["scriptId"]
+  with _admin_connection() as conn:
+    with conn.cursor() as cur:
+      cur.execute("DELETE FROM strategy_config_version WHERE config_id=%s", (config_id,))
+
+  migration = Path(
+    "db/migrations/057_strategy_complete_version_baseline.sql",
+  ).read_text(encoding="utf-8")
+  for _ in range(2):
+    with psycopg.connect(
+      os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], autocommit=True,
+    ) as conn:
+      conn.execute(migration)
+
+  migrated_config = _as_user(
+    BASELINE, lambda: state_store.get_strategy_config(config_id),
+  )
+  with _admin_connection() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT version_no, strategy_version_id, snapshot
+        FROM strategy_config_version WHERE config_id=%s
+      """, (config_id,))
+      rows = cur.fetchall()
+  assert len(rows) == 1
+  assert rows[0]["version_no"] == 1
+  assert str(rows[0]["strategy_version_id"]) == migrated_config["strategyVersionId"]
+  assert rows[0]["snapshot"] == state_store._config_snapshot(migrated_config)
+
+  with _admin_connection() as conn:
+    with conn.cursor() as cur:
+      cur.execute("DELETE FROM strategy_config_version WHERE config_id=%s", (config_id,))
+  changed_script = {
+    **script_payload,
+    "code": "def on_bar(bar, state):\n  return [{'action': 'buy', 'quantity': 100}]\n",
+  }
+  updated = _as_user(
+    BASELINE,
+    lambda: state_store.save_complete_strategy(
+      changed_script,
+      config_payload,
+      script_id,
+      config_id,
+      expected_revision=migrated_config["revision"],
+    ),
+  )
+
+  assert updated["config"]["id"] == config_id
+  assert updated["config"]["scriptId"] == script_id
+  assert updated["config"]["versionNo"] == 2
+  versions = _as_user(
+    BASELINE, lambda: state_store.list_strategy_config_versions(config_id),
+  )
+  assert [item["versionNo"] for item in versions] == [2, 1]
+  assert versions[1]["paramsJson"]["scriptSnapshot"]["code"] == script_payload["code"]
+  assert versions[0]["paramsJson"]["scriptSnapshot"]["code"] == changed_script["code"]

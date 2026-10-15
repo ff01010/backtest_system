@@ -10,8 +10,11 @@ import type {
   MarketInstrument,
   DateItem,
   StrategyConfig,
+  StrategyConfigPage,
+  StrategyConfigSummary,
   StrategyParameterSchemaResponse,
   StrategyConfigVersion,
+  StrategyConfigVersionPage,
   StrategyScript,
   StrategySource,
   ReleaseNotice,
@@ -1255,16 +1258,48 @@ export interface StrategyConfigPayload {
   publish?: boolean;
 }
 
-export async function fetchStrategyConfigs(): Promise<StrategyConfig[]> {
-  const data = await fetchJson<{ configs: StrategyConfig[] }>(`${BASE}/strategy-configs`);
-  return data.configs;
+export interface StrategyConfigPageQuery {
+  limit?: number;
+  cursor?: string | null;
+  query?: string;
 }
 
-export async function fetchStrategyConfigVersions(configId: string): Promise<StrategyConfigVersion[]> {
-  const data = await fetchJson<{ versions: StrategyConfigVersion[] }>(
-    `${BASE}/strategy-configs/${configId}/versions`
+export async function fetchStrategyConfigPage(
+  params: StrategyConfigPageQuery = {},
+): Promise<StrategyConfigPage> {
+  const search = new URLSearchParams({ limit: String(params.limit ?? 50) });
+  if (params.cursor) search.set('cursor', params.cursor);
+  if (params.query?.trim()) search.set('query', params.query.trim());
+  return fetchJson<StrategyConfigPage>(`${BASE}/strategy-configs?${search.toString()}`);
+}
+
+export async function fetchStrategyConfigs(): Promise<StrategyConfigSummary[]> {
+  return (await fetchStrategyConfigPage()).items;
+}
+
+export async function fetchCompleteStrategy(configId: string): Promise<StrategyConfig> {
+  const data = await fetchJson<{ config: StrategyConfig }>(
+    `${BASE}/complete-strategies/${encodeURIComponent(configId)}`,
   );
-  return data.versions;
+  return data.config;
+}
+
+export async function fetchStrategyConfigVersionPage(
+  configId: string,
+  limit = 50,
+  cursor: string | null = null,
+): Promise<StrategyConfigVersionPage> {
+  const search = new URLSearchParams({ limit: String(limit) });
+  if (cursor) search.set('cursor', cursor);
+  return fetchJson<StrategyConfigVersionPage>(
+    `${BASE}/strategy-configs/${encodeURIComponent(configId)}/versions?${search.toString()}`,
+  );
+}
+
+export async function fetchStrategyConfigVersions(
+  configId: string,
+): Promise<StrategyConfigVersion[]> {
+  return (await fetchStrategyConfigVersionPage(configId)).items;
 }
 
 export async function createStrategyConfig(payload: StrategyConfigPayload): Promise<StrategyConfig> {
@@ -1299,6 +1334,30 @@ export async function saveCompleteStrategy(
     `${BASE}/complete-strategies`,
     'POST',
     { script, config, scriptId, configId, expectedRevision },
+  );
+}
+
+export async function createCompleteStrategy(
+  script: StrategyScriptPayload,
+  config: StrategyConfigPayload,
+): Promise<{ script: StrategyScript; config: StrategyConfig }> {
+  return sendJson<{ script: StrategyScript; config: StrategyConfig }>(
+    `${BASE}/complete-strategies`,
+    'POST',
+    { script, config },
+  );
+}
+
+export async function updateCompleteStrategy(
+  configId: string,
+  script: StrategyScriptPayload,
+  config: StrategyConfigPayload,
+  expectedRevision: number,
+): Promise<{ script: StrategyScript; config: StrategyConfig }> {
+  return sendJson<{ script: StrategyScript; config: StrategyConfig }>(
+    `${BASE}/complete-strategies/${encodeURIComponent(configId)}`,
+    'PUT',
+    { script, config, expectedRevision },
   );
 }
 

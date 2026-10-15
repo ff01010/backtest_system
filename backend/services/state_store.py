@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -650,6 +651,7 @@ def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
     "enabled": bool(row["enabled"]),
     "published": bool(row["published"]),
     "publishedVersionId": _uuid(row.get("published_version_id")),
+    "versionNo": int(row.get("complete_version_no") or 0),
     "revision": int(row.get("revision") or 1),
     "archivedAt": _format_time(row.get("archived_at")) if row.get("archived_at") else None,
     "sharedSource": {
@@ -1038,7 +1040,8 @@ def _config_query(where: str = "", *, include_archived: bool = False) -> str:
       version.version_no AS script_version_no,
       version.source_code, version.runtime_config,
       version.content_fingerprint,
-      latest_version.id AS published_version_id
+      latest_version.id AS published_version_id,
+      latest_version.version_no AS complete_version_no
     FROM strategy_config c
     JOIN market_instrument i ON i.id=c.instrument_id
     LEFT JOIN market_instrument b ON b.id=c.benchmark_instrument_id
@@ -1049,7 +1052,7 @@ def _config_query(where: str = "", *, include_archived: bool = False) -> str:
     LEFT JOIN user_strategy_version version
       ON version.id=COALESCE(c.strategy_version_id, current_version.id)
     LEFT JOIN LATERAL (
-      SELECT config_version.id
+      SELECT config_version.id, config_version.version_no
       FROM strategy_config_version config_version
       WHERE config_version.config_id=c.id
       ORDER BY config_version.version_no DESC
@@ -1064,6 +1067,110 @@ def list_strategy_configs() -> list[dict[str, Any]]:
     with conn.cursor() as cur:
       cur.execute(_config_query("ORDER BY c.updated_at DESC, c.id DESC"), (current_user_id(),))
       return [_normalize_config(row) for row in cur.fetchall()]
+
+
+def _normalize_config_summary(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "id": _uuid(row["id"]),
+    "name": row["name"],
+    "scriptId": _uuid(row["strategy_id"]),
+    "strategyVersionId": _uuid(row["strategy_version_id"]),
+    "scriptVersionNo": int(row["script_version_no"]),
+    "versionNo": int(row["version_no"]),
+    "revision": int(row["revision"]),
+    "strategy": row["strategy_key"],
+    "mode": row["mode"],
+    "symbol": f"{row['symbol']}.{row['exchange']}",
+    "timeframe": row["timeframe"],
+    "fillModel": row.get("fill_model") or "bar_next_open",
+    "enabled": bool(row["enabled"]),
+    "published": bool(row["published"]),
+    "publishedVersionId": _uuid(row.get("published_version_id")),
+    "updatedAt": _format_time(row["updated_at"]),
+  }
+
+
+def _encode_strategy_config_cursor(updated_at: datetime, config_id: str) -> str:
+  raw = json.dumps([updated_at.isoformat(), config_id], separators=(",", ":"))
+  return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_strategy_config_cursor(value: str) -> tuple[datetime, str]:
+  try:
+    padded = value + "=" * (-len(value) % 4)
+    raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    updated_at, config_id = json.loads(raw)
+    parsed_time = datetime.fromisoformat(str(updated_at))
+    if not re.fullmatch(
+      r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
+      str(config_id),
+    ):
+      raise ValueError("invalid UUID")
+    return parsed_time, str(config_id)
+  except (
+    ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error,
+  ) as error:
+    raise ValueError("无效的策略资产游标") from error
+
+
+def list_strategy_config_summaries(
+  limit: int,
+  cursor: str | None,
+  query: str,
+) -> dict[str, Any]:
+  """按更新时间游标分页读取轻量策略摘要，不读取源码或完整参数。"""
+  cursor_value = _decode_strategy_config_cursor(cursor) if cursor else None
+  normalized_query = query.strip()
+  query_clause = " AND c.name ILIKE %s ESCAPE '\\'" if normalized_query else ""
+  escaped_query = normalized_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+  query_params: tuple[Any, ...] = (f"%{escaped_query}%",) if normalized_query else ()
+  cursor_clause = " AND (c.updated_at, c.id) < (%s, %s::uuid)" if cursor_value else ""
+  cursor_params: tuple[Any, ...] = cursor_value or ()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(f"""
+        SELECT count(*) AS value
+        FROM strategy_config c
+        WHERE c.owner_user_id=%s AND c.archived_at IS NULL {query_clause}
+      """, (current_user_id(), *query_params))
+      total = int(cur.fetchone()["value"])
+      cur.execute(f"""
+        SELECT c.id, c.name, c.strategy_id, c.strategy_version_id,
+          code_version.version_no AS script_version_no,
+          complete_version.id AS published_version_id,
+          complete_version.version_no, c.revision, c.strategy_key, c.mode,
+          instrument.symbol, instrument.exchange, c.timeframe,
+          COALESCE(c.params->'params'->>'fillModel', 'bar_next_open') AS fill_model,
+          c.enabled, c.published, c.updated_at
+        FROM strategy_config c
+        JOIN market_instrument instrument ON instrument.id=c.instrument_id
+        JOIN user_strategy_version code_version ON code_version.id=c.strategy_version_id
+        LEFT JOIN LATERAL (
+          SELECT version.id, version.version_no
+          FROM strategy_config_version version
+          WHERE version.config_id=c.id
+          ORDER BY version.version_no DESC
+          LIMIT 1
+        ) complete_version ON true
+        WHERE c.owner_user_id=%s AND c.archived_at IS NULL
+          {query_clause} {cursor_clause}
+        ORDER BY c.updated_at DESC, c.id DESC
+        LIMIT %s
+      """, (
+        current_user_id(), *query_params, *cursor_params, limit + 1,
+      ))
+      rows = list(cur.fetchall())
+  page = rows[:limit]
+  next_cursor = None
+  if len(rows) > limit and page:
+    next_cursor = _encode_strategy_config_cursor(
+      page[-1]["updated_at"], str(page[-1]["id"]),
+    )
+  return {
+    "items": [_normalize_config_summary(row) for row in page],
+    "nextCursor": next_cursor,
+    "total": total,
+  }
 
 
 def list_owned_strategy_configs(
@@ -1229,18 +1336,15 @@ def save_complete_strategy_in_transaction(
   """原子保存一对一完整策略，并自动创建精确的发布版本。"""
   owned_script_id: str | None = None
   if config_id is not None:
-    cur.execute("""
-      SELECT strategy_id, revision FROM strategy_config
-      WHERE id=%s AND owner_user_id=%s AND archived_at IS NULL FOR UPDATE
-    """, (config_id, current_user_id()))
-    current = cur.fetchone()
-    if not current:
-      raise KeyError(config_id)
-    owned_script_id = _uuid(current["strategy_id"])
+    current = _get_strategy_config_with_cursor(cur, config_id, for_update=True)
+    owned_script_id = current.get("scriptId")
     if script_id and script_id != owned_script_id:
       raise ConflictError("策略脚本归属不一致，禁止将方案改绑到其他脚本")
     if expected_revision is None or int(current["revision"]) != expected_revision:
       raise RevisionConflictError("该策略已在其他会话中更新，请刷新后重试")
+    # 防御测试库或漏迁移环境：必须先保存旧内容，再允许任何代码或配置写入。
+    if int(current.get("versionNo") or 0) == 0:
+      _publish_strategy_config_with_cursor(cur, current)
   resolved_name = _resolve_unique_strategy_name(
     cur, str(config_payload["name"]), config_id,
   )
@@ -1410,6 +1514,44 @@ def list_strategy_config_versions_page(
         ORDER BY v.version_no DESC LIMIT %s OFFSET %s
       """, (config_id, current_user_id(), limit, offset))
       return [_normalize_version(row) for row in cur.fetchall()], total
+
+
+def list_strategy_config_versions_cursor_page(
+  config_id: str,
+  limit: int,
+  cursor: int | None,
+) -> dict[str, Any]:
+  """按完整版本号倒序分页；游标是上一页最后一条版本号。"""
+  cursor_clause = " AND v.version_no < %s" if cursor is not None else ""
+  cursor_params: tuple[Any, ...] = (cursor,) if cursor is not None else ()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT count(*) AS value FROM strategy_config_version v
+        JOIN strategy_config c ON c.id=v.config_id
+        WHERE v.config_id=%s AND c.owner_user_id=%s
+      """, (config_id, current_user_id()))
+      total = int(cur.fetchone()["value"])
+      if total == 0:
+        cur.execute(
+          "SELECT 1 FROM strategy_config WHERE id=%s AND owner_user_id=%s",
+          (config_id, current_user_id()),
+        )
+        if not cur.fetchone():
+          raise KeyError(config_id)
+      cur.execute(f"""
+        SELECT v.* FROM strategy_config_version v
+        JOIN strategy_config c ON c.id=v.config_id
+        WHERE v.config_id=%s AND c.owner_user_id=%s {cursor_clause}
+        ORDER BY v.version_no DESC LIMIT %s
+      """, (config_id, current_user_id(), *cursor_params, limit + 1))
+      rows = list(cur.fetchall())
+  page = rows[:limit]
+  return {
+    "items": [_normalize_version(row) for row in page],
+    "nextCursor": str(page[-1]["version_no"]) if len(rows) > limit and page else None,
+    "total": total,
+  }
 
 
 def get_strategy_config_version_for_config(
