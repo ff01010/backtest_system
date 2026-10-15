@@ -78,6 +78,17 @@ def test_effective_strategy_parameters_rejects_invalid_override(
     strategy_lifecycle.effective_strategy_parameters(_config(), overrides)
 
 
+@pytest.mark.parametrize("timeframe", ["3m", "45m"])
+def test_save_strategy_rejects_retired_derived_timeframe(timeframe: str) -> None:
+  command = _command()
+  command = strategy_lifecycle.StrategySaveCommand(
+    **{**command.__dict__, "timeframe": timeframe},
+  )
+
+  with pytest.raises(strategy_lifecycle.StrategyLifecycleError, match=f"不支持 {timeframe}"):
+    strategy_lifecycle.save_strategy(command)
+
+
 def test_public_save_replay_precedes_resource_validation(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:

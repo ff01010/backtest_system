@@ -10,6 +10,7 @@ import {
 import EvaluationComparison from './EvaluationComparison';
 import type { ScenarioName } from './comparisonData';
 import {
+  cancelEvaluationRun,
   cancelEvaluationExport,
   createEvaluationExport,
   createEvaluationRun,
@@ -17,6 +18,9 @@ import {
   fetchEvaluationCatalogs,
   fetchEvaluationExports,
   fetchEvaluationRun,
+  fetchEvaluationRunExceptions,
+  fetchEvaluationGroupMembers,
+  fetchEvaluationRunResults,
   fetchEvaluationRuns,
   fetchEvaluationSpecs,
   retryEvaluationExport,
@@ -690,6 +694,76 @@ function EvaluationExports({
   );
 }
 
+function EvaluationGroupMembers({
+  experimentId,
+  evaluationRunId,
+  groupId,
+  memberCount,
+  symbol,
+  timeframe,
+  onOpenRun,
+}: {
+  experimentId: string;
+  evaluationRunId: string;
+  groupId: string;
+  memberCount: number;
+  symbol: string;
+  timeframe: string;
+  onOpenRun?: Props['onOpenRun'];
+}) {
+  const [members, setMembers] = useState<Array<{
+    ordinal: string;
+    trialExecutionId: string;
+    runId: string;
+    trialIndex: number;
+    startDate?: string | null;
+  }>>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const load = async (next = -1) => {
+    setLoading(true);
+    try {
+      const page = await fetchEvaluationGroupMembers(
+        experimentId, evaluationRunId, groupId, next,
+      );
+      setMembers(page.items);
+      setCursor(page.nextCursor);
+      setLoaded(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <details
+      className="evaluation-member-results"
+      onToggle={(event) => {
+        if (event.currentTarget.open && !loaded && !loading) void load();
+      }}
+    >
+      <summary>{memberCount} 项聚合</summary>
+      {members.map((member) => (
+        <button
+          key={member.trialExecutionId}
+          type="button"
+          onClick={() => onOpenRun?.(
+            member.runId, symbol, timeframe, member.startDate ?? '',
+          )}
+        >
+          Trial #{member.trialIndex + 1} · 查看单次结果
+        </button>
+      ))}
+      {loading && <span>正在加载成员…</span>}
+      {loaded && members.length === 0 && <span>该分组没有成员。</span>}
+      {cursor && (
+        <button type="button" disabled={loading} onClick={() => { void load(Number(cursor)); }}>
+          下一页成员
+        </button>
+      )}
+    </details>
+  );
+}
+
 function EvaluationResult({
   detail,
   catalogs,
@@ -705,6 +779,87 @@ function EvaluationResult({
   scenarioNames?: ScenarioName[];
   onOpenRun?: Props['onOpenRun'];
 }) {
+  const [pagedRows, setPagedRows] = useState<Array<{
+    ordinal: string;
+    groupId?: string;
+    trialExecutionId?: string;
+    groupKey?: string;
+    memberCount?: number;
+    runId?: string;
+    startDate?: string | null;
+    members?: Array<{
+      trialExecutionId: string;
+      runId: string;
+      trialIndex: number;
+      startDate?: string | null;
+    }>;
+    values: Record<string, string | number | null>;
+    unsupportedReasons: Record<string, string>;
+  }>>([]);
+  const [nextResultCursor, setNextResultCursor] = useState<string | null>(null);
+  const [pageLoading, setPageLoading] = useState(false);
+  const [pagedExceptions, setPagedExceptions] = useState<Array<{
+    ordinal: string;
+    stageId: string;
+    stageIndex: number;
+    trialId: string;
+    trialIndex: number;
+    startTrialIndex?: number;
+    endTrialIndexExclusive?: number;
+    count?: number;
+    status: 'failed' | 'cancelled' | 'missing';
+    materializationStatus: string;
+    error: Record<string, unknown> | null;
+  }>>([]);
+  const [nextExceptionCursor, setNextExceptionCursor] = useState<string | null>(null);
+  const [exceptionLoading, setExceptionLoading] = useState(false);
+  const loadResultPage = useCallback(async (cursor = -1) => {
+    setPageLoading(true);
+    try {
+      const page = await fetchEvaluationRunResults(
+        detail.experimentId, detail.evaluationRunId, cursor,
+      );
+      const normalized = page.items.map((item) => ({
+        ordinal: item.ordinal,
+        groupId: item.groupId,
+        trialExecutionId: item.trialExecutionId,
+        groupKey: item.groupKey ? JSON.stringify(item.groupKey) : undefined,
+        memberCount: item.memberCount ? Number(item.memberCount) : undefined,
+        runId: item.runId,
+        startDate: item.startDate,
+        members: undefined,
+        values: item.values,
+        unsupportedReasons: item.unsupportedReasons ?? {},
+      }));
+      setPagedRows(normalized);
+      setNextResultCursor(page.nextCursor);
+    } finally {
+      setPageLoading(false);
+    }
+  }, [detail.evaluationRunId, detail.experimentId]);
+  const loadExceptionPage = useCallback(async (cursor = -1) => {
+    setExceptionLoading(true);
+    try {
+      const page = await fetchEvaluationRunExceptions(
+        detail.experimentId, detail.evaluationRunId, cursor,
+      );
+      setPagedExceptions(page.items);
+      setNextExceptionCursor(page.nextCursor);
+    } finally {
+      setExceptionLoading(false);
+    }
+  }, [detail.evaluationRunId, detail.experimentId]);
+  useEffect(() => {
+    if (detail.status === 'succeeded' && detail.outputSchemaVersion === 'evaluation_output_v2') {
+      void loadResultPage();
+      void loadExceptionPage();
+    } else {
+      setPagedRows([]);
+      setNextResultCursor(null);
+      setPagedExceptions([]);
+      setNextExceptionCursor(null);
+    }
+  }, [detail.outputSchemaVersion, detail.status, loadExceptionPage, loadResultPage]);
   const labels = new Map([
     ...catalogs.metricCatalog.metrics.map((item) => [item.metricId, item.displayName] as const),
     ...catalogs.dimensionCatalog.dimensions.map((item) => [
@@ -727,12 +882,18 @@ function EvaluationResult({
     ] as const),
   ]);
   if (detail.status !== 'succeeded' || !detail.output) return null;
+  const resultRows = detail.outputSchemaVersion === 'evaluation_output_v2'
+    ? pagedRows
+    : detail.output.rows;
   const completeness = detail.output.completeness ?? detail.completeness;
+  const displayedExceptions = detail.outputSchemaVersion === 'evaluation_output_v2'
+    ? [...completeness.exceptions, ...pagedExceptions]
+    : completeness.exceptions;
   const isPartial = detail.output.isPartial ?? completeness.isPartial;
   const visualizations = detail.output.visualizations ?? [];
   // 自定义参数系列可能使用不同分组口径，保留为折叠明细，不能因指标相同而丢弃。
   const additionalVisualizations = visualizations.filter((item) => item.type !== 'time_stability_v1');
-  const firstRow = detail.output.rows[0];
+  const firstRow = resultRows[0];
   const candidateColumns = (detail.output.groupBy ?? [])
     .filter((id) => firstRow?.values[id] !== null && firstRow?.values[id] !== undefined);
   const candidateSummaryColumns = candidateColumns.length > 0
@@ -772,7 +933,7 @@ function EvaluationResult({
         <div>
           <span>规则摘要</span>
           <code>{detail.specHash ?? detail.evaluationSpecId}</code>
-          <span>执行集合 {detail.executionCount} 项</span>
+          <span>执行集合 {detail.executionCountExact ?? detail.executionCount} 项</span>
           <code>{detail.resultSetHash}</code>
           <span>输出摘要</span>
           <code>{detail.outputHash}</code>
@@ -781,21 +942,27 @@ function EvaluationResult({
       <div className="evaluation-table-wrap">
         <table className="evaluation-table">
           <thead><tr><th>{rankLabel}</th>{detail.output.columns.map((id) => <th key={id}>{labels.get(id) ?? id}</th>)}<th>成员结果</th></tr></thead>
-          <tbody>{detail.output.rows.map((row, index) => (
-            <tr key={row.trialExecutionId ?? row.groupKey ?? `${row.stageIndex}-${row.trialIndex}`}>
-              <td>{index + 1}</td>
+          <tbody>{resultRows.map((row, index) => (
+            <tr key={row.trialExecutionId ?? row.groupKey ?? String(index)}>
+              <td>{'ordinal' in row ? Number(row.ordinal) + 1 : index + 1}</td>
               {detail.output!.columns.map((id) => (
                 <td key={id} title={row.unsupportedReasons[id] ?? ''}>{formatEvaluationValue(row.values[id], id, dataTypes, scenarioNames)}</td>
               ))}
-              <td>{row.runId ? <button className="app-button is-quiet" type="button" onClick={() => onOpenRun?.(row.runId!, symbol, timeframe, row.startDate ?? '')}>查看结果</button> : (
+              <td>{row.runId ? <button className="app-button is-quiet" type="button" onClick={() => onOpenRun?.(row.runId!, symbol, timeframe, row.startDate ?? '')}>查看结果</button> : row.groupId ? (
+                <EvaluationGroupMembers
+                  experimentId={detail.experimentId}
+                  evaluationRunId={detail.evaluationRunId}
+                  groupId={row.groupId}
+                  memberCount={row.memberCount ?? 0}
+                  symbol={symbol}
+                  timeframe={timeframe}
+                  onOpenRun={onOpenRun}
+                />
+              ) : (
                 <details className="evaluation-member-results">
                   <summary>{row.memberCount ?? 0} 项聚合</summary>
                   {(row.members ?? []).map((member) => (
-                    <button
-                      key={member.trialExecutionId}
-                      type="button"
-                      onClick={() => onOpenRun?.(member.runId, symbol, timeframe, member.startDate ?? '')}
-                    >
+                    <button key={member.trialExecutionId} type="button" onClick={() => onOpenRun?.(member.runId, symbol, timeframe, member.startDate ?? '')}>
                       Trial #{member.trialIndex + 1} · 查看单次结果
                     </button>
                   ))}
@@ -806,14 +973,19 @@ function EvaluationResult({
           ))}</tbody>
         </table>
       </div>
+      {nextResultCursor && (
+        <button className="app-button is-quiet" type="button" disabled={pageLoading} onClick={() => { void loadResultPage(Number(nextResultCursor)); }}>
+          {pageLoading ? '正在加载…' : '加载下一页评价结果'}
+        </button>
+      )}
       <EvaluationComparison key={detail.evaluationRunId} visualizations={visualizations} catalogs={catalogs} labels={labels} names={scenarioNames}
         onOpenRun={onOpenRun ? (runId, date) => onOpenRun(runId, symbol, timeframe, date) : undefined} />
       {additionalVisualizations.length > 0 && <details className="evaluation-additional-analysis"><summary>其他已保存分析（{additionalVisualizations.length}）</summary>
         <div className="evaluation-analysis-grid">{additionalVisualizations.map((item, index) => <VisualizationResult item={item} labels={labels} dataTypes={dataTypes} scenarioNames={scenarioNames} key={`${String(item.type)}-${index}`} />)}</div>
       </details>}
       {completeness.dimensionCoverage.length > 0 && <details className="evaluation-exceptions"><summary>关键维度覆盖（{completeness.dimensionCoverage.length}）</summary>{completeness.dimensionCoverage.map((dimension) => <div key={dimension.dimensionId}><strong>{labels.get(dimension.dimensionId) ?? dimension.dimensionId}</strong><span>最低观察值 {formatDecimal(dimension.minimumObservedRate)} / 门槛 {formatDecimal(dimension.requiredRate)}</span>{dimension.values.map((item) => <span key={JSON.stringify(item.value)}>{formatEvaluationValue(item.value, dimension.dimensionId, dataTypes, scenarioNames)}：{item.succeededCount}/{item.expectedCount}（{formatDecimal(item.coverageRate)}）</span>)}</div>)}</details>}
-      {completeness.exceptions.length > 0 && <details className="evaluation-exceptions"><summary>失败、取消与缺失项（{completeness.exceptions.length}）</summary>{completeness.exceptions.map((item) => <div key={`${item.stageId}-${item.trialIndex}`}><span>Trial #{item.trialIndex + 1}</span><strong>{statusLabel(item.status)}</strong><span>{item.error ? JSON.stringify(item.error) : '无结果'}</span></div>)}</details>}
-      <details className="evaluation-execution-set">
+      {displayedExceptions.length > 0 && <details className="evaluation-exceptions"><summary>失败、取消与缺失项</summary>{displayedExceptions.map((item) => <div key={`${item.stageId}-${item.trialIndex ?? item.startTrialIndex}`}><span>{item.trialIndex !== undefined ? `Trial #${item.trialIndex + 1}` : `Trial #${(item.startTrialIndex ?? 0) + 1}～${item.endTrialIndexExclusive ?? 0}（${item.count ?? 0} 项）`}</span><strong>{statusLabel(item.status)}</strong><span>{item.error ? JSON.stringify(item.error) : '无结果'}</span></div>)}{nextExceptionCursor && <button className="app-button is-quiet" type="button" disabled={exceptionLoading} onClick={() => { void loadExceptionPage(Number(nextExceptionCursor)); }}>{exceptionLoading ? '正在加载…' : '下一页异常明细'}</button>}</details>}
+      {detail.executionSet && <details className="evaluation-execution-set">
         <summary>查看冻结执行集合</summary>
         {detail.executionSet.map((item) => (
           <div key={item.trialExecutionId}>
@@ -822,7 +994,7 @@ function EvaluationResult({
             <code>{item.resultHash}</code>
           </div>
         ))}
-      </details>
+      </details>}
       <EvaluationExports detail={detail} labels={labels} />
     </div>
   );
@@ -841,6 +1013,7 @@ export default function EvaluationBuilder({
   const [specs, setSpecs] = useState<SavedEvaluationSpec[]>([]);
   const [runs, setRuns] = useState<EvaluationRun[]>([]);
   const [selectedRun, setSelectedRun] = useState<EvaluationRunDetail | null>(null);
+  const evaluationCancelKeys = useRef(new Map<string, string>());
   const [name, setName] = useState('基础评价');
   const [columns, setColumns] = useState<string[]>(DEFAULT_METRICS);
   const [filters, setFilters] = useState<EvaluationFilter[]>([]);
@@ -894,7 +1067,7 @@ export default function EvaluationBuilder({
   }, [refresh]);
 
   useEffect(() => {
-    if (!selectedRun || !['queued', 'running'].includes(selectedRun.status)) return;
+    if (!selectedRun || !['queued', 'running', 'cancel_requested'].includes(selectedRun.status)) return;
     let stopped = false;
     const timer = setTimeout(async () => {
       try {
@@ -1083,6 +1256,23 @@ export default function EvaluationBuilder({
     catch (reason) { setError(messageOf(reason)); } finally { setBusy(false); }
   };
 
+  const cancelRun = async (runId: string) => {
+    if (!window.confirm('取消评价只会停止这份评价报告，不会取消实验或导出。确认继续？')) return;
+    const key = evaluationCancelKeys.current.get(runId) ?? createBrowserUuid();
+    evaluationCancelKeys.current.set(runId, key);
+    setBusy(true); setError('');
+    try {
+      await cancelEvaluationRun(experimentId, runId, '用户取消评价', key);
+      evaluationCancelKeys.current.delete(runId);
+      await refresh();
+      setSelectedRun(await fetchEvaluationRun(experimentId, runId));
+    } catch (reason) {
+      setError(messageOf(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (!catalogs) return <div className="experiment-empty"><RefreshCw className="is-spinning" size={16} /> {error || '正在读取评价目录…'}</div>;
   return (
     <section className="experiment-preview-card evaluation-builder">
@@ -1150,6 +1340,7 @@ export default function EvaluationBuilder({
         </div>
         {runs.length > 0 && <label><span>打开报告</span><select aria-label="选择评价报告" value={selectedRun?.evaluationRunId ?? ''} onChange={(event) => { if (event.target.value) void loadRun(event.target.value); else setSelectedRun(null); }}><option value="">请选择一份报告</option>{runs.map((run, index) => <option value={run.evaluationRunId} key={run.evaluationRunId}>报告 #{runs.length - index} · {run.specName ?? '评价'} v{run.specVersionNo ?? '—'} · {statusLabel(run.status)} · {formatDateTime(run.finishedAt)}</option>)}</select></label>}
         {selectedRun?.status === 'failed' && <button className="app-button is-quiet" type="button" disabled={busy} onClick={() => { void retryRun(selectedRun.evaluationRunId); }}><RotateCcw size={14} /> 重试当前报告</button>}
+        {selectedRun && ['queued', 'running'].includes(selectedRun.status) && <button className="app-button is-quiet" type="button" disabled={busy} onClick={() => { void cancelRun(selectedRun.evaluationRunId); }}><X size={14} /> 取消当前评价</button>}
       </section>
       {selectedRun?.error && <div className="experiment-alert is-error" role="alert">{selectedRun.error.message}（{selectedRun.error.code}）</div>}
       {selectedRun && <EvaluationResult detail={selectedRun} catalogs={catalogs} symbol={symbol} timeframe={timeframe} scenarioNames={scenarioNames} onOpenRun={onOpenRun} />}

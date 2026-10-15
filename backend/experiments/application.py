@@ -28,8 +28,18 @@ from backend.experiments.contracts import (
 )
 from backend.experiments.errors import ExperimentError
 from backend.experiments.estimator import ResourceEstimator, SingleBarResourceEstimator
-from backend.experiments.generators import FiniteGridGenerator, GeneratedGrid, seed_bundle
+from backend.experiments.generators import (
+  MAX_PLANNED_TRIAL_COUNT,
+  FiniteGridGenerator,
+  GeneratedGrid,
+  seed_bundle,
+)
+from backend.experiments.lifecycle import (
+  ExperimentLifecycleCommands,
+  LifecycleCommand,
+)
 from backend.experiments.recovery import default_failure_policy
+from backend.experiments.rollout import ContractEpoch, current_contract_epoch
 from backend.experiments.repository import (
   ExperimentRepository,
   PostgresExperimentRepository,
@@ -69,6 +79,7 @@ class ExperimentApplication:
     compiler: TrialCompiler | None = None,
     estimator: ResourceEstimator | None = None,
     repository: PreviewRepository | None = None,
+    lifecycle_commands: ExperimentLifecycleCommands | None = None,
     clock: Callable[[], datetime] | None = None,
   ) -> None:
     self._resolver = resolver or LegacySingleStrategyResolver()
@@ -77,6 +88,7 @@ class ExperimentApplication:
     self._compiler = compiler or LegacySingleBarTrialCompiler()
     self._estimator = estimator or SingleBarResourceEstimator()
     self._repository = repository or PostgresExperimentRepository()
+    self._lifecycle_commands = lifecycle_commands or ExperimentLifecycleCommands()
     self._clock = clock or (lambda: datetime.now(timezone.utc))
 
   def resolve_subject(self, subject_ref: SubjectRef) -> dict[str, Any]:
@@ -113,12 +125,7 @@ class ExperimentApplication:
   ) -> tuple[dict[str, Any], int]:
     response = self._calculate_preview(request.experimentSpec)
     if not response["limitDecision"]["allowed"]:
-      raise ExperimentError(
-        "experiment.plan_limit_exceeded",
-        "实验计划超过当前硬上限，请重新调整后预览",
-        429,
-        details={"blockingReasons": response["limitDecision"]["blockingReasons"]},
-      )
+      self._raise_create_blocked(response)
     if request.specHash != response["specHash"]:
       raise ExperimentError(
         "experiment.preview_stale", "实验定义已变化，请重新预览", 409,
@@ -298,6 +305,16 @@ class ExperimentApplication:
     idempotency_key: str,
     request_id: str | None = None,
   ) -> tuple[dict[str, Any], int]:
+    if current_contract_epoch() >= ContractEpoch.LIFECYCLE_V2:
+      detail = self.detail(experiment_id)
+      return self.cancel_lifecycle(
+        experiment_id,
+        str(detail["currentRevisionId"]),
+        int(detail["lifecycleVersion"]),
+        "旧版取消接口请求",
+        idempotency_key,
+        request_id,
+      )
     result = self._experiment_repository().cancel_experiment(
       experiment_id,
       idempotency_key,
@@ -309,6 +326,67 @@ class ExperimentApplication:
     )
     return result.response, result.status_code
 
+  def pause_lifecycle(
+    self,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_lifecycle_version: int,
+    reason: str,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    result = self._lifecycle_commands.pause(LifecycleCommand(
+      experiment_id=experiment_id,
+      expected_revision_id=expected_revision_id,
+      expected_lifecycle_version=expected_lifecycle_version,
+      idempotency_key=idempotency_key,
+      reason=reason,
+      request_id=request_id,
+    ))
+    return result.response, result.status_code
+
+  def resume_lifecycle(
+    self,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_lifecycle_version: int,
+    resume_mode: str,
+    reason: str,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    if resume_mode not in {"user_pause", "execution_circuit"}:
+      raise ExperimentError("experiment.command_invalid", "恢复模式无效", 409)
+    result = self._lifecycle_commands.resume(LifecycleCommand(
+      experiment_id=experiment_id,
+      expected_revision_id=expected_revision_id,
+      expected_lifecycle_version=expected_lifecycle_version,
+      idempotency_key=idempotency_key,
+      reason=reason,
+      request_id=request_id,
+      resume_mode=resume_mode,  # type: ignore[arg-type]
+    ))
+    return result.response, result.status_code
+
+  def cancel_lifecycle(
+    self,
+    experiment_id: str,
+    expected_revision_id: str,
+    expected_lifecycle_version: int,
+    reason: str,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    result = self._lifecycle_commands.cancel(LifecycleCommand(
+      experiment_id=experiment_id,
+      expected_revision_id=expected_revision_id,
+      expected_lifecycle_version=expected_lifecycle_version,
+      idempotency_key=idempotency_key,
+      reason=reason,
+      request_id=request_id,
+    ))
+    return result.response, result.status_code
+
   def resume(
     self,
     experiment_id: str,
@@ -317,6 +395,17 @@ class ExperimentApplication:
     idempotency_key: str,
     request_id: str | None = None,
   ) -> tuple[dict[str, Any], int]:
+    if current_contract_epoch() >= ContractEpoch.LIFECYCLE_V2:
+      detail = self.detail(experiment_id)
+      return self.resume_lifecycle(
+        experiment_id,
+        expected_revision_id,
+        int(detail["lifecycleVersion"]),
+        "execution_circuit",
+        reason,
+        idempotency_key,
+        request_id,
+      )
     repository = self._experiment_repository()
     if not hasattr(repository, "resume_experiment"):
       raise RuntimeError("当前实验仓储不支持恢复操作")
@@ -420,16 +509,24 @@ class ExperimentApplication:
     response: dict[str, Any],
   ) -> None:
     if not response["limitDecision"]["allowed"]:
-      raise ExperimentError(
-        "experiment.plan_limit_exceeded",
-        "实验计划超过当前硬上限，请重新调整后预览",
-        429,
-        details={"blockingReasons": response["limitDecision"]["blockingReasons"]},
-      )
+      ExperimentApplication._raise_create_blocked(response)
     if request.specHash != response["specHash"]:
       raise ExperimentError(
         "experiment.preview_stale", "实验定义已变化，请重新预览", 409,
       )
+
+  @staticmethod
+  def _raise_create_blocked(response: dict[str, Any]) -> None:
+    legacy = current_contract_epoch() < ContractEpoch.ROLLING_WINDOW_V1
+    raise ExperimentError(
+      "experiment.plan_limit_exceeded" if legacy else "experiment.validation_failed",
+      (
+        "实验计划超过当前硬上限，请重新调整后预览"
+        if legacy else "实验输入不符合创建要求，请重新调整后预览"
+      ),
+      429 if legacy else 422,
+      details={"blockingReasons": response["limitDecision"]["blockingReasons"]},
+    )
 
   def _calculate_preview(self, request: ExperimentPreviewRequest) -> dict[str, Any]:
     self._require_capability()
@@ -446,8 +543,18 @@ class ExperimentApplication:
     estimate = self._estimator.estimate(
       template, datasets, grid.planned_trial_count, len(stage_request.dateScenarios),
     )
+    if (
+      current_contract_epoch() < ContractEpoch.ROLLING_WINDOW_V1
+      and estimate["estimateStatus"] == "unavailable"
+    ):
+      raise ExperimentError(
+        "experiment.capacity_unavailable",
+        "当前数据或周期元数据不足，无法形成可靠资源估算",
+        503,
+        retryable=True,
+      )
     limit_decision = self._limit_decision(grid, estimate)
-    examples = self._examples(template, grid, limit_decision["allowed"])
+    examples = self._examples(template, grid)
     normalized_spec = self._normalized_spec(request, template, grid, datasets, estimate)
     spec_hash = self._spec_hash(normalized_spec)
     response = self._preview_response(
@@ -491,50 +598,58 @@ class ExperimentApplication:
         "message": "单个维度候选值数量超过上限",
         "dimensions": oversized,
       })
-    if grid.planned_trial_count > settings.EXPERIMENT_MAX_TRIALS:
-      reasons.append({
-        "code": "trial_limit_exceeded",
-        "message": "Trial 总数超过单实验上限",
-        "actual": grid.planned_trial_count,
-        "limit": settings.EXPERIMENT_MAX_TRIALS,
-      })
-    if estimate["estimatedBarCount"] > settings.EXPERIMENT_BAR_MAX_ESTIMATED_BARS:
-      reasons.append({
-        "code": "bar_budget_exceeded",
-        "message": "预计 Bar 总量超过标准 Bar 资源预算",
-        "actual": estimate["estimatedBarCount"],
-        "limit": settings.EXPERIMENT_BAR_MAX_ESTIMATED_BARS,
-      })
+    if current_contract_epoch() < ContractEpoch.ROLLING_WINDOW_V1:
+      if grid.planned_trial_count > settings.EXPERIMENT_MAX_TRIALS:
+        reasons.append({
+          "code": "trial_limit_exceeded",
+          "message": "Trial 总数超过单实验上限",
+          "actual": grid.planned_trial_count,
+          "limit": settings.EXPERIMENT_MAX_TRIALS,
+        })
+      estimated_bars = estimate.get("estimatedBarCount")
+      if (
+        estimated_bars is not None
+        and int(estimated_bars) > settings.EXPERIMENT_BAR_MAX_ESTIMATED_BARS
+      ):
+        reasons.append({
+          "code": "bar_budget_exceeded",
+          "message": "预计 Bar 总量超过标准 Bar 资源预算",
+          "actual": estimated_bars,
+          "limit": settings.EXPERIMENT_BAR_MAX_ESTIMATED_BARS,
+        })
     warnings = []
-    if estimate["resourceClass"] == "heavy" and not reasons:
-      warnings.append({"code": "high_resource_estimate", "message": "该实验预计资源消耗较高"})
+    if estimate["estimateStatus"] == "unavailable":
+      warnings.append({
+        "code": "resource_estimate_unavailable",
+        "message": "当前覆盖元数据不足，暂时无法估算耗时",
+      })
+    elif estimate["resourceClass"] == "heavy":
+      warnings.append({
+        "code": "high_resource_estimate",
+        "message": "该实验预计资源消耗较高，创建后可能长时间排队",
+      })
     return {"allowed": not reasons, "warnings": warnings, "blockingReasons": reasons}
 
   def _examples(
     self,
     template: ResolvedRunTemplate,
     grid: GeneratedGrid,
-    validate_all: bool,
   ) -> list[dict[str, Any]]:
-    indexes = list(range(grid.planned_trial_count)) if validate_all else _sample_indexes(
-      grid.planned_trial_count,
-    )
+    indexes = _sample_indexes(grid.planned_trial_count)
     examples: list[dict[str, Any]] = []
-    sample_indexes = set(_sample_indexes(grid.planned_trial_count))
     for index in indexes:
       assignment = grid.assignment_at(index)
       compiled = self._compiler.compile(template, assignment)
-      if index in sample_indexes:
-        trial_fingerprint = grid.trial_fingerprint(
-          index, assignment, self._compiler.contract_version,
-        )
-        examples.append({
-          "trialIndex": index,
-          "trialFingerprint": trial_fingerprint,
-          "seedBundle": seed_bundle(trial_fingerprint),
-          "dimensionAssignment": assignment,
-          "compiledRequestDigest": compiled["requestDigest"],
-        })
+      trial_fingerprint = grid.trial_fingerprint(
+        index, assignment, self._compiler.contract_version,
+      )
+      examples.append({
+        "trialIndex": index,
+        "trialFingerprint": trial_fingerprint,
+        "seedBundle": seed_bundle(trial_fingerprint),
+        "dimensionAssignment": assignment,
+        "compiledRequestDigest": compiled["requestDigest"],
+      })
     return examples
 
   def _normalized_spec(
@@ -545,6 +660,12 @@ class ExperimentApplication:
     datasets: tuple[dict[str, Any], ...],
     estimate: dict[str, Any],
   ) -> dict[str, Any]:
+    budget = self._budget_summary()
+    policy = (
+      {"admissionPolicy": budget["admissionPolicy"]}
+      if budget["budgetVersion"] == "experiment_budget_v3"
+      else {"capacityPolicy": budget}
+    )
     return canonical_value(with_version({
       "schemaVersion": request.schemaVersion,
       "name": request.name.strip(),
@@ -561,7 +682,7 @@ class ExperimentApplication:
       },
       "datasetSnapshots": list(datasets),
       "resourceEstimate": estimate,
-      "capacityPolicy": self._budget_summary(),
+      **policy,
       "failurePolicy": default_failure_policy(),
       "determinism": {
         "seedDerivation": "trial-seed-v1",
@@ -628,15 +749,23 @@ class ExperimentApplication:
     })
 
   def _budget_summary(self) -> dict[str, Any]:
+    if current_contract_epoch() < ContractEpoch.ROLLING_WINDOW_V1:
+      return with_version({
+        "budgetVersion": "experiment_budget_v2",
+        "maxValuesPerDimension": settings.EXPERIMENT_MAX_VALUES_PER_DIMENSION,
+        "maxTrials": settings.EXPERIMENT_MAX_TRIALS,
+        "maxUserPlannedTrials": settings.EXPERIMENT_MAX_USER_PLANNED_TRIALS,
+        "maxEstimatedBars": settings.EXPERIMENT_BAR_MAX_ESTIMATED_BARS,
+        "maxInFlightPerExperiment": settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT,
+        "maxInFlightPerUser": settings.EXPERIMENT_MAX_IN_FLIGHT_PER_USER,
+        "schedulerCapacity": settings.BACKTEST_BASE_CONCURRENCY,
+      })
     return with_version({
-      "budgetVersion": "experiment_budget_v2",
-      "maxValuesPerDimension": settings.EXPERIMENT_MAX_VALUES_PER_DIMENSION,
-      "maxTrials": settings.EXPERIMENT_MAX_TRIALS,
-      "maxUserPlannedTrials": settings.EXPERIMENT_MAX_USER_PLANNED_TRIALS,
-      "maxEstimatedBars": settings.EXPERIMENT_BAR_MAX_ESTIMATED_BARS,
-      "maxInFlightPerExperiment": settings.EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT,
-      "maxInFlightPerUser": settings.EXPERIMENT_MAX_IN_FLIGHT_PER_USER,
-      "schedulerCapacity": settings.BACKTEST_BASE_CONCURRENCY,
+      "budgetVersion": "experiment_budget_v3",
+      "admissionPolicy": {
+        "maxValuesPerDimension": settings.EXPERIMENT_MAX_VALUES_PER_DIMENSION,
+        "maxExactPlannedTrialCount": MAX_PLANNED_TRIAL_COUNT,
+      },
     })
 
 

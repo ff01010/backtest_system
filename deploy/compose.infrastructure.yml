@@ -412,13 +412,52 @@ services:
       TREND_GRID_DEFAULT_USER_ID: ${TREND_GRID_DEFAULT_USER_ID}
       TREND_GRID_APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
       TREND_GRID_CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+      TREND_GRID_EXPERIMENT_STORAGE_PROBE_URL: http://storage-probe:8091
     command: ['python', '-m', 'backend.experiment_coordinator']
     depends_on:
       postgres:
         condition: service_healthy
+      storage-probe:
+        condition: service_started
     cpus: 1.0
     mem_limit: 1g
     pids_limit: 128
+    networks:
+      - quant-backtest-net
+
+  storage-probe:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args:
+        APPLICATION_BUILD_ID: ${APPLICATION_BUILD_ID:-dev}
+        CLIENT_COMPATIBILITY_VERSION: ${CLIENT_COMPATIBILITY_VERSION:-1}
+    container_name: quant-backtest-storage-probe
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ['ALL']
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      STORAGE_PROBE_POSTGRES_MOUNT: /volumes/postgres
+      STORAGE_PROBE_ARTIFACT_MOUNT: /volumes/artifacts
+      STORAGE_PROBE_PORT: '8091'
+    command: ['python', '-m', 'backend.storage_probe']
+    volumes:
+      - quant-backtest-postgres-data:/volumes/postgres:ro
+      - quant-backtest-artifacts:/volumes/artifacts:ro
+    tmpfs:
+      - /tmp
+    cpus: 0.1
+    mem_limit: 96m
+    pids_limit: 32
+    logging: *bounded-logging
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - quant-backtest-net
 

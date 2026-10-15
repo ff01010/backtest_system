@@ -343,6 +343,29 @@ def _process_resource_batch(cur: Any, purge_id: str, phase: str) -> bool:
     if not items:
       continue
     resource_ids = [str(item["resource_id"]) for item in items]
+    if resource_type == "evaluation_run":
+      for child in (
+        "backtest_experiment_evaluation_exception",
+        "backtest_experiment_evaluation_group_result",
+        "backtest_experiment_evaluation_result_row",
+        "backtest_experiment_evaluation_execution",
+      ):
+        cur.execute(
+          f"DELETE FROM {child} WHERE evaluation_run_id=ANY(%s)",
+          (resource_ids,),
+        )
+    elif resource_type == "trial":
+      cur.execute(
+        "DELETE FROM backtest_experiment_window_event WHERE trial_id=ANY(%s)",
+        (resource_ids,),
+      )
+    elif resource_type == "stage":
+      for child in (
+        "backtest_experiment_window_event",
+        "backtest_experiment_generation_token",
+        "backtest_experiment_window_stage",
+      ):
+        cur.execute(f"DELETE FROM {child} WHERE stage_id=ANY(%s)", (resource_ids,))
     cur.execute(f"DELETE FROM {table} WHERE id=ANY(%s)", (resource_ids,))
     _mark_items(cur, [str(item["id"]) for item in items], "deleted")
     return True

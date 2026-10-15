@@ -117,6 +117,53 @@ class EvaluationApplication:
   def run_detail(self, experiment_id: str, run_id: str) -> dict[str, Any]:
     return self._repository.get_run(experiment_id, run_id)
 
+  def run_results(
+    self,
+    experiment_id: str,
+    run_id: str,
+    *,
+    after_ordinal: int,
+    limit: int,
+  ) -> dict[str, Any]:
+    return self._repository.page_run_results(
+      experiment_id,
+      run_id,
+      after_ordinal=after_ordinal,
+      limit=limit,
+    )
+
+  def run_exceptions(
+    self,
+    experiment_id: str,
+    run_id: str,
+    *,
+    after_ordinal: int,
+    limit: int,
+  ) -> dict[str, Any]:
+    return self._repository.page_run_exceptions(
+      experiment_id,
+      run_id,
+      after_ordinal=after_ordinal,
+      limit=limit,
+    )
+
+  def group_members(
+    self,
+    experiment_id: str,
+    run_id: str,
+    group_id: str,
+    *,
+    after_ordinal: int,
+    limit: int,
+  ) -> dict[str, Any]:
+    return self._repository.page_group_members(
+      experiment_id,
+      run_id,
+      group_id,
+      after_ordinal=after_ordinal,
+      limit=limit,
+    )
+
   def retry_run(
     self,
     experiment_id: str,
@@ -132,6 +179,29 @@ class EvaluationApplication:
         "operationType": "experiment.evaluation_run.retry.v1",
         "experimentId": experiment_id,
         "evaluationRunId": run_id,
+      })),
+      request_id=request_id,
+    )
+    return result.response, result.status_code
+
+  def cancel_run(
+    self,
+    experiment_id: str,
+    run_id: str,
+    reason: str | None,
+    idempotency_key: str,
+    request_id: str | None = None,
+  ) -> tuple[dict[str, Any], int]:
+    result = self._repository.cancel_run(
+      experiment_id=experiment_id,
+      run_id=run_id,
+      reason=reason,
+      idempotency_key=idempotency_key,
+      request_hash=digest(with_version({
+        "operationType": "experiment.evaluation_run.cancel.v1",
+        "experimentId": experiment_id,
+        "evaluationRunId": run_id,
+        "reason": reason,
       })),
       request_id=request_id,
     )

@@ -7,6 +7,9 @@ compose_file="$project_root/deploy/compose.infrastructure.yml"
 clickhouse_compose_file="$project_root/deploy/compose.clickhouse.yml"
 submission_gate_dir="$project_root/deploy/submission-gate"
 deploy_lock_file="/tmp/quant-backtest-deploy.lock"
+script_args=("$@")
+env_defaults_changed=false
+env_backup_file="${env_file}.backup-before-managed-update"
 
 # 让 flock 父进程持有整段发布锁，脚本更新后可在同一把锁内安全重启。
 if [[ "${QUANT_DEPLOY_LOCK_HELD:-}" != "1" ]]; then
@@ -15,7 +18,8 @@ if [[ "${QUANT_DEPLOY_LOCK_HELD:-}" != "1" ]]; then
     exit 1
   }
   if flock -n -E 75 "$deploy_lock_file" \
-    env QUANT_DEPLOY_LOCK_HELD=1 bash "$project_root/scripts/deploy-server.sh"; then
+    env QUANT_DEPLOY_LOCK_HELD=1 bash "$project_root/scripts/deploy-server.sh" \
+      "${script_args[@]}"; then
     exit 0
   else
     status=$?
@@ -29,6 +33,95 @@ fi
 fail() {
   echo "发布终止：$1" >&2
   exit 1
+}
+
+env_key_count() {
+  local name="$1"
+  grep -Ec "^${name}=" "$env_file" || true
+}
+
+append_auth_session_env_defaults() {
+  local name count temp_file
+  local added_names=()
+  for name in TREND_GRID_AUTH_SESSION_IDLE_HOURS \
+    TREND_GRID_AUTH_SESSION_MAX_DAYS \
+    TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS; do
+    count="$(env_key_count "$name")"
+    [[ "$count" -le 1 ]] || fail "deploy/.env 中的 ${name} 存在重复定义"
+  done
+  if [[ "$(env_key_count TREND_GRID_AUTH_SESSION_IDLE_HOURS)" == "1" \
+    && "$(env_key_count TREND_GRID_AUTH_SESSION_MAX_DAYS)" == "1" \
+    && "$(env_key_count TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS)" == "1" ]]; then
+    return
+  fi
+  cp --preserve=mode "$env_file" "$env_backup_file" \
+    || fail "无法备份 deploy/.env"
+  temp_file="$(mktemp "${env_file}.tmp.XXXXXX")"
+  cp --preserve=mode "$env_file" "$temp_file" || {
+    rm -f "$temp_file"
+    fail "无法创建 deploy/.env 临时副本"
+  }
+  if [[ "$(env_key_count TREND_GRID_AUTH_SESSION_IDLE_HOURS)" == "0" ]]; then
+    printf '\n# 用户连续无操作达到该时长后，会话失效并要求重新登录。\nTREND_GRID_AUTH_SESSION_IDLE_HOURS=24\n' >> "$temp_file"
+    added_names+=(TREND_GRID_AUTH_SESSION_IDLE_HOURS)
+  fi
+  if [[ "$(env_key_count TREND_GRID_AUTH_SESSION_MAX_DAYS)" == "0" ]]; then
+    printf '\n# 单次登录的最长有效天数；即使持续操作，达到该期限后也必须重新登录。\nTREND_GRID_AUTH_SESSION_MAX_DAYS=7\n' >> "$temp_file"
+    added_names+=(TREND_GRID_AUTH_SESSION_MAX_DAYS)
+  fi
+  if [[ "$(env_key_count TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS)" == "0" ]]; then
+    printf '\n# 最近活动时间的最小写入间隔，用于减少高频接口轮询造成的数据库写入。\nTREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS=300\n' >> "$temp_file"
+    added_names+=(TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS)
+  fi
+  mv "$temp_file" "$env_file" || {
+    rm -f "$temp_file"
+    fail "无法原子更新 deploy/.env"
+  }
+  env_defaults_changed=true
+  echo "发布配置已增量新增变量：${added_names[*]}；原配置已备份至 ${env_backup_file}"
+}
+
+read_bounded_env_int() {
+  local name="$1" minimum="$2" maximum="$3" value
+  [[ "$(env_key_count "$name")" == "1" ]] || {
+    echo "deploy/.env 中的 ${name} 必须且只能定义一次" >&2
+    return 1
+  }
+  value="$(grep -E "^${name}=" "$env_file" | cut -d= -f2-)"
+  value="${value//[[:space:]]/}"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -ge "$minimum" && "$value" -le "$maximum" ]] || {
+    echo "deploy/.env 中的 ${name} 不在允许范围" >&2
+    return 1
+  }
+  echo "$value"
+}
+
+validate_auth_session_env() {
+  local idle_hours max_days touch_seconds
+  idle_hours="$(read_bounded_env_int TREND_GRID_AUTH_SESSION_IDLE_HOURS 1 72)" || return 1
+  max_days="$(read_bounded_env_int TREND_GRID_AUTH_SESSION_MAX_DAYS 1 30)" || return 1
+  touch_seconds="$(read_bounded_env_int TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS 60 3600)" || return 1
+  [[ "$((max_days * 24))" -gt "$idle_hours" ]] || {
+    echo "登录会话最长有效期必须大于空闲超时时间" >&2
+    return 1
+  }
+  [[ "$touch_seconds" -lt "$((idle_hours * 3600))" ]] || {
+    echo "登录会话活动写入间隔必须小于空闲超时时间" >&2
+    return 1
+  }
+}
+
+restore_env_defaults_backup() {
+  local temp_file
+  [[ "$env_defaults_changed" == "true" && -f "$env_backup_file" ]] || return
+  temp_file="$(mktemp "${env_file}.restore.XXXXXX")"
+  cp --preserve=mode "$env_backup_file" "$temp_file" \
+    && mv "$temp_file" "$env_file" || {
+      rm -f "$temp_file"
+      fail "配置校验失败且 deploy/.env 自动恢复失败"
+    }
+  env_defaults_changed=false
+  echo "配置校验失败，已从备份恢复 deploy/.env" >&2
 }
 
 close_submission_gate() {
@@ -114,7 +207,7 @@ check_active_backtests() {
 stop_submission_and_wait_for_backtests() {
   local attempt
   echo "停止 backend，阻断新的页面和开放 API 回测提交"
-  "${compose[@]}" stop frontend backend experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner
+  "${compose[@]}" stop frontend backend experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner storage-probe
   for attempt in $(seq 1 360); do
     if check_active_backtests; then
       echo "回测队列已排空，可以开始迁移和同批发布"
@@ -171,6 +264,7 @@ wait_for_application() {
     if runner_containers_ready "bar-runner" "$bar_replicas" \
       && runner_containers_ready "l2-runner" "$l2_replicas" \
       && runner_containers_ready "experiment-coordinator" "1" \
+      && runner_containers_ready "storage-probe" "1" \
       && runner_containers_ready "evaluation-worker" "1" \
       && runner_containers_ready "evaluation-export-worker" "1" \
       && runner_containers_ready "experiment-purge-worker" "1" \
@@ -286,6 +380,101 @@ verify_release_admin_image() {
   echo "release-admin 镜像验证通过：image=${RELEASE_ADMIN_IMAGE}, manifest=${host_digest}"
 }
 
+verify_experiment_service_builds() {
+  local service container_id build_id health
+  for service in backend experiment-coordinator evaluation-worker \
+    evaluation-export-worker storage-probe frontend; do
+    container_id="$("${compose[@]}" ps -q "$service")"
+    [[ -n "$container_id" ]] || fail "语义激活前缺少服务容器：${service}"
+    build_id="$(docker inspect --format \
+      '{{ index .Config.Labels "io.trend-grid.application-build-id" }}' \
+      "$container_id")"
+    [[ "$build_id" == "$APPLICATION_BUILD_ID" ]] \
+      || fail "服务 ${service} 的 buildId 不一致：${build_id}"
+    health="$(docker inspect --format \
+      '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+      "$container_id")"
+    [[ "$health" == "healthy" || "$health" == "running" ]] \
+      || fail "服务 ${service} 当前不健康：${health}"
+  done
+}
+
+validate_epoch_step() {
+  local expected="$1" target="$2"
+  case "${expected}:${target}" in
+    legacy:lifecycle_v2|lifecycle_v2:evaluation_v2|evaluation_v2:rolling_window_v1) ;;
+    *) fail "语义纪元只能单步推进：${expected} -> ${target}" ;;
+  esac
+}
+
+activate_experiment_epoch() {
+  local expected="$1" target="$2" actor="$3"
+  local port health_url health_response active_build actual_epoch takeover_args
+  validate_epoch_step "$expected" "$target"
+  [[ -n "$actor" ]] || fail "语义激活必须提供操作者标识"
+  active_build="$(docker exec quant-backtest-postgres sh -c \
+    'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT trim(current_build_id) FROM app_deployment_state WHERE singleton_key=true;"')"
+  [[ "$active_build" == "$APPLICATION_BUILD_ID" ]] \
+    || fail "当前部署 buildId=${active_build}，与工作区 ${APPLICATION_BUILD_ID} 不一致"
+  actual_epoch="$(docker exec quant-backtest-postgres sh -c \
+    'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT contract_epoch FROM backtest_experiment_rollout_state WHERE singleton;"')"
+  [[ "$actual_epoch" == "$expected" ]] \
+    || fail "语义纪元冲突：预期 ${expected}，实际 ${actual_epoch}"
+  verify_experiment_service_builds
+  port="$(read_http_port)"
+  health_url="http://127.0.0.1:${port}/api/health"
+  health_response="$(curl --fail --silent --show-error "$health_url")"
+  [[ "$health_response" == *"\"applicationBuildId\":\"${APPLICATION_BUILD_ID}\""* ]] \
+    || fail "后端健康响应 buildId 不一致"
+  [[ "$health_response" == *'"maximum":"rolling_window_v1"'* ]] \
+    || fail "后端未声明支持 rolling_window_v1"
+  [[ "$health_response" == *'"storagePressure":{"status":"open"'* ]] \
+    || fail "存储压力信号未全部新鲜且开放"
+  verify_frontend_build "$port"
+  if [[ "$target" == "rolling_window_v1" ]]; then
+    takeover_args=(python -m backend.experiments.takeover
+      --build-id "$APPLICATION_BUILD_ID" --actor "$actor")
+    "${compose[@]}" run --rm --no-deps experiment-coordinator \
+      "${takeover_args[@]}" \
+      || fail "活动 Revision 接管预检失败；保持 evaluation_v2"
+  fi
+
+  close_submission_gate
+  release_activated=false
+  trap report_incomplete_release EXIT
+  "${compose[@]}" stop frontend backend experiment-coordinator \
+    evaluation-worker evaluation-export-worker
+  if [[ "$target" == "rolling_window_v1" ]]; then
+    "${compose[@]}" run --rm --no-deps experiment-coordinator \
+      python -m backend.experiments.takeover --apply \
+      --build-id "$APPLICATION_BUILD_ID" --actor "$actor" \
+      || fail "活动 Revision 接管失败；语义纪元未推进，保持提交门禁关闭"
+  fi
+  "${compose[@]}" --profile release-admin run --rm --no-deps release-admin \
+    activate-experiment-epoch \
+    --expected-epoch "$expected" --target-epoch "$target" \
+    --build-id "$APPLICATION_BUILD_ID" --actor "$actor" \
+    --detail-json '{"activationPath":"scripts/deploy-server.sh"}'
+  if [[ "$target" == "rolling_window_v1" ]]; then
+    "${compose[@]}" run --rm --no-deps experiment-coordinator \
+      python -m backend.experiments.legacy_quota_cleanup --apply \
+      --build-id "$APPLICATION_BUILD_ID" --actor "$actor" \
+      || fail "旧计划额度清理失败；保持提交门禁关闭并执行前向修复"
+  fi
+  "${compose[@]}" start backend experiment-coordinator evaluation-worker \
+    evaluation-export-worker frontend
+  bar_runner_replicas="$(read_runner_replicas TREND_GRID_BAR_RUNNER_REPLICAS)"
+  l2_runner_replicas="$(read_runner_replicas TREND_GRID_L2_RUNNER_REPLICAS)"
+  wait_for_application "$port" "$bar_runner_replicas" "$l2_runner_replicas"
+  health_response="$(curl --fail --silent --show-error "$health_url")"
+  [[ "$health_response" == *"\"contractEpoch\":\"${target}\""* ]] \
+    || fail "服务恢复后未读取到目标语义纪元 ${target}"
+  release_activated=true
+  open_submission_gate
+  trap - EXIT
+  echo "实验语义纪元已激活：${expected} -> ${target}，buildId=${APPLICATION_BUILD_ID}"
+}
+
 preserve_recovery_image() {
   local recovery_image="quant-backtest-release-admin:recovery-v1"
   if docker image inspect "$recovery_image" >/dev/null 2>&1; then
@@ -306,6 +495,23 @@ cd "$project_root"
 [[ "$(git branch --show-current)" == "main" ]] || fail "当前分支不是 main"
 [[ -z "$(git status --porcelain)" ]] || fail "工作区有未提交改动，请先处理后再发布"
 
+if [[ "${1:-deploy}" == "activate-experiment-epoch" ]]; then
+  [[ "$#" == "4" ]] \
+    || fail "用法：deploy-server.sh activate-experiment-epoch <expected> <target> <actor>"
+  require_release_database_password
+  APPLICATION_BUILD_ID="$(git rev-parse HEAD)"
+  CLIENT_COMPATIBILITY_VERSION="$(read_client_compatibility_version)"
+  RELEASE_ADMIN_IMAGE="quant-backtest-release-admin:${APPLICATION_BUILD_ID}"
+  export APPLICATION_BUILD_ID CLIENT_COMPATIBILITY_VERSION RELEASE_ADMIN_IMAGE
+  compose=(docker compose --env-file "$env_file" -f "$compose_file" -f "$clickhouse_compose_file" --profile observability)
+  "${compose[@]}" config >/dev/null || fail "Docker Compose 配置校验失败"
+  verify_release_admin_image
+  activate_experiment_epoch "$2" "$3" "$4"
+  exit 0
+fi
+[[ "$#" == "0" || "${1:-}" == "deploy" ]] \
+  || fail "未知命令：${1:-}"
+
 script_digest_before="$(sha256sum "$project_root/scripts/deploy-server.sh" | cut -d' ' -f1)"
 git fetch origin main
 git pull --ff-only origin main
@@ -314,9 +520,14 @@ if [[ "$script_digest_before" != "$script_digest_after" \
   && "${QUANT_DEPLOY_REEXECUTED:-}" != "1" ]]; then
   echo "部署脚本已更新，在同一发布锁内重新执行新版本"
   exec env QUANT_DEPLOY_LOCK_HELD=1 QUANT_DEPLOY_REEXECUTED=1 \
-    bash "$project_root/scripts/deploy-server.sh"
+    bash "$project_root/scripts/deploy-server.sh" "${script_args[@]}"
 fi
 
+append_auth_session_env_defaults
+if ! validate_auth_session_env; then
+  restore_env_defaults_backup
+  fail "登录会话配置校验失败"
+fi
 require_release_database_password
 APPLICATION_BUILD_ID="$(git rev-parse HEAD)"
 CLIENT_COMPATIBILITY_VERSION="$(read_client_compatibility_version)"
@@ -329,7 +540,11 @@ compose=(docker compose --env-file "$env_file" -f "$compose_file" -f "$clickhous
 bar_runner_replicas="$(read_runner_replicas TREND_GRID_BAR_RUNNER_REPLICAS)"
 l2_runner_replicas="$(read_runner_replicas TREND_GRID_L2_RUNNER_REPLICAS)"
 validate_clickhouse_network
-"${compose[@]}" config >/dev/null || fail "Docker Compose 配置校验失败"
+if ! "${compose[@]}" config >/dev/null; then
+  restore_env_defaults_backup
+  fail "Docker Compose 配置校验失败"
+fi
+env_defaults_changed=false
 # 不依赖业务迁移的日志服务先预检，避免其故障发生在停服之后。
 observability_preflight_ready=false
 if "${compose[@]}" up -d --build docker-socket-proxy loki alloy \
@@ -359,7 +574,7 @@ fi
 "${compose[@]}" up -d --build --remove-orphans \
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \
-  backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner
+  backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner storage-probe
 "${compose[@]}" --profile release-admin build release-admin
 verify_release_admin_image
 # Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。

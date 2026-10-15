@@ -23,7 +23,10 @@ from backend.time_utils import format_shanghai_datetime
 
 
 SESSION_COOKIE = "quant_backtest_session"
-SESSION_LIFETIME = timedelta(hours=12)
+SESSION_IDLE_TIMEOUT = timedelta(hours=settings.AUTH_SESSION_IDLE_HOURS)
+SESSION_MAX_LIFETIME = timedelta(days=settings.AUTH_SESSION_MAX_DAYS)
+SESSION_TOUCH_INTERVAL = timedelta(seconds=settings.AUTH_SESSION_TOUCH_INTERVAL_SECONDS)
+RESEARCH_IDENTITY_LIFETIME = timedelta(hours=12)
 CSRF_ROTATION_GRACE = timedelta(seconds=30)
 PASSWORD_ITERATIONS = 210_000
 API_KEY_SCOPES = {
@@ -374,7 +377,7 @@ def authenticate(
         row["id"],
         _token_hash(token),
         _token_hash(csrf_token),
-        datetime.now(timezone.utc) + SESSION_LIFETIME,
+        datetime.now(timezone.utc) + SESSION_MAX_LIFETIME,
         client_ip,
         user_agent,
       ))
@@ -396,12 +399,17 @@ def get_user_by_token(token: str | None) -> CurrentUser | None:
         SELECT u.* FROM auth_session s
         JOIN app_user u ON u.id=s.user_id
         WHERE s.token_hash=%s AND s.revoked_at IS NULL
-          AND s.expires_at > now() AND u.status='active'
-      """, (token_hash,))
+          AND s.expires_at > now()
+          AND s.last_seen_at > now() - %s
+          AND u.status='active'
+      """, (token_hash, SESSION_IDLE_TIMEOUT))
       row = cur.fetchone()
       if not row:
         return None
-      cur.execute("UPDATE auth_session SET last_seen_at=now() WHERE token_hash=%s", (token_hash,))
+      cur.execute("""
+        UPDATE auth_session SET last_seen_at=now()
+        WHERE token_hash=%s AND last_seen_at <= now() - %s
+      """, (token_hash, SESSION_TOUCH_INTERVAL))
       return _to_current_user(row)
 
 
@@ -423,8 +431,14 @@ def rotate_csrf_token(token: str | None, request_id: str | None = None) -> str |
           csrf_rotated_at=now(),
           last_seen_at=now()
         WHERE token_hash=%s AND revoked_at IS NULL AND expires_at > now()
+          AND last_seen_at > now() - %s
         RETURNING id, user_id
-      """, (CSRF_ROTATION_GRACE, _token_hash(csrf_token), _token_hash(token)))
+      """, (
+        CSRF_ROTATION_GRACE,
+        _token_hash(csrf_token),
+        _token_hash(token),
+        SESSION_IDLE_TIMEOUT,
+      ))
       row = cur.fetchone()
       if not row:
         return None
@@ -449,7 +463,8 @@ def validate_csrf_token(session_token: str | None, csrf_token: str | None) -> bo
           csrf_previous_valid_until > now() AS previous_is_valid
         FROM auth_session
         WHERE token_hash=%s AND revoked_at IS NULL AND expires_at > now()
-      """, (_token_hash(session_token),))
+          AND last_seen_at > now() - %s
+      """, (_token_hash(session_token), SESSION_IDLE_TIMEOUT))
       row = cur.fetchone()
   if not row:
     return False

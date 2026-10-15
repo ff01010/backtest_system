@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
+from backend import settings
 from backend.services import shared_backtest_artifacts, state_store
 
 
@@ -87,8 +88,11 @@ def _copy_payloads(
     raise ValueError("共享回测快照不完整，暂时无法复制")
   code = str(strategy.get("code") or "")
   symbol = str(configuration.get("symbol") or "")
+  timeframe = str(configuration.get("timeframe") or "5m")
   if not code.strip() or not symbol:
     raise ValueError("共享回测快照不完整，暂时无法复制")
+  if not settings.validate_backtest_timeframe(timeframe):
+    raise ValueError(f"共享回测使用的周期 {timeframe} 已停止支持，请改用数据库原生周期")
   name = _copy_name(str(publication["title"]))
   script_payload = {
     "name": name,
@@ -102,7 +106,7 @@ def _copy_payloads(
     "strategy": str(configuration.get("strategy") or "user_script"),
     "mode": "backtest",
     "symbol": symbol,
-    "timeframe": str(configuration.get("timeframe") or "5m"),
+    "timeframe": timeframe,
     "benchmarkSymbol": configuration.get("benchmarkSymbol"),
     "accountId": None,
     "paramsJson": {

@@ -1325,6 +1325,21 @@ def test_temporary_quote_provider_normalizes_frontend_date(value: str, expected:
   assert TemporaryQuoteBarProvider._parse_date(value).isoformat() == expected
 
 
+@pytest.mark.parametrize("timeframe", ["3m", "45m"])
+def test_temporary_quote_provider_rejects_retired_derived_timeframe(timeframe: str) -> None:
+  provider = TemporaryQuoteBarProvider(
+    load_temporary_quote_profile(),
+    VersionedBarCache(None, 60),
+    "tick_quote_session_v5",
+    "tick_quote_depth_v3",
+  )
+
+  with pytest.raises(L2DataError) as raised:
+    provider.load_bars("688981.SH", timeframe, "2026-01-02", "2026-01-02")
+
+  assert raised.value.code == "backtest.timeframe_unsupported"
+
+
 def test_temporary_quote_provider_excludes_zero_price_non_trading_days(monkeypatch: pytest.MonkeyPatch) -> None:
   provider = TemporaryQuoteBarProvider(
     load_temporary_quote_profile(), VersionedBarCache(None, 60), "tick_quote_session_v5", "tick_quote_depth_v3",

@@ -4,9 +4,10 @@ import type { SessionUser } from '../api/client';
 
 interface Props {
   onLogin: (user: SessionUser) => void;
+  notice?: string;
 }
 
-export default function LoginPage({ onLogin }: Props) {
+export default function LoginPage({ onLogin, notice = '' }: Props) {
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -35,6 +36,7 @@ export default function LoginPage({ onLogin }: Props) {
         <div style={{ color: 'var(--accent)', fontSize: 12, letterSpacing: 2, fontWeight: 750 }}>QUANT WORKSPACE</div>
         <h1 style={{ margin: '10px 0 8px', fontSize: 28, color: 'var(--text)', fontFamily: 'ui-serif, "Songti SC", "Noto Serif SC", serif' }}>玄龄量化回测系统</h1>
         <p style={{ color: 'var(--text-muted)', marginBottom: 28 }}>请使用管理员创建的账户登录。</p>
+        {notice && <div role="status" style={{ color: '#895500', background: '#fff8e8', padding: '9px 11px', borderRadius: 7, marginBottom: 16 }}>{notice}</div>}
         <form onSubmit={submit} style={{ display: 'grid', gap: 16 }}>
           <label style={{ color: 'var(--text-muted)', display: 'grid', gap: 7 }}>
             用户名

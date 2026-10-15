@@ -287,6 +287,42 @@ def test_admin_endpoint_forwards_exact_task_uuid_without_user_filter(
   assert captured["args"][2] == "117f14fd-203a-4705-8fe3-c4a3a42d4746"
 
 
+def test_admin_capacity_endpoint_combines_slots_and_runner_health(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  capacity = {
+    "baseLimit": 16, "burstLimit": 24, "effectiveLimit": 16,
+    "overrideLimit": None, "overrideExpiresAt": None,
+    "activeCount": 14, "barActiveCount": 10, "l2ActiveCount": 4,
+  }
+  runners = {
+    "bar": {
+      "healthy": 16, "errors": 0, "queued": 7,
+      "oldestQueuedSeconds": 83,
+    },
+    "l2": {
+      "healthy": 16, "errors": 0, "queued": 2,
+      "oldestQueuedSeconds": 18,
+    },
+  }
+  monkeypatch.setattr(api_app, "_require_admin", lambda _: None)
+  monkeypatch.setattr(
+    state_store, "get_backtest_scheduler_capacity", lambda: capacity,
+  )
+  monkeypatch.setattr(
+    state_store, "get_backtest_runner_health",
+    lambda: {"status": "ok", "runners": runners},
+  )
+
+  result = api_app.admin_backtest_capacity(object())
+
+  assert result == {
+    **capacity,
+    "runnerStatus": "ok",
+    "runners": runners,
+  }
+
+
 def test_admin_diagnostics_endpoint_accepts_only_uuid_parameters(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:

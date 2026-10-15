@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import SystemErrorLogPage from '../components/SystemErrorLogPage';
 
 const apiMocks = vi.hoisted(() => ({
+  fetchBacktestResourceStatus: vi.fn(),
   fetchBacktestRunDiagnostics: vi.fn(),
   fetchStrategyRuntimeErrorStats: vi.fn(),
   fetchSystemErrorLogs: vi.fn(),
@@ -15,6 +16,21 @@ describe('SystemErrorLogPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     apiMocks.fetchUsers.mockResolvedValue([]);
+    apiMocks.fetchBacktestResourceStatus.mockResolvedValue({
+      baseLimit: 16,
+      burstLimit: 24,
+      effectiveLimit: 16,
+      overrideLimit: null,
+      overrideExpiresAt: null,
+      activeCount: 16,
+      barActiveCount: 12,
+      l2ActiveCount: 4,
+      runnerStatus: 'ok',
+      runners: {
+        bar: { healthy: 16, errors: 0, queued: 7, oldestQueuedSeconds: 83 },
+        l2: { healthy: 16, errors: 0, queued: 2, oldestQueuedSeconds: 18 },
+      },
+    });
     apiMocks.fetchStrategyRuntimeErrorStats.mockResolvedValue([]);
     apiMocks.fetchSystemErrorLogs.mockResolvedValue([{
       id: 1,
@@ -102,5 +118,26 @@ describe('SystemErrorLogPage', () => {
     await waitFor(() => expect(apiMocks.fetchBacktestRunDiagnostics).toHaveBeenCalledWith(
       '117f14fd-203a-4705-8fe3-c4a3a42d4746',
     ));
+  });
+
+  it('shows scheduler capacity and runner pressure before diagnostic logs', async () => {
+    render(<SystemErrorLogPage />);
+
+    const progress = await screen.findByRole('progressbar');
+    expect(progress.getAttribute('aria-valuenow')).toBe('16');
+    expect(progress.getAttribute('aria-valuemax')).toBe('16');
+    expect(screen.getByText('基础容量已满')).toBeTruthy();
+    expect(screen.getByText('Bar')).toBeTruthy();
+    expect(screen.getByText('L2')).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '回测监控与诊断' })).toBeTruthy();
+  });
+
+  it('keeps log data visible when the resource snapshot cannot be loaded', async () => {
+    apiMocks.fetchBacktestResourceStatus.mockRejectedValueOnce(new Error('容量接口不可用'));
+
+    render(<SystemErrorLogPage />);
+
+    expect(await screen.findByText('容量接口不可用')).toBeTruthy();
+    expect(await screen.findByText('#42')).toBeTruthy();
   });
 });

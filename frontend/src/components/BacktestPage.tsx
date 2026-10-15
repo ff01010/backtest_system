@@ -191,8 +191,14 @@ const DEFAULT_PARAMS = {
 };
 
 export const BACKTEST_TIMEFRAMES: readonly string[] = [
-  '1m', '3m', '5m', '15m', '30m', '45m', '60m', '1d',
+  '1m', '5m', '15m', '30m', '60m', '1d',
 ];
+
+export function getUnsupportedBacktestTimeframeError(timeframe: string): string | null {
+  return BACKTEST_TIMEFRAMES.includes(timeframe)
+    ? null
+    : `回测周期 ${timeframe} 已停止支持，请改用数据库原生周期后重新保存策略`;
+}
 
 const EXPERIMENT_PARAM_KEYS = new Set([
   'startDate',
@@ -508,6 +514,7 @@ export function getResearchSignalSelectionError(
   return null;
 }
 
+// 兼容既有研究信号数据集；这里不是回测运行周期白名单。
 const RESEARCH_TIMEFRAME_MINUTES: Record<string, number> = {
   '1m': 1,
   '3m': 3,
@@ -1535,6 +1542,7 @@ export default function BacktestPage({
     () => researchSignalDatasets.find((item) => item.id === selectedSignalDatasetId) ?? null,
     [researchSignalDatasets, selectedSignalDatasetId]
   );
+  const unsupportedTimeframeError = getUnsupportedBacktestTimeframeError(selectedTimeframe);
   const researchSignalTimeframeError = getResearchSignalTimeframeError(
     selectedResearchSignal?.timeframe,
     selectedTimeframe
@@ -1729,12 +1737,19 @@ export default function BacktestPage({
   }, [experimentFingerprint, publishedExperimentFingerprint, selectedConfigId]);
 
   useEffect(() => {
+    if (unsupportedTimeframeError) {
+      dataStatusRequestIdRef.current += 1;
+      setDataStatus(null);
+      setDataStatusError(unsupportedTimeframeError);
+      setLoadingDataStatus(false);
+      return;
+    }
     refreshDataStatus(
       selectedSymbol,
       selectedTimeframe,
       normalizeFillModel(params.fillModel),
     );
-  }, [selectedSymbol, selectedTimeframe, params.fillModel]);
+  }, [selectedSymbol, selectedTimeframe, params.fillModel, unsupportedTimeframeError]);
 
   useEffect(() => {
     if (normalizeFillModel(params.fillModel) === 'l2_quote') {
@@ -1761,8 +1776,15 @@ export default function BacktestPage({
   useEffect(() => {
     if (normalizeFillModel(params.fillModel) === 'l2_quote') return;
     if (selectedBenchmarkSymbol === selectedSymbol) return;
+    if (unsupportedTimeframeError) {
+      benchmarkDataStatusRequestIdRef.current += 1;
+      setBenchmarkDataStatus(null);
+      setBenchmarkDataStatusError(unsupportedTimeframeError);
+      setLoadingBenchmarkDataStatus(false);
+      return;
+    }
     refreshBenchmarkDataStatus(selectedBenchmarkSymbol, selectedTimeframe);
-  }, [selectedBenchmarkSymbol, selectedSymbol, selectedTimeframe, params.fillModel]);
+  }, [selectedBenchmarkSymbol, selectedSymbol, selectedTimeframe, params.fillModel, unsupportedTimeframeError]);
 
   useEffect(() => {
     if (isCustomScriptStrategy(selectedStrategy)) {
@@ -2128,9 +2150,6 @@ export default function BacktestPage({
         initialPositionEnabled: false,
         t0Enabled: false,
       });
-    if (strategyCategory === 'core_position_overlay' && !BACKTEST_TIMEFRAMES.includes(selectedTimeframe)) {
-      setSelectedTimeframe('1m');
-    }
   };
 
   const setInitialPositionEnabled = (enabled: boolean) => {
@@ -2152,15 +2171,13 @@ export default function BacktestPage({
 
   const setVersionTimeframe = (timeframe: string) => {
     setSelectedTimeframe(timeframe);
+    setError('');
   };
 
   const setFillModel = (fillModel: 'bar_next_open' | 'l2_quote') => {
     setParam('fillModel', fillModel);
     if (fillModel !== 'l2_quote') {
       setParam('executionAlgorithm', 'immediate');
-    }
-    if (fillModel === 'l2_quote' && !BACKTEST_TIMEFRAMES.includes(selectedTimeframe)) {
-      setSelectedTimeframe('1m');
     }
   };
 
@@ -2392,6 +2409,11 @@ export default function BacktestPage({
 
     setError('');
     setStatus('');
+    if (unsupportedTimeframeError) {
+      setError(unsupportedTimeframeError);
+      revealConfigSection('scope');
+      return null;
+    }
     const strategyName = configName.trim() || scriptForm.name.trim();
     if (!strategyName) {
       setError('策略名称不能为空');
@@ -2513,6 +2535,11 @@ export default function BacktestPage({
     if (!hasSelectedConfig) {
       setError('请先选择策略方案，再运行回测');
       revealConfigSection('strategy');
+      return;
+    }
+    if (unsupportedTimeframeError) {
+      setError(unsupportedTimeframeError);
+      revealConfigSection('scope');
       return;
     }
     if (versionDirty) {
@@ -3103,19 +3130,20 @@ export default function BacktestPage({
   const historyRangeEnd = Math.min(historyPageStart + filteredHistoryRuns.length, historyTotal);
   const historyGridColumns = '32px 36px minmax(64px, 0.5fr) minmax(150px, 1.25fr) minmax(150px, 1.25fr) minmax(120px, 0.95fr) minmax(76px, 0.6fr) minmax(76px, 0.6fr) minmax(70px, 0.5fr) minmax(130px, 1fr) 88px';
   const activePanelLabel = resultTabs.find((item) => item.id === activePanel)?.label || '概览';
-  const runDisabled = running || activeRun != null || !hasSelectedConfig || versionDirty;
+  const runDisabled = running || activeRun != null || !hasSelectedConfig || versionDirty || unsupportedTimeframeError != null;
   const publishedConfigParams = asHistoryRecord(activeConfig?.paramsJson.params);
   const publishedFillModel = String(publishedConfigParams.fillModel ?? 'bar_next_open');
   const experimentEntryDisabled = versionDirty
+    || unsupportedTimeframeError != null
     || !experimentPreviewEnabled
     || !activeConfig?.published
     || !activeConfig.publishedVersionId
     || publishedFillModel !== 'bar_next_open';
-  const statusMessage = error || status || (versionDirty
+  const statusMessage = error || unsupportedTimeframeError || status || (versionDirty
     ? '策略内容已修改，请先保存策略后运行回测。'
     : activeConfig ? `当前策略：${activeConfig.name}` : '请先新建并保存策略');
-  const statusColor = error ? '#b91c1c' : status ? '#0f766e' : '#94a3b8';
-  const statusBackground = error ? '#fef2f2' : status ? '#ecfdf5' : '#f8fafc';
+  const statusColor = error || unsupportedTimeframeError ? '#b91c1c' : status ? '#0f766e' : '#94a3b8';
+  const statusBackground = error || unsupportedTimeframeError ? '#fef2f2' : status ? '#ecfdf5' : '#f8fafc';
   const strategySaveNotice = getStrategySaveNoticeState(
     versionDirty,
     experimentDirty,
@@ -3640,7 +3668,7 @@ export default function BacktestPage({
             minWidth: 0,
             color: statusColor,
             background: statusBackground,
-            border: `1px solid ${error ? '#fecaca' : status ? '#99f6e4' : '#d7dde8'}`,
+            border: `1px solid ${error || unsupportedTimeframeError ? '#fecaca' : status ? '#99f6e4' : '#d7dde8'}`,
             borderRadius: 4,
             padding: '7px 10px',
             fontSize: 13,
@@ -3657,7 +3685,9 @@ export default function BacktestPage({
             className="app-button is-quiet"
             type="button"
             disabled={experimentEntryDisabled}
-            title={versionDirty
+            title={unsupportedTimeframeError
+              ? unsupportedTimeframeError
+              : versionDirty
               ? '策略结构已修改，请先保存并发布'
               : !experimentPreviewEnabled
                 ? '自动化回测能力尚未开放'
@@ -3700,7 +3730,9 @@ export default function BacktestPage({
             disabled={runDisabled}
             title={!hasSelectedConfig
               ? '请先选择策略方案'
-              : versionDirty
+              : unsupportedTimeframeError
+                ? unsupportedTimeframeError
+                : versionDirty
                 ? '请先保存策略'
                 : undefined}
             style={{
@@ -4293,12 +4325,22 @@ export default function BacktestPage({
                         onChange={(e) => setVersionTimeframe(e.target.value)}
                         style={fieldStyle}
                       >
+                        {unsupportedTimeframeError && (
+                          <option value={selectedTimeframe} disabled>
+                            {selectedTimeframe}（已停止支持）
+                          </option>
+                        )}
                         {BACKTEST_TIMEFRAMES.map((timeframe) => (
                           <option key={timeframe} value={timeframe}>
                             {timeframe}
                           </option>
                         ))}
                       </select>
+                      {unsupportedTimeframeError && (
+                        <div style={{ color: '#b91c1c', fontSize: 11, lineHeight: 1.5, marginTop: 4 }}>
+                          {unsupportedTimeframeError}
+                        </div>
+                      )}
                     </label>
                     <InstrumentSearchField label="基准标的" value={selectedBenchmarkSymbol} onChange={setSelectedBenchmarkSymbol} />
                     <div>
@@ -4553,7 +4595,7 @@ export default function BacktestPage({
                       gap: 6,
                       cursor: runDisabled ? 'not-allowed' : 'pointer',
                       opacity: runDisabled ? 0.7 : 1,
-                    }} onClick={handleRunBacktest} disabled={runDisabled} title={versionDirty || !hasSelectedConfig ? '请先保存策略' : undefined}>
+                    }} onClick={handleRunBacktest} disabled={runDisabled} title={unsupportedTimeframeError || (versionDirty || !hasSelectedConfig ? '请先保存策略' : undefined)}>
                       <Play size={14} />
                       {running ? '处理中...' : !hasSelectedConfig ? '请选择策略方案' : '运行回测'}
                     </button>

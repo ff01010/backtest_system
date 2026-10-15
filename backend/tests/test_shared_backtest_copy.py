@@ -174,6 +174,15 @@ def test_copy_name_keeps_suffix_with_long_shared_title() -> None:
   assert name.endswith("-副本")
 
 
+@pytest.mark.parametrize("timeframe", ["3m", "45m"])
+def test_copy_rejects_retired_derived_timeframe(timeframe: str) -> None:
+  publication = publication_row()
+  publication["snapshot_json"]["configuration"]["timeframe"] = timeframe
+
+  with pytest.raises(ValueError, match=f"周期 {timeframe} 已停止支持"):
+    shared_backtest_copy._copy_payloads(publication)
+
+
 def test_repeat_copy_returns_existing_without_increment(monkeypatch: pytest.MonkeyPatch) -> None:
   cursor = CopyCursor(existing=True)
   connection = CopyConnection(cursor)

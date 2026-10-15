@@ -35,9 +35,12 @@ def test_missing_requested_timeframe_returns_none(tmp_path: Path, monkeypatch) -
 
 
 def test_backtest_timeframes_are_explicit() -> None:
+  assert settings.BACKTEST_TIMEFRAMES == ("1m", "5m", "15m", "30m", "60m", "1d")
   assert settings.validate_backtest_timeframe("1m")
   assert settings.validate_backtest_timeframe("5m")
   assert not settings.validate_backtest_timeframe("2m")
+  assert not settings.validate_backtest_timeframe("3m")
+  assert not settings.validate_backtest_timeframe("45m")
 
 
 def test_quote_prefetch_size_has_safe_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -95,6 +98,34 @@ def test_read_http_origins_rejects_path(monkeypatch: pytest.MonkeyPatch) -> None
     settings._read_http_origins("TEST_CSRF_TRUSTED_ORIGINS", ())
 
 
+def test_auth_session_defaults_balance_daily_use_and_absolute_expiry() -> None:
+  assert settings.AUTH_SESSION_IDLE_HOURS == 24
+  assert settings.AUTH_SESSION_MAX_DAYS == 7
+  assert settings.AUTH_SESSION_TOUCH_INTERVAL_SECONDS == 300
+  settings.validate_auth_configuration()
+
+
+def test_auth_session_rejects_absolute_expiry_not_longer_than_idle_timeout(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "AUTH_SESSION_IDLE_HOURS", 48)
+  monkeypatch.setattr(settings, "AUTH_SESSION_MAX_DAYS", 2)
+
+  with pytest.raises(ValueError, match="最长有效期必须大于空闲超时时间"):
+    settings.validate_auth_configuration()
+
+
+def test_auth_session_rejects_touch_interval_not_shorter_than_idle_timeout(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "AUTH_SESSION_IDLE_HOURS", 1)
+  monkeypatch.setattr(settings, "AUTH_SESSION_MAX_DAYS", 7)
+  monkeypatch.setattr(settings, "AUTH_SESSION_TOUCH_INTERVAL_SECONDS", 3600)
+
+  with pytest.raises(ValueError, match="活动写入间隔必须小于空闲超时时间"):
+    settings.validate_auth_configuration()
+
+
 def test_research_reporting_requires_target_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setattr(settings, "BACKTEST_INSTANCE_ID", "server")
   monkeypatch.setattr(settings, "RESEARCH_RESULT_REPORT_ENABLED", True)
@@ -128,10 +159,11 @@ def test_observability_rejects_unsafe_compose_project(monkeypatch: pytest.Monkey
     settings.validate_observability_configuration()
 
 
-def test_l2_strategy_config_accepts_derived_l2_timeframe() -> None:
-  assert settings.validate_l2_backtest_timeframe("3m")
-  assert settings.validate_backtest_timeframe("3m")
-  assert not settings.validate_l2_backtest_timeframe("2m")
+def test_l2_strategy_config_uses_same_native_timeframes() -> None:
+  assert settings.L2_BACKTEST_TIMEFRAMES == settings.BACKTEST_TIMEFRAMES
+  assert settings.validate_l2_backtest_timeframe("1m")
+  assert not settings.validate_l2_backtest_timeframe("3m")
+  assert not settings.validate_l2_backtest_timeframe("45m")
 
 
 def test_backtest_timeframe_availability_uses_database_cache(monkeypatch: pytest.MonkeyPatch) -> None:

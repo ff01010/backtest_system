@@ -58,6 +58,13 @@ def _parser() -> argparse.ArgumentParser:
   withdraw.add_argument("--release-id", required=True)
   withdraw.add_argument("--deployment-id", required=True)
   withdraw.add_argument("--expected-generation", required=True, type=int)
+
+  experiment_epoch = commands.add_parser("activate-experiment-epoch")
+  experiment_epoch.add_argument("--expected-epoch", required=True)
+  experiment_epoch.add_argument("--target-epoch", required=True)
+  experiment_epoch.add_argument("--build-id", required=True)
+  experiment_epoch.add_argument("--actor", required=True)
+  experiment_epoch.add_argument("--detail-json", default="{}")
   return parser
 
 
@@ -88,6 +95,22 @@ def run_command(args: argparse.Namespace) -> dict[str, Any]:
       validate_build_id(args.build_id), args.client_version, args.deployment_id,
       args.expected_generation, args.release_id,
     )
+  if args.command == "activate-experiment-epoch":
+    build_id = validate_build_id(args.build_id)
+    try:
+      detail = json.loads(args.detail_json)
+    except json.JSONDecodeError as error:
+      raise ValueError("detail-json 必须是 JSON 对象") from error
+    if not isinstance(detail, dict):
+      raise ValueError("detail-json 必须是 JSON 对象")
+    activated = state_store.activate_experiment_contract_epoch(
+      args.expected_epoch,
+      args.target_epoch,
+      build_id,
+      args.actor,
+      detail,
+    )
+    return {"contractEpoch": activated, "buildId": build_id}
   return state_store.withdraw_release_record(
     args.release_id, args.deployment_id, args.expected_generation,
   )

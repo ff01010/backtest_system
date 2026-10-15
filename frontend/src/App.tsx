@@ -4,8 +4,7 @@ import KlineChart from './components/KlineChart';
 import StatusBar from './components/StatusBar';
 import BacktestPage from './components/BacktestPage';
 import LoginPage from './components/LoginPage';
-import SystemErrorLogPage from './components/SystemErrorLogPage';
-import UserManagementPage from './components/UserManagementPage';
+import SystemManagementPage from './components/SystemManagementPage';
 import ApiKeyPage from './components/ApiKeyPage';
 import SharedBacktestPage from './components/SharedBacktestPage';
 import ReleaseNotificationManager from './components/ReleaseNotificationManager';
@@ -21,6 +20,7 @@ import {
   fetchStrategies,
   createResearchAuthorizationCode,
   logout,
+  AUTH_SESSION_EXPIRED_EVENT,
 } from './api/client';
 import type { SessionUser } from './api/client';
 import { useUrlState } from './hooks/useUrlState';
@@ -44,7 +44,7 @@ async function enterResearchCenter(): Promise<void> {
 
 function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogout: () => void }) {
   const [urlParams, setUrlParams] = useUrlState();
-  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'experiments' | 'sharedBacktests' | 'apiKeys' | 'users' | 'systemErrors'>(
+  const [activePage, setActivePage] = useState<'signals' | 'backtest' | 'experiments' | 'sharedBacktests' | 'apiKeys' | 'system'>(
     urlParams.workspace === 'experiments' ? 'experiments' : 'backtest',
   );
   const [experimentSubject, setExperimentSubject] = useState<ExperimentSubjectRef | null>(() => (
@@ -222,8 +222,7 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
           { key: 'sharedBacktests' as const, label: '策略广场' },
           { key: 'signals' as const, label: '信号可视化' },
           { key: 'apiKeys' as const, label: 'API Key' },
-          ...(currentUser.role === 'admin' ? [{ key: 'users' as const, label: '人员管理' }] : []),
-          ...(currentUser.role === 'admin' ? [{ key: 'systemErrors' as const, label: '回测诊断日志' }] : []),
+          ...(currentUser.role === 'admin' ? [{ key: 'system' as const, label: '系统管理' }] : []),
         ].map((item) => {
           const active = activePage === item.key;
           return (
@@ -432,12 +431,8 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
         />
       )}
 
-      {activePage === 'users' && (
-        <UserManagementPage />
-      )}
-
-      {activePage === 'systemErrors' && (
-        <SystemErrorLogPage />
+      {activePage === 'system' && (
+        <SystemManagementPage />
       )}
 
       {activePage === 'apiKeys' && (
@@ -450,15 +445,37 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
 export default function App() {
   const [currentUser, setCurrentUser] = useState<SessionUser | null>(null);
   const [checkingSession, setCheckingSession] = useState(true);
+  const [loginNotice, setLoginNotice] = useState('');
 
   useEffect(() => {
-    fetchCurrentUser().then(setCurrentUser).catch(() => setCurrentUser(null)).finally(() => setCheckingSession(false));
+    let mounted = true;
+    const handleSessionExpired = () => {
+      setCurrentUser(null);
+      setLoginNotice('登录已过期，请重新登录。');
+      setCheckingSession(false);
+    };
+    window.addEventListener(AUTH_SESSION_EXPIRED_EVENT, handleSessionExpired);
+    void fetchCurrentUser()
+      .then((user) => {
+        if (mounted) setCurrentUser(user);
+      })
+      .catch(() => {
+        if (mounted) setCurrentUser(null);
+      })
+      .finally(() => {
+        if (mounted) setCheckingSession(false);
+      });
+    return () => {
+      mounted = false;
+      window.removeEventListener(AUTH_SESSION_EXPIRED_EVENT, handleSessionExpired);
+    };
   }, []);
 
   const handleLogout = async () => {
     try {
       await logout();
     } finally {
+      setLoginNotice('');
       setCurrentUser(null);
     }
   };
@@ -466,6 +483,14 @@ export default function App() {
   if (checkingSession) {
     return <div style={{ height: '100vh', display: 'grid', placeItems: 'center', background: 'var(--canvas)', color: 'var(--text-muted)' }}>正在检查登录状态…</div>;
   }
-  if (!currentUser) return <LoginPage onLogin={setCurrentUser} />;
+  if (!currentUser) return (
+    <LoginPage
+      notice={loginNotice}
+      onLogin={(user) => {
+        setLoginNotice('');
+        setCurrentUser(user);
+      }}
+    />
+  );
   return <Workspace currentUser={currentUser} onLogout={() => { void handleLogout(); }} />;
 }

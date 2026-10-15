@@ -183,7 +183,7 @@ def safe_filename(value: str) -> str:
 
 def _rows(output: dict[str, Any]) -> Iterable[dict[str, Any]]:
   rows = output.get("rows")
-  if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+  if not isinstance(rows, Iterable) or isinstance(rows, (str, bytes, dict)):
     raise EvaluationExportError("评价输出行格式不受支持")
   return rows
 

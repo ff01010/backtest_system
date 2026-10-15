@@ -1,4 +1,4 @@
-"""QMT 原始历史行情的 ClickHouse 读取、覆盖检查和周期聚合服务。"""
+"""QMT 原始历史行情的 ClickHouse 读取、覆盖检查和规范化服务。"""
 
 from __future__ import annotations
 
@@ -33,7 +33,6 @@ _HISTORY_TABLES = {
 _HISTORY_PERIODS = {
   "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1h", "1d": "1d",
 }
-_HISTORY_DERIVED_PERIODS = {"3m": 3, "45m": 45}
 _HISTORY_MINUTE_BATCH_DATES = 10
 _HISTORY_OTHER_BATCH_DATES = 40
 _HISTORY_QUERY_RETRY_DELAY_SECONDS = 1.0
@@ -69,7 +68,6 @@ class BacktestDataResolution:
 class _SourceCandidate:
   source: str
   source_period: str
-  derivation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -179,7 +177,7 @@ def _resolve_candidate(
     resolution = BacktestDataResolution(
       timeframe=timeframe,
       source_period=candidate.source_period,
-      derivation=candidate.derivation,
+      derivation=None,
       formal_dates=tuple(candidate_dates),
       warmup_dates=tuple(warmup_dates),
       available_warmup_days=len(warmup_dates),
@@ -212,6 +210,8 @@ def _resolution_from_snapshot(
   source = _snapshot_source(snapshot)
   source_period = str(snapshot.get("sourcePeriod") or "")
   derivation = snapshot.get("derivation")
+  if derivation is not None:
+    raise MarketDataError("历史 Bar 快照使用了已停止支持的派生周期", "snapshot_invalid")
   if not source_period or _source_table(source, source_period) != str(snapshot.get("sourceTable") or ""):
     raise MarketDataError("历史 Bar 快照物理来源不完整", "snapshot_invalid")
   expected_database = _source_database(source)
@@ -220,7 +220,6 @@ def _resolution_from_snapshot(
   candidate = _SourceCandidate(
     source=source,
     source_period=source_period,
-    derivation=str(derivation) if derivation is not None else None,
   )
   if candidate not in _source_candidates(timeframe):
     raise MarketDataError("历史 Bar 快照来源与任务周期不一致", "snapshot_invalid")
@@ -234,7 +233,7 @@ def _resolution_from_snapshot(
   return BacktestDataResolution(
     timeframe=timeframe,
     source_period=source_period,
-    derivation=candidate.derivation,
+    derivation=None,
     formal_dates=normalized_formal,
     warmup_dates=warmup_dates,
     available_warmup_days=len(warmup_dates),
@@ -295,7 +294,6 @@ def load_backtest_bars(
     frame = _rows_to_frame(rows)
     allowed_dates = set(all_dates)
     frame = _validated_source_frame(frame, allowed_dates)
-    frame = _transform_source_frame(frame, resolution)
     if frame.empty:
       raise MarketDataError(
         f"{symbol} {resolution.timeframe} 区间内无可用 QMT 行情", "empty_bar_data",
@@ -354,7 +352,7 @@ def ensure_cached(symbol: str, timeframe: str, start_date: str, end_date: str) -
 
 
 def load_bars(symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
-  """从 ClickHouse 读取 QMT 原始 K 线，必要时由 1 分钟线派生周期。"""
+  """从 ClickHouse 读取并规范化 QMT 原生 K 线。"""
   resolution = resolve_backtest_data(symbol, timeframe, start_date, end_date)
   frame, _ = load_backtest_bars(symbol, resolution)
   return frame
@@ -457,8 +455,6 @@ def _source_candidates(timeframe: str) -> tuple[_SourceCandidate, ...]:
   history_period = _HISTORY_PERIODS.get(timeframe)
   if history_period is not None:
     return (_SourceCandidate(_HISTORY_SOURCE, history_period),)
-  if timeframe in _HISTORY_DERIVED_PERIODS:
-    return (_SourceCandidate(_HISTORY_SOURCE, "1m", f"{timeframe}-from-1m-v1"),)
   return ()
 
 
@@ -493,15 +489,7 @@ def _preview_warmup_days(symbol: str, timeframe: str, start_date: str, count: in
 
 
 def _resolution_reason(resolution: BacktestDataResolution) -> str:
-  if resolution.derivation:
-    return f"由完整 1m 数据派生 {resolution.timeframe}"
   return "QMT 行情可用"
-
-
-def _transform_source_frame(frame: pd.DataFrame, resolution: BacktestDataResolution) -> pd.DataFrame:
-  if resolution.derivation:
-    return _aggregate_minutes(frame, int(resolution.timeframe.removesuffix("m")))
-  return frame
 
 
 def _cached_timeframe_status(symbol: str, timeframe: str, start_date: str, end_date: str) -> dict[str, Any]:
@@ -761,26 +749,6 @@ def _validated_source_frame(
       "invalid_bar_data",
     )
   return frame.sort_values("_timestamp", kind="stable").reset_index(drop=True)
-
-
-def _aggregate_minutes(frame: pd.DataFrame, minutes: int) -> pd.DataFrame:
-  if frame.empty:
-    return frame
-  frame = frame.copy()
-  frame["_bucket"] = frame["_timestamp"].map(lambda item: _period_end(item.to_pydatetime(), minutes))
-  grouped = frame.groupby("_bucket", sort=True)
-  result = grouped.agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).reset_index()
-  result["time"] = result["_bucket"].dt.strftime("%Y%m%d%H%M")
-  return result
-
-
-def _period_end(value: datetime, minutes: int) -> datetime:
-  morning = value.replace(hour=9, minute=30, second=0, microsecond=0)
-  afternoon = value.replace(hour=13, minute=0, second=0, microsecond=0)
-  session_start = morning if morning <= value <= value.replace(hour=11, minute=30, second=0, microsecond=0) else afternoon
-  offset = int((value - session_start).total_seconds() // 60)
-  bucket_count = max(1, math.ceil(offset / minutes))
-  return session_start + timedelta(minutes=bucket_count * minutes)
 
 
 def _row_preview(row: dict[str, Any]) -> dict[str, Any]:

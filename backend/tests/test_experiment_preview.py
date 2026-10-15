@@ -147,7 +147,7 @@ def _template() -> ResolvedRunTemplate:
   ("1h", {"formalDateCount": 2, "warmupDateCount": 1}),
   ("5m", {"formalDateCount": 2}),
 ])
-def test_resource_estimator_rejects_unreliable_metadata(
+def test_resource_estimator_marks_unreliable_metadata_unavailable(
   timeframe: str,
   dataset: dict[str, Any],
 ) -> None:
@@ -158,12 +158,11 @@ def test_resource_estimator_rejects_unreliable_metadata(
     snapshot={**template.snapshot, "fixedStructure": fixed},
   )
 
-  with pytest.raises(ExperimentError) as rejected:
-    SingleBarResourceEstimator().estimate(unreliable, (dataset,), 1, 1)
+  estimate = SingleBarResourceEstimator().estimate(unreliable, (dataset,), 1, 1)
 
-  assert rejected.value.code == "experiment.capacity_unavailable"
-  assert rejected.value.status_code == 503
-  assert rejected.value.retryable
+  assert estimate["estimateStatus"] == "unavailable"
+  assert estimate["estimatedBarCount"] is None
+  assert estimate["resourceClass"] == "unknown"
 
 
 def _request(**stage_changes: Any) -> ExperimentPreviewRequest:
@@ -367,8 +366,11 @@ def test_generator_enforces_catalog_range_constraints() -> None:
 def test_generator_rejects_trial_count_overflow(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setattr(generators, "MAX_PLANNED_TRIAL_COUNT", 4)
 
-  with pytest.raises(ExperimentError, match="组合数量溢出"):
+  with pytest.raises(ExperimentError) as rejected:
     FiniteGridGenerator().normalize(_request().plan.stages[0], _template())
+
+  assert rejected.value.code == "experiment.validation_failed"
+  assert rejected.value.details["boundaryType"] == "cross_client_exact_integer"
 
 
 def test_preview_is_reproducible_but_issues_a_fresh_owner_bound_token(
@@ -387,7 +389,7 @@ def test_preview_is_reproducible_but_issues_a_fresh_owner_bound_token(
   second = application.preview(_request())
 
   assert first["specHash"] == second["specHash"]
-  assert first["specHash"] == "acc826f703fdc120e49acd3562e06b72d84bd2ceabfedfade6837612e173833a"
+  assert first["specHash"] == "1bfe8ab77378af69f3e11db9ca0dc4e8fbd7bdf34d5dd01a972527f5110b1257"
   assert first["plannedTrialCount"] == 8
   assert first["examples"] == second["examples"]
   assert first["examples"][0]["trialFingerprint"] == (

@@ -20,6 +20,18 @@ def _read_bounded_int(name: str, default: int, minimum: int, maximum: int) -> in
   return value
 
 
+def _read_optional_positive_int(name: str) -> int | None:
+  """读取部署容量；缺失或非法时由运行门禁按 unknown 故障安全处理。"""
+  raw = os.getenv(name, "").strip()
+  if not raw:
+    return None
+  try:
+    value = int(raw)
+  except ValueError:
+    return None
+  return value if value > 0 else None
+
+
 def _read_bool(name: str, default: bool) -> bool:
   raw = os.getenv(name, str(default)).strip().lower()
   if raw not in {"true", "false"}:
@@ -63,11 +75,11 @@ KLINE_ROOT = os.getenv("TREND_GRID_KLINE_ROOT", "./runtime/kline")
 # 信号数据根目录。
 SIGNAL_ROOT = os.getenv("TREND_GRID_SIGNAL_ROOT", "./runtime/signals")
 
-# 支持的 K 线周期：部分周期由 1m/5m 拟合生成。
-TIMEFRAMES = ["1m", "2m", "3m", "4m", "5m", "10m", "15m", "30m", "45m", "60m", "1d"]
+# 数据库原生 K 线周期；平台不再在运行时派生额外周期。
+TIMEFRAMES = ["1m", "5m", "15m", "30m", "60m", "1d"]
 
 # 两种回测模式共用统一 Bar 周期；L2 模式额外校验十档快照和必要的逐笔成交。
-BAR_RUN_TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "45m", "60m", "1d")
+BAR_RUN_TIMEFRAMES = ("1m", "5m", "15m", "30m", "60m", "1d")
 BACKTEST_TIMEFRAMES = BAR_RUN_TIMEFRAMES
 L2_BACKTEST_TIMEFRAMES = BAR_RUN_TIMEFRAMES
 
@@ -235,6 +247,23 @@ def default_fee_profile() -> dict[str, float]:
 
 # 当前部署尚未配置 HTTPS，默认关闭 Secure 以保证同源 HTTP 登录可用。
 AUTH_COOKIE_SECURE = os.getenv("TREND_GRID_AUTH_COOKIE_SECURE", "false").lower() == "true"
+AUTH_SESSION_IDLE_HOURS = _read_bounded_int(
+  "TREND_GRID_AUTH_SESSION_IDLE_HOURS", 24, 1, 72,
+)
+AUTH_SESSION_MAX_DAYS = _read_bounded_int(
+  "TREND_GRID_AUTH_SESSION_MAX_DAYS", 7, 1, 30,
+)
+AUTH_SESSION_TOUCH_INTERVAL_SECONDS = _read_bounded_int(
+  "TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS", 300, 60, 3600,
+)
+
+
+def validate_auth_configuration() -> None:
+  """拒绝期限关系无效的会话策略。"""
+  if AUTH_SESSION_MAX_DAYS * 24 <= AUTH_SESSION_IDLE_HOURS:
+    raise ValueError("登录会话最长有效期必须大于空闲超时时间")
+  if AUTH_SESSION_TOUCH_INTERVAL_SECONDS >= AUTH_SESSION_IDLE_HOURS * 3600:
+    raise ValueError("登录会话活动写入间隔必须小于空闲超时时间")
 
 # 同源请求始终允许；这里仅列出本地开发代理等额外可信浏览器来源。
 CSRF_TRUSTED_ORIGINS = _read_http_origins(
@@ -253,6 +282,7 @@ EXPERIMENT_BAR_ENABLED = _read_bool("TREND_GRID_EXPERIMENT_BAR_ENABLED", False)
 EXPERIMENT_MAX_VALUES_PER_DIMENSION = _read_bounded_int(
   "TREND_GRID_EXPERIMENT_MAX_VALUES_PER_DIMENSION", 50, 1, 1000,
 )
+# 仅供 rolling_window_v1 激活前的旧语义使用；达到收缩门槛后再删除。
 EXPERIMENT_MAX_TRIALS = _read_bounded_int(
   "TREND_GRID_EXPERIMENT_MAX_TRIALS", 1000, 1, 1_000_000,
 )
@@ -292,6 +322,30 @@ EXPERIMENT_COORDINATOR_HEARTBEAT_SECONDS = _read_bounded_int(
 EXPERIMENT_COORDINATOR_POLL_SECONDS = _read_bounded_int(
   "TREND_GRID_EXPERIMENT_COORDINATOR_POLL_SECONDS", 1, 1, 30,
 )
+EXPERIMENT_POSTGRES_LOGICAL_HIGH_WATER_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_POSTGRES_LOGICAL_HIGH_WATER_BYTES",
+)
+EXPERIMENT_POSTGRES_LOGICAL_LOW_WATER_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_POSTGRES_LOGICAL_LOW_WATER_BYTES",
+)
+EXPERIMENT_POSTGRES_VOLUME_MIN_FREE_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_POSTGRES_VOLUME_MIN_FREE_BYTES",
+)
+EXPERIMENT_POSTGRES_VOLUME_RESUME_FREE_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_POSTGRES_VOLUME_RESUME_FREE_BYTES",
+)
+EXPERIMENT_ARTIFACT_VOLUME_MIN_FREE_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_ARTIFACT_VOLUME_MIN_FREE_BYTES",
+)
+EXPERIMENT_ARTIFACT_VOLUME_RESUME_FREE_BYTES = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_ARTIFACT_VOLUME_RESUME_FREE_BYTES",
+)
+EXPERIMENT_STORAGE_SIGNAL_MAX_AGE_SECONDS = _read_optional_positive_int(
+  "TREND_GRID_EXPERIMENT_STORAGE_SIGNAL_MAX_AGE_SECONDS",
+)
+EXPERIMENT_STORAGE_PROBE_URL = os.getenv(
+  "TREND_GRID_EXPERIMENT_STORAGE_PROBE_URL", "http://storage-probe:8091",
+).strip()
 EXPERIMENT_PURGE_ENABLED = _read_bool(
   "TREND_GRID_EXPERIMENT_PURGE_ENABLED", False,
 )
@@ -320,10 +374,13 @@ def validate_experiment_configuration() -> None:
     raise ValueError(
       "TREND_GRID_EXPERIMENTS_ENABLED=true 时必须启用至少一个实验执行路径",
     )
-  if EXPERIMENT_MAX_USER_PLANNED_TRIALS <= 0:
-    raise ValueError("启用实验时必须配置正数的用户计划 Trial 上限")
-  if EXPERIMENT_MAX_TRIALS > EXPERIMENT_MAX_USER_PLANNED_TRIALS:
-    raise ValueError("单实验 Trial 上限不能大于用户计划 Trial 上限")
+  from backend.experiments.rollout import ContractEpoch, current_contract_epoch
+
+  if current_contract_epoch() < ContractEpoch.ROLLING_WINDOW_V1:
+    if EXPERIMENT_MAX_USER_PLANNED_TRIALS <= 0:
+      raise ValueError("启用实验时必须配置正数的用户计划 Trial 上限")
+    if EXPERIMENT_MAX_TRIALS > EXPERIMENT_MAX_USER_PLANNED_TRIALS:
+      raise ValueError("单实验 Trial 上限不能大于用户计划 Trial 上限")
   if EXPERIMENT_MAX_IN_FLIGHT_PER_EXPERIMENT > EXPERIMENT_MAX_IN_FLIGHT_PER_USER:
     raise ValueError("单实验在途上限不能大于用户实验在途上限")
   if EXPERIMENT_MANUAL_RESERVED_PERMITS > EXPERIMENT_MAX_IN_FLIGHT_PER_USER:

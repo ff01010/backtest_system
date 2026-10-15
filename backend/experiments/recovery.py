@@ -19,15 +19,16 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "partially_completed", "failed", "cancelled", "generation_blocked",
   }),
   "generation_blocked": frozenset({
-    "generation_blocked", "preparing", "cancelling", "cancelled",
+    "generation_blocked", "preparing", "queued", "running",
+    "cancelling", "cancelled",
   }),
   "queued": frozenset({
     "queued", "running", "cancelling", "completed", "partially_completed",
-    "failed", "cancelled",
+    "failed", "cancelled", "generation_blocked",
   }),
   "running": frozenset({
     "queued", "running", "cancelling", "completed", "partially_completed",
-    "failed", "cancelled",
+    "failed", "cancelled", "generation_blocked",
   }),
   "cancelling": frozenset({
     "cancelling", "completed", "partially_completed", "cancelled",

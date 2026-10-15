@@ -210,7 +210,7 @@ class EvaluationExportWorker:
     labels = column_labels(dict(source["catalogSnapshot"]))
     progress = _ProgressReporter(
       self._repository, export["id"], attempt_token,
-      len(list(output.get("rows") or [])),
+      int(output.get("matchedRowCount") or len(list(output.get("rows") or []))),
     )
     arguments = (
       part_path, output, list(export["columns"]), labels,
@@ -250,7 +250,12 @@ class EvaluationExportWorker:
   @staticmethod
   def _assert_storage(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(directory).free < settings.EXPERIMENT_EXPORT_MIN_FREE_BYTES:
+    global_minimum = settings.EXPERIMENT_ARTIFACT_VOLUME_MIN_FREE_BYTES
+    minimum_free = max(
+      settings.EXPERIMENT_EXPORT_MIN_FREE_BYTES,
+      int(global_minimum) if global_minimum is not None else 0,
+    )
+    if shutil.disk_usage(directory).free < minimum_free:
       raise StorageUnavailable("评价导出存储暂不可用，请稍后重试")
     probe = directory / f".write-probe-{os.getpid()}"
     try:

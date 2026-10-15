@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """发布脚本与 Compose 的关键不可变镜像契约。"""
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -357,3 +362,105 @@ def test_production_defaults_provide_32_runner_pool_with_guarded_concurrency() -
   assert "TREND_GRID_BACKTEST_BURST_MAX_CONCURRENCY=24" in env_example
   assert 'echo "16"' in runner_validation
   assert "1 至 32" in runner_validation
+
+
+def test_deploy_incrementally_adds_documented_auth_session_defaults() -> None:
+  settings = (ROOT / "backend" / "settings.py").read_text(encoding="utf-8")
+  env_example = (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  expected = {
+    "TREND_GRID_AUTH_SESSION_IDLE_HOURS": "24",
+    "TREND_GRID_AUTH_SESSION_MAX_DAYS": "7",
+    "TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS": "300",
+  }
+
+  for name, value in expected.items():
+    assert f'{name}={value}' in env_example
+    assert f'{name}={value}' in script
+    assert f'"{name}"' in settings
+  for explanation in (
+    "用户连续无操作达到该时长后",
+    "单次登录的最长有效天数",
+    "最近活动时间的最小写入间隔",
+  ):
+    assert explanation in env_example
+    assert explanation in script
+  assert "存在重复定义" in script
+  assert 'cp --preserve=mode "$env_file" "$env_backup_file"' in script
+  assert 'mktemp "${env_file}.tmp.XXXXXX"' in script
+  assert "env_defaults_changed=true" in script
+  assert "deploy/.env.example deploy/.env" not in script
+
+
+def _auth_env_harness(tmp_path: Path) -> tuple[str, Path]:
+  """提取真实发布函数，供临时配置行为测试复用。"""
+  if os.name == "nt":
+    pytest.skip("增量发布配置行为测试仅在原生 POSIX 发布环境执行")
+  bash = shutil.which("bash")
+  if bash is None:
+    pytest.skip("当前环境没有 bash，无法执行发布配置增量测试")
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  function_block = "env_key_count() {" + script.split(
+    "env_key_count() {", 1,
+  )[1].split("\nclose_submission_gate() {", 1)[0]
+  harness = tmp_path / "env-defaults-harness.sh"
+  harness.write_text("\n".join([
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    'env_file="$1"',
+    'env_defaults_changed=false',
+    'env_backup_file="${env_file}.backup-before-managed-update"',
+    'fail() { echo "发布终止：$1" >&2; exit 1; }',
+    function_block,
+    "append_auth_session_env_defaults",
+    "validate_auth_session_env",
+  ]), encoding="utf-8")
+  return bash, harness
+
+
+def _run_auth_env_harness(
+  bash: str, harness: Path, env_file: Path, check: bool,
+) -> subprocess.CompletedProcess[str]:
+  return subprocess.run(
+    [bash, harness.name, env_file.name], cwd=env_file.parent,
+    check=check, capture_output=True, text=True, encoding="utf-8",
+  )
+
+
+def test_auth_session_env_defaults_are_idempotent_and_preserve_existing_values(
+  tmp_path: Path,
+) -> None:
+  bash, harness = _auth_env_harness(tmp_path)
+  env_file = tmp_path / "server.env"
+  original = "PRIVATE_VALUE=keep\nTREND_GRID_AUTH_SESSION_MAX_DAYS=14\n"
+  env_file.write_text(original, encoding="utf-8")
+
+  _run_auth_env_harness(bash, harness, env_file, check=True)
+  first_result = env_file.read_text(encoding="utf-8")
+  assert "PRIVATE_VALUE=keep" in first_result
+  assert "TREND_GRID_AUTH_SESSION_MAX_DAYS=14" in first_result
+  assert "TREND_GRID_AUTH_SESSION_IDLE_HOURS=24" in first_result
+  assert "TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS=300" in first_result
+  assert "用户连续无操作达到该时长后" in first_result
+  assert "最近活动时间的最小写入间隔" in first_result
+  assert env_file.with_name(
+    "server.env.backup-before-managed-update",
+  ).read_text(encoding="utf-8") == original
+
+  _run_auth_env_harness(bash, harness, env_file, check=True)
+  assert env_file.read_text(encoding="utf-8") == first_result
+
+
+def test_auth_session_env_defaults_reject_duplicate_definitions(tmp_path: Path) -> None:
+  bash, harness = _auth_env_harness(tmp_path)
+  duplicate_env = tmp_path / "duplicate.env"
+  duplicate_env.write_text(
+    "TREND_GRID_AUTH_SESSION_IDLE_HOURS=24\n"
+    "TREND_GRID_AUTH_SESSION_IDLE_HOURS=48\n",
+    encoding="utf-8",
+  )
+  duplicate_result = _run_auth_env_harness(
+    bash, harness, duplicate_env, check=False,
+  )
+  assert duplicate_result.returncode != 0
+  assert "存在重复定义" in duplicate_result.stderr

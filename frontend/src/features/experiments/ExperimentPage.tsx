@@ -7,6 +7,7 @@ import {
   Copy,
   FlaskConical,
   LockKeyhole,
+  Pause,
   Play,
   Plus,
   RefreshCw,
@@ -30,6 +31,7 @@ import {
   fetchExperimentSubject,
   fetchExperimentTrials,
   findCreatedExperiment,
+  pauseExperiment,
   previewExperiment,
   previewRetryFailedTrials,
   retryFailedTrials,
@@ -97,14 +99,16 @@ type ExperimentCopyTarget = {
   initialDraft: ExperimentDraft;
 };
 
+type CancelConfirmation = {
+  revisionId: string;
+  lifecycleVersion: number;
+  idempotencyKey: string;
+  reason: string;
+};
+
 const ACTIVE_EXPERIMENT_STATUSES = new Set(['preparing', 'queued', 'running', 'cancelling']);
-const CANCELLABLE_EXPERIMENT_STATUSES = new Set([
-  'preparing', 'generation_blocked', 'queued', 'running',
-]);
 const RECOVERABLE_BLOCK_CODES = new Set([
-  'experiment.capacity_blocked',
-  'experiment.manual_queue_reserved',
-  'experiment.manual_wait_blocked',
+  'experiment.execution_blocked',
 ]);
 const TERMINAL_EXPERIMENT_STATUSES = new Set([
   'completed', 'partially_completed', 'failed', 'cancelled',
@@ -678,18 +682,21 @@ function RuntimeDimensions({
 }
 
 function PreviewResult({ preview }: { preview: ExperimentPreview }) {
+  const estimatedBars = preview.resourceEstimate.estimatedBarCountExact
+    ?? preview.resourceEstimate.estimatedBarCount?.toLocaleString()
+    ?? '暂时无法估算耗时';
   return (
     <section className={`experiment-preview ${preview.limitDecision.allowed ? 'is-allowed' : 'is-blocked'}`}>
       <div className="experiment-preview-metrics">
         <div><span>Trial 总数</span><strong>{preview.plannedTrialCount.toLocaleString()}</strong></div>
-        <div><span>预计 Bar</span><strong>{preview.resourceEstimate.estimatedBarCount.toLocaleString()}</strong></div>
-        <div><span>资源等级</span><strong>{resourceClassLabel(preview.resourceEstimate.resourceClass)}</strong></div>
+        <div><span>预计 Bar</span><strong>{estimatedBars}</strong></div>
+        <div><span>资源等级（提示）</span><strong>{preview.resourceEstimate.estimateStatus === 'unavailable' ? '暂不可估算' : resourceClassLabel(preview.resourceEstimate.resourceClass)}</strong></div>
         <div><span>维度数量</span><strong>{Object.keys(preview.dimensionCounts).length}</strong></div>
       </div>
       <div className="experiment-preview-decision">
         <ShieldCheck size={18} />
         <div>
-          <strong>{preview.limitDecision.allowed ? '预览通过资源边界检查' : '预览存在阻塞项'}</strong>
+          <strong>{preview.limitDecision.allowed ? '预览完成，可创建实验' : '预览存在输入阻塞项'}</strong>
           <span>有效至 {new Date(preview.expiresAt).toLocaleString()} · 规范 {preview.canonicalizationVersion}</span>
         </div>
       </div>
@@ -712,6 +719,11 @@ function PreviewResult({ preview }: { preview: ExperimentPreview }) {
       {preview.limitDecision.warnings.map((warning) => (
         <div className="experiment-alert" key={warning.code}>{warning.message}</div>
       ))}
+      {preview.limitDecision.allowed && (
+        <div className="experiment-alert">
+          Trial 总数和预计 Bar 仅描述逻辑规模与资源提示。大计划会滚动生成并受实际并发和存储压力控制，可能长时间排队，可随时暂停或取消。
+        </div>
+      )}
       <div className="experiment-samples">
         <h3>首尾 Trial 样例</h3>
         {preview.examples.map((example) => (
@@ -756,12 +768,15 @@ function ExperimentDetailView({
   const [selectedTrialId, setSelectedTrialId] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [cancelling, setCancelling] = useState(false);
+  const [pausing, setPausing] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [lifecycleAction, setLifecycleAction] = useState<'' | 'archive' | 'restore' | 'purge'>('');
   const [lifecycleMessage, setLifecycleMessage] = useState('');
   const [relatedRunsOpen, setRelatedRunsOpen] = useState(false);
+  const [cancelConfirmation, setCancelConfirmation] = useState<CancelConfirmation | null>(null);
   const cancelInFlight = useRef(false);
+  const pauseInFlight = useRef(false);
   const resumeInFlight = useRef(false);
   const retryInFlight = useRef(false);
   const lifecycleInFlight = useRef(false);
@@ -832,22 +847,70 @@ function ExperimentDetailView({
   }, [selectedTrialId]);
 
   const handleCancel = async () => {
-    if (cancelInFlight.current) return;
+    if (!detail || !cancelConfirmation || cancelInFlight.current) return;
+    if (
+      detail.revision.revisionId !== cancelConfirmation.revisionId
+      || detail.lifecycleVersion !== cancelConfirmation.lifecycleVersion
+    ) {
+      setCancelConfirmation(null);
+      setError('实验生命周期已经变化，请刷新详情后重新确认取消。');
+      return;
+    }
     cancelInFlight.current = true;
     setCancelling(true);
     setError('');
     try {
-      await cancelExperiment(experimentId, createBrowserUuid());
+      await cancelExperiment(
+        experimentId,
+        cancelConfirmation.revisionId,
+        cancelConfirmation.lifecycleVersion,
+        cancelConfirmation.reason,
+        cancelConfirmation.idempotencyKey,
+      );
+      setCancelConfirmation(null);
       setDetail(await fetchExperimentDetail(experimentId));
     } catch (reason) {
-      setError(errorMessage(reason));
+      if (reason instanceof TypeError) {
+        setError('网络结果不明确；再次点击“重试取消”会复用同一幂等键。');
+      } else {
+        if (
+          reason instanceof ApiResponseError
+          && ['experiment.revision_conflict', 'experiment.lifecycle_conflict'].includes(reason.code)
+        ) {
+          setCancelConfirmation(null);
+          setDetail(await fetchExperimentDetail(experimentId));
+        }
+        setError(errorMessage(reason));
+      }
     } finally {
       cancelInFlight.current = false;
       setCancelling(false);
     }
   };
 
-  const handleResume = async () => {
+  const handlePause = async () => {
+    if (!detail || pauseInFlight.current) return;
+    pauseInFlight.current = true;
+    setPausing(true);
+    setError('');
+    try {
+      await pauseExperiment(
+        experimentId,
+        detail.revision.revisionId,
+        detail.lifecycleVersion ?? 1,
+        '用户在实验详情页暂停实验',
+        createBrowserUuid(),
+      );
+      setDetail(await fetchExperimentDetail(experimentId));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      pauseInFlight.current = false;
+      setPausing(false);
+    }
+  };
+
+  const handleResume = async (resumeMode: 'user_pause' | 'execution_circuit') => {
     if (!detail || resumeInFlight.current) return;
     resumeInFlight.current = true;
     setResuming(true);
@@ -856,7 +919,11 @@ function ExperimentDetailView({
       await resumeExperiment(
         experimentId,
         detail.revision.revisionId,
-        '用户在实验详情页确认继续未完成 Trial',
+        detail.lifecycleVersion ?? 1,
+        resumeMode,
+        resumeMode === 'user_pause'
+          ? '用户在实验详情页继续已暂停实验'
+          : '用户在实验详情页解除执行熔断',
         createBrowserUuid(),
       );
       setDetail(await fetchExperimentDetail(experimentId));
@@ -1049,7 +1116,8 @@ function ExperimentDetailView({
           <button className="app-button is-quiet" type="button" onClick={onClose}>
             <ArrowLeft size={15} /> 返回实验入口
           </button>
-          {TERMINAL_EXPERIMENT_STATUSES.has(detail.status)
+          {(TERMINAL_EXPERIMENT_STATUSES.has(detail.status)
+            || detail.lifecycleState === 'cancelling')
             && viewingCurrentRevision && !detail.archivedAt && (
             <button
               className="app-button is-primary"
@@ -1098,6 +1166,21 @@ function ExperimentDetailView({
           {detail.purgeJobId && ` 物理清理任务：${detail.purgeJobId}。`}
         </div>
       )}
+      {detail.lifecycleState === 'pausing' && (
+        <div className="experiment-alert is-warning" role="status">
+          实验正在暂停：不再生成或物化新 Trial，已有排队和运行任务会自然结束。
+        </div>
+      )}
+      {detail.lifecycleState === 'paused' && (
+        <div className="experiment-alert is-warning" role="status">
+          实验已由用户暂停，生成游标和已有结果均已保留。
+        </div>
+      )}
+      {detail.systemBlockCode === 'storage_pressure' && (
+        <div className="experiment-alert is-warning" role="status">
+          系统存储压力门禁已关闭自动化实验的新生成和新物化；信号恢复后会自动继续，用户恢复命令不能绕过该门禁。
+        </div>
+      )}
       {detail.blockedReason && (
         <div
           className={`experiment-alert ${RECOVERABLE_BLOCK_CODES.has(detail.blockedReason.code) ? 'is-warning' : 'is-error'}`}
@@ -1111,7 +1194,7 @@ function ExperimentDetailView({
               className="app-button is-quiet"
               type="button"
               disabled={resuming}
-              onClick={() => { void handleResume(); }}
+              onClick={() => { void handleResume('execution_circuit'); }}
             >
               <Play size={15} /> {resuming ? '正在校验并恢复…' : '继续未完成 Trial'}
             </button>
@@ -1148,6 +1231,9 @@ function ExperimentDetailView({
         <div><span>成功</span><strong>{detail.stage.succeededTrialCount}</strong></div>
         <div><span>失败</span><strong>{detail.stage.failedTrialCount}</strong></div>
         <div><span>取消</span><strong>{detail.stage.cancelledTrialCount}</strong></div>
+        <div><span>待物化</span><strong>{detail.stage.readyTrialCount}</strong></div>
+        <div><span>回测排队</span><strong>{detail.stage.queuedTrialCount}</strong></div>
+        <div><span>尚未生成</span><strong>{detail.stage.remainingLogicalTrialCount}</strong></div>
       </section>
       <div className="experiment-detail-workspace">
         <div className="experiment-detail-main">
@@ -1176,7 +1262,9 @@ function ExperimentDetailView({
           )}
         </div>
         <div className="experiment-preview-heading">
-          <div><span>排队</span><strong>{detail.stage.queuedTrialCount}</strong></div>
+          <div><span>待物化</span><strong>{detail.stage.readyTrialCount}</strong></div>
+          <div><span>回测排队</span><strong>{detail.stage.queuedTrialCount}</strong></div>
+          <div><span>尚未生成</span><strong>{detail.stage.remainingLogicalTrialCount}</strong></div>
           <div><span>在途</span><strong>{detail.stage.inFlightTrialCount}</strong></div>
           <div><span>成功</span><strong>{detail.stage.succeededTrialCount}</strong></div>
           <div><span>失败</span><strong>{detail.stage.failedTrialCount}</strong></div>
@@ -1445,11 +1533,37 @@ function ExperimentDetailView({
           </section>
         </aside>
       </div>
-      {CANCELLABLE_EXPERIMENT_STATUSES.has(detail.status) && (
+      {detail.lifecycleCommandsAvailable
+        && detail.lifecycleState !== 'terminal'
+        && viewingCurrentRevision
+        && !detail.archivedAt && (
         <section className="experiment-command-bar">
-          <div><strong>取消实验</strong><span>系统将停止生成和物化新 Trial；已提交任务按普通回测取消语义收敛，已有结果继续保留。</span></div>
-          <button className="app-button is-quiet" type="button" disabled={cancelling} onClick={() => { void handleCancel(); }}>
-            <Ban size={15} /> {cancelling ? '正在取消…' : '取消实验'}
+          <div>
+            <strong>实验生命周期</strong>
+            <span>大计划采用滚动生成，可暂停后从原游标继续；取消当前 Revision 不可恢复，但已有结果继续保留。</span>
+          </div>
+          {detail.lifecycleState === 'active' && (
+            <button className="app-button is-quiet" type="button" disabled={pausing} onClick={() => { void handlePause(); }}>
+              <Pause size={15} /> {pausing ? '正在暂停…' : '暂停实验'}
+            </button>
+          )}
+          {['pausing', 'paused'].includes(detail.lifecycleState ?? 'active') && (
+            <button className="app-button is-primary" type="button" disabled={resuming} onClick={() => { void handleResume('user_pause'); }}>
+              <Play size={15} /> {resuming ? '正在继续…' : '继续实验'}
+            </button>
+          )}
+          <button
+            className="app-button is-quiet"
+            type="button"
+            disabled={cancelling || detail.lifecycleState === 'cancelling'}
+            onClick={() => setCancelConfirmation({
+              revisionId: detail.revision.revisionId,
+              lifecycleVersion: detail.lifecycleVersion ?? 1,
+              idempotencyKey: createBrowserUuid(),
+              reason: '用户在实验详情页确认取消当前 Revision',
+            })}
+          >
+            <Ban size={15} /> {detail.lifecycleState === 'cancelling' ? '正在取消…' : '取消实验'}
           </button>
         </section>
       )}
@@ -1468,6 +1582,61 @@ function ExperimentDetailView({
             <Trash2 size={15} /> {lifecycleAction === 'purge' ? '正在提交…' : '物理清理实验'}
           </button>
         </section>
+      )}
+      {cancelConfirmation && (
+        <div
+          className="shared-modal-backdrop"
+          role="presentation"
+          onMouseDown={() => {
+            if (!cancelling) setCancelConfirmation(null);
+          }}
+        >
+          <div
+            className="shared-modal is-compact"
+            role="dialog"
+            aria-modal="true"
+            aria-label="确认取消实验"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="shared-modal-heading">
+              <div>
+                <span>不可恢复的 Revision 命令</span>
+                <h2>确认取消实验？</h2>
+              </div>
+              <button className="app-icon-button" type="button" disabled={cancelling} onClick={() => setCancelConfirmation(null)} aria-label="关闭取消确认">
+                <X size={16} />
+              </button>
+            </div>
+            <p className="shared-modal-note">
+              取消后停止生成和物化新 Trial；已提交任务按普通回测取消语义异步收敛；已有结果、参数快照和审计记录继续保留。
+            </p>
+            <div className="experiment-preview-heading">
+              <div><span>计划</span><strong>{detail.stage.plannedTrialCount}</strong></div>
+              <div><span>已生成</span><strong>{detail.stage.generatedTrialCount}</strong></div>
+              <div><span>已完成</span><strong>{detail.stage.terminalTrialCount}</strong></div>
+              <div><span>待物化</span><strong>{detail.stage.readyTrialCount}</strong></div>
+              <div><span>排队</span><strong>{detail.stage.queuedTrialCount}</strong></div>
+              <div><span>运行</span><strong>{detail.stage.inFlightTrialCount}</strong></div>
+              <div><span>尚未生成</span><strong>{detail.stage.remainingLogicalTrialCount}</strong></div>
+            </div>
+            <label>
+              <span>取消原因</span>
+              <textarea
+                maxLength={500}
+                value={cancelConfirmation.reason}
+                onChange={(event) => setCancelConfirmation((current) => (
+                  current ? { ...current, reason: event.target.value } : current
+                ))}
+              />
+            </label>
+            <div className="shared-modal-actions">
+              <button className="app-button is-quiet" type="button" disabled={cancelling} onClick={() => setCancelConfirmation(null)}>返回</button>
+              <button className="app-button is-primary" type="button" disabled={cancelling || !cancelConfirmation.reason.trim()} onClick={() => { void handleCancel(); }}>
+                <Ban size={15} /> {cancelling ? '正在提交…' : error.includes('网络结果不明确') ? '重试取消' : '确认取消'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
       <ExperimentBacktestRunDrawer
         experimentId={experimentId}
