@@ -25,11 +25,14 @@ backend dockerbackend
   server dockersocket /var/run/docker.sock
 
 backend dockerstream
+  option abortonclose
   server dockersocket /var/run/docker.sock
   timeout server 0
+  timeout server-fin 5s
 
 frontend dockerfrontend
   bind ${BIND_CONFIG}
+  timeout client-fin 5s
   http-request deny unless METH_GET
 
   # 只允许 Alloy 发现/读取日志及事件观察器订阅所需的精确只读接口。

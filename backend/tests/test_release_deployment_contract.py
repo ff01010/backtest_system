@@ -4,7 +4,11 @@
 import os
 import re
 import shutil
+import socket
 import subprocess
+import time
+import urllib.request
+import uuid
 from pathlib import Path
 
 import pytest
@@ -344,6 +348,160 @@ def test_socket_proxy_reserves_pid_capacity_for_healthcheck() -> None:
   pid_limit = int(pid_limit_match.group(1))
   assert thread_count <= 4
   assert pid_limit >= thread_count + 4
+
+
+def test_alloy_log_stream_avoids_refresh_interval_http_timeout() -> None:
+  config = (ROOT / "deploy" / "alloy" / "config.alloy").read_text(
+    encoding="utf-8",
+  )
+  discovery = config.split('discovery.docker "local" {', 1)[1].split(
+    "\n}", 1,
+  )[0]
+  source = config.split('loki.source.docker "containers" {', 1)[1].split(
+    "\n}", 1,
+  )[0]
+
+  assert '"http://docker-socket-proxy:2375"' in discovery
+  assert '"tcp://docker-socket-proxy:2375"' in source
+  assert "refresh_interval" not in source
+
+
+def test_socket_proxy_expires_abandoned_half_closed_log_streams() -> None:
+  proxy = (
+    ROOT / "deploy" / "docker-socket-proxy" / "haproxy.cfg.template"
+  ).read_text(encoding="utf-8")
+  frontend = proxy.split("frontend docker", 1)[1].split(
+    "backend dockerapi", 1,
+  )[0]
+  stream_backend = proxy.split("backend dockerstream", 1)[1]
+
+  assert "timeout client-fin 5s" in frontend
+  assert "option abortonclose" in stream_backend
+  assert "timeout server 0" in stream_backend
+  assert "timeout server-fin 5s" in stream_backend
+
+
+def test_observability_config_changes_recreate_only_their_consumers() -> None:
+  compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(
+    encoding="utf-8",
+  )
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  socket_proxy = compose.split("  docker-socket-proxy:", 1)[1].split(
+    "\n  loki:", 1,
+  )[0]
+  alloy = compose.split("  alloy:", 1)[1].split(
+    "\n  container-event-observer:", 1,
+  )[0]
+
+  assert "export_observability_config_digests()" in script
+  assert script.count("export_observability_config_digests") >= 3
+  assert "deploy/docker-socket-proxy/haproxy.cfg.template" in script
+  assert "deploy/alloy/config.alloy" in script
+  assert (
+    "com.trend-grid.config-digest: "
+    "${TREND_GRID_DOCKER_SOCKET_PROXY_CONFIG_DIGEST:-dev}"
+  ) in socket_proxy
+  assert (
+    "com.trend-grid.config-digest: ${TREND_GRID_ALLOY_CONFIG_DIGEST:-dev}"
+  ) in alloy
+
+
+SOCKET_PROXY_IMAGE = (
+  "ghcr.io/tecnativa/docker-socket-proxy:v0.4.2@"
+  "sha256:1f3a6f303320723d199d2316a3e82b2e2685d86c275d5e3deeaf182573b47476"
+)
+
+
+def _run_docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+  return subprocess.run(
+    ["docker", *args],
+    check=check,
+    capture_output=True,
+    text=True,
+    encoding="utf-8",
+  )
+
+
+def _wait_for_socket_proxy(port: int) -> None:
+  ping_url = f"http://127.0.0.1:{port}/_ping"
+  for _ in range(30):
+    try:
+      with urllib.request.urlopen(ping_url, timeout=1) as response:
+        if response.read() == b"OK":
+          return
+    except OSError:
+      time.sleep(0.2)
+  pytest.fail("Docker Socket Proxy 未能在 6 秒内就绪")
+
+
+def _proxy_fd_count(name: str) -> int:
+  result = _run_docker(
+    "exec",
+    name,
+    "sh",
+    "-c",
+    "for pid in $(pidof haproxy); do ls /proc/$pid/fd; done | wc -l",
+  )
+  return int(result.stdout.strip())
+
+
+def _open_proxy_log_streams(name: str, port: int) -> list[socket.socket]:
+  request = (
+    f"GET /containers/{name}/logs?stdout=1&follow=1&tail=0 HTTP/1.1\r\n"
+    f"Host: 127.0.0.1:{port}\r\n\r\n"
+  ).encode("ascii")
+  streams: list[socket.socket] = []
+  for _ in range(16):
+    stream = socket.create_connection(("127.0.0.1", port), timeout=2)
+    stream.sendall(request)
+    streams.append(stream)
+  return streams
+
+
+@pytest.mark.skipif(
+  os.environ.get("TREND_GRID_RUN_DOCKER_INTEGRATION") != "1",
+  reason="需要显式启用本机 Docker 集成测试",
+)
+def test_socket_proxy_reclaims_cancelled_log_streams() -> None:
+  """真实 HAProxy 与 Docker socket 必须回收客户端取消的日志流。"""
+  name = f"trend-grid-proxy-test-{uuid.uuid4().hex[:12]}"
+  config = ROOT / "deploy" / "docker-socket-proxy" / "haproxy.cfg.template"
+  streams: list[socket.socket] = []
+  try:
+    _run_docker(
+      "run",
+      "--detach",
+      "--name",
+      name,
+      "--publish",
+      "127.0.0.1::2375",
+      "--env",
+      "BIND_CONFIG=:2375",
+      "--env",
+      "CONTAINERS=1",
+      "--env",
+      "LOG_LEVEL=warning",
+      "--volume",
+      "/var/run/docker.sock:/var/run/docker.sock:ro",
+      "--volume",
+      f"{config.resolve()}:/usr/local/etc/haproxy/haproxy.cfg.template:ro",
+      SOCKET_PROXY_IMAGE,
+    )
+    port_result = _run_docker("port", name, "2375/tcp")
+    port = int(port_result.stdout.strip().rsplit(":", 1)[1])
+    _wait_for_socket_proxy(port)
+    baseline = _proxy_fd_count(name)
+    streams = _open_proxy_log_streams(name, port)
+    assert _proxy_fd_count(name) >= baseline + 16
+    for stream in streams:
+      stream.close()
+    streams.clear()
+    time.sleep(7)
+    assert _proxy_fd_count(name) <= baseline + 6
+  finally:
+    for stream in streams:
+      stream.close()
+    _run_docker("rm", "--force", name, check=False)
 
 
 def test_production_defaults_provide_32_runner_pool_with_guarded_concurrency() -> None:

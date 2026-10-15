@@ -191,7 +191,9 @@ services:
     mem_limit: 128m
     pids_limit: 128
     logging: *bounded-logging
-    labels: *log-on-observability
+    labels:
+      <<: *log-on-observability
+      com.trend-grid.config-digest: ${TREND_GRID_DOCKER_SOCKET_PROXY_CONFIG_DIGEST:-dev}
     healthcheck:
       test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:2375/_ping']
       interval: 15s
@@ -253,7 +255,9 @@ services:
     mem_limit: 512m
     pids_limit: 128
     logging: *bounded-logging
-    labels: *log-on-observability
+    labels:
+      <<: *log-on-observability
+      com.trend-grid.config-digest: ${TREND_GRID_ALLOY_CONFIG_DIGEST:-dev}
     healthcheck:
       test: ['CMD', '/bin/alloy', '--version']
       interval: 30s
