@@ -139,6 +139,7 @@ def test_claim_persists_each_attempt_without_overwriting_expired_attempt() -> No
       "job_kind": "bar", "run_id": "run-b", "owner_user_id": "user-b",
       "owner_active_count": 0,
     },
+    {"run_id": "run-b"},
     {"active_count": 0, "override_limit": None},
     job_row,
   ])
@@ -196,6 +197,7 @@ def test_global_scheduler_uses_fairness_burst_for_user_without_slot(monkeypatch:
   }
   cursor = FakeCursor(None, fetch_rows=[
     {"job_kind": "bar", "run_id": "run-b", "owner_user_id": "user-b", "owner_active_count": 0},
+    {"run_id": "run-b"},
     {"active_count": 8, "override_limit": None},
     job_row,
   ])
@@ -218,6 +220,7 @@ def test_global_scheduler_uses_fairness_burst_for_user_without_slot(monkeypatch:
 def test_global_scheduler_does_not_burst_for_user_with_active_slot(monkeypatch: Any) -> None:
   cursor = FakeCursor(None, fetch_rows=[
     {"job_kind": "bar", "run_id": "run-a", "owner_user_id": "user-a", "owner_active_count": 1},
+    {"run_id": "run-a"},
     {"active_count": 8, "override_limit": None},
   ])
   monkeypatch.setattr(state_store.settings, "BACKTEST_BASE_CONCURRENCY", 8)
@@ -389,23 +392,33 @@ def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypa
   assert state_store.claim_bar_backtest_job("runner-1", 30) is None
 
   assert cursor.commands[0] == (
+    "SELECT set_config('lock_timeout', %s, true)",
+    ("2000ms",),
+  )
+  assert cursor.commands[1] == (
     "SELECT pg_advisory_xact_lock(%s)",
     (state_store._BACKTEST_SCHEDULER_LOCK_KEY,),
   )
-  cleanup_query, cleanup_params = cursor.commands[1]
+  assert cursor.commands[2] == (
+    "SELECT set_config('lock_timeout', %s, true)",
+    ("250ms",),
+  )
+  cleanup_query, cleanup_params = cursor.commands[3]
   assert "UPDATE bar_backtest_job" in cleanup_query
   assert "status='cancelling' AND lease_expires_at < now()" in cleanup_query
   assert "UPDATE backtest_run AS run" in cleanup_query
   assert cleanup_params is None
-  assert "UPDATE l2_backtest_job" in cursor.commands[2][0]
-  assert "DELETE FROM backtest_execution_slot" in cursor.commands[3][0]
-  claim_query, claim_params = cursor.commands[4]
+  assert "UPDATE l2_backtest_job" in cursor.commands[4][0]
+  assert "DELETE FROM backtest_execution_slot" in cursor.commands[5][0]
+  claim_query, claim_params = cursor.commands[6]
   assert "UNION ALL" in claim_query
   assert claim_params == (
     state_store.SCRIPT_RUNTIME_VERSION,
     state_store.RUNTIME_CAPABILITY_DIGEST,
+    [],
     state_store.SCRIPT_RUNTIME_VERSION,
     state_store.RUNTIME_CAPABILITY_DIGEST,
+    [],
     None,
     None,
   )

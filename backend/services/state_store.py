@@ -16,7 +16,7 @@ from uuid import uuid4
 
 import psycopg
 from psycopg import IsolationLevel
-from psycopg.errors import IntegrityError
+from psycopg.errors import IntegrityError, LockNotAvailable
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -69,6 +69,8 @@ class ExperimentRunRetainedError(ValueError):
 
 
 _BACKTEST_SCHEDULER_LOCK_KEY = 314159265
+_BACKTEST_SCHEDULER_LOCK_TIMEOUT_MS = 2_000
+_BACKTEST_SCHEDULER_WRITE_TIMEOUT_MS = 250
 _STRATEGY_NAME_MAX_LENGTH = 64
 # 保留旧名称，避免外部诊断脚本在迁移期间失效。
 _L2_FAIR_CLAIM_LOCK_KEY = _BACKTEST_SCHEDULER_LOCK_KEY
@@ -2092,11 +2094,16 @@ def _finalize_expired_backtest_jobs(cur: Any) -> None:
   """回收过期槽位，并将已失去执行器的取消任务收敛到终态。"""
   for table in ("bar_backtest_job", "l2_backtest_job"):
     cur.execute(f"""
-      WITH expired_jobs AS (
-        UPDATE {table}
-        SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
+      WITH expired_candidates AS (
+        SELECT run_id FROM {table}
         WHERE status='cancelling' AND lease_expires_at < now()
-        RETURNING run_id, attempt_token
+        FOR UPDATE SKIP LOCKED
+      ), expired_jobs AS (
+        UPDATE {table} AS job
+        SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
+        FROM expired_candidates AS candidate
+        WHERE job.run_id=candidate.run_id
+        RETURNING job.run_id, job.attempt_token
       ), finalized_attempts AS (
         UPDATE backtest_run_attempt AS attempt
         SET status='cancelled', termination_reason='cancelled_by_user',
@@ -2112,7 +2119,16 @@ def _finalize_expired_backtest_jobs(cur: Any) -> None:
       FROM expired_jobs
       WHERE run.id=expired_jobs.run_id AND run.status='cancelling'
     """)
-  cur.execute("DELETE FROM backtest_execution_slot WHERE lease_expires_at < now()")
+  cur.execute("""
+    WITH expired_slots AS (
+      SELECT run_id FROM backtest_execution_slot
+      WHERE lease_expires_at < now()
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM backtest_execution_slot AS slot
+    USING expired_slots
+    WHERE slot.run_id=expired_slots.run_id
+  """)
 
 
 def _next_backtest_candidate(
@@ -2120,6 +2136,7 @@ def _next_backtest_candidate(
   job_kind: str | None = None,
   runtime_version: str = SCRIPT_RUNTIME_VERSION,
   capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
+  excluded_run_ids: tuple[str, ...] = (),
 ) -> dict[str, Any] | None:
   """先按用户公平选队首，再优先领取该用户的普通手工任务。"""
   cur.execute("""
@@ -2131,6 +2148,7 @@ def _next_backtest_candidate(
       WHERE (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
         AND NOT job.cancel_requested
         AND job.runtime_version=%s AND job.capability_digest=%s
+        AND NOT (job.run_id=ANY(%s::uuid[]))
       UNION ALL
       SELECT 'l2' AS job_kind, job.run_id, job.owner_user_id,
         job.created_at, run.origin_type
@@ -2139,6 +2157,7 @@ def _next_backtest_candidate(
       WHERE (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
         AND NOT job.cancel_requested
         AND job.runtime_version=%s AND job.capability_digest=%s
+        AND NOT (job.run_id=ANY(%s::uuid[]))
     ), eligible AS (
       SELECT * FROM candidates
       WHERE (%s::text IS NULL OR job_kind=%s::text)
@@ -2158,10 +2177,54 @@ def _next_backtest_candidate(
     ORDER BY owner_active_count, created_at, run_id
     LIMIT 1
   """, (
-    runtime_version, capability_digest, runtime_version, capability_digest,
-    job_kind, job_kind,
+    runtime_version, capability_digest, list(excluded_run_ids),
+    runtime_version, capability_digest, list(excluded_run_ids), job_kind, job_kind,
   ))
   return cur.fetchone()
+
+
+def _lock_backtest_candidate(
+  cur: Any,
+  candidate: dict[str, Any],
+  runtime_version: str,
+  capability_digest: str,
+) -> bool:
+  """非阻塞锁定任务及其运行记录，避免持有全局锁等待行锁。"""
+  table = "bar_backtest_job" if candidate["job_kind"] == "bar" else "l2_backtest_job"
+  cur.execute(f"""
+    SELECT job.run_id
+    FROM {table} AS job
+    JOIN backtest_run AS run ON run.id=job.run_id
+    WHERE job.run_id=%s AND NOT job.cancel_requested
+      AND job.runtime_version=%s AND job.capability_digest=%s
+      AND (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
+    FOR UPDATE OF job, run SKIP LOCKED
+  """, (candidate["run_id"], runtime_version, capability_digest))
+  return cur.fetchone() is not None
+
+
+def _next_claimable_backtest_candidate(
+  cur: Any,
+  job_kind: str,
+  runtime_version: str,
+  capability_digest: str,
+  initial_candidate: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+  """按公平顺序跳过被占用任务，返回当前事务已锁定的候选。"""
+  excluded_run_ids: list[str] = []
+  candidate = initial_candidate
+  while True:
+    if candidate is None:
+      candidate = _next_backtest_candidate(
+        cur, job_kind, runtime_version, capability_digest,
+        tuple(excluded_run_ids),
+      )
+    if candidate is None:
+      return None
+    if _lock_backtest_candidate(cur, candidate, runtime_version, capability_digest):
+      return candidate
+    excluded_run_ids.append(str(candidate["run_id"]))
+    candidate = None
 
 
 def _scheduler_capacity(cur: Any) -> tuple[int, int]:
@@ -2338,7 +2401,15 @@ def _claim_backtest_job(
   """领取 Bar/L2 共用容量中的一个槽位。"""
   if job_kind not in {"bar", "l2"}:
     raise ValueError("回测任务类型无效")
+  cur.execute(
+    "SELECT set_config('lock_timeout', %s, true)",
+    (f"{_BACKTEST_SCHEDULER_LOCK_TIMEOUT_MS}ms",),
+  )
   cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BACKTEST_SCHEDULER_LOCK_KEY,))
+  cur.execute(
+    "SELECT set_config('lock_timeout', %s, true)",
+    (f"{_BACKTEST_SCHEDULER_WRITE_TIMEOUT_MS}ms",),
+  )
   _finalize_expired_backtest_jobs(cur)
   candidate = _next_backtest_candidate(
     cur, runtime_version=runtime_version, capability_digest=capability_digest,
@@ -2350,11 +2421,12 @@ def _claim_backtest_job(
       "全局最优先任务等待对应执行器: kind=%s reason=%s",
       candidate["job_kind"], f"{candidate['job_kind']}_executor_wait",
     )
-    candidate = _next_backtest_candidate(
-      cur, job_kind, runtime_version, capability_digest,
-    )
-    if not candidate:
-      return None
+    candidate = None
+  candidate = _next_claimable_backtest_candidate(
+    cur, job_kind, runtime_version, capability_digest, candidate,
+  )
+  if not candidate:
+    return None
 
   active_count, override_limit = _scheduler_capacity(cur)
   normal_limit = override_limit or settings.BACKTEST_BASE_CONCURRENCY
@@ -2435,21 +2507,27 @@ def claim_l2_backtest_job(
   """从统一容量中原子领取一个 L2 任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("L2 runner 标识和租约时长必须有效")
-  with _db() as conn:
-    with conn.cursor() as cur:
-      row = _claim_backtest_job(
-        cur, "l2", worker_id, lease_seconds, runtime_version, capability_digest,
-      )
-      if not row:
-        return None
-      cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
-      return {
-        "runId": _uuid(row["run_id"]),
-        "ownerUserId": _uuid(row["owner_user_id"]),
-        "payload": _json(row["payload"], {}),
-        "attemptNo": int(row["attempt_no"]),
-        "attemptToken": _uuid(row["attempt_token"]),
-      }
+  try:
+    with _db() as conn:
+      with conn.cursor() as cur:
+        row = _claim_backtest_job(
+          cur, "l2", worker_id, lease_seconds, runtime_version, capability_digest,
+        )
+        if not row:
+          return None
+        cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
+        return {
+          "runId": _uuid(row["run_id"]),
+          "ownerUserId": _uuid(row["owner_user_id"]),
+          "payload": _json(row["payload"], {}),
+          "attemptNo": int(row["attempt_no"]),
+          "attemptToken": _uuid(row["attempt_token"]),
+        }
+  except DatabaseError as error:
+    if not isinstance(error.__cause__, LockNotAvailable):
+      raise
+    logger.info("L2 任务领取跳过锁等待: worker=%s", worker_id)
+    return None
 
 
 def claim_bar_backtest_job(
@@ -2461,21 +2539,27 @@ def claim_bar_backtest_job(
   """从统一容量中原子领取一个标准 Bar 回测任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("Bar runner 标识和租约时长必须有效")
-  with _db() as conn:
-    with conn.cursor() as cur:
-      row = _claim_backtest_job(
-        cur, "bar", worker_id, lease_seconds, runtime_version, capability_digest,
-      )
-      if not row:
-        return None
-      cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
-      return {
-        "runId": _uuid(row["run_id"]),
-        "ownerUserId": _uuid(row["owner_user_id"]),
-        "payload": _json(row["payload"], {}),
-        "attemptNo": int(row["attempt_no"]),
-        "attemptToken": _uuid(row["attempt_token"]),
-      }
+  try:
+    with _db() as conn:
+      with conn.cursor() as cur:
+        row = _claim_backtest_job(
+          cur, "bar", worker_id, lease_seconds, runtime_version, capability_digest,
+        )
+        if not row:
+          return None
+        cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
+        return {
+          "runId": _uuid(row["run_id"]),
+          "ownerUserId": _uuid(row["owner_user_id"]),
+          "payload": _json(row["payload"], {}),
+          "attemptNo": int(row["attempt_no"]),
+          "attemptToken": _uuid(row["attempt_token"]),
+        }
+  except DatabaseError as error:
+    if not isinstance(error.__cause__, LockNotAvailable):
+      raise
+    logger.info("Bar 任务领取跳过锁等待: worker=%s", worker_id)
+    return None
 
 
 def _finalize_expired_bar_backtest_cancellations(cur: Any) -> None:
