@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import ExperimentPage, { isStandardBarConfig } from '../features/experiments/ExperimentPage';
-import { fetchStrategyConfigs } from '../api/client';
+import { fetchStrategyConfigPage } from '../api/client';
 import {
   archiveExperiment,
   cancelExperiment,
@@ -34,7 +34,7 @@ import type {
 
 vi.mock('../api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api/client')>();
-  return { ...actual, fetchStrategyConfigs: vi.fn() };
+  return { ...actual, fetchStrategyConfigPage: vi.fn() };
 });
 
 vi.mock('../features/experiments/api', () => ({
@@ -315,7 +315,9 @@ const TRIAL: ExperimentTrial = {
 
 beforeEach(() => {
   localStorage.clear();
-  vi.mocked(fetchStrategyConfigs).mockReset().mockResolvedValue([]);
+  vi.mocked(fetchStrategyConfigPage).mockReset().mockResolvedValue({
+    items: [], nextCursor: null, total: 0,
+  });
   vi.mocked(fetchExperimentSubject).mockReset().mockResolvedValue(SUBJECT);
   vi.mocked(previewExperiment).mockReset().mockResolvedValue(PREVIEW);
   vi.mocked(createExperiment).mockReset().mockResolvedValue(CREATED);
@@ -448,7 +450,8 @@ describe('ExperimentPage', () => {
       scriptVersionNo: 1, description: '', code: 'def on_bar(bar, state): return []',
       entryType: 'on_bar', signalRequired: false, strategy: 'user_script', mode: 'backtest',
       symbol: '688981.SH', timeframe: '5m', benchmarkSymbol: null, accountId: null,
-      enabled: true, published: true, publishedVersionId: 'published-1', revision: 1,
+      enabled: true, published: true, publishedVersionId: 'published-1', versionNo: 1,
+      revision: 1,
       createdAt: '2026-10-08', updatedAt: '2026-10-08',
     } as const;
 

@@ -309,6 +309,37 @@ def save_strategy(
   return {**body, "replayed": replayed, "response_status": response_status}
 
 
+def create_strategy(command: StrategySaveCommand) -> dict[str, Any]:
+  """按显式新建意图创建独立策略身份和完整版本 V1。"""
+  if command.config_id is not None or command.script_id is not None:
+    raise StrategyLifecycleError(
+      "strategy.create_identity_conflict",
+      "新建策略不能携带已有策略身份",
+      409,
+    )
+  return save_strategy(command)
+
+
+def update_strategy(
+  config_id: str,
+  expected_revision: int,
+  command: StrategySaveCommand,
+) -> dict[str, Any]:
+  """按配置资源身份更新，不允许调用方改绑脚本身份。"""
+  return save_strategy(StrategySaveCommand(
+    **{
+      **command.__dict__,
+      "config_id": config_id,
+      "expected_revision": expected_revision,
+    },
+  ))
+
+
+def create_strategy_from_copy(command: StrategySaveCommand) -> dict[str, Any]:
+  """复制草稿保存仍是显式创建；名称冲突由服务端全量资产判定。"""
+  return create_strategy(command)
+
+
 def _public_backtest_parameters(params: dict[str, Any]) -> dict[str, Any]:
   execution_parameters = {
     "duration_seconds": params.get("twapDurationSeconds"),

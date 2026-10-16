@@ -206,3 +206,62 @@ def test_complete_strategy_save_uses_one_lifecycle_call(monkeypatch: pytest.Monk
   assert command.config_id is None
   assert command.expected_revision is None
   assert command.params_json["params"]["startDate"] == "2026-08-27"
+
+
+def test_complete_strategy_put_uses_explicit_update_identity(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  captured: list[Any] = []
+
+  def update(config_id: str, revision: int, command: Any) -> dict[str, Any]:
+    captured.append((config_id, revision, command))
+    return {"script": {"id": "script-1"}, "config": {"id": config_id}}
+
+  monkeypatch.setattr(api_app.strategy_lifecycle, "update_strategy", update)
+  payload = schemas.CompleteStrategyUpdate(
+    script={"name": "完整策略", "code": "def on_bar(bar, state):\n  return []"},
+    config={
+      "name": "完整策略", "symbol": "688981.SH", "timeframe": "5m",
+      "paramsJson": {
+        "params": {"startDate": "2026-08-27", "endDate": "2026-08-27"},
+      },
+    },
+    expectedRevision=4,
+  )
+
+  result = api_app.update_complete_strategy("config-1", payload)
+
+  assert result["config"]["id"] == "config-1"
+  assert captured[0][0:2] == ("config-1", 4)
+  assert captured[0][2].config_id is None
+  assert captured[0][2].script_id is None
+
+
+def test_complete_strategy_post_keeps_legacy_update_compatibility(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  captured: list[Any] = []
+
+  def update(config_id: str, revision: int, command: Any) -> dict[str, Any]:
+    captured.append((config_id, revision, command))
+    return {"script": {"id": "script-1"}, "config": {"id": config_id}}
+
+  monkeypatch.setattr(api_app.strategy_lifecycle, "update_strategy", update)
+  payload = schemas.CompleteStrategySave(
+    script={"name": "完整策略", "code": "def on_bar(bar, state):\n  return []"},
+    config={
+      "name": "完整策略", "symbol": "688981.SH", "timeframe": "5m",
+      "paramsJson": {
+        "params": {"startDate": "2026-08-27", "endDate": "2026-08-27"},
+      },
+    },
+    scriptId="script-1",
+    configId="config-1",
+    expectedRevision=4,
+  )
+
+  result = api_app.save_complete_strategy(payload)
+
+  assert result["config"]["id"] == "config-1"
+  assert captured[0][0:2] == ("config-1", 4)
+  assert captured[0][2].script_id == "script-1"

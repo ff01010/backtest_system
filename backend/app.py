@@ -1725,9 +1725,16 @@ def delete_strategy_script(script_id: str):
   return {"deleted": deleted}
 
 
-@app.get("/api/strategy-configs")
-def strategy_configs():
-  return {"configs": state_store.list_strategy_configs()}
+@app.get("/api/strategy-configs", response_model=schemas.StrategyConfigPage)
+def strategy_configs(
+  limit: int = Query(50, ge=1, le=100),
+  cursor: str | None = Query(default=None, max_length=2048),
+  query: str = Query(default="", max_length=100),
+):
+  try:
+    return state_store.list_strategy_config_summaries(limit, cursor, query)
+  except ValueError as error:
+    raise HTTPException(422, str(error)) from error
 
 
 @app.post("/api/strategy-configs")
@@ -1768,41 +1775,20 @@ def update_strategy_config(config_id: str, payload: schemas.StrategyConfigUpdate
 
 @app.post("/api/complete-strategies")
 def save_complete_strategy(payload: schemas.CompleteStrategySave):
-  script_request = _model_dump(payload.script)
-  config_request = _model_dump(payload.config)
-  params_json = config_request.get("paramsJson")
-  strategy_parameters = (
-    params_json.get("strategyParams")
-    if isinstance(params_json, dict) and isinstance(params_json.get("strategyParams"), dict)
-    else None
-  )
   try:
-    saved = strategy_lifecycle.save_strategy(
-      strategy_lifecycle.StrategySaveCommand(
-        name=str(config_request["name"]),
-        description=str(script_request.get("description", "")),
-        code=str(script_request["code"]),
-        entry_type=str(script_request.get("entryType", "on_bar")),
-        signal_required=bool(script_request.get("signalRequired", False)),
-        strategy=str(config_request.get("strategy", "user_script")),
-        mode=str(config_request.get("mode", "backtest")),
-        symbol=str(config_request["symbol"]),
-        timeframe=str(config_request.get("timeframe", "5m")),
-        benchmark_symbol=config_request.get("benchmarkSymbol"),
-        account_id=config_request.get("accountId"),
-        params_json=dict(params_json) if isinstance(params_json, dict) else {},
-        strategy_parameters=strategy_parameters,
-        enabled=bool(config_request.get("enabled", True)),
-        script_id=payload.scriptId,
-        config_id=payload.configId,
-        expected_revision=payload.expectedRevision,
-      ),
+    command = _complete_strategy_command(
+      _model_dump(payload.script),
+      _model_dump(payload.config),
+      payload.scriptId if payload.configId else None,
     )
-    return {
-      **saved,
-      "runtimeVersion": SCRIPT_RUNTIME_VERSION,
-      "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
-    }
+    saved = (
+      strategy_lifecycle.update_strategy(
+        payload.configId, payload.expectedRevision or 0, command,
+      )
+      if payload.configId
+      else strategy_lifecycle.create_strategy(command)
+    )
+    return _complete_strategy_response(saved)
   except strategy_lifecycle.StrategyLifecycleError as error:
     raise HTTPException(error.status_code, str(error)) from error
   except KeyError as error:
@@ -1811,6 +1797,68 @@ def save_complete_strategy(payload: schemas.CompleteStrategySave):
     raise HTTPException(409, str(error)) from error
   except state_store.DatabaseError as error:
     raise HTTPException(500, f"PostgreSQL 保存完整策略失败: {error}") from error
+
+
+def _complete_strategy_command(
+  script_request: dict[str, Any],
+  config_request: dict[str, Any],
+  script_id: str | None = None,
+) -> strategy_lifecycle.StrategySaveCommand:
+  params_json = config_request.get("paramsJson")
+  strategy_parameters = (
+    params_json.get("strategyParams")
+    if isinstance(params_json, dict) and isinstance(params_json.get("strategyParams"), dict)
+    else None
+  )
+  return strategy_lifecycle.StrategySaveCommand(
+    name=str(config_request["name"]),
+    description=str(script_request.get("description", "")),
+    code=str(script_request["code"]),
+    entry_type=str(script_request.get("entryType", "on_bar")),
+    signal_required=bool(script_request.get("signalRequired", False)),
+    strategy=str(config_request.get("strategy", "user_script")),
+    mode=str(config_request.get("mode", "backtest")),
+    symbol=str(config_request["symbol"]),
+    timeframe=str(config_request.get("timeframe", "5m")),
+    benchmark_symbol=config_request.get("benchmarkSymbol"),
+    account_id=config_request.get("accountId"),
+    params_json=dict(params_json) if isinstance(params_json, dict) else {},
+    strategy_parameters=strategy_parameters,
+    enabled=bool(config_request.get("enabled", True)),
+    script_id=script_id,
+  )
+
+
+def _complete_strategy_response(saved: dict[str, Any]) -> dict[str, Any]:
+  return {
+    **saved,
+    "runtimeVersion": SCRIPT_RUNTIME_VERSION,
+    "capabilityDigest": RUNTIME_CAPABILITY_DIGEST,
+  }
+
+
+@app.put("/api/complete-strategies/{config_id}")
+def update_complete_strategy(
+  config_id: str,
+  payload: schemas.CompleteStrategyUpdate,
+):
+  try:
+    saved = strategy_lifecycle.update_strategy(
+      config_id,
+      payload.expectedRevision,
+      _complete_strategy_command(
+        _model_dump(payload.script), _model_dump(payload.config),
+      ),
+    )
+    return _complete_strategy_response(saved)
+  except strategy_lifecycle.StrategyLifecycleError as error:
+    raise HTTPException(error.status_code, str(error)) from error
+  except KeyError as error:
+    raise HTTPException(404, "策略不存在或无权访问") from error
+  except state_store.ConflictError as error:
+    raise HTTPException(409, str(error)) from error
+  except state_store.DatabaseError as error:
+    raise HTTPException(500, f"PostgreSQL 更新完整策略失败: {error}") from error
 
 
 @app.get("/api/complete-strategies/{config_id}")
@@ -1861,13 +1909,21 @@ def delete_strategy_config(config_id: str):
   return {"deleted": deleted}
 
 
-@app.get("/api/strategy-configs/{config_id}/versions")
-def strategy_config_versions(config_id: str):
+@app.get(
+  "/api/strategy-configs/{config_id}/versions",
+  response_model=schemas.StrategyConfigVersionPage,
+)
+def strategy_config_versions(
+  config_id: str,
+  limit: int = Query(50, ge=1, le=100),
+  cursor: int | None = Query(default=None, ge=1),
+):
   try:
-    state_store.get_strategy_config(config_id)
+    return state_store.list_strategy_config_versions_cursor_page(
+      config_id, limit, cursor,
+    )
   except KeyError:
     raise HTTPException(404, f"策略配置不存在: {config_id}")
-  return {"versions": state_store.list_strategy_config_versions(config_id)}
 
 
 def _raise_experiment_error(error: ExperimentError) -> NoReturn:

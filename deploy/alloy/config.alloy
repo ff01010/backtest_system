@@ -58,10 +58,9 @@ discovery.relabel "task_logs" {
 }
 
 loki.source.docker "containers" {
-  host             = "http://docker-socket-proxy:2375"
-  targets          = discovery.relabel.task_logs.output
-  forward_to       = [loki.write.local.receiver]
-  refresh_interval = "5s"
+  host       = "tcp://docker-socket-proxy:2375"
+  targets    = discovery.relabel.task_logs.output
+  forward_to = [loki.write.local.receiver]
 }
 
 loki.write "local" {

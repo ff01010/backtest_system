@@ -418,6 +418,7 @@ export interface StrategyConfig {
   enabled: boolean;
   published: boolean;
   publishedVersionId: string | null;
+  versionNo: number;
   revision: number;
   archivedAt?: string | null;
   sharedSource?: {
@@ -427,6 +428,31 @@ export interface StrategyConfig {
   } | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface StrategyConfigSummary {
+  id: string;
+  name: string;
+  scriptId: string;
+  strategyVersionId: string;
+  scriptVersionNo: number;
+  versionNo: number;
+  revision: number;
+  strategy: string;
+  mode: 'backtest' | 'live' | string;
+  symbol: string;
+  timeframe: string;
+  fillModel: string;
+  enabled: boolean;
+  published: boolean;
+  publishedVersionId: string | null;
+  updatedAt: string;
+}
+
+export interface StrategyConfigPage {
+  items: StrategyConfigSummary[];
+  nextCursor: string | null;
+  total: number;
 }
 
 export interface StrategyConfigVersion {
@@ -445,6 +471,12 @@ export interface StrategyConfigVersion {
   paramsJson: Record<string, unknown>;
   changeNote: string;
   createdAt: string;
+}
+
+export interface StrategyConfigVersionPage {
+  items: StrategyConfigVersion[];
+  nextCursor: string | null;
+  total: number;
 }
 
 export interface BacktestRunHistory {

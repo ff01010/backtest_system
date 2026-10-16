@@ -1,15 +1,18 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import BacktestPage from '../components/BacktestPage';
 import type { BacktestRunPage } from '../api/client';
-import type { BacktestRunHistory } from '../types';
+import type { BacktestRunHistory, StrategyConfig, StrategyConfigSummary } from '../types';
 
 
 const apiMocks = vi.hoisted(() => ({
   fetchBacktestRunPage: vi.fn(),
   fetchBacktestRuns: vi.fn(),
   fetchBacktestRun: vi.fn(),
-  fetchStrategyConfigs: vi.fn(),
+  fetchStrategyConfigPage: vi.fn(),
+  fetchCompleteStrategy: vi.fn(),
+  createCompleteStrategy: vi.fn(),
+  updateCompleteStrategy: vi.fn(),
   fetchResearchSignalDatasets: vi.fn(),
   fetchDataStatus: vi.fn(),
   fetchBacktestTimeframes: vi.fn(),
@@ -35,11 +38,15 @@ vi.mock('../api/client', () => ({
   deleteBacktestSelection: apiMocks.deleteBacktestSelection,
   deleteStrategyConfig: vi.fn(),
   fetchAccounts: vi.fn().mockResolvedValue([]),
-  fetchStrategyConfigVersions: vi.fn().mockResolvedValue([]),
+  fetchCompleteStrategy: apiMocks.fetchCompleteStrategy,
+  fetchStrategyConfigVersionPage: vi.fn().mockResolvedValue({
+    items: [], nextCursor: null, total: 0,
+  }),
   fetchStrategyParameterSchema: vi.fn(),
   fetchStrategySource: vi.fn(),
   runBacktest: vi.fn(),
-  saveCompleteStrategy: vi.fn(),
+  createCompleteStrategy: apiMocks.createCompleteStrategy,
+  updateCompleteStrategy: apiMocks.updateCompleteStrategy,
   setBacktestRunFavorite: apiMocks.setBacktestRunFavorite,
   createSignalDetailExport: apiMocks.createSignalDetailExport,
   fetchSignalDetailExports: apiMocks.fetchSignalDetailExports,
@@ -86,6 +93,61 @@ function makeRun(displayNo: number): BacktestRunHistory {
   };
 }
 
+function makeStrategyConfig(): StrategyConfig {
+  return {
+    id: 'config-1',
+    name: '分页策略',
+    scriptId: 'script-1',
+    strategyVersionId: 'code-version-1',
+    scriptVersionNo: 1,
+    versionNo: 1,
+    description: '',
+    code: 'def on_bar(bar, state):\n  return []\n',
+    entryType: 'on_bar',
+    signalRequired: false,
+    strategy: 'user_script',
+    mode: 'backtest',
+    symbol: '688981.SH',
+    timeframe: '5m',
+    benchmarkSymbol: '000300.SH',
+    accountId: null,
+    paramsJson: {
+      params: {
+        startDate: '2026-06-01',
+        endDate: '2026-06-26',
+        fillModel: 'bar_next_open',
+      },
+    },
+    enabled: true,
+    published: true,
+    publishedVersionId: 'complete-version-1',
+    revision: 1,
+    createdAt: '2026-10-15T08:00:00Z',
+    updatedAt: '2026-10-15T08:00:00Z',
+  };
+}
+
+function makeStrategySummary(config = makeStrategyConfig()): StrategyConfigSummary {
+  return {
+    id: config.id,
+    name: config.name,
+    scriptId: config.scriptId!,
+    strategyVersionId: config.strategyVersionId!,
+    scriptVersionNo: config.scriptVersionNo,
+    versionNo: config.versionNo,
+    revision: config.revision,
+    strategy: config.strategy,
+    mode: config.mode,
+    symbol: config.symbol,
+    timeframe: config.timeframe,
+    fillModel: 'bar_next_open',
+    enabled: config.enabled,
+    published: config.published,
+    publishedVersionId: config.publishedVersionId,
+    updatedAt: config.updatedAt,
+  };
+}
+
 function makeSignalExportTask() {
   return {
     id: 'export-1', selectionMode: 'ids', selectionSnapshot: {}, status: 'queued',
@@ -119,7 +181,9 @@ describe('BacktestPage history pagination', () => {
         symbols: ['688981.SH'],
       };
     });
-    apiMocks.fetchStrategyConfigs.mockResolvedValue([]);
+    apiMocks.fetchStrategyConfigPage.mockResolvedValue({
+      items: [], nextCursor: null, total: 0,
+    });
     apiMocks.fetchResearchSignalDatasets.mockResolvedValue([]);
     apiMocks.fetchDataStatus.mockRejectedValue(new Error('测试环境无行情'));
     apiMocks.fetchBacktestTimeframes.mockResolvedValue([]);
@@ -160,6 +224,92 @@ describe('BacktestPage history pagination', () => {
     expect(await screen.findByText('回测 #187')).toBeTruthy();
     expect(apiMocks.fetchBacktestRun).toHaveBeenCalledWith('run-187');
     expect(screen.getByText('回测记录与结果快照追溯')).toBeTruthy();
+  });
+
+  it('只读取首个摘要页，并在选择后按 ID 读取完整策略', async () => {
+    const config = makeStrategyConfig();
+    apiMocks.fetchStrategyConfigPage.mockResolvedValue({
+      items: [makeStrategySummary(config)], nextCursor: 'next-page', total: 10000,
+    });
+    apiMocks.fetchCompleteStrategy.mockResolvedValue(config);
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(apiMocks.fetchStrategyConfigPage).toHaveBeenCalledWith({
+      limit: 50, query: '',
+    }));
+    const selector = screen.getByLabelText('搜索策略方案');
+    fireEvent.focus(selector);
+    fireEvent.click(await screen.findByRole('option', { name: /分页策略/ }));
+
+    await waitFor(() => expect(apiMocks.fetchCompleteStrategy).toHaveBeenCalledWith('config-1'));
+    expect(await screen.findByDisplayValue('分页策略')).toBeTruthy();
+  });
+
+  it('编辑使用 PUT，新建保存使用 POST 且提交中阻止重复创建', async () => {
+    const config = makeStrategyConfig();
+    apiMocks.fetchStrategyConfigPage.mockResolvedValue({
+      items: [makeStrategySummary(config)], nextCursor: null, total: 1,
+    });
+    apiMocks.fetchCompleteStrategy.mockResolvedValue(config);
+    apiMocks.updateCompleteStrategy.mockResolvedValue({
+      script: { id: 'script-1' },
+      config: { ...config, revision: 2 },
+    });
+    let resolveCreate: (value: unknown) => void = () => undefined;
+    apiMocks.createCompleteStrategy.mockImplementation(() => new Promise((resolve) => {
+      resolveCreate = resolve;
+    }));
+    render(
+      <BacktestPage
+        symbol="688981.SH"
+        strategy="user_script"
+        strategies={['user_script']}
+        instruments={[]}
+        isAdmin={false}
+        onViewTradeChart={vi.fn()}
+      />,
+    );
+
+    const selector = await screen.findByLabelText('搜索策略方案');
+    fireEvent.focus(selector);
+    fireEvent.click(await screen.findByRole('option', { name: /分页策略/ }));
+    await waitFor(() => expect(apiMocks.fetchCompleteStrategy).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: '策略代码' }));
+    fireEvent.click(await screen.findByRole('button', { name: '保存策略' }));
+    await waitFor(() => expect(apiMocks.updateCompleteStrategy).toHaveBeenCalledWith(
+      'config-1', expect.any(Object), expect.any(Object), 1,
+    ));
+
+    fireEvent.click(screen.getByRole('button', { name: '新建策略' }));
+    fireEvent.change(screen.getByPlaceholderText('策略名称'), {
+      target: { value: '新策略' },
+    });
+    const saveButton = screen.getByRole('button', { name: '保存策略' });
+    fireEvent.click(saveButton);
+    fireEvent.click(saveButton);
+    expect(apiMocks.createCompleteStrategy).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolveCreate({
+        script: { id: 'script-new' },
+        config: {
+          ...config,
+          id: 'config-new',
+          scriptId: 'script-new',
+          name: '新策略',
+        },
+      });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getAllByText(/已保存策略 新策略/).length).toBeGreaterThan(0));
   });
 
   it('shows the finished L2 no-data state instead of permanent range loading', async () => {

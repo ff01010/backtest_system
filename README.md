@@ -190,8 +190,16 @@ npm run dev
 前端开发服务器默认使用 `5174`，并把 API 请求代理到 `http://127.0.0.1:8000`；这仅适用于后端与依赖服务已自行准备好的开发场景。
 
 ```powershell
-python -m pytest backend/tests
+# 快速反馈：不启动外部基础设施
+python -m pytest -m "not integration" backend/tests
+
+# 完整后端验证：在隔离的临时 PostgreSQL 中执行迁移和集成测试
+.\scripts\test-backend.ps1
+
 cd frontend
 npm test
 npm run build
 ```
+
+`test-backend.ps1` 使用独立的 Compose 项目和临时文件系统，测试结束后自动清理，
+不会连接或修改本地开发使用的 `quant-backtest-postgres` 数据。

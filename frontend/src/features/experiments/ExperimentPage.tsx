@@ -17,8 +17,8 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { ApiResponseError, fetchStrategyConfigs } from '../../api/client';
-import type { StrategyConfig } from '../../types';
+import { ApiResponseError, fetchStrategyConfigPage } from '../../api/client';
+import type { StrategyConfig, StrategyConfigSummary } from '../../types';
 import { createBrowserUuid } from '../../utils/browserUuid';
 import {
   archiveExperiment,
@@ -273,9 +273,13 @@ async function retryUncertain<T>(operation: () => Promise<T>): Promise<T> {
   }
 }
 
-export function isStandardBarConfig(config: StrategyConfig): boolean {
-  const params = config.paramsJson.params;
-  const fillModel = params && typeof params === 'object'
+export function isStandardBarConfig(
+  config: StrategyConfig | StrategyConfigSummary,
+): boolean {
+  const params = 'paramsJson' in config ? config.paramsJson.params : null;
+  const fillModel = 'fillModel' in config
+    ? config.fillModel
+    : params && typeof params === 'object'
     ? (params as Record<string, unknown>).fillModel
     : null;
   return config.enabled
@@ -308,7 +312,13 @@ function ExperimentLanding({
   onOpenExperiment: (experimentId: string) => void;
   onBack: () => void;
 }) {
-  const [configs, setConfigs] = useState<StrategyConfig[]>([]);
+  const [configs, setConfigs] = useState<StrategyConfigSummary[]>([]);
+  const [configQuery, setConfigQuery] = useState('');
+  const [configTotal, setConfigTotal] = useState(0);
+  const [configNextCursor, setConfigNextCursor] = useState<string | null>(null);
+  const [configLoading, setConfigLoading] = useState(true);
+  const [configLoadingMore, setConfigLoadingMore] = useState(false);
+  const configRequestId = useRef(0);
   const [experiments, setExperiments] = useState<ExperimentListItem[]>([]);
   const [adminArchived, setAdminArchived] = useState<AdminArchivedExperimentItem[]>([]);
   const [nextAdminCursor, setNextAdminCursor] = useState<string | null>(null);
@@ -327,13 +337,11 @@ function ExperimentLanding({
       ? fetchAdminArchivedExperiments()
       : Promise.resolve({ items: [], nextCursor: null });
     Promise.all([
-      fetchStrategyConfigs(),
       fetchExperiments(undefined, showArchived, { limit: 5 }),
       adminRequest,
     ])
-      .then(([items, page, adminPage]) => {
+      .then(([page, adminPage]) => {
         if (!active) return;
-        setConfigs(items.filter(isStandardBarConfig));
         setExperiments(page.items);
         setAdminArchived(adminPage.items);
         setNextAdminCursor(adminPage.nextCursor);
@@ -348,6 +356,50 @@ function ExperimentLanding({
       active = false;
     };
   }, [isAdmin, showArchived]);
+
+  useEffect(() => {
+    const requestId = ++configRequestId.current;
+    setConfigLoading(true);
+    const timer = window.setTimeout(() => {
+      fetchStrategyConfigPage({ limit: 50, query: configQuery })
+        .then((page) => {
+          if (requestId !== configRequestId.current) return;
+          setConfigs(page.items.filter(isStandardBarConfig));
+          setConfigNextCursor(page.nextCursor);
+          setConfigTotal(page.total);
+        })
+        .catch((reason: unknown) => {
+          if (requestId === configRequestId.current) setError(errorMessage(reason));
+        })
+        .finally(() => {
+          if (requestId === configRequestId.current) setConfigLoading(false);
+        });
+    }, configQuery.trim() ? 250 : 0);
+    return () => window.clearTimeout(timer);
+  }, [configQuery]);
+
+  const loadMoreConfigs = async () => {
+    if (!configNextCursor || configLoadingMore) return;
+    const requestId = configRequestId.current;
+    setConfigLoadingMore(true);
+    try {
+      const page = await fetchStrategyConfigPage({
+        limit: 50, cursor: configNextCursor, query: configQuery,
+      });
+      if (requestId !== configRequestId.current) return;
+      setConfigs((current) => {
+        const merged = new Map(current.map((item) => [item.id, item]));
+        page.items.filter(isStandardBarConfig).forEach((item) => merged.set(item.id, item));
+        return [...merged.values()];
+      });
+      setConfigNextCursor(page.nextCursor);
+      setConfigTotal(page.total);
+    } catch (reason) {
+      if (requestId === configRequestId.current) setError(errorMessage(reason));
+    } finally {
+      if (requestId === configRequestId.current) setConfigLoadingMore(false);
+    }
+  };
 
   const loadMoreAdminArchived = async () => {
     if (!nextAdminCursor || loadingMore) return;
@@ -502,9 +554,21 @@ function ExperimentLanding({
           )}
         </section>
       )}
-      <section className="experiment-subject-grid" aria-busy={loading}>
-        {loading && <div className="experiment-empty"><RefreshCw className="is-spinning" size={20} /> 正在读取策略版本…</div>}
-        {!loading && configs.length === 0 && (
+      <section className="experiment-command-bar">
+        <label className="experiment-trial-search">
+          <Search size={15} />
+          <input
+            aria-label="搜索策略名称"
+            value={configQuery}
+            placeholder="搜索策略名称"
+            onChange={(event) => setConfigQuery(event.target.value)}
+          />
+        </label>
+        <span>共 {configTotal.toLocaleString()} 个策略，当前仅显示可用于标准 Bar 实验的摘要</span>
+      </section>
+      <section className="experiment-subject-grid" aria-busy={configLoading}>
+        {configLoading && <div className="experiment-empty"><RefreshCw className="is-spinning" size={20} /> 正在读取策略版本…</div>}
+        {!configLoading && configs.length === 0 && (
           <div className="experiment-empty">暂无可用的已发布标准 Bar 策略。请先在策略回测中完成保存与发布。</div>
         )}
         {configs.map((config) => (
@@ -520,11 +584,21 @@ function ExperimentLanding({
           >
             <span className="experiment-subject-icon"><FlaskConical size={18} /></span>
             <strong>{config.name}</strong>
-            <span>{config.symbol} · {config.timeframe} · 脚本 v{config.scriptVersionNo}</span>
+            <span>{config.symbol} · {config.timeframe} · 完整版本 V{config.versionNo}</span>
             <small>发布版本 {shortDigest(config.publishedVersionId)}</small>
           </button>
         ))}
       </section>
+      {configNextCursor && (
+        <button
+          className="app-button is-quiet"
+          type="button"
+          disabled={configLoadingMore}
+          onClick={() => { void loadMoreConfigs(); }}
+        >
+          {configLoadingMore ? '正在加载…' : '加载更多策略'}
+        </button>
+      )}
       <ExperimentCatalogDrawer
         archived={showArchived}
         open={allExperimentsOpen}

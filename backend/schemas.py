@@ -511,6 +511,7 @@ class StrategyConfig(BaseModel):
   enabled: bool
   published: bool = True
   publishedVersionId: str | None = None
+  versionNo: int = 0
   revision: int = 1
   sharedSource: dict[str, Any] | None = None
   createdAt: str
@@ -533,6 +534,37 @@ class StrategyConfigVersion(BaseModel):
   paramsJson: dict[str, Any]
   changeNote: str
   createdAt: str
+
+
+class StrategyConfigSummary(BaseModel):
+  id: str
+  name: str
+  scriptId: str
+  strategyVersionId: str
+  scriptVersionNo: int
+  versionNo: int
+  revision: int
+  strategy: str
+  mode: str
+  symbol: str
+  timeframe: str
+  fillModel: str
+  enabled: bool
+  published: bool
+  publishedVersionId: str | None
+  updatedAt: str
+
+
+class StrategyConfigPage(BaseModel):
+  items: list[StrategyConfigSummary]
+  nextCursor: str | None
+  total: int
+
+
+class StrategyConfigVersionPage(BaseModel):
+  items: list[StrategyConfigVersion]
+  nextCursor: str | None
+  total: int
 
 
 class BacktestRunHistory(BaseModel):
@@ -859,12 +891,21 @@ class DateItem(BaseModel):
   hasKline: bool
   hasSignal: bool
 
-class CompleteStrategySave(BaseModel):
+class CompleteStrategyCreate(BaseModel):
   script: StrategyScriptCreate
   config: StrategyConfigCreate
+
+
+class CompleteStrategySave(CompleteStrategyCreate):
   scriptId: str | None = None
   configId: str | None = None
   expectedRevision: int | None = Field(default=None, ge=1)
+
+
+class CompleteStrategyUpdate(BaseModel):
+  script: StrategyScriptCreate
+  config: StrategyConfigUpdate
+  expectedRevision: int = Field(ge=1)
 
 
 class ReleaseAcknowledgeRequest(BaseModel):

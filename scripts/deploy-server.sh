@@ -35,6 +35,16 @@ fail() {
   exit 1
 }
 
+export_observability_config_digests() {
+  local proxy_config="$project_root/deploy/docker-socket-proxy/haproxy.cfg.template"
+  local alloy_config="$project_root/deploy/alloy/config.alloy"
+  [[ -f "$proxy_config" ]] || fail "缺少 Docker Socket Proxy 配置"
+  [[ -f "$alloy_config" ]] || fail "缺少 Alloy 配置"
+  TREND_GRID_DOCKER_SOCKET_PROXY_CONFIG_DIGEST="$(sha256sum "$proxy_config" | cut -d' ' -f1)"
+  TREND_GRID_ALLOY_CONFIG_DIGEST="$(sha256sum "$alloy_config" | cut -d' ' -f1)"
+  export TREND_GRID_DOCKER_SOCKET_PROXY_CONFIG_DIGEST TREND_GRID_ALLOY_CONFIG_DIGEST
+}
+
 env_key_count() {
   local name="$1"
   grep -Ec "^${name}=" "$env_file" || true
@@ -503,6 +513,7 @@ if [[ "${1:-deploy}" == "activate-experiment-epoch" ]]; then
   CLIENT_COMPATIBILITY_VERSION="$(read_client_compatibility_version)"
   RELEASE_ADMIN_IMAGE="quant-backtest-release-admin:${APPLICATION_BUILD_ID}"
   export APPLICATION_BUILD_ID CLIENT_COMPATIBILITY_VERSION RELEASE_ADMIN_IMAGE
+  export_observability_config_digests
   compose=(docker compose --env-file "$env_file" -f "$compose_file" -f "$clickhouse_compose_file" --profile observability)
   "${compose[@]}" config >/dev/null || fail "Docker Compose 配置校验失败"
   verify_release_admin_image
@@ -533,6 +544,7 @@ APPLICATION_BUILD_ID="$(git rev-parse HEAD)"
 CLIENT_COMPATIBILITY_VERSION="$(read_client_compatibility_version)"
 RELEASE_ADMIN_IMAGE="quant-backtest-release-admin:${APPLICATION_BUILD_ID}"
 export APPLICATION_BUILD_ID CLIENT_COMPATIBILITY_VERSION RELEASE_ADMIN_IMAGE
+export_observability_config_digests
 deployment_id="$(cat /proc/sys/kernel/random/uuid)"
 echo "目标构建：${APPLICATION_BUILD_ID}，客户端兼容版本：${CLIENT_COMPATIBILITY_VERSION}"
 

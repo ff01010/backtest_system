@@ -150,6 +150,7 @@ describe('isCustomScriptStrategy', () => {
       enabled: true,
       published: true,
       publishedVersionId: 'config-version-1',
+      versionNo: 1,
       revision: 1,
       createdAt: '2026-09-03 10:00:00',
       updatedAt: '2026-09-03 10:00:00',
@@ -213,7 +214,8 @@ describe('isCustomScriptStrategy', () => {
           label: { type: 'string', default: 'demo' },
         },
       },
-      enabled: true, published: true, publishedVersionId: 'published-1', revision: 1,
+      enabled: true, published: true, publishedVersionId: 'published-1', versionNo: 1,
+      revision: 1,
       createdAt: '2026-09-28', updatedAt: '2026-09-28',
     };
     const schema = strategyParameterSchemaFromConfig(config);

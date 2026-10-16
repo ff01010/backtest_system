@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -15,7 +16,7 @@ from uuid import uuid4
 
 import psycopg
 from psycopg import IsolationLevel
-from psycopg.errors import IntegrityError
+from psycopg.errors import IntegrityError, LockNotAvailable
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -68,6 +69,8 @@ class ExperimentRunRetainedError(ValueError):
 
 
 _BACKTEST_SCHEDULER_LOCK_KEY = 314159265
+_BACKTEST_SCHEDULER_LOCK_TIMEOUT_MS = 2_000
+_BACKTEST_SCHEDULER_WRITE_TIMEOUT_MS = 250
 _STRATEGY_NAME_MAX_LENGTH = 64
 # 保留旧名称，避免外部诊断脚本在迁移期间失效。
 _L2_FAIR_CLAIM_LOCK_KEY = _BACKTEST_SCHEDULER_LOCK_KEY
@@ -650,6 +653,7 @@ def _normalize_config(row: dict[str, Any]) -> dict[str, Any]:
     "enabled": bool(row["enabled"]),
     "published": bool(row["published"]),
     "publishedVersionId": _uuid(row.get("published_version_id")),
+    "versionNo": int(row.get("complete_version_no") or 0),
     "revision": int(row.get("revision") or 1),
     "archivedAt": _format_time(row.get("archived_at")) if row.get("archived_at") else None,
     "sharedSource": {
@@ -1038,7 +1042,8 @@ def _config_query(where: str = "", *, include_archived: bool = False) -> str:
       version.version_no AS script_version_no,
       version.source_code, version.runtime_config,
       version.content_fingerprint,
-      latest_version.id AS published_version_id
+      latest_version.id AS published_version_id,
+      latest_version.version_no AS complete_version_no
     FROM strategy_config c
     JOIN market_instrument i ON i.id=c.instrument_id
     LEFT JOIN market_instrument b ON b.id=c.benchmark_instrument_id
@@ -1049,7 +1054,7 @@ def _config_query(where: str = "", *, include_archived: bool = False) -> str:
     LEFT JOIN user_strategy_version version
       ON version.id=COALESCE(c.strategy_version_id, current_version.id)
     LEFT JOIN LATERAL (
-      SELECT config_version.id
+      SELECT config_version.id, config_version.version_no
       FROM strategy_config_version config_version
       WHERE config_version.config_id=c.id
       ORDER BY config_version.version_no DESC
@@ -1064,6 +1069,110 @@ def list_strategy_configs() -> list[dict[str, Any]]:
     with conn.cursor() as cur:
       cur.execute(_config_query("ORDER BY c.updated_at DESC, c.id DESC"), (current_user_id(),))
       return [_normalize_config(row) for row in cur.fetchall()]
+
+
+def _normalize_config_summary(row: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "id": _uuid(row["id"]),
+    "name": row["name"],
+    "scriptId": _uuid(row["strategy_id"]),
+    "strategyVersionId": _uuid(row["strategy_version_id"]),
+    "scriptVersionNo": int(row["script_version_no"]),
+    "versionNo": int(row["version_no"]),
+    "revision": int(row["revision"]),
+    "strategy": row["strategy_key"],
+    "mode": row["mode"],
+    "symbol": f"{row['symbol']}.{row['exchange']}",
+    "timeframe": row["timeframe"],
+    "fillModel": row.get("fill_model") or "bar_next_open",
+    "enabled": bool(row["enabled"]),
+    "published": bool(row["published"]),
+    "publishedVersionId": _uuid(row.get("published_version_id")),
+    "updatedAt": _format_time(row["updated_at"]),
+  }
+
+
+def _encode_strategy_config_cursor(updated_at: datetime, config_id: str) -> str:
+  raw = json.dumps([updated_at.isoformat(), config_id], separators=(",", ":"))
+  return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_strategy_config_cursor(value: str) -> tuple[datetime, str]:
+  try:
+    padded = value + "=" * (-len(value) % 4)
+    raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    updated_at, config_id = json.loads(raw)
+    parsed_time = datetime.fromisoformat(str(updated_at))
+    if not re.fullmatch(
+      r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
+      str(config_id),
+    ):
+      raise ValueError("invalid UUID")
+    return parsed_time, str(config_id)
+  except (
+    ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error,
+  ) as error:
+    raise ValueError("无效的策略资产游标") from error
+
+
+def list_strategy_config_summaries(
+  limit: int,
+  cursor: str | None,
+  query: str,
+) -> dict[str, Any]:
+  """按更新时间游标分页读取轻量策略摘要，不读取源码或完整参数。"""
+  cursor_value = _decode_strategy_config_cursor(cursor) if cursor else None
+  normalized_query = query.strip()
+  query_clause = " AND c.name ILIKE %s ESCAPE '\\'" if normalized_query else ""
+  escaped_query = normalized_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+  query_params: tuple[Any, ...] = (f"%{escaped_query}%",) if normalized_query else ()
+  cursor_clause = " AND (c.updated_at, c.id) < (%s, %s::uuid)" if cursor_value else ""
+  cursor_params: tuple[Any, ...] = cursor_value or ()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute(f"""
+        SELECT count(*) AS value
+        FROM strategy_config c
+        WHERE c.owner_user_id=%s AND c.archived_at IS NULL {query_clause}
+      """, (current_user_id(), *query_params))
+      total = int(cur.fetchone()["value"])
+      cur.execute(f"""
+        SELECT c.id, c.name, c.strategy_id, c.strategy_version_id,
+          code_version.version_no AS script_version_no,
+          complete_version.id AS published_version_id,
+          complete_version.version_no, c.revision, c.strategy_key, c.mode,
+          instrument.symbol, instrument.exchange, c.timeframe,
+          COALESCE(c.params->'params'->>'fillModel', 'bar_next_open') AS fill_model,
+          c.enabled, c.published, c.updated_at
+        FROM strategy_config c
+        JOIN market_instrument instrument ON instrument.id=c.instrument_id
+        JOIN user_strategy_version code_version ON code_version.id=c.strategy_version_id
+        LEFT JOIN LATERAL (
+          SELECT version.id, version.version_no
+          FROM strategy_config_version version
+          WHERE version.config_id=c.id
+          ORDER BY version.version_no DESC
+          LIMIT 1
+        ) complete_version ON true
+        WHERE c.owner_user_id=%s AND c.archived_at IS NULL
+          {query_clause} {cursor_clause}
+        ORDER BY c.updated_at DESC, c.id DESC
+        LIMIT %s
+      """, (
+        current_user_id(), *query_params, *cursor_params, limit + 1,
+      ))
+      rows = list(cur.fetchall())
+  page = rows[:limit]
+  next_cursor = None
+  if len(rows) > limit and page:
+    next_cursor = _encode_strategy_config_cursor(
+      page[-1]["updated_at"], str(page[-1]["id"]),
+    )
+  return {
+    "items": [_normalize_config_summary(row) for row in page],
+    "nextCursor": next_cursor,
+    "total": total,
+  }
 
 
 def list_owned_strategy_configs(
@@ -1229,18 +1338,15 @@ def save_complete_strategy_in_transaction(
   """原子保存一对一完整策略，并自动创建精确的发布版本。"""
   owned_script_id: str | None = None
   if config_id is not None:
-    cur.execute("""
-      SELECT strategy_id, revision FROM strategy_config
-      WHERE id=%s AND owner_user_id=%s AND archived_at IS NULL FOR UPDATE
-    """, (config_id, current_user_id()))
-    current = cur.fetchone()
-    if not current:
-      raise KeyError(config_id)
-    owned_script_id = _uuid(current["strategy_id"])
+    current = _get_strategy_config_with_cursor(cur, config_id, for_update=True)
+    owned_script_id = current.get("scriptId")
     if script_id and script_id != owned_script_id:
       raise ConflictError("策略脚本归属不一致，禁止将方案改绑到其他脚本")
     if expected_revision is None or int(current["revision"]) != expected_revision:
       raise RevisionConflictError("该策略已在其他会话中更新，请刷新后重试")
+    # 防御测试库或漏迁移环境：必须先保存旧内容，再允许任何代码或配置写入。
+    if int(current.get("versionNo") or 0) == 0:
+      _publish_strategy_config_with_cursor(cur, current)
   resolved_name = _resolve_unique_strategy_name(
     cur, str(config_payload["name"]), config_id,
   )
@@ -1410,6 +1516,44 @@ def list_strategy_config_versions_page(
         ORDER BY v.version_no DESC LIMIT %s OFFSET %s
       """, (config_id, current_user_id(), limit, offset))
       return [_normalize_version(row) for row in cur.fetchall()], total
+
+
+def list_strategy_config_versions_cursor_page(
+  config_id: str,
+  limit: int,
+  cursor: int | None,
+) -> dict[str, Any]:
+  """按完整版本号倒序分页；游标是上一页最后一条版本号。"""
+  cursor_clause = " AND v.version_no < %s" if cursor is not None else ""
+  cursor_params: tuple[Any, ...] = (cursor,) if cursor is not None else ()
+  with _db() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        SELECT count(*) AS value FROM strategy_config_version v
+        JOIN strategy_config c ON c.id=v.config_id
+        WHERE v.config_id=%s AND c.owner_user_id=%s
+      """, (config_id, current_user_id()))
+      total = int(cur.fetchone()["value"])
+      if total == 0:
+        cur.execute(
+          "SELECT 1 FROM strategy_config WHERE id=%s AND owner_user_id=%s",
+          (config_id, current_user_id()),
+        )
+        if not cur.fetchone():
+          raise KeyError(config_id)
+      cur.execute(f"""
+        SELECT v.* FROM strategy_config_version v
+        JOIN strategy_config c ON c.id=v.config_id
+        WHERE v.config_id=%s AND c.owner_user_id=%s {cursor_clause}
+        ORDER BY v.version_no DESC LIMIT %s
+      """, (config_id, current_user_id(), *cursor_params, limit + 1))
+      rows = list(cur.fetchall())
+  page = rows[:limit]
+  return {
+    "items": [_normalize_version(row) for row in page],
+    "nextCursor": str(page[-1]["version_no"]) if len(rows) > limit and page else None,
+    "total": total,
+  }
 
 
 def get_strategy_config_version_for_config(
@@ -1950,11 +2094,16 @@ def _finalize_expired_backtest_jobs(cur: Any) -> None:
   """回收过期槽位，并将已失去执行器的取消任务收敛到终态。"""
   for table in ("bar_backtest_job", "l2_backtest_job"):
     cur.execute(f"""
-      WITH expired_jobs AS (
-        UPDATE {table}
-        SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
+      WITH expired_candidates AS (
+        SELECT run_id FROM {table}
         WHERE status='cancelling' AND lease_expires_at < now()
-        RETURNING run_id, attempt_token
+        FOR UPDATE SKIP LOCKED
+      ), expired_jobs AS (
+        UPDATE {table} AS job
+        SET status='cancelled', lease_expires_at=NULL, finished_at=now(), updated_at=now()
+        FROM expired_candidates AS candidate
+        WHERE job.run_id=candidate.run_id
+        RETURNING job.run_id, job.attempt_token
       ), finalized_attempts AS (
         UPDATE backtest_run_attempt AS attempt
         SET status='cancelled', termination_reason='cancelled_by_user',
@@ -1970,7 +2119,16 @@ def _finalize_expired_backtest_jobs(cur: Any) -> None:
       FROM expired_jobs
       WHERE run.id=expired_jobs.run_id AND run.status='cancelling'
     """)
-  cur.execute("DELETE FROM backtest_execution_slot WHERE lease_expires_at < now()")
+  cur.execute("""
+    WITH expired_slots AS (
+      SELECT run_id FROM backtest_execution_slot
+      WHERE lease_expires_at < now()
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM backtest_execution_slot AS slot
+    USING expired_slots
+    WHERE slot.run_id=expired_slots.run_id
+  """)
 
 
 def _next_backtest_candidate(
@@ -1978,6 +2136,7 @@ def _next_backtest_candidate(
   job_kind: str | None = None,
   runtime_version: str = SCRIPT_RUNTIME_VERSION,
   capability_digest: str = RUNTIME_CAPABILITY_DIGEST,
+  excluded_run_ids: tuple[str, ...] = (),
 ) -> dict[str, Any] | None:
   """先按用户公平选队首，再优先领取该用户的普通手工任务。"""
   cur.execute("""
@@ -1989,6 +2148,7 @@ def _next_backtest_candidate(
       WHERE (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
         AND NOT job.cancel_requested
         AND job.runtime_version=%s AND job.capability_digest=%s
+        AND NOT (job.run_id=ANY(%s::uuid[]))
       UNION ALL
       SELECT 'l2' AS job_kind, job.run_id, job.owner_user_id,
         job.created_at, run.origin_type
@@ -1997,6 +2157,7 @@ def _next_backtest_candidate(
       WHERE (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
         AND NOT job.cancel_requested
         AND job.runtime_version=%s AND job.capability_digest=%s
+        AND NOT (job.run_id=ANY(%s::uuid[]))
     ), eligible AS (
       SELECT * FROM candidates
       WHERE (%s::text IS NULL OR job_kind=%s::text)
@@ -2016,10 +2177,54 @@ def _next_backtest_candidate(
     ORDER BY owner_active_count, created_at, run_id
     LIMIT 1
   """, (
-    runtime_version, capability_digest, runtime_version, capability_digest,
-    job_kind, job_kind,
+    runtime_version, capability_digest, list(excluded_run_ids),
+    runtime_version, capability_digest, list(excluded_run_ids), job_kind, job_kind,
   ))
   return cur.fetchone()
+
+
+def _lock_backtest_candidate(
+  cur: Any,
+  candidate: dict[str, Any],
+  runtime_version: str,
+  capability_digest: str,
+) -> bool:
+  """非阻塞锁定任务及其运行记录，避免持有全局锁等待行锁。"""
+  table = "bar_backtest_job" if candidate["job_kind"] == "bar" else "l2_backtest_job"
+  cur.execute(f"""
+    SELECT job.run_id
+    FROM {table} AS job
+    JOIN backtest_run AS run ON run.id=job.run_id
+    WHERE job.run_id=%s AND NOT job.cancel_requested
+      AND job.runtime_version=%s AND job.capability_digest=%s
+      AND (job.status='queued' OR (job.status='running' AND job.lease_expires_at < now()))
+    FOR UPDATE OF job, run SKIP LOCKED
+  """, (candidate["run_id"], runtime_version, capability_digest))
+  return cur.fetchone() is not None
+
+
+def _next_claimable_backtest_candidate(
+  cur: Any,
+  job_kind: str,
+  runtime_version: str,
+  capability_digest: str,
+  initial_candidate: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+  """按公平顺序跳过被占用任务，返回当前事务已锁定的候选。"""
+  excluded_run_ids: list[str] = []
+  candidate = initial_candidate
+  while True:
+    if candidate is None:
+      candidate = _next_backtest_candidate(
+        cur, job_kind, runtime_version, capability_digest,
+        tuple(excluded_run_ids),
+      )
+    if candidate is None:
+      return None
+    if _lock_backtest_candidate(cur, candidate, runtime_version, capability_digest):
+      return candidate
+    excluded_run_ids.append(str(candidate["run_id"]))
+    candidate = None
 
 
 def _scheduler_capacity(cur: Any) -> tuple[int, int]:
@@ -2196,7 +2401,15 @@ def _claim_backtest_job(
   """领取 Bar/L2 共用容量中的一个槽位。"""
   if job_kind not in {"bar", "l2"}:
     raise ValueError("回测任务类型无效")
+  cur.execute(
+    "SELECT set_config('lock_timeout', %s, true)",
+    (f"{_BACKTEST_SCHEDULER_LOCK_TIMEOUT_MS}ms",),
+  )
   cur.execute("SELECT pg_advisory_xact_lock(%s)", (_BACKTEST_SCHEDULER_LOCK_KEY,))
+  cur.execute(
+    "SELECT set_config('lock_timeout', %s, true)",
+    (f"{_BACKTEST_SCHEDULER_WRITE_TIMEOUT_MS}ms",),
+  )
   _finalize_expired_backtest_jobs(cur)
   candidate = _next_backtest_candidate(
     cur, runtime_version=runtime_version, capability_digest=capability_digest,
@@ -2208,11 +2421,12 @@ def _claim_backtest_job(
       "全局最优先任务等待对应执行器: kind=%s reason=%s",
       candidate["job_kind"], f"{candidate['job_kind']}_executor_wait",
     )
-    candidate = _next_backtest_candidate(
-      cur, job_kind, runtime_version, capability_digest,
-    )
-    if not candidate:
-      return None
+    candidate = None
+  candidate = _next_claimable_backtest_candidate(
+    cur, job_kind, runtime_version, capability_digest, candidate,
+  )
+  if not candidate:
+    return None
 
   active_count, override_limit = _scheduler_capacity(cur)
   normal_limit = override_limit or settings.BACKTEST_BASE_CONCURRENCY
@@ -2293,21 +2507,27 @@ def claim_l2_backtest_job(
   """从统一容量中原子领取一个 L2 任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("L2 runner 标识和租约时长必须有效")
-  with _db() as conn:
-    with conn.cursor() as cur:
-      row = _claim_backtest_job(
-        cur, "l2", worker_id, lease_seconds, runtime_version, capability_digest,
-      )
-      if not row:
-        return None
-      cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
-      return {
-        "runId": _uuid(row["run_id"]),
-        "ownerUserId": _uuid(row["owner_user_id"]),
-        "payload": _json(row["payload"], {}),
-        "attemptNo": int(row["attempt_no"]),
-        "attemptToken": _uuid(row["attempt_token"]),
-      }
+  try:
+    with _db() as conn:
+      with conn.cursor() as cur:
+        row = _claim_backtest_job(
+          cur, "l2", worker_id, lease_seconds, runtime_version, capability_digest,
+        )
+        if not row:
+          return None
+        cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
+        return {
+          "runId": _uuid(row["run_id"]),
+          "ownerUserId": _uuid(row["owner_user_id"]),
+          "payload": _json(row["payload"], {}),
+          "attemptNo": int(row["attempt_no"]),
+          "attemptToken": _uuid(row["attempt_token"]),
+        }
+  except DatabaseError as error:
+    if not isinstance(error.__cause__, LockNotAvailable):
+      raise
+    logger.info("L2 任务领取跳过锁等待: worker=%s", worker_id)
+    return None
 
 
 def claim_bar_backtest_job(
@@ -2319,21 +2539,27 @@ def claim_bar_backtest_job(
   """从统一容量中原子领取一个标准 Bar 回测任务。"""
   if not worker_id.strip() or lease_seconds <= 0:
     raise ValueError("Bar runner 标识和租约时长必须有效")
-  with _db() as conn:
-    with conn.cursor() as cur:
-      row = _claim_backtest_job(
-        cur, "bar", worker_id, lease_seconds, runtime_version, capability_digest,
-      )
-      if not row:
-        return None
-      cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
-      return {
-        "runId": _uuid(row["run_id"]),
-        "ownerUserId": _uuid(row["owner_user_id"]),
-        "payload": _json(row["payload"], {}),
-        "attemptNo": int(row["attempt_no"]),
-        "attemptToken": _uuid(row["attempt_token"]),
-      }
+  try:
+    with _db() as conn:
+      with conn.cursor() as cur:
+        row = _claim_backtest_job(
+          cur, "bar", worker_id, lease_seconds, runtime_version, capability_digest,
+        )
+        if not row:
+          return None
+        cur.execute("UPDATE backtest_run SET status='running', started_at=COALESCE(started_at, now()) WHERE id=%s", (row["run_id"],))
+        return {
+          "runId": _uuid(row["run_id"]),
+          "ownerUserId": _uuid(row["owner_user_id"]),
+          "payload": _json(row["payload"], {}),
+          "attemptNo": int(row["attempt_no"]),
+          "attemptToken": _uuid(row["attempt_token"]),
+        }
+  except DatabaseError as error:
+    if not isinstance(error.__cause__, LockNotAvailable):
+      raise
+    logger.info("Bar 任务领取跳过锁等待: worker=%s", worker_id)
+    return None
 
 
 def _finalize_expired_bar_backtest_cancellations(cur: Any) -> None:
