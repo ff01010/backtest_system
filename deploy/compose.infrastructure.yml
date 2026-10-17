@@ -91,6 +91,8 @@ services:
         for file in /migrations/*.sql; do
           psql -v ON_ERROR_STOP=1 --set=app_db_user="$${APP_DB_USER}" \
             -c 'SET ROLE quant_backtest_owner' \
+            -c "SELECT set_config('app.current_user_id', '00000000-0000-0000-0000-000000000001', false)" \
+            -c "SELECT set_config('app.current_is_admin', 'true', false)" \
             -f "$$file";
         done
     networks:

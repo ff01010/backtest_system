@@ -67,6 +67,32 @@ def test_new_migrations_are_transactional() -> None:
   assert non_transactional_migrations == []
 
 
+@pytest.mark.parametrize(
+  "compose_path",
+  (
+    ROOT / "deploy" / "compose.infrastructure.yml",
+    ROOT / "deploy" / "compose.test.yml",
+  ),
+)
+def test_migration_runner_sets_admin_rls_context_before_sql_files(
+  compose_path: Path,
+) -> None:
+  compose = compose_path.read_text(encoding="utf-8")
+  role = compose.index("-c 'SET ROLE quant_backtest_owner'")
+  user_context = compose.index(
+    "set_config('app.current_user_id', "
+    "'00000000-0000-0000-0000-000000000001', false)",
+    role,
+  )
+  admin_context = compose.index(
+    "set_config('app.current_is_admin', 'true', false)",
+    user_context,
+  )
+  migration_file = compose.index('-f "$$file"', admin_context)
+
+  assert role < user_context < admin_context < migration_file
+
+
 def test_scheduler_capacity_constraint_matches_configurable_maximum() -> None:
   settings = (ROOT / "backend" / "settings.py").read_text(encoding="utf-8")
   migration = (

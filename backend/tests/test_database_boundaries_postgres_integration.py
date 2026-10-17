@@ -495,6 +495,14 @@ def test_complete_version_migration_and_update_preserve_real_baselines() -> None
     with psycopg.connect(
       os.environ["EXPERIMENT_TEST_ADMIN_DATABASE_URL"], autocommit=True,
     ) as conn:
+      conn.execute("SET ROLE quant_backtest_owner")
+      conn.execute(
+        "SELECT set_config('app.current_user_id', "
+        "'00000000-0000-0000-0000-000000000001', false)",
+      )
+      conn.execute(
+        "SELECT set_config('app.current_is_admin', 'true', false)",
+      )
       conn.execute(migration)
 
   migrated_config = _as_user(
