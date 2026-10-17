@@ -41,3 +41,22 @@ def test_instrument_search_matches_exact_symbol_with_exchange() -> None:
 
   assert "symbol=%s AND exchange=%s" in cursor.query
   assert cursor.params == ("688981", "SH", 20)
+
+
+def test_empty_instrument_search_uses_a_bounded_default_query() -> None:
+  cursor = FakeCursor()
+
+  state_store._execute_instrument_search(cursor, "", 20)
+
+  assert "OR" not in cursor.query
+  assert "LIMIT %s" in cursor.query
+  assert cursor.params == (20,)
+
+
+def test_instrument_name_search_escapes_like_wildcards() -> None:
+  cursor = FakeCursor()
+
+  state_store._execute_instrument_search(cursor, r"A%_\B", 20)
+
+  assert "lower(display_name) LIKE %s ESCAPE '\\'" in cursor.query
+  assert cursor.params[1] == r"%a\%\_\\b%"

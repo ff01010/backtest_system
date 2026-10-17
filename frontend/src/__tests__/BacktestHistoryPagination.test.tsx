@@ -1,11 +1,13 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import BacktestPage from '../components/BacktestPage';
+import BacktestPage, { historySearchDelay } from '../components/BacktestPage';
 import type { BacktestRunPage } from '../api/client';
 import type { BacktestRunHistory, StrategyConfig, StrategyConfigSummary } from '../types';
 
 
 const apiMocks = vi.hoisted(() => ({
+  fetchBacktestRunFilterOptions: vi.fn(),
+  fetchBacktestRunOptions: vi.fn(),
   fetchBacktestRunPage: vi.fn(),
   fetchBacktestRuns: vi.fn(),
   fetchBacktestRun: vi.fn(),
@@ -170,15 +172,37 @@ describe('BacktestPage history pagination', () => {
     const history = Array.from({ length: 35 }, (_, index) => makeRun(35 - index));
     apiMocks.fetchBacktestRuns.mockResolvedValue(history.slice(0, 10));
     apiMocks.fetchBacktestRun.mockResolvedValue(history[0]);
-    apiMocks.fetchBacktestRunPage.mockImplementation(async ({ limit, offset, query }) => {
+    apiMocks.fetchBacktestRunFilterOptions.mockResolvedValue(['688981.SH']);
+    apiMocks.fetchBacktestRunOptions.mockImplementation(async ({ query }) => ({
+      items: query === 'run-1'
+        ? [{
+          id: history[34].id,
+          displayNo: history[34].displayNo,
+          symbol: history[34].symbol,
+          strategy: history[34].strategy,
+          configName: null,
+          createdAt: history[34].createdAt,
+          status: history[34].status,
+        }]
+        : [],
+      nextCursor: null,
+      limit: 20,
+    }));
+    apiMocks.fetchBacktestRunPage.mockImplementation(async ({
+      limit, cursor, includeTotals, query,
+    }) => {
       const filtered = query === '候选' || query === 'run-1' ? [history[34]] : history;
+      const pageIndex = cursor ? Number(String(cursor).replace('cursor-', '')) : 0;
+      const start = pageIndex * limit;
+      const nextCursor = start + limit < filtered.length ? `cursor-${pageIndex + 1}` : null;
       return {
-        runs: filtered.slice(offset, offset + limit),
-        total: filtered.length,
-        selectableTotal: filtered.length,
+        runs: filtered.slice(start, start + limit),
+        total: includeTotals === false ? null : filtered.length,
+        selectableTotal: includeTotals === false ? null : filtered.length,
+        nextCursor,
         limit,
-        offset,
-        symbols: ['688981.SH'],
+        offset: 0,
+        symbols: [],
       };
     });
     apiMocks.fetchStrategyConfigPage.mockResolvedValue({
@@ -203,6 +227,16 @@ describe('BacktestPage history pagination', () => {
       selectionDigest: 'a'.repeat(64),
     });
     apiMocks.deleteBacktestSelection.mockResolvedValue(35);
+  });
+
+  it('classifies exact searches immediately and rejects one-character text', () => {
+    expect(historySearchDelay('')).toBe(0);
+    expect(historySearchDelay('#42')).toBe(0);
+    expect(historySearchDelay('688981.SH')).toBe(0);
+    expect(historySearchDelay('550e8400-e29b-41d4-a716-446655440000')).toBe(0);
+    expect(historySearchDelay('0193b4dc-8a5b-7cc3-923f-2957b0a88410')).toBe(0);
+    expect(historySearchDelay('候')).toBeNull();
+    expect(historySearchDelay('候选')).toBe(300);
   });
 
   it('opens a requested run in the history detail panel', async () => {
@@ -243,9 +277,10 @@ describe('BacktestPage history pagination', () => {
       />,
     );
 
-    await waitFor(() => expect(apiMocks.fetchStrategyConfigPage).toHaveBeenCalledWith({
-      limit: 50, query: '',
-    }));
+    await waitFor(() => expect(apiMocks.fetchStrategyConfigPage).toHaveBeenCalledWith(
+      { limit: 50, query: '' },
+      { signal: expect.any(AbortSignal) },
+    ));
     const selector = screen.getByLabelText('搜索策略方案');
     fireEvent.focus(selector);
     fireEvent.click(await screen.findByRole('option', { name: /分页策略/ }));
@@ -382,12 +417,17 @@ describe('BacktestPage history pagination', () => {
     }
 
     expect(screen.getByText('显示 31-35 / 35 条实验')).toBeTruthy();
-    expect(apiMocks.fetchBacktestRunPage).toHaveBeenLastCalledWith({
-      limit: 10,
-      offset: 30,
-      query: '',
-      symbol: '',
-    });
+    expect(apiMocks.fetchBacktestRunPage).toHaveBeenLastCalledWith(
+      {
+        limit: 10,
+        cursor: 'cursor-3',
+        includeTotals: false,
+        includeFilterOptions: false,
+        query: '',
+        symbol: '',
+      },
+      { signal: expect.any(AbortSignal) },
+    );
   });
 
   it('keeps the selected history detail while navigating pages', async () => {
@@ -435,12 +475,17 @@ describe('BacktestPage history pagination', () => {
     });
 
     expect(await screen.findByText('显示 1-1 / 1 条实验')).toBeTruthy();
-    expect(apiMocks.fetchBacktestRunPage).toHaveBeenLastCalledWith({
-      limit: 10,
-      offset: 0,
-      query: '候选',
-      symbol: '',
-    });
+    expect(apiMocks.fetchBacktestRunPage).toHaveBeenLastCalledWith(
+      {
+        limit: 10,
+        cursor: null,
+        includeTotals: true,
+        includeFilterOptions: false,
+        query: '候选',
+        symbol: '',
+      },
+      { signal: expect.any(AbortSignal) },
+    );
   });
 
   it('does not let an older search response replace the latest results', async () => {
@@ -452,14 +497,16 @@ describe('BacktestPage history pagination', () => {
     const latestResponse = new Promise<BacktestRunPage>((resolve) => {
       resolveLatest = resolve;
     });
-    apiMocks.fetchBacktestRunPage.mockImplementation(async ({ limit, offset, query }) => {
+    apiMocks.fetchBacktestRunPage.mockImplementation(async ({ limit, query }) => {
       if (query === '旧条件') return olderResponse;
       if (query === '新条件') return latestResponse;
       return {
         runs: [makeRun(35)],
         total: 1,
+        selectableTotal: 1,
+        nextCursor: null,
         limit,
-        offset,
+        offset: 0,
         symbols: ['688981.SH'],
       };
     });
@@ -478,28 +525,38 @@ describe('BacktestPage history pagination', () => {
     await screen.findByRole('button', { name: '#35' });
     const search = screen.getByPlaceholderText('搜索实验、策略、标签或方案');
     fireEvent.change(search, { target: { value: '旧条件' } });
-    await waitFor(() => expect(apiMocks.fetchBacktestRunPage).toHaveBeenCalledWith({
-      limit: 10,
-      offset: 0,
-      query: '旧条件',
-      symbol: '',
-    }));
+    await waitFor(() => expect(apiMocks.fetchBacktestRunPage).toHaveBeenCalledWith(
+      {
+        limit: 10,
+        cursor: null,
+        includeTotals: true,
+        includeFilterOptions: false,
+        query: '旧条件',
+        symbol: '',
+      },
+      { signal: expect.any(AbortSignal) },
+    ));
     fireEvent.change(search, { target: { value: '新条件' } });
-    await waitFor(() => expect(apiMocks.fetchBacktestRunPage).toHaveBeenCalledWith({
-      limit: 10,
-      offset: 0,
-      query: '新条件',
-      symbol: '',
-    }));
+    await waitFor(() => expect(apiMocks.fetchBacktestRunPage).toHaveBeenCalledWith(
+      {
+        limit: 10,
+        cursor: null,
+        includeTotals: true,
+        includeFilterOptions: false,
+        query: '新条件',
+        symbol: '',
+      },
+      { signal: expect.any(AbortSignal) },
+    ));
 
     resolveLatest({
       runs: [makeRun(2)], total: 1, selectableTotal: 1,
-      limit: 10, offset: 0, symbols: ['688981.SH'],
+      nextCursor: null, limit: 10, offset: 0, symbols: ['688981.SH'],
     });
     expect(await screen.findByRole('button', { name: '#02' })).toBeTruthy();
     resolveOlder({
       runs: [makeRun(1)], total: 1, selectableTotal: 1,
-      limit: 10, offset: 0, symbols: ['688981.SH'],
+      nextCursor: null, limit: 10, offset: 0, symbols: ['688981.SH'],
     });
 
     await waitFor(() => expect(screen.queryByRole('button', { name: '#01' })).toBeNull());
@@ -524,12 +581,10 @@ describe('BacktestPage history pagination', () => {
       target: { value: 'run-1' },
     });
 
-    await waitFor(() => expect(apiMocks.fetchBacktestRunPage).toHaveBeenCalledWith({
-      limit: 20,
-      offset: 0,
-      query: 'run-1',
-      symbol: '',
-    }));
+    await waitFor(() => expect(apiMocks.fetchBacktestRunOptions).toHaveBeenCalledWith(
+      { limit: 20, query: 'run-1' },
+      { signal: expect.any(AbortSignal) },
+    ));
     expect(await screen.findByRole('option', { name: /#01/ })).toBeTruthy();
   });
 
@@ -574,13 +629,18 @@ describe('BacktestPage history pagination', () => {
     await screen.findByText('显示 11-20 / 35 条实验');
     fireEvent.click(screen.getByRole('button', { name: '只看收藏' }));
 
-    await waitFor(() => expect(apiMocks.fetchBacktestRunPage).toHaveBeenLastCalledWith({
-      limit: 10,
-      offset: 0,
-      query: '',
-      symbol: '',
-      favoritesOnly: true,
-    }));
+    await waitFor(() => expect(apiMocks.fetchBacktestRunPage).toHaveBeenLastCalledWith(
+      {
+        limit: 10,
+        cursor: null,
+        includeTotals: true,
+        includeFilterOptions: false,
+        query: '',
+        symbol: '',
+        favoritesOnly: true,
+      },
+      { signal: expect.any(AbortSignal) },
+    ));
   });
 
   it('uses one toolbar to export an explicit multi-selection', async () => {
@@ -733,11 +793,13 @@ describe('BacktestPage history pagination', () => {
       favoritedAt: '2026-09-16T10:30:00+08:00',
     };
     let favorited = true;
-    apiMocks.fetchBacktestRunPage.mockImplementation(async ({ limit, offset }) => ({
+    apiMocks.fetchBacktestRunPage.mockImplementation(async ({ limit }) => ({
       runs: favorited ? [{ ...run, isFavorited: favorited }] : [],
       total: favorited ? 1 : 0,
+      selectableTotal: favorited ? 1 : 0,
+      nextCursor: null,
       limit,
-      offset,
+      offset: 0,
       symbols: [run.symbol],
     }));
     apiMocks.setBacktestRunFavorite.mockImplementation(async (runId) => {
@@ -831,7 +893,8 @@ describe('BacktestPage history pagination', () => {
       warnings: [],
     } satisfies NonNullable<BacktestRunHistory['resultJson']>;
     apiMocks.fetchBacktestRunPage.mockResolvedValue({
-      runs: [run], total: 1, limit: 10, offset: 0, symbols: [run.symbol],
+      runs: [run], total: 1, selectableTotal: 1, nextCursor: null,
+      limit: 10, offset: 0, symbols: [run.symbol],
     });
     apiMocks.fetchBacktestRun.mockResolvedValue(run);
     apiMocks.publishBacktestRun.mockResolvedValue({

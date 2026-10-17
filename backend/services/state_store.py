@@ -11,18 +11,27 @@ import json
 import logging
 from pathlib import Path
 import re
+from time import perf_counter
 from typing import Any, Callable, Iterator
 from uuid import uuid4
 
 import psycopg
 from psycopg import IsolationLevel
-from psycopg.errors import IntegrityError, LockNotAvailable
+from psycopg.errors import IntegrityError, LockNotAvailable, QueryCanceled
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend import settings
 from backend.services.backtest_errors import normalize_public_error_summary
 from backend.services import shared_backtest_artifacts, shared_backtest_snapshot
+from backend.services.search_query import (
+  BacktestRunSearchSpec,
+  backtest_search_bindings,
+  decode_backtest_cursor,
+  encode_backtest_cursor,
+  escape_like_literal,
+  parse_backtest_run_search,
+)
 from backend.services.user_context import get_current_user
 from backend.strategies.runtime_contract import (
   RUNTIME_CAPABILITY_DIGEST,
@@ -60,6 +69,10 @@ class RunnerUnavailableError(DatabaseError):
   """指定类型的回测执行器暂时不可用。"""
 
 
+class SearchTimeoutError(DatabaseError):
+  """搜索查询超过数据库保护时限。"""
+
+
 class SelectionChangedError(ConflictError):
   """批量删除范围与用户最后确认的快照不一致。"""
 
@@ -69,6 +82,7 @@ class ExperimentRunRetainedError(ValueError):
 
 
 _BACKTEST_SCHEDULER_LOCK_KEY = 314159265
+_BACKTEST_DEPLOYMENT_BARRIER_LOCK_KEY = 741_852_963
 _BACKTEST_SCHEDULER_LOCK_TIMEOUT_MS = 2_000
 _BACKTEST_SCHEDULER_WRITE_TIMEOUT_MS = 250
 _STRATEGY_NAME_MAX_LENGTH = 64
@@ -79,6 +93,8 @@ logger = logging.getLogger(__name__)
 
 
 def _translate_error(error: Exception) -> DatabaseError:
+  if isinstance(error, QueryCanceled):
+    return SearchTimeoutError("搜索耗时过长，请缩小条件后重试")
   if isinstance(error, IntegrityError):
     return ConflictError(str(error))
   return DatabaseError(str(error))
@@ -486,6 +502,7 @@ def search_market_instruments(query: str, limit: int = 20) -> list[dict[str, Any
   keyword = query.strip()
   with _db() as conn:
     with conn.cursor() as cur:
+      _set_search_statement_timeout(cur)
       _execute_instrument_search(cur, keyword, limit)
       return [{
         "symbol": f"{row['symbol']}.{row['exchange']}",
@@ -497,6 +514,15 @@ def search_market_instruments(query: str, limit: int = 20) -> list[dict[str, Any
 
 
 def _execute_instrument_search(cur: Any, keyword: str, limit: int) -> None:
+  if not keyword:
+    cur.execute("""
+      SELECT symbol, exchange, display_name, instrument_type, board
+      FROM market_instrument
+      WHERE is_active=true
+      ORDER BY exchange, symbol
+      LIMIT %s
+    """, (limit,))
+    return
   code_match = re.fullmatch(r"(\d{6})(?:\.(SH|SZ|BJ))?", keyword.upper())
   if code_match:
     code, exchange = code_match.groups()
@@ -517,16 +543,18 @@ def _execute_instrument_search(cur: Any, keyword: str, limit: int) -> None:
       LIMIT %s
     """, (code, limit))
     return
-  pattern = f"%{keyword}%"
+  escaped = escape_like_literal(keyword.lower())
+  pattern = f"%{escaped}%"
+  symbol_prefix = f"{keyword.upper().replace('%', '').replace('_', '')}%"
   cur.execute("""
     SELECT symbol, exchange, display_name, instrument_type, board
     FROM market_instrument
     WHERE is_active=true
-      AND (%s = '' OR symbol ILIKE %s OR display_name ILIKE %s)
-    ORDER BY CASE WHEN symbol = %s THEN 0 WHEN symbol ILIKE %s THEN 1 ELSE 2 END,
+      AND (symbol LIKE %s OR lower(display_name) LIKE %s ESCAPE '\\')
+    ORDER BY CASE WHEN symbol = %s THEN 0 WHEN symbol LIKE %s THEN 1 ELSE 2 END,
              exchange, symbol
     LIMIT %s
-  """, (keyword, pattern, pattern, keyword, f"{keyword}%", limit))
+  """, (symbol_prefix, pattern, keyword.upper(), symbol_prefix, limit))
 
 
 def upsert_market_instruments(items: list[Any]) -> int:
@@ -1119,23 +1147,27 @@ def list_strategy_config_summaries(
   limit: int,
   cursor: str | None,
   query: str,
+  include_totals: bool = True,
 ) -> dict[str, Any]:
   """按更新时间游标分页读取轻量策略摘要，不读取源码或完整参数。"""
   cursor_value = _decode_strategy_config_cursor(cursor) if cursor else None
   normalized_query = query.strip()
-  query_clause = " AND c.name ILIKE %s ESCAPE '\\'" if normalized_query else ""
-  escaped_query = normalized_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+  query_clause = " AND lower(c.name) LIKE %s ESCAPE '\\'" if normalized_query else ""
+  escaped_query = normalized_query.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
   query_params: tuple[Any, ...] = (f"%{escaped_query}%",) if normalized_query else ()
   cursor_clause = " AND (c.updated_at, c.id) < (%s, %s::uuid)" if cursor_value else ""
   cursor_params: tuple[Any, ...] = cursor_value or ()
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(f"""
-        SELECT count(*) AS value
-        FROM strategy_config c
-        WHERE c.owner_user_id=%s AND c.archived_at IS NULL {query_clause}
-      """, (current_user_id(), *query_params))
-      total = int(cur.fetchone()["value"])
+      _set_search_statement_timeout(cur)
+      total: int | None = None
+      if include_totals:
+        cur.execute(f"""
+          SELECT count(*) AS value
+          FROM strategy_config c
+          WHERE c.owner_user_id=%s AND c.archived_at IS NULL {query_clause}
+        """, (current_user_id(), *query_params))
+        total = int(cur.fetchone()["value"])
       cur.execute(f"""
         SELECT c.id, c.name, c.strategy_id, c.strategy_version_id,
           code_version.version_no AS script_version_no,
@@ -2402,6 +2434,14 @@ def _claim_backtest_job(
   if job_kind not in {"bar", "l2"}:
     raise ValueError("回测任务类型无效")
   cur.execute(
+    "SELECT pg_try_advisory_xact_lock_shared(%s) AS acquired",
+    (_BACKTEST_DEPLOYMENT_BARRIER_LOCK_KEY,),
+  )
+  barrier = cur.fetchone()
+  if not barrier or not bool(barrier["acquired"]):
+    logger.info("发布领取屏障已关闭: kind=%s", job_kind)
+    return None
+  cur.execute(
     "SELECT set_config('lock_timeout', %s, true)",
     (f"{_BACKTEST_SCHEDULER_LOCK_TIMEOUT_MS}ms",),
   )
@@ -3091,11 +3131,12 @@ def list_backtest_runs(
       return [_normalize_run(row) for row in cur.fetchall()]
 
 
-def _backtest_run_filter_clause(
-  query: str,
+def _backtest_candidate_filters(
   symbol: str | None,
   config_id: str | None,
   favorites_only: bool,
+  statuses: tuple[str, ...] | None,
+  excluded_ids: list[str] | None,
 ) -> tuple[str, tuple[Any, ...]]:
   clauses: list[str] = []
   params: list[Any] = []
@@ -3105,38 +3146,61 @@ def _backtest_run_filter_clause(
     clauses.append("r.config_id=%s")
     params.append(config_id)
   if symbol:
-    clauses.append(
-      "COALESCE(i.symbol || '.' || i.exchange, r.requested_params->>'symbol')=%s"
+    clauses.append("upper(COALESCE(r.requested_params->>'symbol', ''))=%s")
+    params.append(symbol.upper())
+  if statuses:
+    clauses.append("r.status=ANY(%s)")
+    params.append(list(statuses))
+  if excluded_ids:
+    clauses.append("NOT (r.id=ANY(%s))")
+    params.append(excluded_ids)
+  return "".join(f" AND {clause}" for clause in clauses), tuple(params)
+
+
+def _backtest_search_predicate(
+  spec: BacktestRunSearchSpec,
+) -> tuple[str, tuple[Any, ...]]:
+  if spec.mode == "display_no":
+    return " AND r.display_no=%s", (spec.display_no,)
+  if spec.mode == "uuid":
+    return " AND r.id=%s::uuid", (spec.run_id,)
+  if spec.mode == "text":
+    return " AND r.search_text_v1 ILIKE %s ESCAPE '\\'", (spec.text_pattern,)
+  return "", ()
+
+
+def build_backtest_run_candidate_query(
+  spec: BacktestRunSearchSpec,
+  owner_user_id: str,
+  *,
+  symbol: str | None = None,
+  config_id: str | None = None,
+  favorites_only: bool = False,
+  statuses: tuple[str, ...] | None = None,
+  excluded_ids: list[str] | None = None,
+) -> tuple[str, tuple[Any, ...]]:
+  """构造所有历史列表和批量操作共用的候选 ID 查询。"""
+  filters, filter_params = _backtest_candidate_filters(
+    symbol, config_id, favorites_only, statuses, excluded_ids,
+  )
+  base = "SELECT r.id FROM backtest_run r WHERE r.owner_user_id=%s"
+  if spec.mode == "symbol":
+    display_branch = f"{base}{filters} AND r.display_no=%s"
+    symbol_branch = (
+      f"{base}{filters} "
+      "AND upper(COALESCE(r.requested_params->>'symbol', ''))=ANY(%s)"
     )
-    params.append(symbol)
-  normalized_query = query.strip()
-  if normalized_query:
-    query_pattern = f"%{normalized_query}%"
-    is_display_number = (
-      normalized_query.startswith("#") and normalized_query[1:].isdigit()
+    return (
+      f"{display_branch} UNION {symbol_branch}",
+      (
+        owner_user_id, *filter_params, spec.display_no,
+        owner_user_id, *filter_params, list(spec.symbols),
+      ),
     )
-    display_predicate = (
-      "r.display_no=%s" if is_display_number else "r.display_no::text ILIKE %s"
-    )
-    display_value: Any = (
-      int(normalized_query[1:]) if is_display_number else query_pattern
-    )
-    clauses.append(f"""
-      (r.id::text ILIKE %s OR {display_predicate}
-        OR COALESCE(i.symbol || '.' || i.exchange, r.requested_params->>'symbol', '') ILIKE %s
-        OR COALESCE(r.requested_params->>'strategy', '') ILIKE %s
-        OR COALESCE(c.name, '') ILIKE %s OR COALESCE(r.tags::text, '') ILIKE %s)
-    """)
-    params.extend([
-      query_pattern,
-      display_value,
-      query_pattern,
-      query_pattern,
-      query_pattern,
-      query_pattern,
-    ])
-  clause = "" if not clauses else " AND " + " AND ".join(clauses)
-  return clause, tuple(params)
+  predicate, predicate_params = _backtest_search_predicate(spec)
+  return f"{base}{filters}{predicate}", (
+    owner_user_id, *filter_params, *predicate_params,
+  )
 
 
 def _unique_selection_ids(values: list[str]) -> list[str]:
@@ -3190,31 +3254,25 @@ def _backtest_selection_query(
     )
   if mode != "filter":
     raise ValueError("无效的回测选择模式")
-  filter_clause, filter_params = _backtest_run_filter_clause(
-    str(selection.get("query") or ""),
-    selection.get("symbol"),
-    selection.get("configId"),
-    bool(selection.get("favoritesOnly", False)),
-  )
   excluded_ids = _unique_selection_ids(list(selection.get("excludedRunIds") or []))
-  exclusion_clause = " AND NOT (r.id=ANY(%s))" if excluded_ids else ""
-  exclusion_params: tuple[Any, ...] = (excluded_ids,) if excluded_ids else ()
+  spec = parse_backtest_run_search(str(selection.get("query") or ""))
+  candidates, candidate_params = build_backtest_run_candidate_query(
+    spec,
+    owner_user_id,
+    symbol=selection.get("symbol"),
+    config_id=selection.get("configId"),
+    favorites_only=bool(selection.get("favoritesOnly", False)),
+    statuses=_SELECTABLE_BACKTEST_STATUSES,
+    excluded_ids=excluded_ids,
+  )
   return (
     f"""
       SELECT {columns}
-      FROM backtest_run r
-      LEFT JOIN strategy_config c ON c.id=r.config_id
-      LEFT JOIN market_instrument i ON i.id=r.instrument_id
-      WHERE r.owner_user_id=%s AND r.status=ANY(%s)
-        {filter_clause}{exclusion_clause}
+      FROM ({candidates}) candidate
+      JOIN backtest_run r ON r.id=candidate.id
       ORDER BY {order_by}
     """,
-    (
-      owner_user_id,
-      list(_SELECTABLE_BACKTEST_STATUSES),
-      *filter_params,
-      *exclusion_params,
-    ),
+    candidate_params,
   )
 
 
@@ -3233,6 +3291,7 @@ def summarize_backtest_run_selection(selection: dict[str, Any]) -> dict[str, Any
   owner_user_id = current_user_id()
   with _db() as conn:
     with conn.cursor() as cur:
+      _set_search_statement_timeout(cur)
       if selection.get("mode") == "ids":
         _validate_explicit_backtest_selection(
           cur, list(selection.get("runIds") or []), owner_user_id,
@@ -3248,6 +3307,86 @@ def summarize_backtest_run_selection(selection: dict[str, Any]) -> dict[str, Any
       }
 
 
+_BACKTEST_PAGE_COLUMNS = """
+  r.id, r.display_no, r.config_id, r.config_version_id,
+  r.account_id, r.strategy_version_id, r.requested_params,
+  r.market_data_snapshot, r.result_summary, NULL::jsonb AS result_json,
+  r.status, r.timeframe, r.fill_model, r.output_dir, r.note, r.tags,
+  r.script_snapshot, r.params_snapshot, r.favorited_at, r.queued_at,
+  r.started_at, r.finished_at, r.created_at, r.execution_kind,
+  strategy.id AS strategy_id,
+  instrument.symbol || '.' || instrument.exchange AS symbol,
+  benchmark.symbol || '.' || benchmark.exchange AS benchmark_symbol,
+  COALESCE(bar_job.cancel_requested, l2_job.cancel_requested, false)
+    AS cancel_requested,
+  publication.id AS publication_id,
+  page.page_order_value
+"""
+
+
+def _set_search_statement_timeout(cur: Any) -> None:
+  cur.execute("SET LOCAL statement_timeout = '5s'", ())
+
+
+def _backtest_page_query(
+  candidates: str,
+  *,
+  favorites_only: bool,
+  has_cursor: bool,
+  use_offset: bool,
+) -> str:
+  order_column = "r.favorited_at" if favorites_only else "r.created_at"
+  cursor_clause = (
+    f"AND ({order_column}, r.id) < (%s::timestamptz, %s::uuid)"
+    if has_cursor else ""
+  )
+  offset_clause = "OFFSET %s" if use_offset else ""
+  return f"""
+    WITH candidates AS ({candidates}), page AS (
+      SELECT r.id, {order_column} AS page_order_value
+      FROM candidates candidate
+      JOIN backtest_run r ON r.id=candidate.id
+      WHERE true {cursor_clause}
+      ORDER BY {order_column} DESC, r.id DESC
+      LIMIT %s {offset_clause}
+    )
+    SELECT {_BACKTEST_PAGE_COLUMNS}
+    FROM page
+    JOIN backtest_run r ON r.id=page.id
+    LEFT JOIN user_strategy_version strategy_version
+      ON strategy_version.id=r.strategy_version_id
+    LEFT JOIN user_strategy strategy ON strategy.id=strategy_version.strategy_id
+    LEFT JOIN market_instrument instrument ON instrument.id=r.instrument_id
+    LEFT JOIN market_instrument benchmark ON benchmark.id=r.benchmark_instrument_id
+    LEFT JOIN bar_backtest_job bar_job ON bar_job.run_id=r.id
+    LEFT JOIN l2_backtest_job l2_job ON l2_job.run_id=r.id
+    LEFT JOIN backtest_publication publication ON publication.source_run_id=r.id
+    ORDER BY page.page_order_value DESC, r.id DESC
+  """
+
+
+def _backtest_filter_options_with_cursor(
+  cur: Any,
+  owner_user_id: str,
+  config_id: str | None,
+) -> list[str]:
+  config_clause = "AND r.config_id=%s" if config_id else ""
+  params: tuple[Any, ...] = (
+    (owner_user_id, config_id) if config_id else (owner_user_id,)
+  )
+  cur.execute(f"""
+    SELECT DISTINCT COALESCE(
+      instrument.symbol || '.' || instrument.exchange,
+      r.requested_params->>'symbol'
+    ) AS symbol
+    FROM backtest_run r
+    LEFT JOIN market_instrument instrument ON instrument.id=r.instrument_id
+    WHERE r.owner_user_id=%s {config_clause}
+    ORDER BY symbol
+  """, params)
+  return [str(row["symbol"]) for row in cur.fetchall() if row.get("symbol")]
+
+
 def list_backtest_run_page(
   limit: int,
   offset: int,
@@ -3255,65 +3394,167 @@ def list_backtest_run_page(
   symbol: str | None = None,
   config_id: str | None = None,
   favorites_only: bool = False,
+  cursor: str | None = None,
+  include_totals: bool = True,
+  include_filter_options: bool = True,
 ) -> dict[str, Any]:
-  """返回当前用户的历史回测分页及分页所需的索引信息。"""
-  if limit < 1 or limit > 100 or offset < 0:
+  """按统一候选集返回历史回测；新调用方使用游标，旧 offset 仍兼容。"""
+  if limit < 1 or limit > 100 or offset < 0 or (cursor and offset):
     raise ValueError("分页参数无效")
   user_id = current_user_id()
-  filter_clause, filter_params = _backtest_run_filter_clause(
-    query, symbol, config_id, favorites_only,
+  spec = parse_backtest_run_search(query)
+  bindings = backtest_search_bindings(
+    spec, symbol=symbol, config_id=config_id, favorites_only=favorites_only,
   )
-  base_params = (user_id, *filter_params)
-  order_clause = (
-    "r.favorited_at DESC, r.id DESC"
-    if favorites_only
-    else "r.created_at DESC, r.id DESC"
+  cursor_position = decode_backtest_cursor(
+    cursor, bindings, settings.EXPERIMENT_CURSOR_SIGNING_SECRET,
+  ) if cursor else None
+  candidates, candidate_params = build_backtest_run_candidate_query(
+    spec, user_id, symbol=symbol, config_id=config_id,
+    favorites_only=favorites_only,
   )
+  aggregate_ms = 0.0
+  page_started = perf_counter()
   with _db() as conn:
     with conn.cursor() as cur:
-      cur.execute(f"""
-        SELECT count(*) AS value
-        FROM backtest_run r
-        LEFT JOIN strategy_config c ON c.id=r.config_id
-        LEFT JOIN market_instrument i ON i.id=r.instrument_id
-        WHERE r.owner_user_id=%s {filter_clause}
-      """, base_params)
-      total = int(cur.fetchone()["value"])
-      cur.execute(f"""
-        SELECT count(*) AS value
-        FROM backtest_run r
-        LEFT JOIN strategy_config c ON c.id=r.config_id
-        LEFT JOIN market_instrument i ON i.id=r.instrument_id
-        WHERE r.owner_user_id=%s AND r.status=ANY(%s) {filter_clause}
-      """, (user_id, list(_SELECTABLE_BACKTEST_STATUSES), *filter_params))
-      selectable_total = int(cur.fetchone()["value"])
-      cur.execute(
-        _run_query(
-          f"{filter_clause} ORDER BY {order_clause} LIMIT %s OFFSET %s"
-        ),
-        (*base_params, limit, offset),
+      _set_search_statement_timeout(cur)
+      total: int | None = None
+      selectable_total: int | None = None
+      if include_totals:
+        aggregate_started = perf_counter()
+        cur.execute(f"""
+          WITH candidates AS ({candidates})
+          SELECT count(*) AS total,
+            count(*) FILTER (WHERE r.status=ANY(%s)) AS selectable_total
+          FROM candidates candidate
+          JOIN backtest_run r ON r.id=candidate.id
+        """, (*candidate_params, list(_SELECTABLE_BACKTEST_STATUSES)))
+        totals = cur.fetchone()
+        total = int(totals["total"])
+        selectable_total = int(totals["selectable_total"])
+        aggregate_ms = (perf_counter() - aggregate_started) * 1000
+      cursor_params: tuple[Any, ...] = cursor_position or ()
+      page_query = _backtest_page_query(
+        candidates,
+        favorites_only=favorites_only,
+        has_cursor=cursor_position is not None,
+        use_offset=offset > 0,
       )
-      runs = [_normalize_run(row) for row in cur.fetchall()]
-      symbol_config_clause = " AND r.config_id=%s" if config_id else ""
-      symbol_params = (user_id, config_id) if config_id else (user_id,)
-      cur.execute(f"""
-        SELECT DISTINCT COALESCE(
-          i.symbol || '.' || i.exchange, r.requested_params->>'symbol'
-        ) AS symbol
-        FROM backtest_run r
-        LEFT JOIN market_instrument i ON i.id=r.instrument_id
-        WHERE r.owner_user_id=%s {symbol_config_clause}
-        ORDER BY symbol
-      """, symbol_params)
-      symbols = [str(row["symbol"]) for row in cur.fetchall() if row.get("symbol")]
+      page_params: tuple[Any, ...] = (
+        *candidate_params, *cursor_params, limit + 1,
+        *((offset,) if offset > 0 else ()),
+      )
+      cur.execute(page_query, page_params)
+      rows = list(cur.fetchall())
+      page_rows = rows[:limit]
+      symbols = (
+        _backtest_filter_options_with_cursor(cur, user_id, config_id)
+        if include_filter_options else []
+      )
+  next_cursor = None
+  if len(rows) > limit and page_rows:
+    last = page_rows[-1]
+    next_cursor = encode_backtest_cursor(
+      last["page_order_value"].isoformat(),
+      str(last["id"]),
+      bindings,
+      settings.EXPERIMENT_CURSOR_SIGNING_SECRET,
+    )
+  logger.info("search_request %s", json.dumps({
+    "endpoint": "backtest_runs",
+    "mode": spec.mode,
+    "queryLength": len(spec.normalized),
+    "favoritesOnly": favorites_only,
+    "hasSymbol": bool(symbol),
+    "hasConfig": bool(config_id),
+    "aggregateMs": round(aggregate_ms, 3),
+    "pageMs": round((perf_counter() - page_started) * 1000, 3),
+    "resultCount": len(page_rows),
+  }, separators=(",", ":")))
+  return {
+    "runs": [_normalize_run(row) for row in page_rows],
+    "total": total,
+    "selectableTotal": selectable_total,
+    "nextCursor": next_cursor,
+    "limit": limit,
+    "offset": offset,
+    "symbols": symbols,
+  }
+
+
+def list_backtest_run_filter_options(config_id: str | None = None) -> dict[str, Any]:
+  """独立返回历史页面标的筛选项，不随文字搜索和翻页重复计算。"""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      _set_search_statement_timeout(cur)
       return {
-        "runs": runs,
-        "total": total,
-        "selectableTotal": selectable_total,
-        "limit": limit,
-        "offset": offset,
-        "symbols": symbols,
+        "symbols": _backtest_filter_options_with_cursor(
+          cur, current_user_id(), config_id,
+        ),
       }
+
+
+def _normalize_backtest_run_option(row: dict[str, Any]) -> dict[str, Any]:
+  request = _json(row.get("requested_params"), {})
+  snapshot = _json(row.get("params_snapshot"), {})
+  return {
+    "id": str(row["id"]),
+    "displayNo": int(row["display_no"]),
+    "symbol": str(request.get("symbol") or ""),
+    "strategy": str(request.get("strategy") or ""),
+    "configName": str(snapshot.get("name") or ""),
+    "createdAt": _format_time(row["created_at"]),
+    "status": str(row["status"]),
+  }
+
+
+def list_backtest_run_options(
+  *,
+  query: str,
+  limit: int,
+  cursor: str | None,
+) -> dict[str, Any]:
+  """返回对比选择器所需的轻量候选，不读取结果与全量统计。"""
+  if limit < 1 or limit > 100:
+    raise ValueError("分页参数无效")
+  owner_user_id = current_user_id()
+  spec = parse_backtest_run_search(query)
+  bindings = backtest_search_bindings(
+    spec, symbol=None, config_id=None, favorites_only=False,
+  )
+  position = decode_backtest_cursor(
+    cursor, bindings, settings.EXPERIMENT_CURSOR_SIGNING_SECRET,
+  ) if cursor else None
+  candidates, params = build_backtest_run_candidate_query(spec, owner_user_id)
+  after_sql = "AND (r.created_at, r.id) < (%s::timestamptz, %s::uuid)" if position else ""
+  with _db() as conn:
+    with conn.cursor() as cur:
+      _set_search_statement_timeout(cur)
+      cur.execute(f"""
+        WITH candidates AS ({candidates})
+        SELECT r.id, r.display_no, r.requested_params, r.params_snapshot,
+          r.created_at, r.status
+        FROM candidates candidate
+        JOIN backtest_run r ON r.id=candidate.id
+        WHERE true {after_sql}
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT %s
+      """, (*params, *(position or ()), limit + 1))
+      rows = list(cur.fetchall())
+  page = rows[:limit]
+  next_cursor = None
+  if len(rows) > limit and page:
+    next_cursor = encode_backtest_cursor(
+      page[-1]["created_at"].isoformat(),
+      str(page[-1]["id"]),
+      bindings,
+      settings.EXPERIMENT_CURSOR_SIGNING_SECRET,
+    )
+  return {
+    "items": [_normalize_backtest_run_option(row) for row in page],
+    "nextCursor": next_cursor,
+    "limit": limit,
+  }
 
 
 def get_backtest_run(run_id: str) -> dict[str, Any]:
@@ -3862,6 +4103,7 @@ def delete_backtest_run_selection(
   owner_user_id = current_user_id()
   with _repeatable_read_db() as conn:
     with conn.cursor() as cur:
+      _set_search_statement_timeout(cur)
       if selection.get("mode") == "ids":
         _validate_explicit_backtest_selection(
           cur, list(selection.get("runIds") or []), owner_user_id,
@@ -4431,6 +4673,7 @@ def create_signal_detail_export(
   export_id = str(uuid4())
   with _repeatable_read_db() as conn:
     with conn.cursor() as cur:
+      _set_search_statement_timeout(cur)
       cur.execute("""
         SELECT * FROM backtest_signal_detail_export
         WHERE owner_user_id=%s AND idempotency_key=%s
@@ -4467,7 +4710,7 @@ def create_signal_detail_export(
         row_number() OVER (ORDER BY r.display_no ASC, r.id ASC)::integer AS ordinal,
         r.id,
         r.display_no,
-        COALESCE(i.symbol || '.' || i.exchange, r.requested_params->>'symbol', ''),
+        COALESCE(r.requested_params->>'symbol', ''),
         COALESCE(r.requested_params->>'startDate', ''),
         COALESCE(r.requested_params->>'endDate', '')
       """

@@ -558,7 +558,7 @@ class StrategyConfigSummary(BaseModel):
 class StrategyConfigPage(BaseModel):
   items: list[StrategyConfigSummary]
   nextCursor: str | None
-  total: int
+  total: int | None
 
 
 class StrategyConfigVersionPage(BaseModel):
@@ -582,11 +582,14 @@ class BacktestRunHistory(BaseModel):
   dataVersion: dict[str, Any] | None = None
   benchmarkSymbol: str | None
   strategy: str
+  strategyCategory: str = "directional_holding"
   startDate: str
   endDate: str
   paramsJson: dict[str, Any]
   status: str
+  executionKind: str = "published"
   summaryJson: dict[str, Any]
+  resultJson: dict[str, Any] | None = None
   outputDir: str
   note: str
   tags: list[str]
@@ -598,6 +601,36 @@ class BacktestRunHistory(BaseModel):
   createdAt: str
   finishedAt: str
   publicationId: str | None = None
+
+
+class BacktestRunPage(BaseModel):
+  runs: list[BacktestRunHistory]
+  total: int | None
+  selectableTotal: int | None
+  nextCursor: str | None
+  limit: int
+  offset: int
+  symbols: list[str]
+
+
+class BacktestRunFilterOptions(BaseModel):
+  symbols: list[str]
+
+
+class BacktestRunOption(BaseModel):
+  id: str
+  displayNo: int
+  symbol: str
+  strategy: str
+  configName: str
+  createdAt: str
+  status: str
+
+
+class BacktestRunOptionPage(BaseModel):
+  items: list[BacktestRunOption]
+  nextCursor: str | None
+  limit: int
 
 
 class SharedBacktestPublicationCreate(BaseModel):

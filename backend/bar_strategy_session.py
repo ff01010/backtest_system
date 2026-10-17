@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import os
 import re
 import time
 import traceback
+import uuid
 from collections.abc import Callable
 from dataclasses import asdict
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+import pandas as pd
+
+from backend import settings
+from backend.bar_market_data_transport import (
+  BAR_DTYPE,
+  AttachedBarMarketData,
+  BarMarketDataRuntime,
+  ParentBarMarketData,
+  attach_bar_market_data,
+)
 from backend.backtesting import Bar, BarBacktestEngine, FeeProfile, NextOpenExecutionModel
 from backend.backtesting.legacy import fill_to_api_trade
 from backend.services.backtest_errors import RemoteBacktestError, error_detail
@@ -26,6 +38,8 @@ from backend.strategies.runtime_contract import (
   strategy_source_line,
 )
 from backend.strategies.scripted import ScriptedBarStrategy
+
+logger = logging.getLogger(__name__)
 
 
 class BarStrategyProcessError(RuntimeError):
@@ -48,49 +62,178 @@ class BarStrategySession:
 
   _POLL_SECONDS = 0.2
 
-  def __init__(self, abort_check: Callable[[], None] | None = None, cancel_grace_seconds: int = 5) -> None:
+  def __init__(
+    self,
+    abort_check: Callable[[], None] | None = None,
+    cancel_grace_seconds: int = 5,
+    *,
+    ipc_mode: Literal["legacy", "auto"] | None = None,
+    market_data_runtime: BarMarketDataRuntime | None = None,
+    transport_override: Literal["shared_memory", "mmap"] | None = None,
+  ) -> None:
     self._abort_check = abort_check
     self._cancel_grace_seconds = cancel_grace_seconds
+    self._ipc_mode = ipc_mode or settings.BAR_IPC_MODE
+    self._market_data_runtime = market_data_runtime
+    self._transport_override = transport_override
 
-  def run_script(self, payload: dict[str, Any]) -> dict[str, Any]:
+  def run_script(
+    self,
+    payload: dict[str, Any],
+    bars: pd.DataFrame,
+  ) -> dict[str, Any]:
     self._check_abort()
-    context = multiprocessing.get_context("spawn")
-    parent, child = context.Pipe(duplex=False)
-    process = context.Process(target=_bar_process_main, args=(child, payload), daemon=True)
-    process.start()
-    child.close()
+    if self._uses_market_data_reference(payload):
+      return self._run_with_market_data_reference(payload, bars)
+    return self._run_process(_legacy_payload(payload, bars), None, "")
+
+  def _uses_market_data_reference(self, payload: dict[str, Any]) -> bool:
+    signals = (payload.get("params") or {}).get("_researchSignalByBarTime")
+    return (
+      self._ipc_mode == "auto"
+      and payload.get("strategy", "user_script") == "user_script"
+      and not signals
+    )
+
+  def _run_with_market_data_reference(
+    self,
+    payload: dict[str, Any],
+    bars: pd.DataFrame,
+  ) -> dict[str, Any]:
+    owns_runtime = self._market_data_runtime is None
+    runtime = self._market_data_runtime or BarMarketDataRuntime(
+      settings.BAR_IPC_TEMP_ROOT,
+      shared_memory_limit_bytes=settings.BAR_RUNNER_SHM_SIZE_BYTES,
+    )
+    task_uuid = uuid.uuid4().hex
+    resource: ParentBarMarketData | None = None
+    status = "failed"
     try:
-      while not parent.poll(self._POLL_SECONDS):
+      resource = runtime.create(
+        bars,
+        str(payload["symbol"]),
+        int(payload.get("warmupBarCount", 0)),
+        task_uuid=task_uuid,
+        force_transport=self._transport_override,
+      )
+      child_payload = dict(payload)
+      child_payload.pop("warmupBarCount", None)
+      child_payload["marketDataRef"] = dict(resource.reference)
+      result = self._run_process(child_payload, resource, str(runtime.root))
+      status = "completed"
+      return result
+    finally:
+      try:
+        if resource is not None:
+          resource.close()
+          status = "cleaned" if status == "completed" else "failed_cleaned"
+      finally:
         try:
-          self._check_abort()
-        except Exception:
-          _terminate(process, self._cancel_grace_seconds)
-          raise
-        if not process.is_alive():
-          raise _process_exit_error(process, "Bar 策略子进程异常退出")
-      message = parent.recv()
-      return _parse_response(message)
+          _log_market_data_lifecycle(
+            task_uuid, resource, len(bars), status, self._transport_override,
+          )
+        finally:
+          if owns_runtime:
+            runtime.close()
+
+  def _run_process(
+    self,
+    payload: dict[str, Any],
+    resource: ParentBarMarketData | None,
+    managed_root: str,
+  ) -> dict[str, Any]:
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=True)
+    process = context.Process(
+      target=_bar_process_main,
+      args=(child, payload, managed_root),
+      daemon=True,
+    )
+    started = False
+    try:
+      process.start()
+      started = True
+      child.close()
+      while True:
+        while not parent.poll(self._POLL_SECONDS):
+          try:
+            self._check_abort()
+          except Exception:
+            _terminate(process, self._cancel_grace_seconds)
+            raise
+          if not process.is_alive():
+            raise _process_exit_error(process, "Bar 策略子进程异常退出")
+        message = parent.recv()
+        if isinstance(message, dict) and message.get("status") == "market_data_attached":
+          if resource is None:
+            raise BarStrategyProcessError("Bar 策略子进程返回了意外的行情挂载确认")
+          resource.mark_attached()
+          continue
+        if isinstance(message, dict) and message.get("status") == "market_data_materialized":
+          if resource is None:
+            raise BarStrategyProcessError("Bar 策略子进程返回了意外的行情物化确认")
+          resource.close()
+          parent.send({"status": "market_data_released"})
+          continue
+        return _parse_response(message)
     except (EOFError, OSError) as error:
       process.join(timeout=0.2)
       raise _process_exit_error(process, "Bar 策略子进程通信中断") from error
     finally:
       parent.close()
-      process.join(timeout=1)
-      if process.is_alive():
-        _terminate(process, self._cancel_grace_seconds)
+      child.close()
+      if started:
+        process.join(timeout=1)
+        if process.is_alive():
+          _terminate(process, self._cancel_grace_seconds)
 
   def _check_abort(self) -> None:
     if self._abort_check is not None:
       self._abort_check()
 
 
-def _bar_process_main(connection: Connection, payload: dict[str, Any]) -> None:
+def _bar_process_main(
+  connection: Connection,
+  payload: dict[str, Any],
+  managed_root: str,
+) -> None:
   """只接收冻结脚本、参数和行情，不继承数据库或外部服务配置。"""
+  attached: AttachedBarMarketData | None = None
+  bars: list[Bar] | None = None
+  reference: dict[str, Any] | None = None
   try:
     os.environ.clear()
     restore_numeric_thread_environment()
+    candidate = payload.pop("marketDataRef", None)
+    if isinstance(candidate, dict):
+      reference = candidate
+      attached = attach_bar_market_data(reference, managed_root)
+      connection.send({"status": "market_data_attached"})
+      warmup_bar_count = int(reference["warmupBarCount"])
+      bars = attached.materialize_bars()
+      attached.close()
+      attached = None
+      reference = None
+      candidate = None
+      managed_root = ""
+      connection.send({"status": "market_data_materialized"})
+      release_message = connection.recv()
+      if not (
+        isinstance(release_message, dict)
+        and release_message.get("status") == "market_data_released"
+      ):
+        raise RuntimeError("Bar 行情传输资源释放确认无效")
+      release_message = None
+    else:
+      bars = _legacy_bars(payload)
+      warmup_bar_count = int(payload.get("warmupBarCount", 0))
     drop_strategy_process_privileges()
-    connection.send({"status": "ok", "result": _execute_script(payload)})
+    if bars is None:
+      raise RuntimeError("Bar 行情未挂载")
+    connection.send({
+      "status": "ok",
+      "result": _execute_script(payload, bars, warmup_bar_count),
+    })
   except Exception as error:
     try:
       connection.send({
@@ -101,15 +244,52 @@ def _bar_process_main(connection: Connection, payload: dict[str, Any]) -> None:
     except (BrokenPipeError, EOFError, OSError):
       pass
   finally:
+    bars = None
+    if attached is not None:
+      attached.close()
     connection.close()
 
 
-def _execute_script(payload: dict[str, Any]) -> dict[str, Any]:
-  bars = [Bar(
+def _log_market_data_lifecycle(
+  task_uuid: str,
+  resource: ParentBarMarketData | None,
+  row_count: int,
+  status: str,
+  requested_transport: Literal["shared_memory", "mmap"] | None,
+) -> None:
+  if resource is None:
+    logger.info(
+      "Bar IPC 资源生命周期: task=%s transport=%s rows=%s bytes=%s status=create_failed fallback=none",
+      task_uuid,
+      requested_transport or "auto",
+      row_count,
+      row_count * BAR_DTYPE.itemsize,
+    )
+    return
+  logger.info(
+    "Bar IPC 资源生命周期: task=%s transport=%s rows=%s bytes=%s status=%s fallback=%s",
+    task_uuid,
+    resource.reference["transport"],
+    resource.reference["rowCount"],
+    resource.reference["dataByteSize"],
+    status,
+    resource.fallback_reason or "none",
+  )
+
+
+def _legacy_bars(payload: dict[str, Any]) -> list[Bar]:
+  return [Bar(
     time=str(item["time"]), symbol=str(item["symbol"]), open=float(item["open"]),
     high=float(item["high"]), low=float(item["low"]), close=float(item["close"]),
     volume=float(item.get("volume", 0)),
   ) for item in payload["bars"]]
+
+
+def _execute_script(
+  payload: dict[str, Any],
+  bars: list[Bar],
+  warmup_bar_count: int,
+) -> dict[str, Any]:
   strategy = ScriptedBarStrategy(
     str(payload["scriptId"]), str(payload["code"]), dict(payload.get("params") or {}),
     runtime_version=str(payload.get("runtimeVersion") or "legacy"),
@@ -135,7 +315,7 @@ def _execute_script(payload: dict[str, Any]) -> dict[str, Any]:
     strategy_category=str(payload.get("strategyCategory") or "directional_holding"),
     overlay_settlement_policy=str(payload.get("overlaySettlementPolicy") or "intraday_restore"),
   )
-  result = engine.run(strategy, bars, int(payload.get("warmupBarCount", 0)))
+  result = engine.run(strategy, bars, warmup_bar_count)
   return {
     "fills": [asdict(fill) for fill in result.fills],
     "trades": [fill_to_api_trade(fill) for fill in result.fills],
@@ -144,6 +324,20 @@ def _execute_script(payload: dict[str, Any]) -> dict[str, Any]:
     "unexecutedOrders": [_unexecuted_order_to_api(item) for item in result.unexecuted_orders],
     "warnings": strategy.direction_warnings,
   }
+
+
+def _legacy_payload(payload: dict[str, Any], bars: pd.DataFrame) -> dict[str, Any]:
+  legacy = dict(payload)
+  symbol = str(payload["symbol"])
+  legacy["bars"] = [
+    {
+      "time": str(row.time), "symbol": symbol, "open": float(row.open),
+      "high": float(row.high), "low": float(row.low), "close": float(row.close),
+      "volume": float(row.volume),
+    }
+    for row in bars.itertuples(index=False)
+  ]
+  return legacy
 
 
 def _snapshot_to_dict(snapshot: Any) -> dict[str, Any]:

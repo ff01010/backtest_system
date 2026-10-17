@@ -91,6 +91,8 @@ services:
         for file in /migrations/*.sql; do
           psql -v ON_ERROR_STOP=1 --set=app_db_user="$${APP_DB_USER}" \
             -c 'SET ROLE quant_backtest_owner' \
+            -c "SELECT set_config('app.current_user_id', '00000000-0000-0000-0000-000000000001', false)" \
+            -c "SELECT set_config('app.current_is_admin', 'true', false)" \
             -f "$$file";
         done
     networks:
@@ -377,6 +379,9 @@ services:
       TREND_GRID_L2_BAR_MAPPING_JSON: ${TREND_GRID_L2_BAR_MAPPING_JSON:-}
       TREND_GRID_L2_REDIS_HOST: l2-bar-cache
       TREND_GRID_L2_REDIS_PORT: '6379'
+      TREND_GRID_BAR_IPC_MODE: ${TREND_GRID_BAR_IPC_MODE:-legacy}
+      TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES: ${TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES:-134217728}
+      TREND_GRID_BAR_IPC_TEMP_ROOT: /tmp/trend-grid-bar-ipc
     command:
       - python
       - -m
@@ -391,6 +396,7 @@ services:
         condition: service_healthy
     volumes:
       - quant-backtest-artifacts:/runtime/artifacts
+    shm_size: ${TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES:-134217728}
     cpus: 2.0
     mem_limit: 3g
     pids_limit: 256

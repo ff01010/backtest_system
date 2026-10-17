@@ -452,7 +452,7 @@ export interface StrategyConfigSummary {
 export interface StrategyConfigPage {
   items: StrategyConfigSummary[];
   nextCursor: string | null;
-  total: number;
+  total: number | null;
 }
 
 export interface StrategyConfigVersion {
@@ -512,6 +512,16 @@ export interface BacktestRunHistory {
   createdAt: string;
   finishedAt: string;
   publicationId?: string | null;
+}
+
+export interface BacktestRunOption {
+  id: string;
+  displayNo: number;
+  symbol: string;
+  strategy: string;
+  configName: string;
+  createdAt: string;
+  status: string;
 }
 
 export type BacktestRunSelection = {

@@ -34,6 +34,7 @@ from backend.experiments.recovery import (
   validate_status_transition,
 )
 from backend.services import state_store
+from backend.services.search_query import escape_like_literal
 from backend.strategies.runtime_contract import validate_runtime_capability
 
 
@@ -50,6 +51,47 @@ _TRANSIENT_BLOCK_CODES = {
   "experiment.manual_queue_reserved",
   "experiment.manual_wait_blocked",
 }
+
+
+def _experiment_search_candidates(
+  query: str,
+  owner_id: str,
+) -> tuple[str, str, list[Any]]:
+  normalized = query.strip().lower()
+  if not normalized:
+    return "", "", []
+  pattern = f"%{escape_like_literal(normalized)}%"
+  cte = """
+    WITH query_candidates AS (
+      SELECT candidate.id
+      FROM backtest_experiment candidate
+      WHERE candidate.owner_user_id=%s
+        AND lower(candidate.name) LIKE %s ESCAPE '\\'
+      UNION
+      SELECT candidate.id
+      FROM backtest_experiment candidate
+      JOIN backtest_experiment_revision candidate_revision
+        ON candidate_revision.id=candidate.current_revision_id
+      WHERE candidate.owner_user_id=%s
+        AND lower(COALESCE(
+          candidate_revision.experiment_spec
+            #>> '{runTemplateSnapshot,fixedStructure,strategyName}', ''
+        )) LIKE %s ESCAPE '\\'
+      UNION
+      SELECT candidate.id
+      FROM backtest_experiment candidate
+      JOIN backtest_experiment_revision candidate_revision
+        ON candidate_revision.id=candidate.current_revision_id
+      WHERE candidate.owner_user_id=%s
+        AND lower(COALESCE(
+          candidate_revision.experiment_spec
+            #>> '{runTemplateSnapshot,fixedStructure,symbol}', ''
+        )) LIKE %s ESCAPE '\\'
+    )
+  """
+  return cte, "JOIN query_candidates matched ON matched.id=e.id", [
+    owner_id, pattern, owner_id, pattern, owner_id, pattern,
+  ]
 
 
 @dataclass(frozen=True)
@@ -466,24 +508,11 @@ class PostgresExperimentRepository:
       _decode_cursor(cursor, "experiment-list", owner_id, filters)
       if cursor else None
     )
-    params: list[Any] = [owner_id]
+    search_cte, search_join, search_params = _experiment_search_candidates(
+      query, owner_id,
+    )
+    params: list[Any] = [*search_params, owner_id]
     filter_sql: list[str] = []
-    if query:
-      pattern = f"%{query}%"
-      filter_sql.append("""
-        AND (
-          e.name ILIKE %s
-          OR COALESCE(
-            r.experiment_spec #>> '{runTemplateSnapshot,fixedStructure,strategyName}',
-            ''
-          ) ILIKE %s
-          OR COALESCE(
-            r.experiment_spec #>> '{runTemplateSnapshot,fixedStructure,symbol}',
-            ''
-          ) ILIKE %s
-        )
-      """)
-      params.extend([pattern, pattern, pattern])
     if status:
       filter_sql.append("AND e.status=%s")
       params.append(status)
@@ -494,7 +523,9 @@ class PostgresExperimentRepository:
     params.append(limit + 1)
     with state_store.database_session() as conn:
       with conn.cursor() as cur:
+        state_store._set_search_statement_timeout(cur)
         cur.execute(f"""
+          {search_cte}
           SELECT e.id AS experiment_id, e.name, e.status,
             e.blocked_reason_code, e.blocked_reason_message,
             e.archived_at, e.archive_retention_until, e.purge_job_id,
@@ -518,6 +549,7 @@ class PostgresExperimentRepository:
                AND trial.materialization_status='pending'
                AND trial.summary_status='pending') AS ready_count
           FROM backtest_experiment e
+          {search_join}
           JOIN backtest_experiment_revision r ON r.id=e.current_revision_id
           JOIN backtest_experiment_stage s ON s.revision_id=r.id AND s.stage_index=0
           CROSS JOIN backtest_experiment_rollout_state rollout

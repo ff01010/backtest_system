@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from backend import schemas, settings
+from backend.backtesting import Bar
 from backend.bar_strategy_session import _execute_script
 from backend.experiments.canonicalization import digest, with_version
 from backend.experiments.compiler import LegacySingleBarTrialCompiler
@@ -255,15 +256,6 @@ def test_compiler_restores_number_parameters_before_bar_execution() -> None:
     "params": request["effectiveStrategyParams"],
     "runtimeVersion": template.snapshot["fixedStructure"]["runtimeVersion"],
     "capabilityDigest": template.snapshot["fixedStructure"]["runtimeCapabilityDigest"],
-    "bars": [{
-      "time": "2026-07-01 09:35:00",
-      "symbol": "688981.SH",
-      "open": 10,
-      "high": 11,
-      "low": 9,
-      "close": 10.5,
-      "volume": 100,
-    }],
     "initialCapital": request["initialCapital"],
     "commissionRate": request["commissionRate"],
     "feeProfile": request["feeProfile"],
@@ -274,7 +266,15 @@ def test_compiler_restores_number_parameters_before_bar_execution() -> None:
     "t0Enabled": request["t0Enabled"],
     "strategyCategory": request["strategyCategory"],
     "overlaySettlementPolicy": request["overlaySettlementPolicy"],
-  })
+  }, [Bar(
+    time="2026-07-01 09:35:00",
+    symbol="688981.SH",
+    open=10,
+    high=11,
+    low=9,
+    close=10.5,
+    volume=100,
+  )], 0)
 
   assert result["fills"] == []
 

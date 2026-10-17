@@ -23,6 +23,8 @@ import {
   deleteBacktestSelection,
   deleteStrategyConfig,
   fetchAccounts,
+  fetchBacktestRunFilterOptions,
+  fetchBacktestRunOptions,
   fetchBacktestRunPage,
   fetchBacktestRun,
   fetchDataStatus,
@@ -50,6 +52,7 @@ import type {
   BacktestAccount,
   BacktestErrorDetail,
   BacktestRunHistory,
+  BacktestRunOption,
   BacktestRunResponse,
   BacktestSummary,
   BacktestTrade,
@@ -83,6 +86,24 @@ import {
   formatSignalTime,
   getClosedLoopTradePnl,
 } from '../utils/signalDetailCsv';
+
+
+function isAbortError(reason: unknown): boolean {
+  return typeof reason === 'object'
+    && reason !== null
+    && 'name' in reason
+    && reason.name === 'AbortError';
+}
+
+
+export function historySearchDelay(query: string): number | null {
+  const normalized = query.trim();
+  if (!normalized) return 0;
+  if (/^#\d+$/.test(normalized)) return 0;
+  if (/^\d{6}(?:\.(?:SH|SZ|BJ))?$/i.test(normalized)) return 0;
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(normalized)) return 0;
+  return normalized.length >= 2 ? 300 : null;
+}
 export { getClosedLoopTradePnl } from '../utils/signalDetailCsv';
 import { useSignalDetailExports } from '../hooks/useSignalDetailExports';
 import BacktestTabs from './BacktestTabs';
@@ -173,6 +194,18 @@ const SELECTABLE_HISTORY_RUN_STATUSES = new Set([
 
 function isSelectableHistoryRun(run: BacktestRunHistory): boolean {
   return SELECTABLE_HISTORY_RUN_STATUSES.has(run.status);
+}
+
+function historyRunOption(run: BacktestRunHistory): BacktestRunOption {
+  return {
+    id: run.id,
+    displayNo: run.displayNo,
+    symbol: run.symbol,
+    strategy: run.strategy,
+    configName: '',
+    createdAt: run.createdAt,
+    status: run.status,
+  };
 }
 
 export function StrategyStudioErrorNotice({ message }: { message: string }) {
@@ -1449,9 +1482,11 @@ export default function BacktestPage({
   const [historyFavoritesOnly, setHistoryFavoritesOnly] = useState(false);
   const [favoritingHistoryRunIds, setFavoritingHistoryRunIds] = useState<Set<string>>(new Set());
   const [historyCompareQuery, setHistoryCompareQuery] = useState('');
-  const [historyCompareOptions, setHistoryCompareOptions] = useState<BacktestRunHistory[]>([]);
+  const [historyCompareOptions, setHistoryCompareOptions] = useState<BacktestRunOption[]>([]);
   const [historyPage, setHistoryPage] = useState(1);
   const [historyPageSize, setHistoryPageSize] = useState(10);
+  const [historyCursorStack, setHistoryCursorStack] = useState<Array<string | null>>([null]);
+  const [historyNextCursor, setHistoryNextCursor] = useState<string | null>(null);
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historySelectableTotal, setHistorySelectableTotal] = useState(0);
   const [historySymbols, setHistorySymbols] = useState<string[]>([]);
@@ -1537,11 +1572,20 @@ export default function BacktestPage({
   useEffect(() => {
     if (previousHistoryFilterKey.current === historyFilterKey) return;
     previousHistoryFilterKey.current = historyFilterKey;
+    setHistoryPage(1);
+    setHistoryCursorStack([null]);
+    setHistoryNextCursor(null);
     if (selectedBacktestRunCount(historySelection) > 0) {
       setHistorySelection(emptyBacktestRunSelection());
       setStatus('筛选条件已变化，请重新选择');
     }
   }, [historyFilterKey, historySelection]);
+
+  useEffect(() => {
+    setHistoryPage(1);
+    setHistoryCursorStack([null]);
+    setHistoryNextCursor(null);
+  }, [historyPageSize]);
 
   useEffect(() => {
     if (!signalDetailExports.notice) return;
@@ -1660,18 +1704,23 @@ export default function BacktestPage({
 
   useEffect(() => {
     const requestId = ++strategyConfigRequestIdRef.current;
+    const controller = new AbortController();
     setStrategyConfigLoading(true);
     setStrategyConfigLoadingMore(false);
     setStrategyConfigError('');
     const timer = window.setTimeout(() => {
-      fetchStrategyConfigPage({ limit: 50, query: strategyConfigQuery })
+      fetchStrategyConfigPage(
+        { limit: 50, query: strategyConfigQuery },
+        { signal: controller.signal },
+      )
         .then((page) => {
           if (requestId !== strategyConfigRequestIdRef.current) return;
           setStrategyConfigs(page.items);
           setStrategyConfigNextCursor(page.nextCursor);
-          setStrategyConfigTotal(page.total);
+          setStrategyConfigTotal(page.total ?? 0);
         })
         .catch((loadError: unknown) => {
+          if (isAbortError(loadError)) return;
           if (requestId !== strategyConfigRequestIdRef.current) return;
           setStrategyConfigs([]);
           setStrategyConfigNextCursor(null);
@@ -1685,41 +1734,76 @@ export default function BacktestPage({
           }
         });
     }, strategyConfigQuery.trim() ? 250 : 0);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [strategyConfigQuery]);
 
   useEffect(() => {
     historyRequestIdRef.current += 1;
+    const controller = new AbortController();
+    const delay = historySearchDelay(historyQuery);
+    if (delay == null) {
+      setHistoryLoading(false);
+      setHistoryLoadError('普通文字搜索请至少输入两个字符');
+      return () => controller.abort();
+    }
     const timer = window.setTimeout(
-      () => void refreshBacktestRuns(),
-      historyQuery.trim() ? 250 : 0,
+      () => void refreshBacktestRuns(historyPage, controller.signal),
+      delay,
     );
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [historyPage, historyPageSize, historyQuery, historySymbolFilter, historyFavoritesOnly]);
 
   useEffect(() => {
+    const controller = new AbortController();
+    fetchBacktestRunFilterOptions(null, { signal: controller.signal })
+      .then(setHistorySymbols)
+      .catch((reason: unknown) => {
+        if (!isAbortError(reason)) {
+          setHistoryLoadError(reason instanceof Error ? reason.message : '加载标的筛选项失败');
+        }
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
     if (historyCompareQuery.trim()) return;
-    setHistoryCompareOptions(backtestRuns);
+    setHistoryCompareOptions(backtestRuns.map(historyRunOption));
   }, [backtestRuns, historyCompareQuery]);
 
   useEffect(() => {
     const query = historyCompareQuery.trim();
     const requestId = ++historyCompareRequestIdRef.current;
     if (!query) return undefined;
+    const delay = historySearchDelay(query);
+    if (delay == null) {
+      setHistoryCompareOptions([]);
+      return undefined;
+    }
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      fetchBacktestRunPage({ limit: 20, offset: 0, query, symbol: '' })
+      fetchBacktestRunOptions({ limit: 20, query }, { signal: controller.signal })
         .then((page) => {
           if (requestId === historyCompareRequestIdRef.current) {
-            setHistoryCompareOptions(page.runs);
+            setHistoryCompareOptions(page.items);
           }
         })
-        .catch(() => {
+        .catch((reason: unknown) => {
+          if (isAbortError(reason)) return;
           if (requestId === historyCompareRequestIdRef.current) {
             setHistoryCompareOptions([]);
           }
         });
-    }, 250);
-    return () => window.clearTimeout(timer);
+    }, delay);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [historyCompareQuery]);
 
   useEffect(() => {
@@ -2012,6 +2096,7 @@ export default function BacktestPage({
         limit: 50,
         cursor: strategyConfigNextCursor,
         query: strategyConfigQuery,
+        includeTotals: false,
       });
       if (requestId !== strategyConfigRequestIdRef.current) return;
       setStrategyConfigs((current) => {
@@ -2020,7 +2105,7 @@ export default function BacktestPage({
         return [...merged.values()];
       });
       setStrategyConfigNextCursor(page.nextCursor);
-      setStrategyConfigTotal(page.total);
+      if (page.total != null) setStrategyConfigTotal(page.total);
     } catch (loadError) {
       if (requestId === strategyConfigRequestIdRef.current) {
         setStrategyConfigError(
@@ -2051,31 +2136,37 @@ export default function BacktestPage({
     }
   };
 
-  const refreshBacktestRuns = async (targetPage = historyPage) => {
+  const refreshBacktestRuns = async (
+    targetPage = historyPage,
+    signal?: AbortSignal,
+  ) => {
     const requestId = ++historyRequestIdRef.current;
     setHistoryLoading(true);
     setHistoryLoadError('');
     try {
+      const pageCursor = targetPage === 1 ? null : historyCursorStack[targetPage - 1];
+      if (targetPage > 1 && !pageCursor) return;
       const page = await fetchBacktestRunPage({
         limit: historyPageSize,
-        offset: (targetPage - 1) * historyPageSize,
+        cursor: pageCursor,
+        includeTotals: targetPage === 1,
+        includeFilterOptions: false,
         query: historyQuery,
         symbol: historySymbolFilter,
         ...(historyFavoritesOnly ? { favoritesOnly: true } : {}),
-      });
+      }, { signal });
       if (requestId !== historyRequestIdRef.current) return;
-      const lastPage = Math.max(1, Math.ceil(page.total / historyPageSize));
-      setHistoryTotal(page.total);
-      setHistorySelectableTotal(
-        page.selectableTotal ?? page.runs.filter(isSelectableHistoryRun).length,
-      );
-      setHistorySymbols(page.symbols);
-      if (targetPage > lastPage) {
-        setHistoryPage(lastPage);
-        return;
-      }
+      if (page.total != null) setHistoryTotal(page.total);
+      if (page.selectableTotal != null) setHistorySelectableTotal(page.selectableTotal);
+      setHistoryNextCursor(page.nextCursor);
+      setHistoryCursorStack((current) => {
+        const next = current.slice(0, targetPage);
+        if (page.nextCursor) next[targetPage] = page.nextCursor;
+        return next;
+      });
       setBacktestRuns(page.runs);
     } catch (loadError) {
+      if (isAbortError(loadError)) return;
       if (requestId === historyRequestIdRef.current) {
         setHistoryLoadError(loadError instanceof Error ? loadError.message : '加载历史回测失败');
       }
@@ -3254,7 +3345,7 @@ export default function BacktestPage({
     || null;
   const compareHistoryOptions = compareHistoryRun
     && !historyCompareOptions.some((item) => item.id === compareHistoryRun.id)
-    ? [compareHistoryRun, ...historyCompareOptions]
+    ? [historyRunOption(compareHistoryRun), ...historyCompareOptions]
     : historyCompareOptions;
   const selectedHistoryConfigName = selectedHistoryRun?.configId
     ? configNameById.get(selectedHistoryRun.configId) || '已保存方案'
@@ -5642,7 +5733,7 @@ export default function BacktestPage({
                             </select>
                             <button onClick={() => setHistoryPage((page) => Math.max(1, page - 1))} disabled={safeHistoryPage <= 1} style={{ height: 30, borderRadius: 4, border: '1px solid #cbd5e1', background: '#ffffff', color: '#334155', cursor: safeHistoryPage <= 1 ? 'not-allowed' : 'pointer', opacity: safeHistoryPage <= 1 ? 0.45 : 1 }}>上一页</button>
                             <span>{safeHistoryPage} / {historyPageCount}</span>
-                            <button onClick={() => setHistoryPage((page) => Math.min(historyPageCount, page + 1))} disabled={safeHistoryPage >= historyPageCount} style={{ height: 30, borderRadius: 4, border: '1px solid #cbd5e1', background: '#ffffff', color: '#334155', cursor: safeHistoryPage >= historyPageCount ? 'not-allowed' : 'pointer', opacity: safeHistoryPage >= historyPageCount ? 0.45 : 1 }}>下一页</button>
+                            <button onClick={() => setHistoryPage((page) => page + 1)} disabled={!historyNextCursor} style={{ height: 30, borderRadius: 4, border: '1px solid #cbd5e1', background: '#ffffff', color: '#334155', cursor: historyNextCursor ? 'pointer' : 'not-allowed', opacity: historyNextCursor ? 1 : 0.45 }}>下一页</button>
                           </div>
                         </div>
                       )}
@@ -5754,7 +5845,7 @@ export default function BacktestPage({
                                   .filter((item) => item.id !== selectedHistoryRunId)
                                   .map((item) => (
                                     <option key={item.id} value={item.id}>
-                                      回测 {formatRunReference(item.displayNo)} · {item.symbol} · {item.startDate}-{item.endDate}
+                                      回测 {formatRunReference(item.displayNo)} · {item.symbol} · {item.createdAt.slice(0, 10)}
                                     </option>
                                   ))}
                               </select>

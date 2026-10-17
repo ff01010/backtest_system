@@ -70,6 +70,42 @@ def test_backtest_capacity_supports_explicit_capacity_search(
     )
 
 
+def test_bar_ipc_legacy_does_not_require_transport_configuration(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "BAR_IPC_MODE", "legacy")
+  monkeypatch.setattr(settings, "BAR_IPC_TEMP_ROOT", "")
+  monkeypatch.setattr(settings, "BAR_RUNNER_SHM_SIZE_BYTES", 0)
+
+  settings.validate_bar_ipc_configuration()
+
+
+def test_bar_ipc_auto_rejects_unsafe_capacity(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "BAR_IPC_MODE", "auto")
+  monkeypatch.setattr(settings, "BAR_IPC_TEMP_ROOT", "./runtime/bar-ipc")
+  monkeypatch.setattr(settings, "BAR_RUNNER_SHM_SIZE_BYTES", 1024)
+
+  with pytest.raises(ValueError, match="SHM_SIZE_BYTES"):
+    settings.validate_bar_ipc_configuration()
+
+
+def test_bar_ipc_auto_rejects_user_artifact_subdirectory(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(settings, "BAR_IPC_MODE", "auto")
+  monkeypatch.setattr(
+    settings,
+    "BAR_IPC_TEMP_ROOT",
+    str(Path(settings.OUTPUT_ROOT) / "bar-ipc"),
+  )
+  monkeypatch.setattr(settings, "BAR_RUNNER_SHM_SIZE_BYTES", 128 * 1024 * 1024)
+
+  with pytest.raises(ValueError, match="独立的受管临时目录"):
+    settings.validate_bar_ipc_configuration()
+
+
 def test_read_bool_rejects_ambiguous_value(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setenv("TEST_RESEARCH_REPORT_ENABLED", "yes")
 

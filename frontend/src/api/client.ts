@@ -2,6 +2,7 @@ import type {
   BacktestAccount,
   BacktestChartResponse,
   BacktestRunHistory,
+  BacktestRunOption,
   BacktestRunResponse,
   BacktestErrorDetail,
   ChartResponse,
@@ -101,8 +102,8 @@ async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promi
   return response;
 }
 
-export async function fetchJson<T>(url: string): Promise<T> {
-  const res = await apiFetch(url);
+export async function fetchJson<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const res = await apiFetch(url, init);
   if (!res.ok) {
     throw await apiResponseError(res);
   }
@@ -175,7 +176,22 @@ function getStructuredApiError(text: string): {
 }
 
 async function apiResponseError(response: Response): Promise<ApiResponseError> {
-  const detail = getStructuredApiError(await response.text());
+  const text = await response.text();
+  const contentType = response.headers.get('Content-Type')?.toLowerCase() ?? '';
+  const looksLikeJson = contentType.includes('json') || /^\s*[\[{]/.test(text);
+  const proxyFailure = contentType.includes('text/html')
+    || /^\s*<(?:!doctype|html)/i.test(text)
+    || ([502, 503, 504].includes(response.status) && !looksLikeJson);
+  if (proxyFailure) {
+    return new ApiResponseError(
+      response.status,
+      'search_proxy_unavailable',
+      '搜索服务暂时未能及时响应，请缩小条件或稍后重试。',
+      response.headers.get('X-Request-Id'),
+    );
+  }
+  const safeText = text.length <= 500 ? text : `${text.slice(0, 500)}…`;
+  const detail = getStructuredApiError(safeText);
   return new ApiResponseError(
     response.status,
     detail.code,
@@ -603,10 +619,14 @@ export async function fetchInstruments(): Promise<InstrumentItem[]> {
   return data.instruments;
 }
 
-export async function searchMarketInstruments(query: string): Promise<MarketInstrument[]> {
+export async function searchMarketInstruments(
+  query: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<MarketInstrument[]> {
   const search = new URLSearchParams({ q: query, limit: '20' });
   const data = await fetchJson<{ instruments: MarketInstrument[] }>(
-    `${BASE}/market-instruments/search?${search.toString()}`
+    `${BASE}/market-instruments/search?${search.toString()}`,
+    { signal: options.signal },
   );
   return data.instruments;
 }
@@ -774,7 +794,10 @@ export async function fetchBacktestRuns(
 
 export interface BacktestRunPageQuery {
   limit: number;
-  offset: number;
+  offset?: number;
+  cursor?: string | null;
+  includeTotals?: boolean;
+  includeFilterOptions?: boolean;
   query?: string;
   symbol?: string;
   configId?: string | null;
@@ -783,25 +806,58 @@ export interface BacktestRunPageQuery {
 
 export interface BacktestRunPage {
   runs: BacktestRunHistory[];
-  total: number;
-  selectableTotal: number;
+  total: number | null;
+  selectableTotal: number | null;
+  nextCursor: string | null;
   limit: number;
   offset: number;
   symbols: string[];
 }
 
 export async function fetchBacktestRunPage(
-  params: BacktestRunPageQuery
+  params: BacktestRunPageQuery,
+  options: { signal?: AbortSignal } = {},
 ): Promise<BacktestRunPage> {
-  const search = new URLSearchParams({
-    limit: String(params.limit),
-    offset: String(params.offset),
-  });
+  const search = new URLSearchParams({ limit: String(params.limit) });
+  if (params.offset != null) search.set('offset', String(params.offset));
+  if (params.cursor) search.set('cursor', params.cursor);
+  if (params.includeTotals === false) search.set('includeTotals', 'false');
+  if (params.includeFilterOptions !== true) search.set('includeFilterOptions', 'false');
   if (params.query?.trim()) search.set('query', params.query.trim());
   if (params.symbol) search.set('symbol', params.symbol);
   if (params.configId) search.set('configId', params.configId);
   if (params.favoritesOnly) search.set('favoritesOnly', 'true');
-  return fetchJson<BacktestRunPage>(`${BASE}/backtest/runs?${search.toString()}`);
+  return fetchJson<BacktestRunPage>(
+    `${BASE}/backtest/runs?${search.toString()}`,
+    { signal: options.signal },
+  );
+}
+
+export async function fetchBacktestRunFilterOptions(
+  configId: string | null = null,
+  options: { signal?: AbortSignal } = {},
+): Promise<string[]> {
+  const search = new URLSearchParams();
+  if (configId) search.set('configId', configId);
+  const suffix = search.size ? `?${search.toString()}` : '';
+  const data = await fetchJson<{ symbols: string[] }>(
+    `${BASE}/backtest/run-filter-options${suffix}`,
+    { signal: options.signal },
+  );
+  return data.symbols;
+}
+
+export async function fetchBacktestRunOptions(
+  params: { query?: string; limit?: number; cursor?: string | null } = {},
+  options: { signal?: AbortSignal } = {},
+): Promise<{ items: BacktestRunOption[]; nextCursor: string | null; limit: number }> {
+  const search = new URLSearchParams({ limit: String(params.limit ?? 20) });
+  if (params.query?.trim()) search.set('query', params.query.trim());
+  if (params.cursor) search.set('cursor', params.cursor);
+  return fetchJson(
+    `${BASE}/backtest/run-options?${search.toString()}`,
+    { signal: options.signal },
+  );
 }
 
 export async function fetchBacktestRun(runId: string): Promise<BacktestRunHistory> {
@@ -1262,15 +1318,21 @@ export interface StrategyConfigPageQuery {
   limit?: number;
   cursor?: string | null;
   query?: string;
+  includeTotals?: boolean;
 }
 
 export async function fetchStrategyConfigPage(
   params: StrategyConfigPageQuery = {},
+  options: { signal?: AbortSignal } = {},
 ): Promise<StrategyConfigPage> {
   const search = new URLSearchParams({ limit: String(params.limit ?? 50) });
   if (params.cursor) search.set('cursor', params.cursor);
   if (params.query?.trim()) search.set('query', params.query.trim());
-  return fetchJson<StrategyConfigPage>(`${BASE}/strategy-configs?${search.toString()}`);
+  if (params.includeTotals === false) search.set('includeTotals', 'false');
+  return fetchJson<StrategyConfigPage>(
+    `${BASE}/strategy-configs?${search.toString()}`,
+    { signal: options.signal },
+  );
 }
 
 export async function fetchStrategyConfigs(): Promise<StrategyConfigSummary[]> {

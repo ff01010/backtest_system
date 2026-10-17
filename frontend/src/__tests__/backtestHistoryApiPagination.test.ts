@@ -11,6 +11,8 @@ describe('backtest history API pagination', () => {
     const response = {
       runs: [{ id: 'run-31', displayNo: 31 }],
       total: 65,
+      selectableTotal: 65,
+      nextCursor: 'next-cursor',
       limit: 20,
       offset: 40,
       symbols: ['688981.SH'],
@@ -24,6 +26,7 @@ describe('backtest history API pagination', () => {
     const page = await fetchBacktestRunPage({
       limit: 20,
       offset: 40,
+      includeFilterOptions: true,
       query: '候选',
       symbol: '688981.SH',
     });
