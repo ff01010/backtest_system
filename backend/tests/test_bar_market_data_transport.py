@@ -13,42 +13,9 @@ import pytest
 from backend.bar_market_data_transport import (
   BAR_DTYPE,
   BarMarketDataRuntime,
-  BarSequence,
   attach_bar_market_data,
   cleanup_stale_bar_market_data,
 )
-
-
-def _array() -> np.ndarray:
-  rows = np.zeros(3, dtype=BAR_DTYPE)
-  rows["time_key"] = [20260901093000, 20260901093500, 20260901094000]
-  rows["open"] = [-0.0, 10.1, 10.2]
-  rows["high"] = [10.0, 10.2, 10.3]
-  rows["low"] = [9.9, 10.0, 10.1]
-  rows["close"] = [10.0, 10.1, 10.2]
-  rows["volume"] = [100.0, 200.0, 300.0]
-  rows.flags.writeable = False
-  return rows
-
-
-def test_bar_sequence_preserves_python_sequence_and_bar_contract() -> None:
-  sequence = BarSequence(_array(), "688981.SH")
-
-  assert len(sequence) == 3
-  assert sequence[-1].time == "20260901094000"
-  assert sequence[0].symbol == "688981.SH"
-  assert type(sequence[1].open) is float
-  assert math.copysign(1.0, sequence[0].open) == -1.0
-  assert [bar.time for bar in sequence[::-1]] == [
-    "20260901094000", "20260901093500", "20260901093000",
-  ]
-  assert [bar.volume for bar in sequence[::2]] == [100.0, 300.0]
-  assert list(sequence[0:0]) == []
-  assert [bar.time for bar in sequence[::2][::-1]] == [
-    "20260901094000", "20260901093000",
-  ]
-  assert sequence[::2]._source is sequence._source
-  assert len(sequence._source.cache) <= 2
 
 
 def _frame() -> pd.DataFrame:
@@ -82,15 +49,32 @@ def test_transport_round_trips_read_only_bars(
       if transport == "shared_memory" and os.name == "posix":
         with pytest.raises(FileNotFoundError):
           shared_memory.SharedMemory(name=location, create=False)
-      assert attached.bars[0].time == "20260901093000"
-      assert attached.bars[1].close == 10.1
-      assert attached.bars[0].symbol == "688981.SH"
-      assert attached.rows.flags.writeable is False
+      bars = attached.materialize_bars(chunk_size=1)
+      assert isinstance(bars, list)
+      assert bars[0].time == "20260901093000"
+      assert bars[1].close == 10.1
+      assert bars[0].symbol == "688981.SH"
+      assert type(bars[1].open) is float
+      assert math.copysign(1.0, bars[0].open) == -1.0
   finally:
     resource.close()
     runtime.close()
   if transport == "mmap":
     assert not Path(location).exists()
+
+
+def test_materialization_rejects_non_positive_chunk_size(tmp_path: Path) -> None:
+  runtime = BarMarketDataRuntime(tmp_path, shared_memory_limit_bytes=1024 * 1024)
+  resource = runtime.create(
+    _frame(), "688981.SH", 0, task_uuid="chunk-size", force_transport="mmap",
+  )
+  try:
+    with attach_bar_market_data(resource.reference, runtime.root) as attached:
+      with pytest.raises(ValueError, match="分块大小"):
+        attached.materialize_bars(chunk_size=0)
+  finally:
+    resource.close()
+    runtime.close()
 
 
 def test_startup_cleanup_skips_active_runtime_and_removes_stale_mmap(
@@ -152,6 +136,28 @@ def test_auto_transport_uses_capacity_and_falls_back_when_shared_memory_fails(
     assert fallback.reference["transport"] == "mmap"
   finally:
     fallback.close()
+    runtime.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="仅 POSIX 使用共享内存空间预留")
+def test_auto_transport_falls_back_when_shared_memory_reservation_fails(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  runtime = BarMarketDataRuntime(
+    tmp_path / "reservation", shared_memory_limit_bytes=1024 * 1024,
+  )
+
+  def fail_reservation(*_args: object) -> None:
+    raise OSError("no tmpfs capacity")
+
+  monkeypatch.setattr(os, "posix_fallocate", fail_reservation)
+  resource = runtime.create(_frame(), "688981.SH", 0, task_uuid="reservation")
+  try:
+    assert resource.reference["transport"] == "mmap"
+    assert list(runtime.root.glob("shm-*.json")) == []
+  finally:
+    resource.close()
     runtime.close()
 
 

@@ -597,10 +597,7 @@ class BarBacktestEngine:
         pending_orders = []
       self._ledger.mark(bar.symbol, bar.close)
       orders = strategy.on_bar(bar, self._snapshot())
-      is_day_end = (
-        index == len(formal_bars) - 1
-        or formal_bars[index + 1].date != bar.date
-      )
+      is_day_end = self._is_day_end(formal_bars, index)
       accepted_orders = self._accept_orders(strategy, orders, is_day_end, bar.time)
       if self._execute_on_next_bar_open:
         pending_orders = accepted_orders

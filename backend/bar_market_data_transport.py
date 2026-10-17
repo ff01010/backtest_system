@@ -11,13 +11,11 @@ import shutil
 import stat
 import time
 import uuid
-from collections import deque
-from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, TypedDict, overload
+from typing import Any, Literal, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -38,6 +36,7 @@ _SHARED_MEMORY_PREFIX = "tgbar_"
 _REQUIRED_COLUMNS = ("time", "open", "high", "low", "close", "volume")
 _MMAP_DELETE_RETRIES = 8
 _DEFAULT_STALE_SECONDS = 6 * 60 * 60
+_DEFAULT_MATERIALIZATION_CHUNK_SIZE = 16_384
 
 logger = logging.getLogger(__name__)
 
@@ -53,96 +52,46 @@ class MarketDataRef(TypedDict):
   warmupBarCount: int
 
 
-class _BarSource:
-  """在多个切片间共享数组和常数级 Bar 缓存。"""
-
-  def __init__(self, rows: np.ndarray, symbol: str) -> None:
-    if rows.dtype != BAR_DTYPE or rows.ndim != 1:
-      raise ValueError("Bar 数组 dtype 或维度无效")
-    if rows.flags.writeable:
-      raise ValueError("Bar 数组必须只读")
-    if not symbol:
-      raise ValueError("Bar 标的不能为空")
-    self.rows = rows
-    self.symbol = symbol
-    self.cache: dict[int, Bar] = {}
-    self.cache_order: deque[int] = deque()
-
-  def bar_at(self, index: int) -> Bar:
-    cached = self.cache.get(index)
-    if cached is not None:
-      return cached
-    time_key, open_price, high, low, close, volume = self.rows[index].tolist()
-    bar = Bar(
-      time=f"{time_key:014d}",
-      symbol=self.symbol,
-      open=open_price,
-      high=high,
-      low=low,
-      close=close,
-      volume=volume,
-    )
-    if len(self.cache_order) == 2:
-      expired = self.cache_order.popleft()
-      self.cache.pop(expired, None)
-    self.cache[index] = bar
-    self.cache_order.append(index)
-    return bar
-
-
-class BarSequence(Sequence[Bar]):
-  """按需从只读固定类型数组构造标准 Bar。"""
-
-  def __init__(
-    self,
-    rows: np.ndarray,
-    symbol: str,
-    *,
-    _source: _BarSource | None = None,
-    _indices: range | None = None,
-  ) -> None:
-    self._source = _source or _BarSource(rows, symbol)
-    self._indices = _indices if _indices is not None else range(len(rows))
-
-  def __len__(self) -> int:
-    return len(self._indices)
-
-  @overload
-  def __getitem__(self, index: int) -> Bar: ...
-
-  @overload
-  def __getitem__(self, index: slice) -> BarSequence: ...
-
-  def __getitem__(self, index: int | slice) -> Bar | BarSequence:
-    if isinstance(index, slice):
-      return BarSequence(
-        self._source.rows,
-        self._source.symbol,
-        _source=self._source,
-        _indices=self._indices[index],
-      )
-    absolute_index = self._indices[index]
-    return self._source.bar_at(absolute_index)
-
-  def __iter__(self) -> Iterator[Bar]:
-    bar_at = self._source.bar_at
-    for index in self._indices:
-      yield bar_at(index)
-
-
 @dataclass
 class AttachedBarMarketData:
   """子进程已挂载的只读行情和底层句柄。"""
 
-  bars: BarSequence
-  rows: np.ndarray
+  _rows: np.ndarray | None
+  symbol: str
   _shared_memory: shared_memory.SharedMemory | None = None
 
+  def materialize_bars(
+    self,
+    *,
+    chunk_size: int = _DEFAULT_MATERIALIZATION_CHUNK_SIZE,
+  ) -> list[Bar]:
+    """分块转换为引擎原生 Bar 列表，限制临时 tuple 列表峰值。"""
+    if chunk_size <= 0:
+      raise ValueError("Bar 分块大小必须大于 0")
+    rows = self._rows
+    if rows is None:
+      raise RuntimeError("Bar 行情映射已关闭")
+    bars: list[Bar] = []
+    for start in range(0, len(rows), chunk_size):
+      values = rows[start:start + chunk_size].tolist()
+      bars.extend([
+        Bar(
+          time=f"{row[0]:014d}", symbol=self.symbol,
+          open=row[1], high=row[2], low=row[3], close=row[4], volume=row[5],
+        )
+        for row in values
+      ])
+      del values
+    return bars
+
   def close(self) -> None:
-    self.bars = None  # type: ignore[assignment]
-    rows = self.rows
-    self.rows = None  # type: ignore[assignment]
-    del rows
+    rows = self._rows
+    self._rows = None
+    if rows is not None:
+      memory_map = getattr(rows, "_mmap", None)
+      del rows
+      if memory_map is not None:
+        memory_map.close()
     if self._shared_memory is not None:
       self._shared_memory.close()
       self._shared_memory = None
@@ -311,7 +260,7 @@ class BarMarketDataRuntime:
     try:
       shm = shared_memory.SharedMemory(name=name, create=True, size=required_bytes)
       if os.name == "posix":
-        _pretouch_shared_memory(name, required_bytes)
+        _reserve_shared_memory(shm, name, required_bytes)
       rows = np.ndarray((len(frame),), dtype=BAR_DTYPE, buffer=shm.buf)
       _fill_rows(rows, frame)
       rows.flags.writeable = False
@@ -382,7 +331,7 @@ def attach_bar_market_data(
         (validated["rowCount"],), dtype=BAR_DTYPE, buffer=shm.buf,
       )
       rows.flags.writeable = False
-      return AttachedBarMarketData(BarSequence(rows, validated["symbol"]), rows, shm)
+      return AttachedBarMarketData(rows, validated["symbol"], shm)
     except BaseException:
       shm.close()
       raise
@@ -399,7 +348,7 @@ def attach_bar_market_data(
     del rows
     raise ValueError("mmap 行情数组字节数与引用不一致")
   rows.flags.writeable = False
-  return AttachedBarMarketData(BarSequence(rows, validated["symbol"]), rows)
+  return AttachedBarMarketData(rows, validated["symbol"])
 
 
 def cleanup_stale_bar_market_data(
@@ -642,8 +591,23 @@ def _validate_managed_file(path: Path, managed_root: Path) -> None:
     raise ValueError("mmap 文件所有者无效")
 
 
+def _reserve_shared_memory(
+  shm: shared_memory.SharedMemory,
+  name: str,
+  size: int,
+) -> None:
+  if hasattr(os, "posix_fallocate"):
+    descriptor = getattr(shm, "_fd", None)
+    if not isinstance(descriptor, int) or descriptor < 0:
+      raise RuntimeError("SharedMemory 文件描述符不可用")
+    os.posix_fallocate(descriptor, 0, size)
+    return
+  _pretouch_shared_memory(name, size)
+
+
 def _pretouch_shared_memory(name: str, size: int) -> None:
-  context = multiprocessing.get_context("spawn")
+  start_method = "forkserver" if os.name == "posix" else "spawn"
+  context = multiprocessing.get_context(start_method)
   process = context.Process(target=_pretouch_process_main, args=(name, size))
   process.start()
   process.join()

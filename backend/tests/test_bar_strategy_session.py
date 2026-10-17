@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from backend import settings
-from backend.bar_market_data_transport import BarMarketDataRuntime
+from backend.bar_market_data_transport import BarMarketDataRuntime, ParentBarMarketData
 from backend.bar_strategy_session import (
   BarStrategyProcessError,
   BarStrategySession,
@@ -220,6 +222,86 @@ def on_bar(bar, state):
   assert result["trades"][0]["executionTime"] == "20260901094000"
   assert list(runtime.root.glob("bars-*.npy")) == []
   runtime.close()
+
+
+@pytest.mark.parametrize("transport", ["shared_memory", "mmap"])
+def test_parent_releases_transport_before_strategy_callback(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  transport: str,
+) -> None:
+  released = Path(tempfile.gettempdir()) / f"bar-ipc-released-{uuid.uuid4().hex}"
+  original_close = ParentBarMarketData.close
+
+  def record_close(resource: ParentBarMarketData) -> None:
+    original_close(resource)
+    released.write_text("closed", encoding="utf-8")
+
+  monkeypatch.setattr(ParentBarMarketData, "close", record_close)
+  payload = _payload(f"""
+import os
+
+def on_bar(bar, state):
+  if not os.path.exists({str(released)!r}):
+    raise RuntimeError('父进程尚未释放行情传输资源')
+  return []
+""")
+  runtime = BarMarketDataRuntime(
+    tmp_path / f"early-release-{transport}",
+    shared_memory_limit_bytes=1024 * 1024,
+  )
+  try:
+    result = _run_session(payload, session=BarStrategySession(
+      ipc_mode="auto",
+      market_data_runtime=runtime,
+      transport_override=transport,
+    ))
+    assert result["trades"] == []
+    assert released.read_text(encoding="utf-8") == "closed"
+  finally:
+    runtime.close()
+    released.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("transport", ["shared_memory", "mmap"])
+def test_user_strategy_cannot_reflect_transport_objects(
+  tmp_path: Path,
+  transport: str,
+) -> None:
+  payload = _payload("""
+import sys
+
+def on_bar(bar, state):
+  frame = sys._getframe()
+  while frame is not None:
+    for value in frame.f_locals.values():
+      if hasattr(value, '_shared_memory') or hasattr(value, '_source'):
+        raise RuntimeError('反射取得行情映射对象')
+      if hasattr(value, 'filename'):
+        raise RuntimeError('反射取得 mmap 文件对象')
+      if isinstance(value, dict) and {
+        'schemaVersion', 'transport', 'location', 'rowCount'
+      }.issubset(value):
+        raise RuntimeError('反射取得行情传输引用')
+      if isinstance(value, dict) and 'marketDataRef' in value:
+        raise RuntimeError('反射取得含行情引用的控制载荷')
+    frame = frame.f_back
+  return []
+""")
+  runtime = BarMarketDataRuntime(
+    tmp_path / f"reflection-{transport}",
+    shared_memory_limit_bytes=1024 * 1024,
+  )
+  try:
+    result = _run_session(payload, session=BarStrategySession(
+      ipc_mode="auto",
+      market_data_runtime=runtime,
+      transport_override=transport,
+    ))
+  finally:
+    runtime.close()
+
+  assert result["trades"] == []
 
 
 def test_research_signal_payload_stays_on_legacy_transport(tmp_path: Path) -> None:

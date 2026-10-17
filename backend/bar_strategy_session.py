@@ -9,7 +9,7 @@ import re
 import time
 import traceback
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import asdict
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -22,7 +22,6 @@ from backend.bar_market_data_transport import (
   BAR_DTYPE,
   AttachedBarMarketData,
   BarMarketDataRuntime,
-  BarSequence,
   ParentBarMarketData,
   attach_bar_market_data,
 )
@@ -144,7 +143,7 @@ class BarStrategySession:
     managed_root: str,
   ) -> dict[str, Any]:
     context = multiprocessing.get_context("spawn")
-    parent, child = context.Pipe(duplex=False)
+    parent, child = context.Pipe(duplex=True)
     process = context.Process(
       target=_bar_process_main,
       args=(child, payload, managed_root),
@@ -170,6 +169,12 @@ class BarStrategySession:
             raise BarStrategyProcessError("Bar 策略子进程返回了意外的行情挂载确认")
           resource.mark_attached()
           continue
+        if isinstance(message, dict) and message.get("status") == "market_data_materialized":
+          if resource is None:
+            raise BarStrategyProcessError("Bar 策略子进程返回了意外的行情物化确认")
+          resource.close()
+          parent.send({"status": "market_data_released"})
+          continue
         return _parse_response(message)
     except (EOFError, OSError) as error:
       process.join(timeout=0.2)
@@ -194,15 +199,31 @@ def _bar_process_main(
 ) -> None:
   """只接收冻结脚本、参数和行情，不继承数据库或外部服务配置。"""
   attached: AttachedBarMarketData | None = None
-  bars: Sequence[Bar] | None = None
+  bars: list[Bar] | None = None
+  reference: dict[str, Any] | None = None
   try:
     os.environ.clear()
     restore_numeric_thread_environment()
-    if isinstance(payload.get("marketDataRef"), dict):
-      attached = attach_bar_market_data(payload["marketDataRef"], managed_root)
+    candidate = payload.pop("marketDataRef", None)
+    if isinstance(candidate, dict):
+      reference = candidate
+      attached = attach_bar_market_data(reference, managed_root)
       connection.send({"status": "market_data_attached"})
-      bars = attached.bars
-      warmup_bar_count = int(payload["marketDataRef"]["warmupBarCount"])
+      warmup_bar_count = int(reference["warmupBarCount"])
+      bars = attached.materialize_bars()
+      attached.close()
+      attached = None
+      reference = None
+      candidate = None
+      managed_root = ""
+      connection.send({"status": "market_data_materialized"})
+      release_message = connection.recv()
+      if not (
+        isinstance(release_message, dict)
+        and release_message.get("status") == "market_data_released"
+      ):
+        raise RuntimeError("Bar 行情传输资源释放确认无效")
+      release_message = None
     else:
       bars = _legacy_bars(payload)
       warmup_bar_count = int(payload.get("warmupBarCount", 0))
@@ -266,7 +287,7 @@ def _legacy_bars(payload: dict[str, Any]) -> list[Bar]:
 
 def _execute_script(
   payload: dict[str, Any],
-  bars: Sequence[Bar],
+  bars: list[Bar],
   warmup_bar_count: int,
 ) -> dict[str, Any]:
   strategy = ScriptedBarStrategy(
