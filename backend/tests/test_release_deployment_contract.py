@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """发布脚本与 Compose 的关键不可变镜像契约。"""
 
+import hashlib
 import os
 import re
 import shutil
@@ -124,6 +125,26 @@ def test_production_baseline_covers_every_existing_migration_through_056() -> No
     for line in PRODUCTION_BASELINE.read_text(encoding="utf-8").splitlines()
     if line.strip()
   )
+
+
+def test_production_baseline_checksums_are_line_ending_independent() -> None:
+  recorded = {
+    filename: checksum
+    for checksum, filename in (
+      line.split()
+      for line in PRODUCTION_BASELINE.read_text(encoding="utf-8").splitlines()
+      if line.strip()
+    )
+  }
+  expected = {
+    migration.name: hashlib.sha256(
+      migration.read_bytes().replace(b"\r\n", b"\n"),
+    ).hexdigest()
+    for migration in sorted(MIGRATION_ROOT.glob("*.sql"))
+    if int(migration.name.split("_", 1)[0]) <= 56
+  }
+
+  assert recorded == expected
 
 
 def test_migration_ledger_is_owner_only_and_records_application_kind() -> None:

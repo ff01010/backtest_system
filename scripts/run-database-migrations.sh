@@ -87,6 +87,10 @@ parse_version() {
   printf '%s\n' "$parsed_version"
 }
 
+canonical_sha256() {
+  sed 's/\r$//' "$1" | sha256sum | awk '{print $1}'
+}
+
 build_inventory() {
   previous_version=-1
   find "$MIGRATION_DIR" -maxdepth 1 -type f -name '*.sql' -print \
@@ -102,7 +106,7 @@ build_inventory() {
     [ "$version" -gt 0 ] || fail "migration version must be positive: $filename"
     [ "$version" -ne "$previous_version" ] \
       || fail "duplicate migration version: ${filename%%_*}"
-    hash="$(sha256sum "$path" | awk '{print $1}')"
+    hash="$(canonical_sha256 "$path")"
     printf '%s|%s|%s|%s\n' "$version" "$filename" "$hash" "$path" \
       >> "$inventory_file"
     previous_version="$version"
