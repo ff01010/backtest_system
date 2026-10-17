@@ -359,23 +359,32 @@ function ExperimentLanding({
 
   useEffect(() => {
     const requestId = ++configRequestId.current;
+    const controller = new AbortController();
     setConfigLoading(true);
     const timer = window.setTimeout(() => {
-      fetchStrategyConfigPage({ limit: 50, query: configQuery })
+      fetchStrategyConfigPage(
+        { limit: 50, query: configQuery },
+        { signal: controller.signal },
+      )
         .then((page) => {
           if (requestId !== configRequestId.current) return;
           setConfigs(page.items.filter(isStandardBarConfig));
           setConfigNextCursor(page.nextCursor);
-          setConfigTotal(page.total);
+          setConfigTotal(page.total ?? 0);
         })
         .catch((reason: unknown) => {
+          if (typeof reason === 'object' && reason !== null
+            && 'name' in reason && reason.name === 'AbortError') return;
           if (requestId === configRequestId.current) setError(errorMessage(reason));
         })
         .finally(() => {
           if (requestId === configRequestId.current) setConfigLoading(false);
         });
     }, configQuery.trim() ? 250 : 0);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [configQuery]);
 
   const loadMoreConfigs = async () => {
@@ -385,6 +394,7 @@ function ExperimentLanding({
     try {
       const page = await fetchStrategyConfigPage({
         limit: 50, cursor: configNextCursor, query: configQuery,
+        includeTotals: false,
       });
       if (requestId !== configRequestId.current) return;
       setConfigs((current) => {
@@ -393,7 +403,7 @@ function ExperimentLanding({
         return [...merged.values()];
       });
       setConfigNextCursor(page.nextCursor);
-      setConfigTotal(page.total);
+      if (page.total != null) setConfigTotal(page.total);
     } catch (reason) {
       if (requestId === configRequestId.current) setError(errorMessage(reason));
     } finally {

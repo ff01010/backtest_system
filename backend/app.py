@@ -1639,7 +1639,10 @@ def instruments():
 
 @app.get("/api/market-instruments/search")
 def search_market_instruments(q: str = Query("", max_length=64), limit: int = Query(20, ge=1, le=50)):
-  return {"instruments": state_store.search_market_instruments(q, limit)}
+  try:
+    return {"instruments": state_store.search_market_instruments(q, limit)}
+  except state_store.SearchTimeoutError as error:
+    raise _stable_error(504, "search_timeout", str(error)) from error
 
 
 
@@ -1730,9 +1733,14 @@ def strategy_configs(
   limit: int = Query(50, ge=1, le=100),
   cursor: str | None = Query(default=None, max_length=2048),
   query: str = Query(default="", max_length=100),
+  include_totals: bool = Query(True, alias="includeTotals"),
 ):
   try:
-    return state_store.list_strategy_config_summaries(limit, cursor, query)
+    return state_store.list_strategy_config_summaries(
+      limit, cursor, query, include_totals,
+    )
+  except state_store.SearchTimeoutError as error:
+    raise _stable_error(504, "search_timeout", str(error)) from error
   except ValueError as error:
     raise HTTPException(422, str(error)) from error
 
@@ -2023,6 +2031,8 @@ def list_experiments(
       query=search_query,
       status=status,
     )
+  except state_store.SearchTimeoutError as error:
+    raise _stable_error(504, "search_timeout", str(error)) from error
   except ExperimentError as error:
     _raise_experiment_error(error)
 
@@ -2595,23 +2605,66 @@ def retry_experiment_failed(
     _raise_experiment_error(error)
 
 
-@app.get("/api/backtest/runs")
+@app.get("/api/backtest/runs", response_model=schemas.BacktestRunPage)
 def backtest_runs(
   limit: int = Query(30, ge=1, le=100),
   offset: int = Query(0, ge=0),
+  cursor: str | None = Query(default=None, max_length=2048),
   query: str = Query("", max_length=100),
   symbol: str | None = Query(default=None, pattern=r"^\d{6}\.(SH|SZ|BJ)$"),
   config_id: str | None = Query(default=None, alias="configId"),
   favorites_only: bool = Query(False, alias="favoritesOnly"),
+  include_totals: bool = Query(True, alias="includeTotals"),
+  include_filter_options: bool = Query(True, alias="includeFilterOptions"),
 ):
-  return state_store.list_backtest_run_page(
-    limit=limit,
-    offset=offset,
-    query=query,
-    symbol=symbol,
-    config_id=config_id,
-    favorites_only=favorites_only,
-  )
+  try:
+    return state_store.list_backtest_run_page(
+      limit=limit,
+      offset=offset,
+      cursor=cursor,
+      query=query,
+      symbol=symbol,
+      config_id=config_id,
+      favorites_only=favorites_only,
+      include_totals=include_totals,
+      include_filter_options=include_filter_options,
+    )
+  except state_store.SearchTimeoutError as error:
+    logger.warning("search_timeout endpoint=backtest_runs mode=protected")
+    raise _stable_error(504, "search_timeout", str(error)) from error
+  except ValueError as error:
+    raise _stable_error(422, "search_query_invalid", str(error)) from error
+
+
+@app.get(
+  "/api/backtest/run-filter-options",
+  response_model=schemas.BacktestRunFilterOptions,
+)
+def backtest_run_filter_options(
+  config_id: str | None = Query(default=None, alias="configId"),
+):
+  try:
+    return state_store.list_backtest_run_filter_options(config_id)
+  except state_store.SearchTimeoutError as error:
+    logger.warning("search_timeout endpoint=backtest_run_filter_options mode=empty")
+    raise _stable_error(504, "search_timeout", str(error)) from error
+
+
+@app.get("/api/backtest/run-options", response_model=schemas.BacktestRunOptionPage)
+def backtest_run_options(
+  query: str = Query("", max_length=100),
+  limit: int = Query(20, ge=1, le=100),
+  cursor: str | None = Query(default=None, max_length=2048),
+):
+  try:
+    return state_store.list_backtest_run_options(
+      query=query, limit=limit, cursor=cursor,
+    )
+  except state_store.SearchTimeoutError as error:
+    logger.warning("search_timeout endpoint=backtest_run_options mode=protected")
+    raise _stable_error(504, "search_timeout", str(error)) from error
+  except ValueError as error:
+    raise _stable_error(422, "search_query_invalid", str(error)) from error
 
 
 def _stable_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -2641,6 +2694,8 @@ def backtest_run_selection_summary(
     summary = state_store.summarize_backtest_run_selection(
       _selection_payload(payload.selection),
     )
+  except state_store.SearchTimeoutError as error:
+    raise _stable_error(504, "search_timeout", str(error)) from error
   except KeyError as error:
     raise _stable_error(404, "backtest.not_found", "部分回测记录不存在") from error
   except ValueError as error:
@@ -2657,6 +2712,8 @@ def create_signal_detail_export(
     export = state_store.create_signal_detail_export(
       _selection_payload(payload.selection), _idempotency_key(request),
     )
+  except state_store.SearchTimeoutError as error:
+    raise _stable_error(504, "search_timeout", str(error)) from error
   except KeyError as error:
     raise _stable_error(404, "signal_export.not_found", "部分回测记录不存在") from error
   except state_store.RunnerUnavailableError as error:
@@ -2802,15 +2859,18 @@ def shared_backtests(
   favorites_only: bool = Query(False, alias="favoritesOnly"),
 ) -> dict[str, Any]:
   response.headers["Cache-Control"] = "private, no-store"
-  return shared_backtest_discovery.list_shared_backtests(
-    limit=limit,
-    offset=offset,
-    query=query,
-    strategy_category=strategy_category,
-    timeframe=timeframe,
-    sort=sort,
-    favorites_only=favorites_only,
-  )
+  try:
+    return shared_backtest_discovery.list_shared_backtests(
+      limit=limit,
+      offset=offset,
+      query=query,
+      strategy_category=strategy_category,
+      timeframe=timeframe,
+      sort=sort,
+      favorites_only=favorites_only,
+    )
+  except state_store.SearchTimeoutError as error:
+    raise _stable_error(504, "search_timeout", str(error)) from error
 
 
 @app.post("/api/shared-backtests/{publication_id}/favorite")
@@ -3704,6 +3764,8 @@ def delete_backtest_runs(payload: schemas.BacktestRunBatchDeleteRequest):
       )
     else:
       deleted = state_store.delete_backtest_runs(payload.runIds or [])
+  except state_store.SearchTimeoutError as error:
+    raise _stable_error(504, "search_timeout", str(error)) from error
   except KeyError as error:
     raise _stable_error(404, "backtest.not_found", "部分回测记录不存在") from error
   except state_store.SelectionChangedError as error:

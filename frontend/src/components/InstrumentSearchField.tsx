@@ -22,6 +22,7 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
   const searchRequest = useRef(0);
   const valueRequest = useRef(0);
   const commitRequest = useRef(0);
+  const commitController = useRef<AbortController | null>(null);
 
   useEffect(() => {
     setQuery(value);
@@ -33,27 +34,32 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
       setSelected(null);
       return;
     }
-    searchMarketInstruments(value).then((result) => {
+    const controller = new AbortController();
+    searchMarketInstruments(value, { signal: controller.signal }).then((result) => {
       if (requestId !== valueRequest.current) return;
       setSelected(result.find((item) => item.symbol === value) || null);
-    }).catch(() => {
+    }).catch((reason: unknown) => {
+      if (reason instanceof DOMException && reason.name === 'AbortError') return;
       if (requestId === valueRequest.current) setSelected(null);
     });
+    return () => controller.abort();
   }, [value]);
 
   useEffect(() => {
     if (!open) return;
     const requestId = ++searchRequest.current;
+    const controller = new AbortController();
     setLoading(true);
     setActiveIndex(-1);
     const timer = setTimeout(() => {
-      searchMarketInstruments(query).then((result) => {
+      searchMarketInstruments(query, { signal: controller.signal }).then((result) => {
         if (requestId !== searchRequest.current) return;
         setItems(result);
         setActiveIndex(result.length > 0 ? 0 : -1);
         setLoading(false);
         setError('');
       }).catch((reason) => {
+        if (reason instanceof DOMException && reason.name === 'AbortError') return;
         if (requestId !== searchRequest.current) return;
         setItems([]);
         setActiveIndex(-1);
@@ -63,6 +69,7 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
     }, 180);
     return () => {
       clearTimeout(timer);
+      controller.abort();
       if (requestId === searchRequest.current) searchRequest.current += 1;
     };
   }, [open, query]);
@@ -82,7 +89,10 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
     const code = draft.trim().toUpperCase();
     if (!/^\d{6}(?:\.(SH|SZ|BJ))?$/.test(code)) return false;
     const requestId = ++commitRequest.current;
-    const matches = await searchMarketInstruments(code);
+    commitController.current?.abort();
+    const controller = new AbortController();
+    commitController.current = controller;
+    const matches = await searchMarketInstruments(code, { signal: controller.signal });
     if (requestId !== commitRequest.current) return false;
     const item = matches.find((candidate) => candidate.symbol === code || candidate.symbol.startsWith(`${code}.`));
     if (!item) return false;
@@ -92,6 +102,7 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
 
   const cancelEditing = () => {
     commitRequest.current += 1;
+    commitController.current?.abort();
     setQuery(value);
     setEditing(false);
     setOpen(false);

@@ -71,4 +71,26 @@ describe('InstrumentSearchField', () => {
     await waitFor(() => expect(onPreflight).toHaveBeenCalledTimes(1));
     expect(onPreflight).toHaveBeenCalledWith('920161.BJ');
   });
+
+  it('aborts the previous lookup when the value changes or the component unmounts', async () => {
+    const signals: AbortSignal[] = [];
+    searchMock.mockImplementation(async (query, options) => {
+      const signal = options?.signal;
+      if (signal) signals.push(signal);
+      return matches(query);
+    });
+    const view = render(
+      <InstrumentSearchField label="运行标的" value="600519.SH" onChange={vi.fn()} />,
+    );
+    await waitFor(() => expect(signals).toHaveLength(1));
+
+    view.rerender(
+      <InstrumentSearchField label="运行标的" value="920161.BJ" onChange={vi.fn()} />,
+    );
+    await waitFor(() => expect(signals).toHaveLength(2));
+    expect(signals[0].aborted).toBe(true);
+
+    view.unmount();
+    expect(signals[1].aborted).toBe(true);
+  });
 });

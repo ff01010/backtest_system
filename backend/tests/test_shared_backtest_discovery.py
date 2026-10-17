@@ -145,20 +145,21 @@ def test_list_search_filters_favorites_and_uses_stable_copy_order(monkeypatch: A
     offset=24,
   )
 
-  count_sql, count_params = cursor.executions[0]
-  list_sql, list_params = cursor.executions[1]
+  search_queries = [
+    execution for execution in cursor.executions
+    if not execution[0].startswith("SET LOCAL")
+  ]
+  count_sql, count_params = search_queries[0]
+  list_sql, list_params = search_queries[1]
   sql = normalized(list_sql)
   assert "p.status='active'" in sql
-  assert "p.title ILIKE %s" in sql
-  assert "p.author_name_snapshot ILIKE %s" in sql
-  assert "p.symbol ILIKE %s" in sql
-  assert "jsonb_array_elements_text(p.tags)" in sql
+  assert "p.search_text_v1 ILIKE %s" in sql
+  assert "jsonb_array_elements_text(p.tags)" not in sql
   assert "favorite.user_id IS NOT NULL" in sql
   assert "p.strategy_category=%s" in sql and "p.timeframe=%s" in sql
   assert "ORDER BY p.copy_count DESC, p.first_published_at DESC, p.id DESC" in sql
   assert count_params == (
-    "viewer-1", "viewer-1", "%均线%", "%均线%", "%均线%", "%均线%",
-    "directional_holding", "5m",
+    "viewer-1", "viewer-1", "%均线%", "directional_holding", "5m",
   )
   assert list_params == (*count_params, 12, 24)
   assert "snapshot_json" not in page["items"][0]
@@ -178,7 +179,13 @@ def test_latest_order_has_id_tie_breaker(monkeypatch: Any) -> None:
 
   shared_backtest_discovery.list_shared_backtests(sort="latest")
 
-  assert "ORDER BY p.first_published_at DESC, p.id DESC" in normalized(cursor.executions[1][0])
+  search_queries = [
+    execution for execution in cursor.executions
+    if not execution[0].startswith("SET LOCAL")
+  ]
+  assert "ORDER BY p.first_published_at DESC, p.id DESC" in normalized(
+    search_queries[1][0],
+  )
 
 
 @pytest.mark.parametrize("affected, expected", [(1, True), (0, False)])

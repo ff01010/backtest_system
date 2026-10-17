@@ -4,6 +4,7 @@
 from typing import Any, Literal
 
 from backend.services import state_store
+from backend.services.search_query import escape_like_literal
 
 
 SharedBacktestSort = Literal["latest", "copies"]
@@ -13,17 +14,8 @@ def _search_clause(query: str, params: list[Any]) -> str:
   normalized = query.strip()
   if not normalized:
     return ""
-  pattern = f"%{normalized}%"
-  params.extend([pattern, pattern, pattern, pattern])
-  return """
-    AND (
-      p.title ILIKE %s OR p.author_name_snapshot ILIKE %s OR p.symbol ILIKE %s
-      OR EXISTS (
-        SELECT 1 FROM jsonb_array_elements_text(p.tags) AS tag(value)
-        WHERE tag.value ILIKE %s
-      )
-    )
-  """
+  params.append(f"%{escape_like_literal(normalized.lower())}%")
+  return "AND p.search_text_v1 ILIKE %s ESCAPE '\\'"
 
 
 def _filter_clause(
@@ -85,6 +77,7 @@ def list_shared_backtests(
   base_params = [viewer_id, viewer_id, *filter_params]
   with state_store._db() as conn:
     with conn.cursor() as cur:
+      state_store._set_search_statement_timeout(cur)
       cur.execute(f"SELECT count(*) AS value {joins} WHERE {where_sql}", tuple(base_params))
       total = int(cur.fetchone()["value"])
       cur.execute(f"""

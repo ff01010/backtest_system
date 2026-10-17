@@ -28,6 +28,8 @@ class HistoryCursor:
     self.commands.append((query, params))
 
   def fetchone(self) -> dict[str, int]:
+    if "count(*) AS total" in self.last_query:
+      return {"total": self.total, "selectable_total": self.total}
     return {"value": self.total}
 
   def fetchall(self) -> list[dict[str, Any]]:
@@ -128,24 +130,21 @@ def test_history_page_filters_the_complete_user_history(monkeypatch: Any) -> Non
   )
 
   assert [run["displayNo"] for run in page["runs"]] == [42]
-  count_query, count_params = cursor.commands[0]
-  selectable_query, selectable_params = cursor.commands[1]
-  page_query, page_params = cursor.commands[2]
+  search_commands = [item for item in cursor.commands if not item[0].startswith("SET LOCAL")]
+  count_query, count_params = search_commands[0]
+  page_query, page_params = search_commands[1]
   assert "r.owner_user_id=%s" in count_query
   assert "r.config_id=%s" in count_query
-  assert "ILIKE %s" in count_query
-  assert "COALESCE(i.symbol || '.' || i.exchange" in count_query
+  assert "r.search_text_v1 ILIKE %s" in count_query
+  assert "LEFT JOIN strategy_config" not in count_query
+  assert "LEFT JOIN market_instrument" not in count_query
   assert count_params == (
-    "user-1", "config-1", "688981.SH",
-    "%候选%", "%候选%", "%候选%", "%候选%", "%候选%", "%候选%",
+    "user-1", "config-1", "688981.SH", "%候选%",
+    ["succeeded", "failed", "cancelled"],
   )
-  assert "r.status=ANY(%s)" in selectable_query
-  assert selectable_params == (
-    "user-1", ["succeeded", "failed", "cancelled"], "config-1", "688981.SH",
-    "%候选%", "%候选%", "%候选%", "%候选%", "%候选%", "%候选%",
-  )
+  assert "count(*) FILTER" in count_query
   assert "ORDER BY r.created_at DESC, r.id DESC" in page_query
-  assert page_params == (*count_params, 10, 0)
+  assert page_params == ("user-1", "config-1", "688981.SH", "%候选%", 11)
 
 
 def test_history_page_filters_and_orders_favorites(monkeypatch: Any) -> None:
@@ -156,11 +155,11 @@ def test_history_page_filters_and_orders_favorites(monkeypatch: Any) -> None:
 
   state_store.list_backtest_run_page(limit=10, offset=0, favorites_only=True)
 
-  count_query, _ = cursor.commands[0]
-  selectable_query, _ = cursor.commands[1]
-  page_query, _ = cursor.commands[2]
+  search_commands = [item for item in cursor.commands if not item[0].startswith("SET LOCAL")]
+  count_query, _ = search_commands[0]
+  page_query, _ = search_commands[1]
   assert "r.favorited_at IS NOT NULL" in count_query
-  assert "r.status=ANY(%s)" in selectable_query
+  assert "count(*) FILTER" in count_query
   assert "r.favorited_at IS NOT NULL" in page_query
   assert "ORDER BY r.favorited_at DESC, r.id DESC" in page_query
 
@@ -192,6 +191,58 @@ def test_history_endpoint_returns_pagination_metadata(monkeypatch: Any) -> None:
   assert response == expected
 
 
+def test_history_endpoint_maps_database_timeout_to_structured_error(
+  monkeypatch: Any,
+) -> None:
+  def time_out(**_kwargs: Any) -> dict[str, Any]:
+    raise state_store.SearchTimeoutError("搜索耗时过长，请缩小条件后重试")
+
+  monkeypatch.setattr(backend_app.state_store, "list_backtest_run_page", time_out)
+
+  with pytest.raises(backend_app.HTTPException) as captured:
+    backend_app.backtest_runs(
+      limit=20,
+      offset=0,
+      cursor=None,
+      query="候选",
+      symbol=None,
+      config_id=None,
+      favorites_only=False,
+      include_totals=True,
+      include_filter_options=False,
+    )
+
+  assert captured.value.status_code == 504
+  assert captured.value.detail == {
+    "code": "search_timeout",
+    "message": "搜索耗时过长，请缩小条件后重试",
+  }
+
+
+def test_lightweight_option_endpoint_forwards_cursor(monkeypatch: Any) -> None:
+  expected = {"items": [], "nextCursor": None, "limit": 20}
+  calls: list[dict[str, Any]] = []
+
+  def list_options(**kwargs: Any) -> dict[str, Any]:
+    calls.append(kwargs)
+    return expected
+
+  monkeypatch.setattr(
+    backend_app.state_store,
+    "list_backtest_run_options",
+    list_options,
+  )
+
+  response = backend_app.backtest_run_options(
+    query="#42",
+    limit=20,
+    cursor="opaque-cursor",
+  )
+
+  assert response == expected
+  assert calls == [{"query": "#42", "limit": 20, "cursor": "opaque-cursor"}]
+
+
 def test_history_search_accepts_the_displayed_number_prefix(monkeypatch: Any) -> None:
   cursor = HistoryCursor([make_run_row(42)], total=1)
   connection = HistoryConnection(cursor)
@@ -200,10 +251,12 @@ def test_history_search_accepts_the_displayed_number_prefix(monkeypatch: Any) ->
 
   state_store.list_backtest_run_page(limit=10, offset=0, query="#42")
 
-  count_query, count_params = cursor.commands[0]
+  count_query, count_params = next(
+    item for item in cursor.commands if "count(*) AS total" in item[0]
+  )
   assert "r.display_no=%s" in count_query
-  assert count_params[1] == "%#42%"
-  assert count_params[2] == 42
+  assert "ILIKE" not in count_query
+  assert count_params[:2] == ("user-1", 42)
 
 
 def test_history_search_accepts_a_zero_padded_display_number(monkeypatch: Any) -> None:
@@ -214,10 +267,53 @@ def test_history_search_accepts_a_zero_padded_display_number(monkeypatch: Any) -
 
   state_store.list_backtest_run_page(limit=10, offset=0, query="#01")
 
-  count_query, count_params = cursor.commands[0]
+  count_query, count_params = next(
+    item for item in cursor.commands if "count(*) AS total" in item[0]
+  )
   assert "r.display_no=%s" in count_query
-  assert count_params[1] == "%#01%"
-  assert count_params[2] == 1
+  assert "ILIKE" not in count_query
+  assert count_params[:2] == ("user-1", 1)
+
+
+def test_six_digit_search_uses_two_exact_union_branches() -> None:
+  spec = state_store.parse_backtest_run_search("688981")
+
+  query, params = state_store.build_backtest_run_candidate_query(
+    spec,
+    "user-1",
+    favorites_only=True,
+  )
+
+  assert " UNION " in query
+  assert "r.display_no=%s" in query
+  assert "upper(COALESCE(r.requested_params->>'symbol', ''))=ANY(%s)" in query
+  assert "ILIKE" not in query
+  assert params == (
+    "user-1", 688981,
+    "user-1", ["688981.SH", "688981.SZ", "688981.BJ"],
+  )
+
+
+def test_later_cursor_page_skips_totals_and_filter_options(monkeypatch: Any) -> None:
+  cursor = HistoryCursor([make_run_row(42)], total=65)
+  connection = HistoryConnection(cursor)
+  monkeypatch.setattr(state_store, "_db", lambda: history_db(connection))
+  monkeypatch.setattr(state_store, "current_user_id", lambda: "user-1")
+
+  page = state_store.list_backtest_run_page(
+    limit=10,
+    offset=0,
+    include_totals=False,
+    include_filter_options=False,
+  )
+
+  search_commands = [item for item in cursor.commands if not item[0].startswith("SET LOCAL")]
+  assert len(search_commands) == 1
+  assert "count(*)" not in search_commands[0][0]
+  assert "SELECT DISTINCT" not in search_commands[0][0]
+  assert page["total"] is None
+  assert page["selectableTotal"] is None
+  assert page["symbols"] == []
 
 
 @pytest.mark.parametrize(("favorited", "expected"), [(True, True), (False, False)])
