@@ -48,7 +48,8 @@ def test_empty_instrument_search_uses_a_bounded_default_query() -> None:
 
   state_store._execute_instrument_search(cursor, "", 20)
 
-  assert "OR" not in cursor.query
+  assert "symbol LIKE" not in cursor.query
+  assert "lower(display_name) LIKE" not in cursor.query
   assert "LIMIT %s" in cursor.query
   assert cursor.params == (20,)
 

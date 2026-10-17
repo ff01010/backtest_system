@@ -31,23 +31,40 @@ services:
       PGDATABASE: quant_backtest_test
       PGUSER: postgres
       PGPASSWORD: test-postgres-password
+      APP_DB_NAME: quant_backtest_test
       APP_DB_USER: quant_backtest_test_app
+      APPLICATION_BUILD_ID: ffffffffffffffffffffffffffffffffffffffff
+      RELEASE_DB_PASSWORD: test-release-password
     depends_on:
       postgres-test:
         condition: service_healthy
     volumes:
       - ../db/migrations:/migrations:ro
+      - ../db/migration-baselines:/migration-baselines:ro
+      - ../db/migration-runner:/migration-runner:ro
+      - ../scripts/run-database-migrations.sh:/usr/local/bin/run-database-migrations:ro
+    entrypoint: ['sh', '/usr/local/bin/run-database-migrations']
+    command: ['apply']
+
+  migration-upgrade-test:
+    image: postgres:17.4-alpine
+    restart: "no"
+    environment:
+      PGHOST: postgres-test
+      PGPORT: "5432"
+      PGDATABASE: postgres
+      PGUSER: postgres
+      PGPASSWORD: test-postgres-password
+      APP_DB_USER: quant_backtest_test_app
+      RELEASE_DB_PASSWORD: test-release-password
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    volumes:
+      - ..:/workspace:ro
     command:
       - sh
-      - -ec
-      - |
-        for file in /migrations/*.sql; do
-          psql -v ON_ERROR_STOP=1 --set=app_db_user="$${APP_DB_USER}" \
-            -c 'SET ROLE quant_backtest_owner' \
-            -c "SELECT set_config('app.current_user_id', '00000000-0000-0000-0000-000000000001', false)" \
-            -c "SELECT set_config('app.current_is_admin', 'true', false)" \
-            -f "$$file"
-        done
+      - /workspace/scripts/test-database-migrations.sh
 
   backend-tests:
     build:

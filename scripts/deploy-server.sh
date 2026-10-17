@@ -739,6 +739,12 @@ if ! "${compose[@]}" config >/dev/null; then
   restore_env_defaults_backup
   fail "Docker Compose 配置校验失败"
 fi
+"${compose[@]}" up -d postgres
+wait_for_postgres
+if ! "${compose[@]}" --profile migration run --rm migrate plan; then
+  restore_env_defaults_backup
+  fail "数据库迁移计划失败；尚未关闭提交门禁或停止服务"
+fi
 env_defaults_changed=false
 # 不依赖业务迁移的日志服务先预检，避免其故障发生在停服之后。
 observability_preflight_ready=false
@@ -752,8 +758,6 @@ fi
 release_activated=false
 trap deployment_exit_cleanup EXIT
 close_submission_gate
-"${compose[@]}" up -d postgres
-wait_for_postgres
 stop_submission_services
 if runners_support_deployment_barrier; then
   acquire_deployment_barrier
@@ -765,7 +769,7 @@ else
 fi
 check_active_backtests || fail "运行中回测或有效执行槽位未归零；backend 保持停止"
 verify_deployment_barrier || fail "发布前 PostgreSQL 回测领取屏障已丢失"
-"${compose[@]}" --profile migration run --rm migrate
+"${compose[@]}" --profile migration run --rm migrate apply
 # 事件观察器需要迁移后的表结构；启动失败仅降级故障归因。
 if [[ "$observability_preflight_ready" == "true" ]]; then
   if "${compose[@]}" up -d --build container-event-observer; then
