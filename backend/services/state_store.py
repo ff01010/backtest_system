@@ -82,6 +82,7 @@ class ExperimentRunRetainedError(ValueError):
 
 
 _BACKTEST_SCHEDULER_LOCK_KEY = 314159265
+_BACKTEST_DEPLOYMENT_BARRIER_LOCK_KEY = 741_852_963
 _BACKTEST_SCHEDULER_LOCK_TIMEOUT_MS = 2_000
 _BACKTEST_SCHEDULER_WRITE_TIMEOUT_MS = 250
 _STRATEGY_NAME_MAX_LENGTH = 64
@@ -2432,6 +2433,14 @@ def _claim_backtest_job(
   """领取 Bar/L2 共用容量中的一个槽位。"""
   if job_kind not in {"bar", "l2"}:
     raise ValueError("回测任务类型无效")
+  cur.execute(
+    "SELECT pg_try_advisory_xact_lock_shared(%s) AS acquired",
+    (_BACKTEST_DEPLOYMENT_BARRIER_LOCK_KEY,),
+  )
+  barrier = cur.fetchone()
+  if not barrier or not bool(barrier["acquired"]):
+    logger.info("发布领取屏障已关闭: kind=%s", job_kind)
+    return None
   cur.execute(
     "SELECT set_config('lock_timeout', %s, true)",
     (f"{_BACKTEST_SCHEDULER_LOCK_TIMEOUT_MS}ms",),

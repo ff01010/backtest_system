@@ -65,7 +65,7 @@ def __getattr__(name: str) -> Any:
 
 def run_backtest(
   payload: dict[str, Any],
-  script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+  script_executor: Callable[[dict[str, Any], pd.DataFrame], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
   """按策略 ID 分发到对应适配器。"""
   if payload["strategy"] == "user_script":
@@ -136,7 +136,7 @@ def run_trend_grid_backtest(payload: dict[str, Any]) -> dict[str, Any]:
 
 def run_user_script_backtest(
   payload: dict[str, Any],
-  script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+  script_executor: Callable[[dict[str, Any], pd.DataFrame], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
   """将脚本快照交给隔离容器运行，后端只持有数据和结果。"""
   script_id = payload.get("scriptId")
@@ -197,6 +197,8 @@ def run_user_script_backtest(
   execute_script = script_executor
   execution_result = execute_script({
     "scriptId": script_id,
+    "strategy": payload.get("strategy", "user_script"),
+    "symbol": payload["symbol"],
     "code": script["code"],
     "params": {
       **payload.get("strategyParams", {}),
@@ -205,12 +207,6 @@ def run_user_script_backtest(
       "corePositionOverlay": _strategy_category(payload) == "core_position_overlay",
       "_researchSignalByBarTime": research_signal_by_bar_time,
     },
-    "bars": [
-      {"time": str(row.time), "symbol": payload["symbol"], "open": float(row.open),
-       "high": float(row.high), "low": float(row.low), "close": float(row.close),
-       "volume": float(row.volume)}
-      for row in bars.itertuples(index=False)
-    ],
     "initialCapital": float(payload["initialCapital"]),
     "commissionRate": float(payload["commissionRate"]),
     "feeProfile": dict(payload.get("feeProfile") or {}),
@@ -236,7 +232,7 @@ def run_user_script_backtest(
       or payload.get("capabilityDigest")
       or "legacy"
     ),
-  })
+  }, bars)
   initial_cash = float(payload["initialCapital"])
   base_quantity = int(payload.get("baseQuantity", 0))
   base_cost_price = float(payload.get("baseCostPrice", 0))
@@ -352,7 +348,7 @@ def _research_signal_by_bar_time(
 
 def run_research_signal_backtest(
   payload: dict[str, Any],
-  script_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+  script_executor: Callable[[dict[str, Any], pd.DataFrame], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
   """通过现有 Bar 策略子进程回放冻结的标准研究信号快照。"""
   snapshot = payload.get("researchSignalSnapshot")

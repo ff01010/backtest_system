@@ -5,6 +5,7 @@ import json
 import ipaddress
 import os
 import re
+import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -160,6 +161,44 @@ if not 0.2 <= BACKTEST_CANCEL_POLL_SECONDS <= 10:
 BACKTEST_CANCEL_GRACE_SECONDS = _read_bounded_int(
   "TREND_GRID_BACKTEST_CANCEL_GRACE_SECONDS", 5, 1, 30,
 )
+BAR_IPC_MODE = os.getenv("TREND_GRID_BAR_IPC_MODE", "legacy").strip().lower()
+if BAR_IPC_MODE not in {"legacy", "auto"}:
+  raise ValueError("TREND_GRID_BAR_IPC_MODE 必须是 legacy 或 auto")
+_bar_runner_shm_size_raw = os.getenv("TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES", "").strip()
+if not _bar_runner_shm_size_raw and BAR_IPC_MODE == "auto":
+  raise ValueError("auto 模式必须配置 TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES")
+BAR_RUNNER_SHM_SIZE_BYTES = _read_bounded_int(
+  "TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES",
+  134_217_728,
+  1_048_576,
+  16 * 1024 * 1024 * 1024,
+) if _bar_runner_shm_size_raw else 134_217_728
+BAR_IPC_TEMP_ROOT = os.getenv(
+  "TREND_GRID_BAR_IPC_TEMP_ROOT",
+  os.path.join(tempfile.gettempdir(), "trend-grid-bar-ipc"),
+).strip()
+if BAR_IPC_MODE == "auto" and not BAR_IPC_TEMP_ROOT:
+  raise ValueError("auto 模式必须配置 TREND_GRID_BAR_IPC_TEMP_ROOT")
+
+
+def validate_bar_ipc_configuration() -> None:
+  """auto 模式拒绝缺失或指向用户产物目录的 IPC 配置。"""
+  if BAR_IPC_MODE == "legacy":
+    return
+  if BAR_IPC_MODE != "auto":
+    raise ValueError("TREND_GRID_BAR_IPC_MODE 必须是 legacy 或 auto")
+  if not 1_048_576 <= BAR_RUNNER_SHM_SIZE_BYTES <= 16 * 1024 * 1024 * 1024:
+    raise ValueError("TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES 不在允许范围")
+  temp_root = Path(BAR_IPC_TEMP_ROOT).resolve()
+  output_root = Path(OUTPUT_ROOT).resolve() if "OUTPUT_ROOT" in globals() else None
+  if (
+    temp_root == Path(temp_root.anchor)
+    or (
+      output_root is not None
+      and (temp_root == output_root or output_root in temp_root.parents)
+    )
+  ):
+    raise ValueError("TREND_GRID_BAR_IPC_TEMP_ROOT 必须是独立的受管临时目录")
 BACKTEST_CAPACITY_OVERRIDE_MAX_TTL_SECONDS = _read_bounded_int(
   "TREND_GRID_BACKTEST_CAPACITY_OVERRIDE_MAX_TTL_SECONDS", 3600, 60, 86400,
 )

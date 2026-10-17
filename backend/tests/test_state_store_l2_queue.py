@@ -135,6 +135,7 @@ def test_claim_persists_each_attempt_without_overwriting_expired_attempt() -> No
     "attempt_no": 2, "attempt_token": "attempt-b", "lease_expires_at": "later",
   }
   cursor = FakeCursor(None, fetch_rows=[
+    {"acquired": True},
     {
       "job_kind": "bar", "run_id": "run-b", "owner_user_id": "user-b",
       "owner_active_count": 0,
@@ -151,6 +152,16 @@ def test_claim_persists_each_attempt_without_overwriting_expired_attempt() -> No
   assert "UPDATE backtest_run_attempt" in commands
   assert "termination_reason='lease_expired'" in commands
   assert "INSERT INTO backtest_run_attempt" in commands
+
+
+def test_claim_returns_without_touching_queue_when_deployment_barrier_is_held() -> None:
+  cursor = FakeCursor(None, fetch_rows=[{"acquired": False}])
+
+  assert state_store._claim_backtest_job(cursor, "bar", "runner-b", 30) is None
+  assert cursor.commands == [(
+    "SELECT pg_try_advisory_xact_lock_shared(%s) AS acquired",
+    (state_store._BACKTEST_DEPLOYMENT_BARRIER_LOCK_KEY,),
+  )]
 
 
 def test_queued_job_freezes_runtime_route_in_columns_and_payload(monkeypatch: Any) -> None:
@@ -196,6 +207,7 @@ def test_global_scheduler_uses_fairness_burst_for_user_without_slot(monkeypatch:
     "attempt_token": "attempt-b", "lease_expires_at": "later",
   }
   cursor = FakeCursor(None, fetch_rows=[
+    {"acquired": True},
     {"job_kind": "bar", "run_id": "run-b", "owner_user_id": "user-b", "owner_active_count": 0},
     {"run_id": "run-b"},
     {"active_count": 8, "override_limit": None},
@@ -219,6 +231,7 @@ def test_global_scheduler_uses_fairness_burst_for_user_without_slot(monkeypatch:
 
 def test_global_scheduler_does_not_burst_for_user_with_active_slot(monkeypatch: Any) -> None:
   cursor = FakeCursor(None, fetch_rows=[
+    {"acquired": True},
     {"job_kind": "bar", "run_id": "run-a", "owner_user_id": "user-a", "owner_active_count": 1},
     {"run_id": "run-a"},
     {"active_count": 8, "override_limit": None},
@@ -385,32 +398,36 @@ def test_actual_worker_data_snapshot_is_extracted_for_run_history() -> None:
   }
 
 def test_claim_bar_job_finalizes_expired_cancelled_jobs_before_claiming(monkeypatch: Any) -> None:
-  cursor = FakeCursor(None)
+  cursor = FakeCursor(None, fetch_rows=[{"acquired": True}])
   connection = FakeConnection(cursor)
   monkeypatch.setattr(state_store, "_db", lambda: fake_db(connection))
 
   assert state_store.claim_bar_backtest_job("runner-1", 30) is None
 
   assert cursor.commands[0] == (
+    "SELECT pg_try_advisory_xact_lock_shared(%s) AS acquired",
+    (state_store._BACKTEST_DEPLOYMENT_BARRIER_LOCK_KEY,),
+  )
+  assert cursor.commands[1] == (
     "SELECT set_config('lock_timeout', %s, true)",
     ("2000ms",),
   )
-  assert cursor.commands[1] == (
+  assert cursor.commands[2] == (
     "SELECT pg_advisory_xact_lock(%s)",
     (state_store._BACKTEST_SCHEDULER_LOCK_KEY,),
   )
-  assert cursor.commands[2] == (
+  assert cursor.commands[3] == (
     "SELECT set_config('lock_timeout', %s, true)",
     ("250ms",),
   )
-  cleanup_query, cleanup_params = cursor.commands[3]
+  cleanup_query, cleanup_params = cursor.commands[4]
   assert "UPDATE bar_backtest_job" in cleanup_query
   assert "status='cancelling' AND lease_expires_at < now()" in cleanup_query
   assert "UPDATE backtest_run AS run" in cleanup_query
   assert cleanup_params is None
-  assert "UPDATE l2_backtest_job" in cursor.commands[4][0]
-  assert "DELETE FROM backtest_execution_slot" in cursor.commands[5][0]
-  claim_query, claim_params = cursor.commands[6]
+  assert "UPDATE l2_backtest_job" in cursor.commands[5][0]
+  assert "DELETE FROM backtest_execution_slot" in cursor.commands[6][0]
+  claim_query, claim_params = cursor.commands[7]
   assert "UNION ALL" in claim_query
   assert claim_params == (
     state_store.SCRIPT_RUNTIME_VERSION,

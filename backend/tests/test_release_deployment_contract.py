@@ -316,7 +316,7 @@ def test_observability_failure_cannot_stop_core_release_after_cutover() -> None:
 
   preflight = script.index("up -d --build docker-socket-proxy loki alloy")
   gate_close = script.index("\nclose_submission_gate\n")
-  core_stop = script.index("\nstop_submission_and_wait_for_backtests\n")
+  core_stop = script.index("\nstop_submission_services\n")
   assert preflight < gate_close < core_stop
 
   migration = script.index("run --rm migrate")
@@ -341,6 +341,49 @@ def test_observability_failure_cannot_stop_core_release_after_cutover() -> None:
   assert "return 1" in observability_check
   assert "fail " not in observability_check
   assert "可观测性未通过" in script
+
+
+def test_deploy_holds_database_claim_barrier_until_new_runners_are_healthy() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  state_store = (ROOT / "backend" / "services" / "state_store.py").read_text(
+    encoding="utf-8",
+  )
+
+  assert "741_852_963" in state_store
+  assert "backtest_barrier_lock_key=741852963" in script
+  assert "pg_try_advisory_xact_lock_shared" in state_store
+  acquire = script.index("\n  acquire_deployment_barrier\n")
+  wait_active = script.index("\n  wait_for_active_backtests\n")
+  migration = script.index('"${compose[@]}" --profile migration run --rm migrate')
+  health = script.index('wait_for_application "$http_port"', migration)
+  final_verify = script.index(
+    'verify_deployment_barrier || fail "应用健康检查完成前 PostgreSQL 回测领取屏障已丢失"',
+  )
+  release = script.index("\nrelease_deployment_barrier\n", final_verify)
+  gate_open = script.index("\nopen_submission_gate\n")
+
+  assert acquire < wait_active < migration < health < final_verify < release < gate_open
+  assert "pause_legacy_runners_for_bootstrap" in script
+  assert 'docker rm --force "$container_id"' in script
+  assert "resume_bootstrap_runners" in script
+  assert "pg_terminate_backend(${barrier_backend_pid})" in script
+  assert "PGAPPNAME='${barrier_session_name}'" in script
+  assert "SELECT pid FROM pg_stat_activity WHERE application_name=" in script
+
+
+def test_bar_runner_compose_uses_one_shm_capacity_configuration() -> None:
+  compose = (ROOT / "deploy" / "compose.infrastructure.yml").read_text(encoding="utf-8")
+  env_example = (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
+  runner = compose.split("  bar-runner:", 1)[1].split("\n  experiment-coordinator:", 1)[0]
+
+  expected = "${TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES:-134217728}"
+  assert f"TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES: {expected}" in runner
+  assert f"shm_size: {expected}" in runner
+  assert "TREND_GRID_BAR_IPC_MODE=legacy" in env_example
+  assert "TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES=134217728" in env_example
+  assert "append_bar_ipc_env_defaults" in (
+    ROOT / "scripts" / "deploy-server.sh"
+  ).read_text(encoding="utf-8")
 
 
 def test_socket_proxy_uses_exact_read_only_endpoint_allowlist() -> None:

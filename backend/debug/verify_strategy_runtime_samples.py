@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
+import pandas as pd
+
 from backend.bar_strategy_session import BarStrategySession
 from backend.l2.models import NormalizedBar
 from backend.l2.strategy_session import L2StrategySession
@@ -72,8 +74,22 @@ def _payload(sample: dict[str, Any], index: int) -> dict[str, Any]:
   }
 
 
+def _run_bar_session(
+  session: BarStrategySession,
+  payload: dict[str, Any],
+) -> dict[str, Any]:
+  control = dict(payload)
+  rows = control.pop("bars")
+  control["symbol"] = rows[0]["symbol"]
+  frame = pd.DataFrame([
+    {key: value for key, value in row.items() if key != "symbol"}
+    for row in rows
+  ])
+  return session.run_script(control, frame)
+
+
 def _verify_bar_runtime() -> None:
-  result = BarStrategySession().run_script({
+  result = _run_bar_session(BarStrategySession(), {
     "scriptId": "bar-runtime-smoke",
     "code": "def on_bar(bar, state):\n  state['items'] = tuple(enumerate(range(2)))\n  return []\n",
     "params": {},
@@ -124,7 +140,7 @@ def main() -> None:
   succeeded = 0
   for index, sample in enumerate(samples, start=1):
     try:
-      result = BarStrategySession().run_script(_payload(sample, index))
+      result = _run_bar_session(BarStrategySession(), _payload(sample, index))
       if not isinstance(result.get("portfolioSnapshots"), list):
         raise ValueError("Bar 策略子进程未返回最终账户快照")
     except Exception as error:

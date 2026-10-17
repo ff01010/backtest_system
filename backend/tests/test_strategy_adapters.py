@@ -429,8 +429,12 @@ def test_user_script_aligns_frozen_signal_after_loading_formal_bars(
   monkeypatch.setattr(backtest_runner, "_build_benchmark_equity", lambda *_args: ([], []))
   captured: dict[str, Any] = {}
 
-  def execute(script_payload: dict[str, Any]) -> dict[str, Any]:
+  def execute(
+    script_payload: dict[str, Any],
+    market_data: pd.DataFrame,
+  ) -> dict[str, Any]:
     captured.update(script_payload)
+    captured["marketData"] = market_data
     return {
       "trades": [], "fills": [], "skippedSignals": [], "unexecutedOrders": [], "warnings": [],
       "portfolioSnapshots": [{
@@ -459,6 +463,8 @@ def test_user_script_aligns_frozen_signal_after_loading_formal_bars(
 
   signals = captured["params"]["_researchSignalByBarTime"]
   assert list(signals) == ["20260602093500"]
+  assert captured["marketData"].equals(bars)
+  assert "bars" not in captured
   assert result["researchSignalSnapshot"]["alignmentPlan"][0]["executionBarTime"] == "20260602093500"
 
 

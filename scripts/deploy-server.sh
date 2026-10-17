@@ -10,6 +10,12 @@ deploy_lock_file="/tmp/quant-backtest-deploy.lock"
 script_args=("$@")
 env_defaults_changed=false
 env_backup_file="${env_file}.backup-before-managed-update"
+backtest_barrier_lock_key=741852963
+barrier_keeper_pid=""
+barrier_backend_pid=""
+barrier_output_file=""
+barrier_session_name=""
+paused_runner_ids=""
 
 # 让 flock 父进程持有整段发布锁，脚本更新后可在同一把锁内安全重启。
 if [[ "${QUANT_DEPLOY_LOCK_HELD:-}" != "1" ]]; then
@@ -64,8 +70,10 @@ append_auth_session_env_defaults() {
     && "$(env_key_count TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS)" == "1" ]]; then
     return
   fi
-  cp --preserve=mode "$env_file" "$env_backup_file" \
-    || fail "无法备份 deploy/.env"
+  if [[ "$env_defaults_changed" != "true" ]]; then
+    cp --preserve=mode "$env_file" "$env_backup_file" \
+      || fail "无法备份 deploy/.env"
+  fi
   temp_file="$(mktemp "${env_file}.tmp.XXXXXX")"
   cp --preserve=mode "$env_file" "$temp_file" || {
     rm -f "$temp_file"
@@ -82,6 +90,42 @@ append_auth_session_env_defaults() {
   if [[ "$(env_key_count TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS)" == "0" ]]; then
     printf '\n# 最近活动时间的最小写入间隔，用于减少高频接口轮询造成的数据库写入。\nTREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS=300\n' >> "$temp_file"
     added_names+=(TREND_GRID_AUTH_SESSION_TOUCH_INTERVAL_SECONDS)
+  fi
+  mv "$temp_file" "$env_file" || {
+    rm -f "$temp_file"
+    fail "无法原子更新 deploy/.env"
+  }
+  env_defaults_changed=true
+  echo "发布配置已增量新增变量：${added_names[*]}；原配置已备份至 ${env_backup_file}"
+}
+
+append_bar_ipc_env_defaults() {
+  local name count temp_file
+  local added_names=()
+  for name in TREND_GRID_BAR_IPC_MODE TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES; do
+    count="$(env_key_count "$name")"
+    [[ "$count" -le 1 ]] || fail "deploy/.env 中的 ${name} 存在重复定义"
+  done
+  if [[ "$(env_key_count TREND_GRID_BAR_IPC_MODE)" == "1" \
+    && "$(env_key_count TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES)" == "1" ]]; then
+    return
+  fi
+  if [[ "$env_defaults_changed" != "true" ]]; then
+    cp --preserve=mode "$env_file" "$env_backup_file" \
+      || fail "无法备份 deploy/.env"
+  fi
+  temp_file="$(mktemp "${env_file}.tmp.XXXXXX")"
+  cp --preserve=mode "$env_file" "$temp_file" || {
+    rm -f "$temp_file"
+    fail "无法创建 deploy/.env 临时副本"
+  }
+  if [[ "$(env_key_count TREND_GRID_BAR_IPC_MODE)" == "0" ]]; then
+    printf '\n# 标准 Bar 行情跨进程传输模式；首次发布与回滚保持 legacy，完成全部验收后才切换 auto。\nTREND_GRID_BAR_IPC_MODE=legacy\n' >> "$temp_file"
+    added_names+=(TREND_GRID_BAR_IPC_MODE)
+  fi
+  if [[ "$(env_key_count TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES)" == "0" ]]; then
+    printf '\n# 每个 Bar Runner 容器的 /dev/shm 上限；auto 模式最多使用其中 75%%。\nTREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES=134217728\n' >> "$temp_file"
+    added_names+=(TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES)
   fi
   mv "$temp_file" "$env_file" || {
     rm -f "$temp_file"
@@ -121,6 +165,20 @@ validate_auth_session_env() {
   }
 }
 
+validate_bar_ipc_env() {
+  local mode shm_size
+  [[ "$(env_key_count TREND_GRID_BAR_IPC_MODE)" == "1" ]] || return 1
+  mode="$(grep -E '^TREND_GRID_BAR_IPC_MODE=' "$env_file" | cut -d= -f2-)"
+  mode="${mode//[[:space:]]/}"
+  [[ "$mode" == "legacy" || "$mode" == "auto" ]] || {
+    echo "deploy/.env 中的 TREND_GRID_BAR_IPC_MODE 必须是 legacy 或 auto" >&2
+    return 1
+  }
+  shm_size="$(read_bounded_env_int TREND_GRID_BAR_RUNNER_SHM_SIZE_BYTES 1048576 17179869184)" \
+    || return 1
+  [[ -n "$shm_size" ]]
+}
+
 restore_env_defaults_backup() {
   local temp_file
   [[ "$env_defaults_changed" == "true" && -f "$env_backup_file" ]] || return
@@ -149,6 +207,43 @@ report_incomplete_release() {
   if [[ "${release_activated:-false}" != "true" ]]; then
     echo "发布未完成：新回测提交门禁保持关闭，需完成激活或完整回退后手动开放" >&2
   fi
+}
+
+release_deployment_barrier() {
+  if [[ -n "$barrier_keeper_pid" ]]; then
+    if [[ "$barrier_backend_pid" =~ ^[0-9]+$ ]]; then
+      docker exec quant-backtest-postgres sh -c \
+        "psql -U \"\$POSTGRES_USER\" -d \"\$APP_DB_NAME\" -Atc \"SELECT pg_terminate_backend(${barrier_backend_pid});\"" \
+        >/dev/null 2>&1 || true
+    fi
+    kill "$barrier_keeper_pid" >/dev/null 2>&1 || true
+    wait "$barrier_keeper_pid" >/dev/null 2>&1 || true
+    barrier_keeper_pid=""
+    barrier_backend_pid=""
+    barrier_session_name=""
+  fi
+  if [[ -n "$barrier_output_file" ]]; then
+    rm -f "$barrier_output_file"
+    barrier_output_file=""
+  fi
+}
+
+resume_bootstrap_runners() {
+  local container_id
+  [[ -n "$paused_runner_ids" ]] || return
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    docker unpause "$container_id" >/dev/null 2>&1 || true
+  done <<< "$paused_runner_ids"
+  paused_runner_ids=""
+}
+
+deployment_exit_cleanup() {
+  local status=$?
+  release_deployment_barrier
+  resume_bootstrap_runners
+  report_incomplete_release
+  return "$status"
 }
 
 read_client_compatibility_version() {
@@ -206,26 +301,109 @@ read_runner_replicas() {
 }
 
 check_active_backtests() {
-  local counts queued active
-  counts="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT count(*) FILTER (WHERE status='"'"'queued'"'"'), count(*) FILTER (WHERE status IN ('"'"'running'"'"','"'"'cancelling'"'"')) FROM backtest_run;"')"
+  local counts queued active slots
+  counts="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT count(*) FILTER (WHERE status='"'"'queued'"'"'), count(*) FILTER (WHERE status IN ('"'"'running'"'"','"'"'cancelling'"'"')), (SELECT count(*) FROM backtest_execution_slot WHERE lease_expires_at >= now()) FROM backtest_run;"')"
   queued="${counts%%|*}"
-  active="${counts##*|}"
-  echo "发布前回测任务：queued=${queued}, active=${active}"
-  [[ "$queued" == "0" && "$active" == "0" ]]
+  active="${counts#*|}"
+  active="${active%%|*}"
+  slots="${counts##*|}"
+  echo "发布前回测任务：queued=${queued}, active=${active}, slots=${slots}"
+  [[ "$active" == "0" && "$slots" == "0" ]]
 }
 
-stop_submission_and_wait_for_backtests() {
-  local attempt
-  echo "停止 backend，阻断新的页面和开放 API 回测提交"
+stop_submission_services() {
+  echo "停止提交与辅助服务，保留已排队回测"
   "${compose[@]}" stop frontend backend experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner storage-probe
+}
+
+wait_for_active_backtests() {
+  local attempt
   for attempt in $(seq 1 360); do
     if check_active_backtests; then
-      echo "回测队列已排空，可以开始迁移和同批发布"
+      echo "运行中回测和有效执行槽位已归零；排队任务保持不变"
       return
     fi
     sleep 5
   done
-  fail "30 分钟内未能排空回测任务；backend 保持停止"
+  fail "30 分钟内运行中回测未归零；backend 保持停止"
+}
+
+runners_support_deployment_barrier() {
+  local service container_id container_ids
+  for service in bar-runner l2-runner; do
+    container_ids="$("${compose[@]}" ps -q "$service")"
+    [[ -n "$container_ids" ]] || return 1
+    while IFS= read -r container_id; do
+      [[ -n "$container_id" ]] || continue
+      docker exec "$container_id" python -c \
+        "from backend.services import state_store; assert hasattr(state_store, '_BACKTEST_DEPLOYMENT_BARRIER_LOCK_KEY')" \
+        >/dev/null 2>&1 || return 1
+    done <<< "$container_ids"
+  done
+}
+
+verify_deployment_barrier() {
+  [[ "$barrier_backend_pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "$barrier_keeper_pid" ]] && kill -0 "$barrier_keeper_pid" 2>/dev/null || return 1
+  local held
+  held="$(docker exec quant-backtest-postgres sh -c \
+    "psql -U \"\$POSTGRES_USER\" -d \"\$APP_DB_NAME\" -Atc \"SELECT count(*) FROM pg_locks WHERE pid=${barrier_backend_pid} AND locktype='advisory' AND mode='ExclusiveLock' AND granted;\"")"
+  [[ "$held" == "1" ]]
+}
+
+acquire_deployment_barrier() {
+  local attempt
+  barrier_session_name="quant-backtest-deploy-${deployment_id}"
+  barrier_output_file="$(mktemp /tmp/quant-backtest-barrier.XXXXXX)"
+  docker exec quant-backtest-postgres sh -c \
+    "PGAPPNAME='${barrier_session_name}' psql -U \"\$POSTGRES_USER\" -d \"\$APP_DB_NAME\" -v ON_ERROR_STOP=1 -Atc \"SELECT pg_advisory_lock(${backtest_barrier_lock_key}); SELECT pg_sleep(86400);\"" \
+    >"$barrier_output_file" 2>&1 &
+  barrier_keeper_pid=$!
+  for attempt in $(seq 1 60); do
+    barrier_backend_pid="$(docker exec quant-backtest-postgres sh -c \
+      "psql -U \"\$POSTGRES_USER\" -d \"\$APP_DB_NAME\" -Atc \"SELECT pid FROM pg_stat_activity WHERE application_name='${barrier_session_name}' AND datname=current_database() ORDER BY backend_start DESC LIMIT 1;\"" 2>/dev/null || true)"
+    if verify_deployment_barrier; then
+      echo "已取得 PostgreSQL 回测领取排他屏障：pid=${barrier_backend_pid}"
+      return
+    fi
+    kill -0 "$barrier_keeper_pid" 2>/dev/null \
+      || fail "发布辅助进程在取得回测领取屏障前异常退出"
+    sleep 1
+  done
+  fail "60 秒内未取得 PostgreSQL 回测领取排他屏障"
+}
+
+pause_legacy_runners_for_bootstrap() {
+  local attempt container_id current_ids
+  for attempt in $(seq 1 360); do
+    if check_active_backtests; then
+      current_ids="$("${compose[@]}" ps -q bar-runner; "${compose[@]}" ps -q l2-runner)"
+      [[ -n "$current_ids" ]] || fail "首次屏障发布缺少旧 Runner 容器"
+      while IFS= read -r container_id; do
+        [[ -n "$container_id" ]] || continue
+        docker pause "$container_id" >/dev/null
+      done <<< "$current_ids"
+      paused_runner_ids="$current_ids"
+      if check_active_backtests; then
+        echo "旧 Bar/L2 Runner 已暂停，首次发布引导屏障成立"
+        return
+      fi
+      resume_bootstrap_runners
+    fi
+    sleep 5
+  done
+  fail "30 分钟内无法建立首次发布引导屏障"
+}
+
+remove_paused_bootstrap_runners() {
+  local container_id
+  [[ -n "$paused_runner_ids" ]] || return
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    docker rm --force "$container_id" >/dev/null \
+      || fail "无法替换已暂停的旧 Runner 容器"
+  done <<< "$paused_runner_ids"
+  paused_runner_ids=""
 }
 
 runner_containers_ready() {
@@ -535,9 +713,14 @@ if [[ "$script_digest_before" != "$script_digest_after" \
 fi
 
 append_auth_session_env_defaults
+append_bar_ipc_env_defaults
 if ! validate_auth_session_env; then
   restore_env_defaults_backup
   fail "登录会话配置校验失败"
+fi
+if ! validate_bar_ipc_env; then
+  restore_env_defaults_backup
+  fail "标准 Bar IPC 配置校验失败"
 fi
 require_release_database_password
 APPLICATION_BUILD_ID="$(git rev-parse HEAD)"
@@ -567,12 +750,21 @@ else
 fi
 
 release_activated=false
-trap report_incomplete_release EXIT
+trap deployment_exit_cleanup EXIT
 close_submission_gate
 "${compose[@]}" up -d postgres
 wait_for_postgres
-stop_submission_and_wait_for_backtests
-check_active_backtests || fail "回测任务未完全排空；backend 保持停止"
+stop_submission_services
+if runners_support_deployment_barrier; then
+  acquire_deployment_barrier
+  wait_for_active_backtests
+else
+  pause_legacy_runners_for_bootstrap
+  acquire_deployment_barrier
+  remove_paused_bootstrap_runners
+fi
+check_active_backtests || fail "运行中回测或有效执行槽位未归零；backend 保持停止"
+verify_deployment_barrier || fail "发布前 PostgreSQL 回测领取屏障已丢失"
 "${compose[@]}" --profile migration run --rm migrate
 # 事件观察器需要迁移后的表结构；启动失败仅降级故障归因。
 if [[ "$observability_preflight_ready" == "true" ]]; then
@@ -595,6 +787,7 @@ verify_clickhouse_connectivity
 "${compose[@]}" ps
 http_port="$(read_http_port)"
 wait_for_application "$http_port" "$bar_runner_replicas" "$l2_runner_replicas"
+verify_deployment_barrier || fail "应用健康检查完成前 PostgreSQL 回测领取屏障已丢失"
 verify_frontend_build "$http_port"
 verify_market_instrument_directory
 
@@ -612,8 +805,10 @@ fi
 active_build="$(docker exec quant-backtest-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$APP_DB_NAME" -Atc "SELECT trim(current_build_id) FROM app_deployment_state WHERE singleton_key=true;"')"
 [[ "$active_build" == "$APPLICATION_BUILD_ID" ]] || fail "发布激活后数据库构建标识不一致"
 preserve_recovery_image
+release_deployment_barrier
 release_activated=true
 open_submission_gate
+trap - EXIT
 echo "版本通知已激活：buildId=${APPLICATION_BUILD_ID}"
 # 完整链路探针放在恢复业务之后，避免辅助服务延长停机窗口。
 if [[ "$observability_preflight_ready" == "true" ]]; then

@@ -324,6 +324,46 @@ def test_l2_scheduler_favors_the_user_with_fewer_active_slots() -> None:
   ]
 
 
+def test_deployment_barrier_blocks_bar_and_l2_claims_but_not_queued_jobs() -> None:
+  bar_run_id = _as_user(QUEUE_A, lambda: state_store.create_bar_backtest_job({
+    "symbol": "688981.SH", "timeframe": "5m", "fillModel": "bar_next_open",
+    "strategy": "user_script",
+  }))[0]
+  l2_run_id = _as_user(QUEUE_B, lambda: state_store.create_l2_backtest_job({
+    "symbol": "688981.SH", "timeframe": "5m", "fillModel": "l2_quote",
+  }))[0]
+
+  with _admin_connection() as barrier_connection:
+    barrier_connection.execute(
+      "SELECT pg_advisory_lock(%s)",
+      (state_store._BACKTEST_DEPLOYMENT_BARRIER_LOCK_KEY,),
+    )
+    assert _as_user(
+      ADMIN, lambda: state_store.claim_bar_backtest_job("barrier-bar:1", 30),
+    ) is None
+    assert _as_user(
+      ADMIN, lambda: state_store.claim_l2_backtest_job("barrier-l2:2", 30),
+    ) is None
+    with _admin_connection() as observer:
+      statuses = observer.execute(
+        "SELECT id, status FROM backtest_run WHERE id=ANY(%s::uuid[]) ORDER BY id",
+        ([bar_run_id, l2_run_id],),
+      ).fetchall()
+    assert {str(row["id"]): row["status"] for row in statuses} == {
+      bar_run_id: "queued",
+      l2_run_id: "queued",
+    }
+    # 不主动 unlock，验证发布辅助连接异常断开时 PostgreSQL 会自动释放会话锁。
+
+  assert _as_user(
+    ADMIN, lambda: state_store.claim_bar_backtest_job("barrier-bar:1", 30),
+  )["runId"] == bar_run_id
+  assert _as_user(
+    ADMIN, lambda: state_store.claim_l2_backtest_job("barrier-l2:2", 30),
+  )["runId"] == l2_run_id
+  _queue_slots_and_finish_jobs()
+
+
 def _publication_snapshot(
   title: str,
   benchmark_symbol: str = "000300.SH",

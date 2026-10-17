@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from backend import settings
+from backend.bar_market_data_transport import cleanup_stale_bar_market_data
 from backend.bar_strategy_session import BarStrategySession
 from backend.services import backtest_runner, research_result_outbox, state_store
 from backend.services.backtest_errors import error_detail, error_summary, error_terminal_status
@@ -215,6 +216,10 @@ class _BarJobLeaseKeeper:
 def main() -> None:
   logging.basicConfig(level=os.getenv("TREND_GRID_LOG_LEVEL", "INFO"))
   run_runtime_deep_probe()
+  settings.validate_bar_ipc_configuration()
+  if settings.BAR_IPC_TEMP_ROOT:
+    cleaned = cleanup_stale_bar_market_data(settings.BAR_IPC_TEMP_ROOT)
+    logger.info("Bar IPC 启动审计完成: cleaned=%s", cleaned)
   state_store.ensure_schema()
   BarRunner().run_forever()
 
