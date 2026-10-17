@@ -16,6 +16,15 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION_ROOT = ROOT / "db" / "migrations"
+MIGRATION_RUNNER = ROOT / "scripts" / "run-database-migrations.sh"
+MIGRATION_LEDGER_SCHEMA = (
+  ROOT / "db" / "migration-runner" / "001_schema_migration_ledger.sql"
+)
+PRODUCTION_BASELINE_BUILD = "6483efebcb183605be69d4453bc2d11f6780e0a1"
+PRODUCTION_BASELINE = (
+  ROOT / "db" / "migration-baselines" / f"{PRODUCTION_BASELINE_BUILD}.sha256"
+)
+LEGACY_MIGRATION_MAX_VERSION = 59
 LEGACY_NON_TRANSACTIONAL_MIGRATIONS = frozenset(
   {
     "009_normalize_trading_date_json.sql",
@@ -51,20 +60,23 @@ def test_migrations_only_grant_or_revoke_declared_roles() -> None:
   assert unexpected_roles == []
 
 
-def test_new_migrations_are_transactional() -> None:
-  non_transactional_migrations: list[str] = []
+def test_migration_files_follow_versioned_transaction_contract() -> None:
+  invalid_migrations: list[str] = []
 
   for migration in sorted(MIGRATION_ROOT.glob("*.sql")):
-    if migration.name in LEGACY_NON_TRANSACTIONAL_MIGRATIONS:
-      continue
     sql = migration.read_text(encoding="utf-8")
-    if not re.search(r"(?m)^BEGIN;\s*$", sql) or not re.search(
-      r"(?m)^COMMIT;\s*$",
-      sql,
-    ):
-      non_transactional_migrations.append(migration.name)
+    version = int(migration.name.split("_", 1)[0])
+    has_begin = re.search(r"(?m)^BEGIN;\s*$", sql) is not None
+    has_commit = re.search(r"(?m)^COMMIT;\s*$", sql) is not None
+    if version <= LEGACY_MIGRATION_MAX_VERSION:
+      if migration.name not in LEGACY_NON_TRANSACTIONAL_MIGRATIONS and not (
+        has_begin and has_commit
+      ):
+        invalid_migrations.append(migration.name)
+    elif has_begin or has_commit:
+      invalid_migrations.append(migration.name)
 
-  assert non_transactional_migrations == []
+  assert invalid_migrations == []
 
 
 @pytest.mark.parametrize(
@@ -74,23 +86,62 @@ def test_new_migrations_are_transactional() -> None:
     ROOT / "deploy" / "compose.test.yml",
   ),
 )
-def test_migration_runner_sets_admin_rls_context_before_sql_files(
-  compose_path: Path,
-) -> None:
+def test_compose_services_use_the_shared_migration_runner(compose_path: Path) -> None:
   compose = compose_path.read_text(encoding="utf-8")
-  role = compose.index("-c 'SET ROLE quant_backtest_owner'")
-  user_context = compose.index(
-    "set_config('app.current_user_id', "
-    "'00000000-0000-0000-0000-000000000001', false)",
-    role,
-  )
-  admin_context = compose.index(
-    "set_config('app.current_is_admin', 'true', false)",
-    user_context,
-  )
-  migration_file = compose.index('-f "$$file"', admin_context)
+  assert "for file in /migrations/*.sql" not in compose
+  assert "run-database-migrations.sh" in compose
 
-  assert role < user_context < admin_context < migration_file
+
+def test_migration_runner_exposes_plan_and_apply_with_admin_rls_context() -> None:
+  runner = MIGRATION_RUNNER.read_text(encoding="utf-8")
+  role = runner.index("SET ROLE quant_backtest_owner")
+  user_context = runner.index("app.current_user_id", role)
+  admin_context = runner.index("app.current_is_admin", user_context)
+
+  assert "plan|apply" in runner
+  assert 'if [ "$mode" = "apply" ]' in runner
+  assert "pg_advisory_lock" in runner
+  assert "--single-transaction" in runner
+  assert "sha256sum" in runner
+  assert role < user_context < admin_context
+
+
+def test_production_baseline_covers_every_existing_migration_through_056() -> None:
+  entries = [
+    line.split()[1]
+    for line in PRODUCTION_BASELINE.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+  ]
+  expected = [
+    migration.name
+    for migration in sorted(MIGRATION_ROOT.glob("*.sql"))
+    if int(migration.name.split("_", 1)[0]) <= 56
+  ]
+
+  assert entries == expected
+  assert all(
+    re.fullmatch(r"[0-9a-f]{64}\s{2}\d{3}_[A-Za-z0-9_-]+\.sql", line)
+    for line in PRODUCTION_BASELINE.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+  )
+
+
+def test_migration_ledger_is_owner_only_and_records_application_kind() -> None:
+  schema = MIGRATION_LEDGER_SCHEMA.read_text(encoding="utf-8")
+
+  assert "CREATE TABLE IF NOT EXISTS app_schema_migration" in schema
+  assert "baseline" in schema
+  assert "migration" in schema
+  assert "ALTER TABLE app_schema_migration OWNER TO quant_backtest_owner" in schema
+  assert "REVOKE ALL ON app_schema_migration FROM PUBLIC" in schema
+
+
+def test_backend_gate_runs_upgrade_regression_before_fresh_install() -> None:
+  script = (ROOT / "scripts" / "test-backend.ps1").read_text(encoding="utf-8")
+  compose = (ROOT / "deploy" / "compose.test.yml").read_text(encoding="utf-8")
+
+  assert script.index("migration-upgrade-test") < script.index("backend-tests")
+  assert "test-database-migrations.sh" in compose
 
 
 def test_scheduler_capacity_constraint_matches_configurable_maximum() -> None:
@@ -301,7 +352,7 @@ def test_observability_services_are_pinned_isolated_and_started_before_applicati
   assert script.index("up -d --build docker-socket-proxy loki alloy") < script.index(
     "\nclose_submission_gate\n",
   )
-  assert script.index("run --rm migrate") < script.index(
+  assert script.index("run --rm migrate apply") < script.index(
     "up -d --build container-event-observer",
   )
   assert script.index(
@@ -319,7 +370,7 @@ def test_observability_failure_cannot_stop_core_release_after_cutover() -> None:
   core_stop = script.index("\nstop_submission_services\n")
   assert preflight < gate_close < core_stop
 
-  migration = script.index("run --rm migrate")
+  migration = script.index("run --rm migrate apply")
   observer = script.index("up -d --build container-event-observer")
   core_start = script.index(
     "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner",
@@ -354,7 +405,7 @@ def test_deploy_holds_database_claim_barrier_until_new_runners_are_healthy() -> 
   assert "pg_try_advisory_xact_lock_shared" in state_store
   acquire = script.index("\n  acquire_deployment_barrier\n")
   wait_active = script.index("\n  wait_for_active_backtests\n")
-  migration = script.index('"${compose[@]}" --profile migration run --rm migrate')
+  migration = script.index('"${compose[@]}" --profile migration run --rm migrate apply')
   health = script.index('wait_for_application "$http_port"', migration)
   final_verify = script.index(
     'verify_deployment_barrier || fail "应用健康检查完成前 PostgreSQL 回测领取屏障已丢失"',
@@ -369,6 +420,18 @@ def test_deploy_holds_database_claim_barrier_until_new_runners_are_healthy() -> 
   assert "pg_terminate_backend(${barrier_backend_pid})" in script
   assert "PGAPPNAME='${barrier_session_name}'" in script
   assert "SELECT pid FROM pg_stat_activity WHERE application_name=" in script
+
+
+def test_deploy_plans_migrations_before_closing_submission_gate() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+
+  postgres = script.index('"${compose[@]}" up -d postgres')
+  plan = script.index('"${compose[@]}" --profile migration run --rm migrate plan')
+  compose_validation = script.index('"${compose[@]}" config >/dev/null')
+  gate_close = script.index("\nclose_submission_gate\n")
+  apply = script.index('"${compose[@]}" --profile migration run --rm migrate apply')
+
+  assert compose_validation < postgres < plan < gate_close < apply
 
 
 def test_bar_runner_compose_uses_one_shm_capacity_configuration() -> None:
