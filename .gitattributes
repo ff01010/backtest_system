@@ -1,0 +1,3 @@
+*.sh text eol=lf
+backend/requirements.lock text eol=lf
+db/migration-baselines/*.sha256 text eol=lf

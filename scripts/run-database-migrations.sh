@@ -117,7 +117,9 @@ validate_baseline_manifest() {
   awk -F '|' -v max="$BASELINE_MAX_VERSION" \
     '$1 <= max { print $3 "  " $2 }' "$inventory_file" \
     > "$temp_root/current-baseline"
-  if ! cmp -s "$BASELINE_MANIFEST" "$temp_root/current-baseline"; then
+  sed 's/\r$//' "$BASELINE_MANIFEST" > "$temp_root/expected-baseline"
+  if ! cmp -s "$temp_root/expected-baseline" \
+    "$temp_root/current-baseline"; then
     fail "production baseline checksums do not match migrations through 056"
   fi
 }

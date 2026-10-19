@@ -8,6 +8,7 @@ clickhouse_compose_file="$project_root/deploy/compose.clickhouse.yml"
 submission_gate_dir="$project_root/deploy/submission-gate"
 deploy_lock_file="/tmp/quant-backtest-deploy.lock"
 script_args=("$@")
+requested_command="${1:-release}"
 env_defaults_changed=false
 env_backup_file="${env_file}.backup-before-managed-update"
 backtest_barrier_lock_key=741852963
@@ -16,9 +17,15 @@ barrier_backend_pid=""
 barrier_output_file=""
 barrier_session_name=""
 paused_runner_ids=""
+cutover_started=false
+migration_started=false
+release_activated=false
+recovery_manifest_file=""
+previous_build_id=""
 
 # 让 flock 父进程持有整段发布锁，脚本更新后可在同一把锁内安全重启。
-if [[ "${QUANT_DEPLOY_LOCK_HELD:-}" != "1" ]]; then
+if [[ "$requested_command" != "status" \
+  && "${QUANT_DEPLOY_LOCK_HELD:-}" != "1" ]]; then
   command -v flock >/dev/null || {
     echo "发布终止：未安装 flock，无法保证发布互斥" >&2
     exit 1
@@ -238,11 +245,56 @@ resume_bootstrap_runners() {
   paused_runner_ids=""
 }
 
+restore_pre_migration_release() {
+  local service image_ref recovery_ref attempt response port
+  local recovery_services=()
+  [[ -n "$recovery_manifest_file" && -f "$recovery_manifest_file" ]] || return 1
+  while IFS='|' read -r service image_ref recovery_ref; do
+    [[ -n "$service" ]] || continue
+    docker image tag "$recovery_ref" "$image_ref" >/dev/null || return 1
+    recovery_services+=("$service")
+  done < "$recovery_manifest_file"
+  [[ "${#recovery_services[@]}" -gt 0 ]] || return 1
+  APPLICATION_BUILD_ID="$previous_build_id"
+  export APPLICATION_BUILD_ID
+  "${compose[@]}" up -d --no-build --remove-orphans \
+    --scale "bar-runner=$bar_runner_replicas" \
+    --scale "l2-runner=$l2_runner_replicas" \
+    "${recovery_services[@]}" || return 1
+  port="$(read_http_port)"
+  for attempt in $(seq 1 45); do
+    response="$(curl --fail --silent --show-error \
+      "http://127.0.0.1:${port}/api/health" 2>/dev/null || true)"
+    if runner_containers_ready "bar-runner" "$bar_runner_replicas" \
+      && runner_containers_ready "l2-runner" "$l2_runner_replicas" \
+      && [[ "$response" == *'"status":"ok"'* ]] \
+      && [[ "$response" == *"\"applicationBuildId\":\"${previous_build_id}\""* ]]; then
+      open_submission_gate
+      release_activated=true
+      echo "迁移开始前发布失败，已恢复原构建：${previous_build_id}" >&2
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 deployment_exit_cleanup() {
   local status=$?
   release_deployment_barrier
   resume_bootstrap_runners
-  report_incomplete_release
+  if [[ "$cutover_started" == "true" && "$status" != "0" \
+    && "$migration_started" == "false" ]]; then
+    if ! restore_pre_migration_release; then
+      echo "发布恢复失败：提交门禁保持关闭，请人工恢复原镜像" >&2
+    fi
+  fi
+  if [[ -n "$recovery_manifest_file" ]]; then
+    rm -f "$recovery_manifest_file"
+  fi
+  if [[ "$cutover_started" == "true" ]]; then
+    report_incomplete_release
+  fi
   return "$status"
 }
 
@@ -673,6 +725,100 @@ preserve_recovery_image() {
   echo "已建立恢复镜像基线：${recovery_image}"
 }
 
+preserve_current_service_images() {
+  local service container_id image_id image_ref recovery_ref
+  local services=(backend bar-runner l2-runner experiment-coordinator
+    evaluation-worker evaluation-export-worker experiment-purge-worker
+    signal-export-runner storage-probe frontend)
+  previous_build_id="$(docker inspect --format \
+    '{{ index .Config.Labels "io.trend-grid.application-build-id" }}' \
+    quant-backtest-backend 2>/dev/null || true)"
+  [[ "$previous_build_id" =~ ^[0-9a-f]{40}$ ]] \
+    || fail "无法识别当前生产构建，不能建立恢复镜像"
+  recovery_manifest_file="$(mktemp /tmp/quant-backtest-recovery.XXXXXX)"
+  for service in "${services[@]}"; do
+    container_id="$("${compose[@]}" ps -q "$service" | head -n 1)"
+    if [[ -z "$container_id" ]]; then
+      echo "恢复镜像跳过首次新增服务：${service}"
+      continue
+    fi
+    image_id="$(docker inspect --format '{{.Image}}' "$container_id")"
+    image_ref="$(docker inspect --format '{{.Config.Image}}' "$container_id")"
+    recovery_ref="quant-backtest-recovery/${service}:${previous_build_id}"
+    docker image tag "$image_id" "$recovery_ref"
+    printf '%s|%s|%s\n' "$service" "$image_ref" "$recovery_ref" \
+      >> "$recovery_manifest_file"
+  done
+  echo "已保留原构建恢复镜像：${previous_build_id}"
+}
+
+build_release_images() {
+  preserve_current_service_images
+  "${compose[@]}" build \
+    backend bar-runner l2-runner container-event-observer \
+    experiment-coordinator evaluation-worker evaluation-export-worker \
+    experiment-purge-worker signal-export-runner storage-probe frontend
+  "${compose[@]}" --profile release-admin build release-admin
+  verify_release_admin_image
+  echo "目标构建镜像预构建完成：${APPLICATION_BUILD_ID}"
+}
+
+confirm_release_target() {
+  local expected confirmation
+  expected="${APPLICATION_BUILD_ID:0:8}"
+  if [[ "${QUANT_DEPLOY_CONFIRMED_SHA:-}" == "$APPLICATION_BUILD_ID" ]]; then
+    return
+  fi
+  [[ -t 0 ]] || fail "非交互发布必须设置匹配的 QUANT_DEPLOY_CONFIRMED_SHA"
+  read -r -p "输入目标提交前 8 位 ${expected} 以确认正式发布：" confirmation
+  [[ "$confirmation" == "$expected" ]] || fail "目标提交确认不匹配"
+}
+
+deployment_status() {
+  local branch tree_state gate current_build database_build migration_version
+  local bar_count l2_count exited_count port response
+  branch="$(git branch --show-current 2>/dev/null || true)"
+  tree_state="clean"
+  [[ -z "$(git status --porcelain 2>/dev/null || true)" ]] || tree_state="dirty"
+  gate="open"
+  [[ -f "$submission_gate_dir/closed" ]] && gate="closed"
+  current_build="$(docker inspect --format \
+    '{{ index .Config.Labels "io.trend-grid.application-build-id" }}' \
+    quant-backtest-backend 2>/dev/null || true)"
+  database_build="$(docker exec quant-backtest-postgres sh -c \
+    "psql -U \"\$POSTGRES_USER\" -d \"\$APP_DB_NAME\" -Atq -c \
+    \"SELECT COALESCE((SELECT trim(current_build_id) FROM app_deployment_state WHERE singleton_key), 'unknown')\"" \
+    2>/dev/null || true)"
+  migration_version="$(docker exec quant-backtest-postgres sh -c \
+    "psql -U \"\$POSTGRES_USER\" -d \"\$APP_DB_NAME\" -Atq -c \
+    \"SELECT CASE WHEN to_regclass('public.app_schema_migration') IS NULL THEN 'absent' ELSE (SELECT COALESCE(max(version)::text, 'empty') FROM app_schema_migration) END\"" \
+    2>/dev/null || true)"
+  bar_count="$(docker ps --filter label=com.docker.compose.project=quant-backtest-platform \
+    --filter label=com.docker.compose.service=bar-runner --format '{{.ID}}' | wc -l | tr -d ' ')"
+  l2_count="$(docker ps --filter label=com.docker.compose.project=quant-backtest-platform \
+    --filter label=com.docker.compose.service=l2-runner --format '{{.ID}}' | wc -l | tr -d ' ')"
+  exited_count="$(docker ps -a --filter label=com.docker.compose.project=quant-backtest-platform \
+    --filter status=exited --format '{{.ID}}' | wc -l | tr -d ' ')"
+  port="$(read_http_port)"
+  response="$(curl --fail --silent --show-error \
+    "http://127.0.0.1:${port}/api/health" 2>/dev/null || true)"
+  echo "repository_branch=${branch:-unknown}"
+  echo "repository_head=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "working_tree=$tree_state"
+  echo "submission_gate=$gate"
+  echo "running_build_id=${current_build:-unknown}"
+  echo "database_build_id=${database_build:-unknown}"
+  echo "migration_version=${migration_version:-unknown}"
+  echo "bar_runner_count=$bar_count"
+  echo "l2_runner_count=$l2_count"
+  echo "exited_container_count=$exited_count"
+  if [[ "$response" == *'"status":"ok"'* ]]; then
+    echo "application_health=ok"
+  else
+    echo "application_health=unavailable"
+  fi
+}
+
 [[ -f "$env_file" ]] || fail "缺少服务器环境文件：$env_file"
 [[ -f "$clickhouse_compose_file" ]] || fail "缺少 ClickHouse 网络配置：$clickhouse_compose_file"
 command -v docker >/dev/null || fail "未安装 Docker"
@@ -680,6 +826,19 @@ command -v curl >/dev/null || fail "未安装 curl"
 command -v sha256sum >/dev/null || fail "未安装 sha256sum，无法校验发布镜像"
 
 cd "$project_root"
+
+case "$requested_command" in
+  status)
+    [[ "$#" == "1" ]] || fail "用法：deploy-server.sh status"
+    deployment_status
+    exit 0
+    ;;
+  release)
+    ;;
+  *)
+    ;;
+esac
+
 [[ "$(git branch --show-current)" == "main" ]] || fail "当前分支不是 main"
 [[ -z "$(git status --porcelain)" ]] || fail "工作区有未提交改动，请先处理后再发布"
 
@@ -698,8 +857,9 @@ if [[ "${1:-deploy}" == "activate-experiment-epoch" ]]; then
   activate_experiment_epoch "$2" "$3" "$4"
   exit 0
 fi
-[[ "$#" == "0" || "${1:-}" == "deploy" ]] \
-  || fail "未知命令：${1:-}"
+[[ "$#" == "0" || "$requested_command" == "deploy" \
+  || "$requested_command" == "release" ]] \
+  || fail "未知命令：${requested_command}；可用命令：release、status"
 
 script_digest_before="$(sha256sum "$project_root/scripts/deploy-server.sh" | cut -d' ' -f1)"
 git fetch origin main
@@ -746,6 +906,8 @@ if ! "${compose[@]}" --profile migration run --rm migrate plan; then
   fail "数据库迁移计划失败；尚未关闭提交门禁或停止服务"
 fi
 env_defaults_changed=false
+trap deployment_exit_cleanup EXIT
+build_release_images
 # 不依赖业务迁移的日志服务先预检，避免其故障发生在停服之后。
 observability_preflight_ready=false
 if "${compose[@]}" up -d --build docker-socket-proxy loki alloy \
@@ -754,9 +916,9 @@ if "${compose[@]}" up -d --build docker-socket-proxy loki alloy \
 else
   echo "警告：可观测性未通过预检，将继续核心回测发布" >&2
 fi
+confirm_release_target
 
-release_activated=false
-trap deployment_exit_cleanup EXIT
+cutover_started=true
 close_submission_gate
 stop_submission_services
 if runners_support_deployment_barrier; then
@@ -769,24 +931,23 @@ else
 fi
 check_active_backtests || fail "运行中回测或有效执行槽位未归零；backend 保持停止"
 verify_deployment_barrier || fail "发布前 PostgreSQL 回测领取屏障已丢失"
+migration_started=true
 "${compose[@]}" --profile migration run --rm migrate apply
 # 事件观察器需要迁移后的表结构；启动失败仅降级故障归因。
 if [[ "$observability_preflight_ready" == "true" ]]; then
-  if "${compose[@]}" up -d --build container-event-observer; then
+  if "${compose[@]}" up -d --no-build container-event-observer; then
     echo "容器事件观察器已启动"
   else
     observability_preflight_ready=false
     echo "警告：容器事件观察器启动失败，将继续核心回测发布" >&2
   fi
 fi
-"${compose[@]}" up -d --build --remove-orphans \
+"${compose[@]}" up -d --no-build --remove-orphans \
   --scale "bar-runner=$bar_runner_replicas" \
   --scale "l2-runner=$l2_runner_replicas" \
   backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner storage-probe
-"${compose[@]}" --profile release-admin build release-admin
-verify_release_admin_image
 # Nginx 在启动时解析 backend 容器地址；后端重建后必须刷新 frontend，避免保留旧地址返回 502。
-"${compose[@]}" up -d --build --force-recreate frontend
+"${compose[@]}" up -d --no-build --force-recreate frontend
 verify_clickhouse_connectivity
 "${compose[@]}" ps
 http_port="$(read_http_port)"
@@ -812,6 +973,10 @@ preserve_recovery_image
 release_deployment_barrier
 release_activated=true
 open_submission_gate
+if [[ -n "$recovery_manifest_file" ]]; then
+  rm -f "$recovery_manifest_file"
+  recovery_manifest_file=""
+fi
 trap - EXIT
 echo "版本通知已激活：buildId=${APPLICATION_BUILD_ID}"
 # 完整链路探针放在恢复业务之后，避免辅助服务延长停机窗口。
