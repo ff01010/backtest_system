@@ -2071,13 +2071,7 @@ def create_api_backtest_job(
         WHERE record.api_key_id=%s AND run.status IN ('queued', 'running', 'cancelling')
       """, (api_key_id,))
       if int(cur.fetchone()["value"]) >= settings.PUBLIC_API_MAX_INFLIGHT:
-        raise ValueError("API Key 正在排队或运行的回测已达上限")
-      cur.execute("""
-        SELECT count(*) AS value FROM api_idempotency_record
-        WHERE api_key_id=%s AND created_at >= current_date
-      """, (api_key_id,))
-      if int(cur.fetchone()["value"]) >= settings.PUBLIC_API_DAILY_SUBMIT_LIMIT:
-        raise ValueError("API Key 今日回测提交次数已达上限")
+        raise ValueError("API Key 排队、运行或取消中的回测已达上限")
       cur.execute("""
         INSERT INTO api_idempotency_record (
           api_key_id, owner_user_id, idempotency_key, request_hash,

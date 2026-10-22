@@ -526,8 +526,9 @@ def validate_research_integration_configuration() -> None:
 # 对外回测 API 默认关闭。启用后必须配置私有 pepper，避免仅用数据库摘要保护 API Key。
 PUBLIC_API_ENABLED = os.getenv("TREND_GRID_PUBLIC_API_ENABLED", "false").lower() == "true"
 API_KEY_PEPPER = os.getenv("TREND_GRID_API_KEY_PEPPER", "")
-PUBLIC_API_MAX_INFLIGHT = _read_bounded_int("TREND_GRID_PUBLIC_API_MAX_INFLIGHT", 2, 1, 20)
-PUBLIC_API_DAILY_SUBMIT_LIMIT = _read_bounded_int("TREND_GRID_PUBLIC_API_DAILY_SUBMIT_LIMIT", 100, 1, 10_000)
+PUBLIC_API_MAX_INFLIGHT = _read_bounded_int(
+  "TREND_GRID_PUBLIC_API_MAX_INFLIGHT", 100, 1, 100,
+)
 
 
 def validate_public_api_configuration() -> None:

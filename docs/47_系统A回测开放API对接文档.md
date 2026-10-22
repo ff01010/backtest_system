@@ -220,16 +220,15 @@ curl -X POST "{BASE_URL}/api/v1/backtests" \
 - 用户主动发起新回测必须生成新 Key；
 - 当前接口不公开承诺幂等键自动过期，调用方不得复用已经使用过的 Key。
 
-### 6.2 默认限额
+### 6.2 在途任务限额
 
-当前默认限额：
+当前限制单个 API Key 同时处于排队、运行或取消中的任务数量：
 
 | 限额 | 默认值 |
 |---|---:|
-| 单个 API Key 排队、运行或取消中的任务总数 | 2 |
-| 单个 API Key 自然日提交次数 | 100 |
+| 单个 API Key 排队、运行或取消中的任务总数 | 100 |
 
-部署环境可以调整以上额度。超过额度时返回 HTTP `429`，且不创建回测任务。
+部署环境可以在 `1～100` 范围内调整该额度。达到上限时返回 HTTP `429`，且不创建回测任务；已有任务进入终态后会释放名额。接口不限制单个 API Key 的自然日累计提交次数。
 
 ## 7. 查询任务列表
 
@@ -457,7 +456,7 @@ Authorization: Bearer qbk_xxx
 | 422 | `backtest.validation_failed` | 请求字段、方案参数或数据覆盖不符合要求 |
 | 422 | `strategy.validation_failed` | 策略代码、结构、日期、标的或回测配置无效 |
 | 422 | `strategy.parameter_invalid` | 策略参数未声明或值与声明类型不匹配 |
-| 429 | `rate_limit.exceeded` | 活动任务数或当日提交数达到上限 |
+| 429 | `rate_limit.exceeded` | 排队、运行或取消中的任务数达到上限 |
 | 503 | `request.failed` | 回测 Runner 暂时不可用 |
 | 503 | `backtest.unavailable` | 接口发生未预期的服务异常 |
 

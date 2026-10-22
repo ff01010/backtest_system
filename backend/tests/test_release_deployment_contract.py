@@ -239,6 +239,16 @@ def test_agent_rules_name_one_click_release_maintenance_triggers() -> None:
     assert trigger in rules
 
 
+def test_public_api_submission_quota_only_limits_inflight_work() -> None:
+  settings = (ROOT / "backend" / "settings.py").read_text(encoding="utf-8")
+  env_example = (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
+
+  assert '"TREND_GRID_PUBLIC_API_MAX_INFLIGHT", 100, 1, 100' in settings
+  assert "TREND_GRID_PUBLIC_API_MAX_INFLIGHT=100" in env_example
+  assert "PUBLIC_API_DAILY_SUBMIT_LIMIT" not in settings
+  assert "PUBLIC_API_DAILY_SUBMIT_LIMIT" not in env_example
+
+
 def test_scheduler_capacity_constraint_matches_configurable_maximum() -> None:
   settings = (ROOT / "backend" / "settings.py").read_text(encoding="utf-8")
   migration = (
