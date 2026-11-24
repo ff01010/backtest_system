@@ -1898,6 +1898,12 @@ def create_bar_backtest_job(payload: dict[str, Any]) -> tuple[str, int]:
       )
 
 
+def _browser_backtest_request_key(idempotency_key: str) -> str:
+  """将浏览器幂等键映射到已有的用户级唯一请求键。"""
+  digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+  return f"browser:{digest}"
+
+
 def create_browser_backtest_job(
   payload: dict[str, Any],
   idempotency_key: str,
@@ -1905,24 +1911,34 @@ def create_browser_backtest_job(
 ) -> tuple[str, int, bool, str, str]:
   """使用用户级事务锁幂等创建网页回测，兼容未使用该请求头的旧客户端。"""
   owner_user_id = current_user_id()
+  request_key = _browser_backtest_request_key(idempotency_key)
   with _db() as conn:
     with conn.cursor() as cur:
       cur.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-        (f"browser-backtest:{owner_user_id}:{idempotency_key}",),
+        (f"browser-backtest:{owner_user_id}:{request_key}",),
       )
       cur.execute("""
-        SELECT id, display_no, status, fill_model, requested_params
+        SELECT id, display_no, status, fill_model,
+          requested_params->'_browserIdempotency'->>'requestHash' AS request_hash
         FROM backtest_run
-        WHERE owner_user_id=%s
-          AND requested_params->'_browserIdempotency'->>'key'=%s
-        ORDER BY created_at DESC LIMIT 1
-      """, (owner_user_id, idempotency_key))
+        WHERE owner_user_id=%s AND request_key=%s
+        LIMIT 1
+      """, (owner_user_id, request_key))
       existing = cur.fetchone()
+      if existing is None:
+        # 历史网页任务尚未写入 request_key，保留一次精确 JSON 索引兼容查询。
+        cur.execute("""
+          SELECT id, display_no, status, fill_model,
+            requested_params->'_browserIdempotency'->>'requestHash' AS request_hash
+          FROM backtest_run
+          WHERE owner_user_id=%s
+            AND requested_params->'_browserIdempotency'->>'key'=%s
+          LIMIT 1
+        """, (owner_user_id, idempotency_key))
+        existing = cur.fetchone()
       if existing:
-        requested = _json(existing.get("requested_params"), {})
-        idempotency = requested.get("_browserIdempotency", {})
-        if not isinstance(idempotency, dict) or idempotency.get("requestHash") != request_hash:
+        if existing.get("request_hash") != request_hash:
           raise IdempotencyConflictError("同一幂等键不能用于不同请求")
         return (
           _uuid(existing["id"]) or "",
@@ -1942,6 +1958,7 @@ def create_browser_backtest_job(
       queue_table = "l2_backtest_job" if fill_model == "l2_quote" else "bar_backtest_job"
       run_id, display_no = _create_queued_backtest_job(
         cur, stored_payload, owner_user_id, queue_table, fill_model,
+        request_key=request_key,
       )
       return run_id, display_no, False, "queued", fill_model
 
@@ -2071,13 +2088,7 @@ def create_api_backtest_job(
         WHERE record.api_key_id=%s AND run.status IN ('queued', 'running', 'cancelling')
       """, (api_key_id,))
       if int(cur.fetchone()["value"]) >= settings.PUBLIC_API_MAX_INFLIGHT:
-        raise ValueError("API Key 正在排队或运行的回测已达上限")
-      cur.execute("""
-        SELECT count(*) AS value FROM api_idempotency_record
-        WHERE api_key_id=%s AND created_at >= current_date
-      """, (api_key_id,))
-      if int(cur.fetchone()["value"]) >= settings.PUBLIC_API_DAILY_SUBMIT_LIMIT:
-        raise ValueError("API Key 今日回测提交次数已达上限")
+        raise ValueError("API Key 排队、运行或取消中的回测已达上限")
       cur.execute("""
         INSERT INTO api_idempotency_record (
           api_key_id, owner_user_id, idempotency_key, request_hash,

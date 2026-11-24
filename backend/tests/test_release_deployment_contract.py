@@ -18,6 +18,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATION_ROOT = ROOT / "db" / "migrations"
 MIGRATION_RUNNER = ROOT / "scripts" / "run-database-migrations.sh"
+LOCAL_RELEASE_CHECK = ROOT / "scripts" / "release-check.ps1"
 MIGRATION_LEDGER_SCHEMA = (
   ROOT / "db" / "migration-runner" / "001_schema_migration_ledger.sql"
 )
@@ -145,6 +146,8 @@ def test_production_baseline_checksums_are_line_ending_independent() -> None:
   }
 
   assert recorded == expected
+  runner = MIGRATION_RUNNER.read_text(encoding="utf-8")
+  assert 'sed \'s/\\r$//\' "$BASELINE_MANIFEST"' in runner
 
 
 def test_migration_ledger_is_owner_only_and_records_application_kind() -> None:
@@ -163,6 +166,87 @@ def test_backend_gate_runs_upgrade_regression_before_fresh_install() -> None:
 
   assert script.index("migration-upgrade-test") < script.index("backend-tests")
   assert "test-database-migrations.sh" in compose
+
+
+def test_personal_release_check_wraps_the_complete_local_gate() -> None:
+  script = LOCAL_RELEASE_CHECK.read_text(encoding="utf-8")
+  attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+
+  assert '"develop"' in script
+  assert "git status --porcelain" in script
+  assert "git fetch origin main develop" in script
+  assert "origin/main..HEAD" in script
+  assert "test-backend.ps1" in script
+  assert "git rev-parse HEAD" in script
+  assert "*.sh text eol=lf" in attributes
+  assert "backend/requirements.lock text eol=lf" in attributes
+
+
+def test_server_release_has_read_only_status_and_confirmed_preflight() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  status_function = script.split("deployment_status() {", 1)[1].split("\n}", 1)[0]
+  prebuild = script.index("\nbuild_release_images\n")
+  confirmation = script.index("\nconfirm_release_target\n")
+  gate_close = script.index("\nclose_submission_gate\n")
+
+  assert "status)" in script
+  assert "release)" in script
+  assert "git fetch" not in status_function
+  assert "git pull" not in status_function
+  assert "submission_gate=" in status_function
+  assert "bar_runner_count=" in status_function
+  assert "l2_runner_count=" in status_function
+  assert prebuild < confirmation < gate_close
+  assert "输入目标提交前 8 位" in script
+
+
+def test_release_preserves_old_images_and_only_auto_recovers_before_migration() -> None:
+  script = (ROOT / "scripts" / "deploy-server.sh").read_text(encoding="utf-8")
+  cleanup_trap = script.index("\ntrap deployment_exit_cleanup EXIT\n")
+  prebuild = script.index("\nbuild_release_images\n")
+  gate_close = script.index("\nclose_submission_gate\n")
+  migration = script.index('"${compose[@]}" --profile migration run --rm migrate apply')
+
+  assert "preserve_current_service_images" in script
+  assert "quant-backtest-recovery/" in script
+  assert "restore_pre_migration_release" in script
+  assert "migration_started=false" in script
+  assert "cutover_started=true" in script
+  assert cleanup_trap < prebuild < gate_close < migration
+  assert 'if [[ "$cutover_started" == "true"' in script
+  assert '&& "$migration_started" == "false"' in script
+  assert 'if [[ "$cutover_started" == "true" ]]; then\n    report_incomplete_release' in script
+  assert 'recovery_services+=("$service")' in script
+  assert '"${recovery_services[@]}" || return 1' in script
+  assert "up -d --no-build --remove-orphans" in script
+
+
+def test_agent_rules_name_one_click_release_maintenance_triggers() -> None:
+  rules = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+  assert "## 一键发布脚本维护" in rules
+  assert "scripts/release-check.ps1" in rules
+  assert "scripts/deploy-server.sh" in rules
+  for trigger in (
+    "服务",
+    "Dockerfile",
+    "数据库迁移",
+    "提交门禁",
+    "健康检查",
+    "环境变量",
+    "构建标识",
+  ):
+    assert trigger in rules
+
+
+def test_public_api_submission_quota_only_limits_inflight_work() -> None:
+  settings = (ROOT / "backend" / "settings.py").read_text(encoding="utf-8")
+  env_example = (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
+
+  assert '"TREND_GRID_PUBLIC_API_MAX_INFLIGHT", 100, 1, 100' in settings
+  assert "TREND_GRID_PUBLIC_API_MAX_INFLIGHT=100" in env_example
+  assert "PUBLIC_API_DAILY_SUBMIT_LIMIT" not in settings
+  assert "PUBLIC_API_DAILY_SUBMIT_LIMIT" not in env_example
 
 
 def test_scheduler_capacity_constraint_matches_configurable_maximum() -> None:
@@ -374,7 +458,7 @@ def test_observability_services_are_pinned_isolated_and_started_before_applicati
     "\nclose_submission_gate\n",
   )
   assert script.index("run --rm migrate apply") < script.index(
-    "up -d --build container-event-observer",
+    "up -d --no-build container-event-observer",
   )
   assert script.index(
     "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner",
@@ -392,14 +476,14 @@ def test_observability_failure_cannot_stop_core_release_after_cutover() -> None:
   assert preflight < gate_close < core_stop
 
   migration = script.index("run --rm migrate apply")
-  observer = script.index("up -d --build container-event-observer")
+  observer = script.index("up -d --no-build container-event-observer")
   core_start = script.index(
     "backend bar-runner l2-runner experiment-coordinator evaluation-worker evaluation-export-worker experiment-purge-worker signal-export-runner",
   )
 
   assert core_stop < migration < observer < core_start
   assert 'if "${compose[@]}" up -d --build docker-socket-proxy loki alloy' in script
-  assert 'if "${compose[@]}" up -d --build container-event-observer' in script
+  assert 'if "${compose[@]}" up -d --no-build container-event-observer' in script
   assert "fail " not in script[preflight:gate_close]
   assert "fail " not in script[observer:core_start]
   gate_open = script.index("\nopen_submission_gate\n")

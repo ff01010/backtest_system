@@ -194,8 +194,7 @@ Authorization: Bearer qbk_<key_id_prefix>_<random_secret>
 |---|---|---|
 | `TREND_GRID_PUBLIC_API_ENABLED` | 是否启用 `/api/v1` | `false`，未配置时路由返回 404 |
 | `TREND_GRID_API_KEY_PEPPER` | Key 摘要的服务端秘密 | 未配置时拒绝启用开放 API |
-| `TREND_GRID_PUBLIC_API_MAX_INFLIGHT` | 单 Key 运行/排队上限 | 使用保守默认值，例如 2 |
-| `TREND_GRID_PUBLIC_API_DAILY_SUBMIT_LIMIT` | 单 Key 每日提交上限 | 使用保守默认值，例如 100 |
+| `TREND_GRID_PUBLIC_API_MAX_INFLIGHT` | 单 Key 排队、运行或取消中的任务上限 | 默认 100，可配置范围为 1～100 |
 
 `.env.example` 仅提供关闭状态和占位说明；服务器 `deploy/.env` 由部署者单独配置，发布脚本不得覆盖私有配置。
 
@@ -303,19 +302,16 @@ DELETE /api/api-keys/{key_id}
 | 404 | `resource.not_found` | 方案或任务不存在，避免泄露归属 |
 | 409 | `idempotency.conflict` | 同一幂等键对应不同请求 |
 | 422 | `backtest.validation_failed` | 策略方案、参数或数据覆盖不满足要求 |
-| 429 | `rate_limit.exceeded` | 并发或日提交额度超限 |
+| 429 | `rate_limit.exceeded` | 排队、运行或取消中的任务数达到上限 |
 | 503 | `backtest.unavailable` | 服务未启用或临时不可用 |
 
 策略错误仍沿用对普通用户安全的分类信息；管理员通过任务号在系统日志查看原始异常，不通过公共 API 返回堆栈。
 
 ## 10. 限额与公平性
 
-公平调度决定“已入队任务如何领取”，不限制 API 调用方提交大量任务。首期增加两层保护：
+公平调度决定“已入队任务如何领取”，单 Key 在途限额控制调用方一次能够堆入的任务数量。系统不限制自然日累计提交次数；已有任务进入终态后，调用方可以继续滚动提交。
 
-1. 单 Key 排队加运行任务数上限。
-2. 单 Key 自然日提交次数上限。
-
-限额在创建任务前使用数据库事务检查；超限不创建 `backtest_run`。该控制只防止 API Key 滥用，不替代现有多用户公平调度，也不改变网页用户的既有使用规则。
+在途限额在创建任务前使用数据库事务检查，超限不创建 `backtest_run`。该控制只防止单个 API Key 瞬时堆积过多任务，不替代现有多用户公平调度，也不改变网页用户的既有使用规则。
 
 ## 11. 实施步骤
 

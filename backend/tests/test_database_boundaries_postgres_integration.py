@@ -62,6 +62,12 @@ BASELINE = CurrentUser(
   display_name="Boundary Baseline",
   role="user",
 )
+PUBLIC_API_SUBMITTER = CurrentUser(
+  id="20000000-0000-4000-8000-000000000007",
+  username="boundary-public-api",
+  display_name="Boundary Public API",
+  role="user",
+)
 ADMIN = CurrentUser(
   id="00000000-0000-0000-0000-000000000001",
   username="local-system",
@@ -71,6 +77,7 @@ ADMIN = CurrentUser(
 API_KEY_ID = "20000000-0000-4000-8000-000000000010"
 PUBLICATION_ID = "20000000-0000-4000-8000-000000000011"
 INVALID_PUBLICATION_ID = "20000000-0000-4000-8000-000000000012"
+PUBLIC_API_KEY_ID = "20000000-0000-4000-8000-000000000013"
 
 
 def _as_user(user: CurrentUser, action: Callable[[], Any]) -> Any:
@@ -92,7 +99,10 @@ def _admin_connection() -> psycopg.Connection[Any]:
 def database_facts() -> Iterator[None]:
   with _admin_connection() as conn:
     with conn.cursor() as cur:
-      for user in (WRITER, SOURCE, RECIPIENT, QUEUE_A, QUEUE_B, BASELINE):
+      for user in (
+        WRITER, SOURCE, RECIPIENT, QUEUE_A, QUEUE_B, BASELINE,
+        PUBLIC_API_SUBMITTER,
+      ):
         cur.execute("""
           INSERT INTO app_user (
             id, username, display_name, password_hash, role, status
@@ -103,6 +113,16 @@ def database_facts() -> Iterator[None]:
           id, owner_user_id, name, key_prefix, secret_hash, scopes
         ) VALUES (%s, %s, 'integration-key', 'bt_test_boundary', %s, %s)
       """, (API_KEY_ID, WRITER.id, "1" * 64, Jsonb(["strategies:write"])))
+      cur.execute("""
+        INSERT INTO api_access_key (
+          id, owner_user_id, name, key_prefix, secret_hash, scopes
+        ) VALUES (%s, %s, 'public-api-submit', 'bt_test_submit', %s, %s)
+      """, (
+        PUBLIC_API_KEY_ID,
+        PUBLIC_API_SUBMITTER.id,
+        "2" * 64,
+        Jsonb(["backtest:submit"]),
+      ))
   yield
 
 
@@ -266,6 +286,58 @@ def test_public_write_rolls_back_resource_and_idempotency_facts() -> None:
     "rolled_back_scripts": 0,
     "rolled_back_records": 0,
   }
+
+
+def _submit_public_api_backtest(sequence: int) -> tuple[str, int, bool, str, str]:
+  return _as_user(PUBLIC_API_SUBMITTER, lambda: state_store.create_api_backtest_job(
+    {
+      "symbol": "688981.SH",
+      "timeframe": "5m",
+      "fillModel": "bar_next_open",
+      "strategy": "user_script",
+    },
+    PUBLIC_API_KEY_ID,
+    f"public-backtest-{sequence:03d}",
+    f"{sequence:064x}",
+    f"request-{sequence:03d}",
+  ))
+
+
+def _finish_public_api_backtests(run_ids: list[str]) -> None:
+  if not run_ids:
+    return
+  with _admin_connection() as conn:
+    with conn.cursor() as cur:
+      cur.execute("""
+        UPDATE bar_backtest_job SET status='succeeded', finished_at=now()
+        WHERE run_id=ANY(%s::uuid[])
+      """, (run_ids,))
+      cur.execute("""
+        UPDATE backtest_run SET status='succeeded', finished_at=now()
+        WHERE id=ANY(%s::uuid[])
+      """, (run_ids,))
+
+
+def test_public_api_limits_inflight_without_daily_submission_quota(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(state_store.settings, "BACKTEST_RUNNER_AVAILABILITY_REQUIRED", False)
+  run_ids: list[str] = []
+  resumed_run_id: str | None = None
+  try:
+    for sequence in range(100):
+      run_ids.append(_submit_public_api_backtest(sequence)[0])
+    with pytest.raises(ValueError, match="排队、运行或取消中的回测已达上限"):
+      _submit_public_api_backtest(100)
+
+    _finish_public_api_backtests(run_ids)
+    resumed = _submit_public_api_backtest(100)
+    resumed_run_id = resumed[0]
+    assert resumed[2:] == (False, "queued", "bar_next_open")
+  finally:
+    _finish_public_api_backtests(
+      [*run_ids, *([resumed_run_id] if resumed_run_id else [])],
+    )
 
 
 def _queue_slots_and_finish_jobs() -> list[dict[str, Any]]:

@@ -11,6 +11,7 @@ class FakeCursor:
   def __init__(self, rows: list[dict[str, Any] | None]) -> None:
     self.rows = rows
     self.statements: list[str] = []
+    self.params: list[Any] = []
 
   def __enter__(self) -> "FakeCursor":
     return self
@@ -18,8 +19,9 @@ class FakeCursor:
   def __exit__(self, *_: Any) -> None:
     return None
 
-  def execute(self, statement: str, _: Any = None) -> None:
+  def execute(self, statement: str, params: Any = None) -> None:
     self.statements.append(" ".join(statement.split()))
+    self.params.append(params)
 
   def fetchone(self) -> dict[str, Any] | None:
     return self.rows.pop(0)
@@ -59,7 +61,7 @@ def _install_database(
 def test_browser_backtest_first_request_freezes_idempotency_metadata(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  _install_database(monkeypatch, [None])
+  cursor, _connection = _install_database(monkeypatch, [None, None])
   captured: dict[str, Any] = {}
 
   def create_job(
@@ -68,12 +70,15 @@ def test_browser_backtest_first_request_freezes_idempotency_metadata(
     owner_user_id: str,
     queue_table: str,
     fill_model: str,
+    *,
+    request_key: str | None = None,
   ) -> tuple[str, int]:
     captured.update(
       payload=payload,
       owner_user_id=owner_user_id,
       queue_table=queue_table,
       fill_model=fill_model,
+      request_key=request_key,
     )
     return "run-1", 7
 
@@ -90,6 +95,11 @@ def test_browser_backtest_first_request_freezes_idempotency_metadata(
     "key": "browser-12345678",
     "requestHash": "a" * 64,
   }
+  assert captured["request_key"] == state_store._browser_backtest_request_key(
+    "browser-12345678",
+  )
+  assert "request_key=%s" in cursor.statements[1]
+  assert "ORDER BY created_at" not in " ".join(cursor.statements)
 
 
 def test_browser_backtest_replays_existing_task(
@@ -100,12 +110,7 @@ def test_browser_backtest_replays_existing_task(
     "display_no": 7,
     "status": "queued",
     "fill_model": "l2_quote",
-    "requested_params": {
-      "_browserIdempotency": {
-        "key": "browser-12345678",
-        "requestHash": "a" * 64,
-      },
-    },
+    "request_hash": "a" * 64,
   }])
 
   result = state_store.create_browser_backtest_job(
@@ -123,15 +128,31 @@ def test_browser_backtest_rejects_idempotency_key_conflict(
     "display_no": 7,
     "status": "queued",
     "fill_model": "bar_next_open",
-    "requested_params": {
-      "_browserIdempotency": {
-        "key": "browser-12345678",
-        "requestHash": "b" * 64,
-      },
-    },
+    "request_hash": "b" * 64,
   }])
 
   with pytest.raises(state_store.IdempotencyConflictError):
     state_store.create_browser_backtest_job(
       {"fillModel": "bar_next_open"}, "browser-12345678", "a" * 64,
     )
+
+
+def test_browser_backtest_replays_legacy_json_idempotency_key(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  cursor, _connection = _install_database(monkeypatch, [None, {
+    "id": "run-legacy",
+    "display_no": 8,
+    "status": "succeeded",
+    "fill_model": "bar_next_open",
+    "request_hash": "a" * 64,
+  }])
+
+  result = state_store.create_browser_backtest_job(
+    {"fillModel": "bar_next_open"}, "browser-12345678", "a" * 64,
+  )
+
+  assert result == ("run-legacy", 8, True, "succeeded", "bar_next_open")
+  assert "request_key=%s" in cursor.statements[1]
+  assert "requested_params->'_browserIdempotency'->>'key'=%s" in cursor.statements[2]
+  assert "ORDER BY created_at" not in cursor.statements[2]
