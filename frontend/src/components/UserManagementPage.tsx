@@ -125,7 +125,7 @@ export default function UserManagementPage({ headerNavigation }: UserManagementP
   );
 }
 
-const panelStyle = { background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: 16, boxShadow: '0 4px 18px rgba(26, 53, 77, .04)' };
+const panelStyle = { background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: 16, boxShadow: '0 4px 18px rgba(15, 23, 42, .04)' };
 const inputStyle = { height: 36, borderRadius: 6, border: '1px solid var(--border-strong)', background: 'var(--surface-muted)', color: 'var(--text)', padding: '0 9px' };
 const compactInput = { ...inputStyle, height: 31 };
 const buttonStyle = { border: 0, borderRadius: 6, padding: '0 16px', background: 'var(--accent)', color: '#ffffff', fontWeight: 700, cursor: 'pointer' };

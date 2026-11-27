@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { ArrowUpRight } from 'lucide-react';
+import BrandMark from './components/BrandMark';
 import Toolbar from './components/Toolbar';
 import KlineChart from './components/KlineChart';
 import StatusBar from './components/StatusBar';
@@ -25,7 +27,6 @@ import {
 import type { SessionUser } from './api/client';
 import { useUrlState } from './hooks/useUrlState';
 import type { BacktestChartResponse, ChartResponse, DateItem, DisplayModule, DisplaySide, InstrumentItem } from './types';
-import { typography } from './styles/typography';
 
 function createResearchState(): string {
   const bytes = new Uint8Array(24);
@@ -198,60 +199,48 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
   }, [dates, urlParams.date, setUrlParams]);
 
   return (
-    <div className="workspace-shell" style={{
-      display: 'flex', flexDirection: 'column', height: '100vh',
-      background: 'var(--canvas)', color: 'var(--text)',
-      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif',
-      fontSize: typography.base,
-      lineHeight: 1.5,
-    }}>
-      <div className="app-topbar" style={{
-        display: 'flex', alignItems: 'center', gap: '4px',
-        minHeight: 44, padding: '0 18px', background: 'var(--chrome)',
-        borderBottom: '1px solid #2a2e39', flexShrink: 0,
-      }}>
-        <div className="app-brand" style={{
-          color: '#f1f3f7', fontSize: typography.lg, fontWeight: 750,
-          marginRight: 14, letterSpacing: '.02em', fontFamily: 'ui-serif, "Songti SC", "Noto Serif SC", serif',
-        }}>
-          玄龄量化回测系统
+    <div className="workspace-shell">
+      <header className="app-topbar">
+        <div className="app-brand">
+          <BrandMark />
+          <span className="app-brand-text">
+            <span className="app-brand-name">青衡量化回测系统</span>
+            <span className="app-brand-sub">Qingheng Quant</span>
+          </span>
         </div>
-        {[
-          { key: 'backtest' as const, label: '策略回测' },
-          ...(experimentPreviewEnabled === true ? [{ key: 'experiments' as const, label: '自动化回测' }] : []),
-          { key: 'sharedBacktests' as const, label: '策略广场' },
-          { key: 'signals' as const, label: '信号可视化' },
-          { key: 'apiKeys' as const, label: 'API Key' },
-          ...(currentUser.role === 'admin' ? [{ key: 'system' as const, label: '系统管理' }] : []),
-        ].map((item) => {
-          const active = activePage === item.key;
-          return (
-            <button
-              key={item.key}
-              className="app-nav-button"
-              onClick={() => {
-                if (item.key === 'sharedBacktests') setSharedPublicationId(null);
-                setActivePage(item.key);
-                setUrlParams({
-                  workspace: item.key === 'experiments' ? 'experiments' : 'backtest',
-                  experimentConfigId: item.key === 'experiments' ? experimentSubject?.subjectId : undefined,
-                  experimentVersionId: item.key === 'experiments' ? experimentSubject?.subjectVersion : undefined,
-                });
-              }}
-              style={{
-                height: 44, padding: '0 12px', borderRadius: 0,
-                border: 'none', borderBottom: `2px solid ${active ? 'var(--accent)' : 'transparent'}`,
-                background: active ? 'var(--chrome-raised)' : 'transparent',
-                color: active ? '#ffffff' : 'var(--chrome-text)',
-                fontSize: typography.base, cursor: 'pointer',
-              }}
-            >
-              {item.label}
-            </button>
-          );
-        })}
+        <nav className="app-nav" aria-label="主导航">
+          {[
+            { key: 'backtest' as const, label: '策略回测' },
+            ...(experimentPreviewEnabled === true ? [{ key: 'experiments' as const, label: '自动化回测' }] : []),
+            { key: 'sharedBacktests' as const, label: '策略广场' },
+            { key: 'signals' as const, label: '信号可视化' },
+            { key: 'apiKeys' as const, label: 'API Key' },
+            ...(currentUser.role === 'admin' ? [{ key: 'system' as const, label: '系统管理' }] : []),
+          ].map((item) => {
+            const active = activePage === item.key;
+            return (
+              <button
+                key={item.key}
+                className={`app-nav-button${active ? ' is-active' : ''}`}
+                aria-current={active ? 'page' : undefined}
+                onClick={() => {
+                  if (item.key === 'sharedBacktests') setSharedPublicationId(null);
+                  setActivePage(item.key);
+                  setUrlParams({
+                    workspace: item.key === 'experiments' ? 'experiments' : 'backtest',
+                    experimentConfigId: item.key === 'experiments' ? experimentSubject?.subjectId : undefined,
+                    experimentVersionId: item.key === 'experiments' ? experimentSubject?.subjectVersion : undefined,
+                  });
+                }}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+        </nav>
         <button
           type="button"
+          className="app-research-button"
           onClick={() => {
             setResearchStarting(true);
             setResearchError(null);
@@ -261,22 +250,26 @@ function Workspace({ currentUser, onLogout }: { currentUser: SessionUser; onLogo
             });
           }}
           disabled={researchStarting}
-          style={{ marginLeft: 8, border: '1px solid #437463', borderRadius: 4, padding: '5px 10px', background: '#163a32', color: '#c8f1e2', cursor: researchStarting ? 'wait' : 'pointer', fontSize: typography.sm }}
         >
           {researchStarting ? '正在进入…' : '研究中心'}
+          <ArrowUpRight size={13} />
         </button>
-        {researchError && <span role="alert" style={{ color: '#fda4af', fontSize: typography.sm }}>{researchError}</span>}
-        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10, color: 'var(--chrome-text)', fontSize: typography.sm }}>
+        {researchError && <span role="alert" className="app-research-error">{researchError}</span>}
+        <div className="app-user-area">
           <ReleaseNotificationManager
             userId={currentUser.id}
             hasUnsavedStrategy={workspaceSafety.hasUnsavedStrategy}
             isStrategySavePending={workspaceSafety.isStrategySavePending}
             onRequestStrategySave={requestStrategySave}
           />
-          <span>{currentUser.displayName} · {currentUser.role === 'admin' ? '管理员' : '普通用户'}</span>
-          <button onClick={onLogout} style={{ border: '1px solid #3a3f4b', borderRadius: 3, padding: '4px 9px', background: 'transparent', color: 'var(--chrome-text)', cursor: 'pointer' }}>退出</button>
+          <span className="app-user-avatar" aria-hidden="true">{currentUser.displayName.slice(0, 1)}</span>
+          <span className="app-user-meta">
+            <strong>{currentUser.displayName}</strong>
+            <small>{currentUser.role === 'admin' ? '管理员' : '普通用户'}</small>
+          </span>
+          <button type="button" className="app-logout" onClick={onLogout}>退出</button>
         </div>
-      </div>
+      </header>
 
       {activePage === 'signals' && (
         <>
@@ -481,7 +474,7 @@ export default function App() {
   };
 
   if (checkingSession) {
-    return <div style={{ height: '100vh', display: 'grid', placeItems: 'center', background: 'var(--canvas)', color: 'var(--text-muted)' }}>正在检查登录状态…</div>;
+    return <div className="app-boot-screen">正在检查登录状态…</div>;
   }
   if (!currentUser) return (
     <LoginPage

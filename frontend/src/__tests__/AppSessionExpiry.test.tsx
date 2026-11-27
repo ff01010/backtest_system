@@ -45,6 +45,6 @@ describe('App session expiry', () => {
     fireEvent(window, new Event(EVENT_NAME));
 
     expect(await screen.findByText('登录已过期，请重新登录。')).toBeTruthy();
-    expect(screen.getByRole('heading', { name: '玄龄量化回测系统' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '青衡量化回测系统' })).toBeTruthy();
   });
 });

@@ -267,15 +267,15 @@ export default function KlineChart({
     const chart = createChart(containerRef.current, {
       layout: {
         background: { type: ColorType.Solid, color: '#ffffff' },
-        textColor: '#5d606b',
+        textColor: '#6b7688',
       },
       grid: {
-        vertLines: { color: '#f0f3f7' },
-        horzLines: { color: '#f0f3f7' },
+        vertLines: { color: '#eef2f8' },
+        horzLines: { color: '#eef2f8' },
       },
       crosshair: { mode: 0 },
       rightPriceScale: {
-        borderColor: '#e0e3eb',
+        borderColor: '#e3e9f2',
         scaleMargins: { top: 0.05, bottom: 0.22 },
       },
       localization: {
@@ -290,7 +290,7 @@ export default function KlineChart({
         },
       },
       timeScale: {
-        borderColor: '#e0e3eb',
+        borderColor: '#e3e9f2',
         timeVisible: true,
         secondsVisible: false,
         barSpacing: 12,
@@ -310,7 +310,7 @@ export default function KlineChart({
     candleSeriesRef.current = candleSeries;
 
     const closeSeries = chart.addLineSeries({
-      color: '#5d606b',
+      color: '#5b6579',
       lineWidth: 1,
       lastValueVisible: false,
       priceLineVisible: false,
@@ -353,9 +353,9 @@ export default function KlineChart({
     const tooltip = document.createElement('div');
     tooltip.style.cssText = `
       display: none; position: absolute; z-index: 1000;
-      background: #ffffff; color: #131722; padding: 8px 12px;
-      border-radius: 4px; font-size: 12px; font-family: Consolas, monospace;
-      border: 1px solid #e0e3eb; box-shadow: 0 8px 22px rgba(19, 23, 34, .12); pointer-events: none; max-width: 300px;
+      background: #ffffff; color: #111827; padding: 8px 12px;
+      border-radius: 8px; font-size: 12px; font-family: "Cascadia Code", Consolas, monospace;
+      border: 1px solid #dee5f0; box-shadow: 0 18px 40px -24px rgba(15, 23, 42, .5); pointer-events: none; max-width: 300px;
       line-height: 1.5;
     `;
     containerRef.current.appendChild(tooltip);
@@ -474,7 +474,7 @@ export default function KlineChart({
     const volumeData: HistogramData[] = data.bars.map((b) => ({
       time: toChartTimestamp(b.time) as Time,
       value: b.volume,
-      color: b.close >= b.open ? '#ef444466' : '#22c55e66',
+      color: b.close >= b.open ? '#f2364555' : '#08998155',
     }));
 
     const closeData: LineData[] = data.bars.map((b) => ({
@@ -609,7 +609,7 @@ export default function KlineChart({
       {label && (
         <div style={{
           position: 'absolute', top: 6, left: 8, zIndex: 5,
-          color: labelColor || '#5d606b', fontSize: 12, fontWeight: 'bold',
+          color: labelColor || '#5b6579', fontSize: 12, fontWeight: 'bold',
           background: 'rgba(255,255,255,.88)', border: '1px solid #e0e3eb', padding: '2px 8px', borderRadius: 3,
           pointerEvents: 'none',
         }}>
@@ -620,19 +620,19 @@ export default function KlineChart({
         position: 'absolute', top: 6, right: 56, zIndex: 5,
         display: 'flex', flexDirection: 'column', gap: 2,
         padding: '3px 6px', borderRadius: 3,
-        background: 'rgba(255, 255, 255, .9)', color: '#5d606b', border: '1px solid #e0e3eb',
+        background: 'rgba(255, 255, 255, .9)', color: '#5b6579', border: '1px solid #e0e3eb',
         fontSize: 10, lineHeight: 1.4, pointerEvents: 'none',
       }}>
         {backtestTrades !== undefined ? (
           <>
-            <span style={{ color: '#5d606b' }}>━ 收盘</span>
+            <span style={{ color: '#5b6579' }}>━ 收盘</span>
             <span style={{ color: BACKTEST_BUY_COLOR }}>▲ 买入</span>
             <span style={{ color: BACKTEST_SELL_COLOR }}>▼ 卖出</span>
             {backtestStrategyCategory === 'core_position_overlay' && <span style={{ color: BACKTEST_T_COLOR }}>● T</span>}
           </>
         ) : (
           <>
-            <span style={{ color: '#5d606b' }}>━ 收盘</span>
+            <span style={{ color: '#5b6579' }}>━ 收盘</span>
             <span style={{ color: A_COLOR }}>▲▼ A</span>
             <span style={{ color: B_COLOR }}>▲▼ B</span>
           </>

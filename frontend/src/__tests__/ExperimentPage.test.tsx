@@ -1379,7 +1379,7 @@ describe('ExperimentPage', () => {
       ...DETAIL,
       status: 'completed' as const,
       archivedAt: '2026-10-08T00:00:00Z',
-      retentionUntil: '2026-11-07T00:00:00Z',
+      retentionUntil: '2035-11-07T00:00:00Z',
       purgeJobId: null,
     };
     vi.mocked(fetchExperimentDetail).mockResolvedValueOnce(archived).mockResolvedValue(DETAIL);
