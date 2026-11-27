@@ -116,7 +116,7 @@ export default function InstrumentSearchField({ label, value, onChange }: Props)
     <label className="instrument-search" style={{ display: 'grid', gap: 6, position: 'relative' }}>
       <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>{label}</span>
       <div style={{ position: 'relative' }}>
-        <Search size={15} color="#0f766e" style={{ position: 'absolute', left: 10, top: 10, pointerEvents: 'none' }} />
+        <Search size={15} color="#3056d3" style={{ position: 'absolute', left: 10, top: 10, pointerEvents: 'none' }} />
         <input
           className="instrument-search-input"
           role="combobox"
@@ -219,7 +219,7 @@ const inputStyle = {
 const menuStyle = {
   position: 'absolute', zIndex: 30, top: 40, left: 0, right: 0, maxHeight: 240, overflowY: 'auto',
   background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 7,
-  boxShadow: '0 12px 30px rgba(26, 53, 77, .14)', padding: 4,
+  boxShadow: '0 12px 30px rgba(15, 23, 42, .14)', padding: 4,
 } as const;
 
 const optionStyle = {

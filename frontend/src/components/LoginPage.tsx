@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { login } from '../api/client';
 import type { SessionUser } from '../api/client';
+import BrandMark from './BrandMark';
 
 interface Props {
   onLogin: (user: SessionUser) => void;
@@ -27,39 +28,53 @@ export default function LoginPage({ onLogin, notice = '' }: Props) {
   };
 
   return (
-    <main style={{
-      minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 24,
-      background: 'radial-gradient(circle at 12% 4%, #d5efe9 0, transparent 30%), radial-gradient(circle at 92% 100%, #e3edf7 0, transparent 34%), var(--canvas)',
-    }}>
-      <section style={{ width: 'min(440px, 100%)', padding: '42px 38px', borderRadius: 18,
-        border: '1px solid var(--border)', background: 'rgba(255, 255, 255, .96)', boxShadow: '0 24px 65px rgba(31, 57, 83, .12)' }}>
-        <div style={{ color: 'var(--accent)', fontSize: 12, letterSpacing: 2, fontWeight: 750 }}>QUANT WORKSPACE</div>
-        <h1 style={{ margin: '10px 0 8px', fontSize: 28, color: 'var(--text)', fontFamily: 'ui-serif, "Songti SC", "Noto Serif SC", serif' }}>玄龄量化回测系统</h1>
-        <p style={{ color: 'var(--text-muted)', marginBottom: 28 }}>请使用管理员创建的账户登录。</p>
-        {notice && <div role="status" style={{ color: '#895500', background: '#fff8e8', padding: '9px 11px', borderRadius: 7, marginBottom: 16 }}>{notice}</div>}
-        <form onSubmit={submit} style={{ display: 'grid', gap: 16 }}>
-          <label style={{ color: 'var(--text-muted)', display: 'grid', gap: 7 }}>
+    <main className="login-shell">
+      <section className="login-card" aria-labelledby="login-title">
+        <div className="login-brand">
+          <BrandMark size={34} />
+          <span className="login-brand-copy">
+            <span className="login-brand-eyebrow">Qingheng Quant</span>
+            <span className="login-brand-name">青衡量化</span>
+          </span>
+        </div>
+        <h1 className="login-title" id="login-title" aria-label="青衡量化回测系统">
+          <span className="login-title-brand">青衡</span>
+          <span className="login-title-accent">量化回测系统</span>
+        </h1>
+        <p className="login-subtitle">策略研究、回测与验证的统一工作台。请使用管理员创建的账户登录。</p>
+        {notice && <div role="status" className="login-notice">{notice}</div>}
+        <form className="login-form" onSubmit={submit}>
+          <label className="login-field">
             用户名
-            <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required
-              style={inputStyle} />
+            <input
+              className="login-input"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              autoComplete="username"
+              required
+            />
           </label>
-          <label style={{ color: 'var(--text-muted)', display: 'grid', gap: 7 }}>
+          <label className="login-field">
             密码
-            <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" required
-              style={inputStyle} />
+            <input
+              className="login-input"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              type="password"
+              autoComplete="current-password"
+              required
+            />
           </label>
-          {error && <div style={{ color: 'var(--danger)', background: 'var(--danger-soft)', padding: '9px 11px', borderRadius: 7 }}>{error}</div>}
-          <button disabled={submitting} type="submit" style={{ height: 42, marginTop: 5, border: 0, borderRadius: 8,
-            color: '#ffffff', background: submitting ? '#7caea7' : 'var(--accent)', fontWeight: 800, cursor: submitting ? 'wait' : 'pointer' }}>
+          {error && <div className="login-error" role="alert">{error}</div>}
+          <button className="login-submit" disabled={submitting} type="submit">
             {submitting ? '正在验证…' : '登录系统'}
           </button>
         </form>
+        <div className="login-footnote">
+          <span>受控访问 · 账户由管理员统一创建</span>
+          <code>QINGHENG / 01</code>
+        </div>
       </section>
     </main>
   );
 }
-
-const inputStyle = {
-  height: 40, borderRadius: 7, border: '1px solid var(--border-strong)', padding: '0 11px',
-  color: 'var(--text)', background: 'var(--surface-muted)', fontSize: 14,
-};

@@ -779,7 +779,7 @@ function buildNetValueChart(
     ...benchmarkPoints.map((point) => point.date),
   ])).sort();
   const dates = actualDates.length > 0 ? ['__START__', ...actualDates] : [];
-  const strategySeries = buildNetSeries('策略', strategyPoints, dates, '#0f766e');
+  const strategySeries = buildNetSeries('策略', strategyPoints, dates, '#3056d3');
   const benchmarkSeries = buildNetSeries('买入持有基准', benchmarkPoints, dates, '#f59e0b');
   const excessSeries = buildExcessNetSeries(strategySeries, benchmarkSeries, dates);
   const visibleSeries = [
@@ -993,13 +993,13 @@ function ResultContextBar({
   return (
     <section style={{ ...panelStyle, padding: '10px 12px', background: '#ffffff' }}>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', color: '#475569', fontSize: 12, lineHeight: 1.6 }}>
-        <strong style={{ color: '#0f766e' }}>{runReference}</strong>
+        <strong style={{ color: '#3056d3' }}>{runReference}</strong>
         <span>{configName}</span>
         <span>{symbol} · {timeframe}</span>
         <span>{startDate} - {endDate}</span>
       </div>
       <details style={{ marginTop: 8, color: '#475569', fontSize: 12 }}>
-        <summary style={{ color: '#0f766e', cursor: 'pointer', width: 'fit-content' }}>查看本次回测设置</summary>
+        <summary style={{ color: '#3056d3', cursor: 'pointer', width: 'fit-content' }}>查看本次回测设置</summary>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 8, lineHeight: 1.6 }}>
           <span>基准：{benchmarkSymbol || symbol}</span>
           <span>手续费：{commissionRate == null ? '--' : `${(commissionRate * 10_000).toFixed(2)} bp`}</span>
@@ -2991,10 +2991,10 @@ export default function BacktestPage({
       ),
     );
   const dataRangeColor = dataRangeMetadata.tone === 'ok'
-    ? '#0f766e'
+    ? '#3056d3'
     : dataRangeMetadata.tone === 'info' ? '#1d4ed8' : '#b45309';
   const benchmarkRangeColor = benchmarkRangeMetadata.tone === 'ok'
-    ? '#0f766e'
+    ? '#3056d3'
     : benchmarkRangeMetadata.tone === 'info' ? '#1d4ed8' : '#b45309';
   const resultHistoryRun = result?.runId ? backtestRuns.find((item) => item.id === result.runId) || null : null;
   const resultStrategyCategory = result?.strategyCategory || result?.experimentManifest?.strategyCategory || resultHistoryRun?.strategyCategory || params.strategyCategory;
@@ -3136,7 +3136,7 @@ export default function BacktestPage({
       render: (trade) => {
         const skipped = trade.status === 'skipped';
         return (
-          <span className={`trade-status-chip ${skipped ? 'is-skipped' : 'is-filled'}`} style={{ color: skipped ? '#b45309' : '#0f766e', fontWeight: 700 }}>
+          <span className={`trade-status-chip ${skipped ? 'is-skipped' : 'is-filled'}`} style={{ color: skipped ? '#b45309' : '#3056d3', fontWeight: 700 }}>
             {skipped ? '已跳过' : '已成交'}
           </span>
         );
@@ -3431,8 +3431,8 @@ export default function BacktestPage({
   const statusMessage = error || unsupportedTimeframeError || status || (versionDirty
     ? '策略内容已修改，请先保存策略后运行回测。'
     : activeConfig ? `当前策略：${activeConfig.name}` : '请先新建并保存策略');
-  const statusColor = error || unsupportedTimeframeError ? '#b91c1c' : status ? '#0f766e' : '#94a3b8';
-  const statusBackground = error || unsupportedTimeframeError ? '#fef2f2' : status ? '#ecfdf5' : '#f8fafc';
+  const statusColor = error || unsupportedTimeframeError ? '#b91c1c' : status ? '#3056d3' : '#94a3b8';
+  const statusBackground = error || unsupportedTimeframeError ? '#fef2f2' : status ? '#eef3fc' : '#f8fafc';
   const strategySaveNotice = getStrategySaveNoticeState(
     versionDirty,
     experimentDirty,
@@ -3946,7 +3946,7 @@ export default function BacktestPage({
             minWidth: 0,
             color: statusColor,
             background: statusBackground,
-            border: `1px solid ${error || unsupportedTimeframeError ? '#fecaca' : status ? '#99f6e4' : '#d7dde8'}`,
+            border: `1px solid ${error || unsupportedTimeframeError ? '#fecaca' : status ? '#c2cff8' : '#d7dde8'}`,
             borderRadius: 4,
             padding: '7px 10px',
             fontSize: 13,
@@ -4016,9 +4016,9 @@ export default function BacktestPage({
             style={{
               height: 36,
               borderRadius: 4,
-              border: `1px solid ${runDisabled ? '#cbd5e1' : '#0f766e'}`,
-              background: runDisabled ? '#f1f5f9' : '#ccfbf1',
-              color: runDisabled ? '#94a3b8' : '#0f766e',
+              border: `1px solid ${runDisabled ? '#cbd5e1' : '#3056d3'}`,
+              background: runDisabled ? '#f1f5f9' : '#e7ecfd',
+              color: runDisabled ? '#94a3b8' : '#3056d3',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -4423,9 +4423,9 @@ export default function BacktestPage({
                       style={{
                         height: 34,
                         borderRadius: 4,
-                        border: '1px solid #0f766e',
-                        background: '#ccfbf1',
-                        color: '#0f766e',
+                        border: '1px solid #3056d3',
+                        background: '#e7ecfd',
+                        color: '#3056d3',
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
@@ -4475,7 +4475,7 @@ export default function BacktestPage({
                           <button
                             type="button"
                             onClick={() => { void loadMoreConfigVersions(); }}
-                            style={{ border: 0, background: 'transparent', color: '#0f766e', cursor: 'pointer' }}
+                            style={{ border: 0, background: 'transparent', color: '#3056d3', cursor: 'pointer' }}
                           >
                             加载更多版本
                           </button>
@@ -4870,9 +4870,9 @@ export default function BacktestPage({
                   <div className="strategy-config-footer">
                   {status && !error && (
                     <div className="strategy-runtime-message" style={{
-                      color: '#0f766e',
-                      background: '#ecfdf5',
-                      border: '1px solid #99f6e4',
+                      color: '#3056d3',
+                      background: '#eef3fc',
+                      border: '1px solid #c2cff8',
                       borderRadius: 4,
                       padding: '8px 10px',
                       fontSize: 12,
@@ -4885,9 +4885,9 @@ export default function BacktestPage({
                       flex: 1,
                       height: 34,
                       borderRadius: 4,
-                      border: '1px solid #0f766e',
-                      background: '#ccfbf1',
-                      color: '#0f766e',
+                      border: '1px solid #3056d3',
+                      background: '#e7ecfd',
+                      color: '#3056d3',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
@@ -4953,7 +4953,7 @@ export default function BacktestPage({
                 <>
                 {result && (result.executionPlans || []).length > 0 && (
                   <details style={{ ...panelStyle, padding: '10px 12px', background: '#ffffff', color: '#475569', fontSize: 12 }}>
-                    <summary style={{ color: '#0f766e', cursor: 'pointer', width: 'fit-content' }}>
+                    <summary style={{ color: '#3056d3', cursor: 'pointer', width: 'fit-content' }}>
                       执行追溯（{result.executionPlans?.length} 个母单）
                     </summary>
                     <div style={{ display: 'grid', gap: 6, marginTop: 10 }}>
@@ -5014,9 +5014,9 @@ export default function BacktestPage({
                         style={{
                           height: 34,
                           borderRadius: 4,
-                          border: '1px solid #0f766e',
-                          background: filteredTrades.length > 0 ? '#ccfbf1' : '#f1f5f9',
-                          color: filteredTrades.length > 0 ? '#0f766e' : '#94a3b8',
+                          border: '1px solid #3056d3',
+                          background: filteredTrades.length > 0 ? '#e7ecfd' : '#f1f5f9',
+                          color: filteredTrades.length > 0 ? '#3056d3' : '#94a3b8',
                           cursor: filteredTrades.length > 0 ? 'pointer' : 'not-allowed',
                           padding: '0 10px',
                         }}
@@ -5026,7 +5026,7 @@ export default function BacktestPage({
                     </div>
                   </div>
                   <details className="trade-column-controls" style={{ marginTop: 10, color: '#475569', fontSize: 12 }}>
-                    <summary style={{ color: '#0f766e', cursor: 'pointer', width: 'fit-content' }}>选择显示字段（当前 {visibleTradeColumns.length} 项）</summary>
+                    <summary style={{ color: '#3056d3', cursor: 'pointer', width: 'fit-content' }}>选择显示字段（当前 {visibleTradeColumns.length} 项）</summary>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 14px', marginTop: 9 }}>
                       {tradeColumnDefs.map((column) => (
                         <label key={column.key} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
@@ -5067,7 +5067,7 @@ export default function BacktestPage({
                     <div style={{ color: '#0f172a', fontSize: typography.lg, fontWeight: 700 }}>完整指标</div>
                     <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>按收益、风险和交易质量查看回测结果的构成。</div>
                   </div>
-                  <div style={{ color: '#0f766e', fontSize: 12, fontWeight: 600 }}>分析视图</div>
+                  <div style={{ color: '#3056d3', fontSize: 12, fontWeight: 600 }}>分析视图</div>
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(220px, 1fr))', gap: 12 }}>
                   {metricGroups.map((group) => {
@@ -5123,9 +5123,9 @@ export default function BacktestPage({
                         style={{
                           height: 28,
                           borderRadius: 4,
-                          border: `1px solid ${chartRange === value ? '#0f766e' : '#cbd5e1'}`,
-                          background: chartRange === value ? '#ccfbf1' : '#f8fafc',
-                          color: chartRange === value ? '#0f766e' : '#64748b',
+                          border: `1px solid ${chartRange === value ? '#3056d3' : '#cbd5e1'}`,
+                          background: chartRange === value ? '#e7ecfd' : '#f8fafc',
+                          color: chartRange === value ? '#3056d3' : '#64748b',
                           cursor: 'pointer',
                         }}
                       >
@@ -5343,7 +5343,7 @@ export default function BacktestPage({
                     return (
                       <div key={`${trade.time}-${trade.direction}-${index}`}>
                         {showGroupTitle && (
-                          <div className="trade-day-group" style={{ color: '#0f766e', fontSize: 12, fontWeight: 700, padding: '10px 0 4px', borderBottom: '1px solid #e2e8f0' }}>
+                          <div className="trade-day-group" style={{ color: '#3056d3', fontSize: 12, fontWeight: 700, padding: '10px 0 4px', borderBottom: '1px solid #e2e8f0' }}>
                             <span>{currentDate}</span>
                             <span>{dayTrades.length} 条信号 · 成交 {dayFilledCount} 笔 · 当日盈亏 {dayPnl.toFixed(2)}</span>
                           </div>
@@ -5548,7 +5548,7 @@ export default function BacktestPage({
                           <div style={{
                             padding: '8px 10px', border: '1px solid #bae6fd',
                             borderBottom: 'none', borderRadius: '4px 4px 0 0',
-                            background: '#f0f9ff', color: '#075985', fontSize: 12,
+                            background: '#f0f9ff', color: '#1f3ba6', fontSize: 12,
                           }}>
                             本页 {deletablePageRunIds.length} 条可操作记录已全部选择。{' '}
                             <button
@@ -5564,12 +5564,12 @@ export default function BacktestPage({
                         <div style={{
                           padding: '8px 10px', border: '1px solid #bae6fd',
                           borderBottom: 'none', borderRadius: '4px 4px 0 0',
-                          background: '#f0f9ff', color: '#075985', fontSize: 12,
+                          background: '#f0f9ff', color: '#1f3ba6', fontSize: 12,
                         }}>
                           已选择当前筛选结果中的全部 {selectedHistoryRunCount} 条
                         </div>
                       )}
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '8px 10px', border: '1px solid #99f6e4', borderRadius: hasHistorySelectionBanner ? '0 0 4px 4px' : 4, background: '#f0fdfa', color: '#115e59', fontSize: 12 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '8px 10px', border: '1px solid #c2cff8', borderRadius: hasHistorySelectionBanner ? '0 0 4px 4px' : 4, background: '#eef3fc', color: '#115e59', fontSize: 12 }}>
                         <span>已选择 {selectedHistoryRunCount} 条</span>
                         <span className="history-selection-actions">
                           <button
@@ -5636,7 +5636,7 @@ export default function BacktestPage({
                           const isSelected = run.id === selectedHistoryRunId;
                           const deletable = isSelectableHistoryRun(run);
                           return (
-                            <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} onDoubleClick={() => handleViewHistoryResult(run)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#ecfdf5' : 'transparent', cursor: 'pointer' }}>
+                            <div className={`history-run-row${isSelected ? ' is-selected' : ''}`} key={run.id} onClick={() => setSelectedHistoryRunId(run.id)} onDoubleClick={() => handleViewHistoryResult(run)} style={{ display: 'grid', gridTemplateColumns: historyGridColumns, gap: 8, alignItems: 'center', color: '#334155', fontSize: 12, borderBottom: '1px solid #e2e8f0', padding: '9px 10px', background: isSelected ? '#eef3fc' : 'transparent', cursor: 'pointer' }}>
                               <input type="checkbox" checked={deletable && isBacktestRunSelected(historySelection, run.id)} disabled={!deletable} onClick={(event) => event.stopPropagation()} onChange={(event) => toggleHistoryRunSelection(run.id, event.target.checked)} aria-label={`选择历史回测 ${formatRunReference(run.displayNo)}`} />
                               <button
                                 type="button"
@@ -6167,7 +6167,7 @@ export default function BacktestPage({
               style={{
                 width: 36, height: 34, borderRadius: 4,
                 border: '1px solid #cbd5e1', background: '#f8fafc',
-                color: '#0f766e', display: 'flex', alignItems: 'center',
+                color: '#3056d3', display: 'flex', alignItems: 'center',
                 justifyContent: 'center', cursor: 'pointer',
               }}
             >
@@ -6203,7 +6203,7 @@ export default function BacktestPage({
               style={{
                 width: 36, height: 34, borderRadius: 4,
                 border: '1px solid #cbd5e1', background: '#f8fafc',
-                color: '#0f766e', display: 'flex', alignItems: 'center',
+                color: '#3056d3', display: 'flex', alignItems: 'center',
                 justifyContent: 'center', cursor: 'pointer',
               }}
             >
@@ -6256,8 +6256,8 @@ export default function BacktestPage({
               <button
                 onClick={handleSaveConfig}
                 style={{
-                  height: 32, borderRadius: 4, border: '1px solid #0f766e',
-                  background: '#ccfbf1', color: '#0f766e', cursor: 'pointer',
+                  height: 32, borderRadius: 4, border: '1px solid #3056d3',
+                  background: '#e7ecfd', color: '#3056d3', cursor: 'pointer',
                 }}
               >
                 保存策略
@@ -6314,8 +6314,8 @@ export default function BacktestPage({
               <button
                 onClick={handleSaveConfig}
                 style={{
-                  height: 32, borderRadius: 4, border: '1px solid #0f766e',
-                  background: '#ccfbf1', color: '#0f766e', cursor: 'pointer',
+                  height: 32, borderRadius: 4, border: '1px solid #3056d3',
+                  background: '#e7ecfd', color: '#3056d3', cursor: 'pointer',
                 }}
               >
                 保存策略
@@ -6459,8 +6459,8 @@ export default function BacktestPage({
 
           <div style={{
             color: dataRangeColor,
-            background: dataRangeMetadata.tone === 'ok' ? '#ecfdf5' : '#fffbeb',
-            border: `1px solid ${dataRangeMetadata.tone === 'ok' ? '#99f6e4' : '#f59e0b'}`,
+            background: dataRangeMetadata.tone === 'ok' ? '#eef3fc' : '#fffbeb',
+            border: `1px solid ${dataRangeMetadata.tone === 'ok' ? '#c2cff8' : '#f59e0b'}`,
             borderRadius: 4,
             padding: '8px 10px',
             fontSize: 12,
@@ -6471,9 +6471,9 @@ export default function BacktestPage({
 
           {(status || error) && (
             <div style={{
-              color: error ? '#b91c1c' : '#0f766e',
-              background: error ? '#fef2f2' : '#ecfdf5',
-              border: `1px solid ${error ? '#fecaca' : '#99f6e4'}`,
+              color: error ? '#b91c1c' : '#3056d3',
+              background: error ? '#fef2f2' : '#eef3fc',
+              border: `1px solid ${error ? '#fecaca' : '#c2cff8'}`,
               borderRadius: 4, padding: '8px 10px', fontSize: 12,
             }}>
               {error || status}
@@ -6483,8 +6483,8 @@ export default function BacktestPage({
           <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
             <button style={{
               flex: 1, height: 34, borderRadius: 4,
-              border: '1px solid #0f766e', background: '#ccfbf1',
-              color: '#0f766e', display: 'flex', alignItems: 'center',
+              border: '1px solid #3056d3', background: '#e7ecfd',
+              color: '#3056d3', display: 'flex', alignItems: 'center',
               justifyContent: 'center', gap: 6, cursor: 'pointer',
               opacity: runDisabled ? 0.7 : 1,
             }} onClick={handleRunBacktest} disabled={runDisabled}>

@@ -1,6 +1,5 @@
 import { ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 import type { DateItem } from '../types';
-import { typography } from '../styles/typography';
 
 interface Props {
   symbol: string;
@@ -41,77 +40,56 @@ export default function Toolbar({
   const canNext = dateIndex > 0;
 
   return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 8, minHeight: 52, padding: '8px 16px',
-      background: 'var(--surface)', borderBottom: '1px solid var(--border)', flexWrap: 'wrap',
-    }}>
-      <span style={{ color: 'var(--text)', fontFamily: 'Consolas, monospace', fontSize: typography.md, fontWeight: 700 }}>
-        {symbol}
-      </span>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+    <div className="signal-toolbar">
+      <span className="signal-symbol">{symbol}</span>
+      <div className="signal-nav-group">
         <button
           type="button"
+          className="signal-icon-button"
           onClick={onPrevDay}
           disabled={!canPrev}
           aria-label="上一交易日"
-          style={navButtonStyle(canPrev)}
         >
           <ChevronLeft size={15} />
         </button>
-        <select value={date} onChange={(event) => onDateChange(event.target.value)} style={fieldStyle}>
+        <select
+          className="signal-select"
+          aria-label="交易日"
+          value={date}
+          onChange={(event) => onDateChange(event.target.value)}
+        >
           {dates.map((item) => <option key={item.date} value={item.date}>{formatDate(item.date)}</option>)}
         </select>
         <button
           type="button"
+          className="signal-icon-button"
           onClick={onNextDay}
           disabled={!canNext}
           aria-label="下一交易日"
-          style={navButtonStyle(canNext)}
         >
           <ChevronRight size={15} />
         </button>
       </div>
-      <select value={timeframe} onChange={(event) => onTimeframeChange(event.target.value)} style={fieldStyle}>
+      <select
+        className="signal-select signal-select-compact"
+        aria-label="行情周期"
+        value={timeframe}
+        onChange={(event) => onTimeframeChange(event.target.value)}
+      >
         {TIMEFRAMES.map((item) => <option key={item} value={item}>{item}</option>)}
       </select>
       {backtestDisplayNo != null && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ background: 'var(--chrome)', borderRadius: 3, color: '#ffffff', fontSize: typography.sm, padding: '6px 9px' }}>
-            回测 #{backtestDisplayNo} 成交点
-          </span>
-        </div>
+        <span className="signal-run-chip">回测 #{backtestDisplayNo} 成交点</span>
       )}
-      <button type="button" onClick={onRefresh} disabled={loading} aria-label="刷新 K 线" style={navButtonStyle(!loading)}>
+      <button
+        type="button"
+        className="signal-icon-button"
+        onClick={onRefresh}
+        disabled={loading}
+        aria-label="刷新 K 线"
+      >
         <RefreshCw size={15} style={loading ? { animation: 'spin 1s linear infinite' } : undefined} />
       </button>
     </div>
   );
 }
-
-function navButtonStyle(enabled: boolean): Record<string, string | number> {
-  return {
-    width: 32,
-    height: 32,
-    border: '1px solid var(--border-strong)',
-    borderRadius: 3,
-    background: 'var(--surface)',
-    color: enabled ? 'var(--text-muted)' : 'var(--text-subtle)',
-    cursor: enabled ? 'pointer' : 'not-allowed',
-    opacity: enabled ? 1 : 0.45,
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-  };
-}
-
-const fieldStyle = {
-  height: 32,
-  minWidth: 116,
-  border: '1px solid var(--border-strong)',
-  borderRadius: 3,
-  background: 'var(--surface-muted)',
-  color: 'var(--text)',
-  fontFamily: 'Consolas, monospace',
-  fontSize: typography.base,
-  padding: '0 8px',
-} as const;

@@ -141,7 +141,7 @@ export default function StrategyConfigSelector({
               type="button"
               disabled={loadingMore}
               onClick={onLoadMore}
-              style={{ ...optionStyle(false), justifyContent: 'center', color: '#0f766e' }}
+              style={{ ...optionStyle(false), justifyContent: 'center', color: '#3056d3' }}
             >
               {loadingMore ? '正在加载…' : '加载更多'}
             </button>
@@ -169,7 +169,7 @@ function optionStyle(selected: boolean) {
     width: '100%',
     border: 0,
     borderBottom: '1px solid #f1f5f9',
-    background: selected ? '#ecfdf5' : '#fff',
+    background: selected ? '#eef3fc' : '#fff',
     color: '#0f172a',
     padding: '8px 10px',
     display: 'flex',

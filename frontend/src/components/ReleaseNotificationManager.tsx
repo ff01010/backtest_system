@@ -19,15 +19,6 @@ type Props = {
 
 const CLIENT_BUILD_ID = import.meta.env.VITE_APPLICATION_BUILD_ID || 'dev';
 const CLIENT_COMPATIBILITY_VERSION = Number(import.meta.env.VITE_CLIENT_COMPATIBILITY_VERSION || 1);
-const secondaryButtonStyle = {
-  border: '1px solid #475569', borderRadius: 4, padding: '7px 13px',
-  background: '#202632', color: '#dbeafe', cursor: 'pointer', fontWeight: 650,
-} as const;
-const primaryButtonStyle = {
-  border: '1px solid #2dd4bf', borderRadius: 4, padding: '7px 13px',
-  background: '#0f766e', color: '#f0fdfa', cursor: 'pointer', fontWeight: 750,
-  boxShadow: 'inset 0 1px rgba(255,255,255,.12)',
-} as const;
 
 export default function ReleaseNotificationManager({
   userId,
@@ -217,49 +208,77 @@ export default function ReleaseNotificationManager({
 
   return (
     <>
-      <button type="button" onClick={() => { void openHistory(); }} style={{
-        border: '1px solid #3a3f4b', borderRadius: 3, padding: '4px 9px',
-        background: status?.clientOutdated ? '#3b2f12' : 'transparent',
-        color: status?.clientOutdated ? '#facc15' : 'var(--chrome-text)', cursor: 'pointer',
-      }}>
+      <button
+        type="button"
+        className={`release-trigger${status?.clientOutdated ? ' is-outdated' : ''}`}
+        onClick={() => { void openHistory(); }}
+      >
         {status?.clientOutdated ? mismatchLabel : '更新记录'}
       </button>
       {(releaseOpen || mandatory) && status && (
-        <div role="dialog" aria-modal="true" aria-label="版本更新" style={{
-          position: 'fixed', zIndex: 1300, inset: 0, display: 'grid', placeItems: 'center',
-          background: 'rgba(0, 0, 0, .62)', padding: 20,
-        }}>
-          <section style={{ width: 'min(560px, 96vw)', border: '1px solid #385268', borderRadius: 8, background: 'linear-gradient(145deg, #171d27, #11151c)', color: '#f3f4f6', padding: 24, boxShadow: '0 24px 70px rgba(0,0,0,.58), inset 3px 0 #2dd4bf' }}>
+        <div role="dialog" aria-modal="true" aria-label="版本更新" className="release-backdrop">
+          <section className="release-dialog">
             {status.release?.level === 'normal' && !mandatory && (
-              <button type="button" aria-label="关闭版本通知" style={{
-                ...secondaryButtonStyle, float: 'right', padding: '2px 8px', fontSize: 18,
-              }} disabled={acknowledgePending} onClick={() => { void acknowledgeWithFeedback(); }}>×</button>
+              <button
+                type="button"
+                aria-label="关闭版本通知"
+                className="release-dialog-close"
+                disabled={acknowledgePending}
+                onClick={() => { void acknowledgeWithFeedback(); }}
+              >×</button>
             )}
-            {status.release && <div style={{ color: '#93c5fd', fontSize: 13 }}>{status.release.version} · {new Date(status.release.publishedAt).toLocaleString()}</div>}
-            <h2 style={{ margin: '8px 0' }}>{mandatory ? '需要刷新后继续使用' : '发现新版本'}</h2>
-            <h3 style={{ margin: '12px 0 6px' }}>{status.release?.title || '当前页面版本已不再兼容'}</h3>
-            <p style={{ color: '#cbd5e1' }}>{status.release?.summary || '请刷新页面加载服务器要求的客户端版本。'}</p>
+            {status.release && (
+              <div className="release-dialog-meta">
+                {status.release.version} · {new Date(status.release.publishedAt).toLocaleString()}
+              </div>
+            )}
+            <h2>{mandatory ? '需要刷新后继续使用' : '发现新版本'}</h2>
+            <h3>{status.release?.title || '当前页面版本已不再兼容'}</h3>
+            <p>{status.release?.summary || '请刷新页面加载服务器要求的客户端版本。'}</p>
             {status.release && <ul>{status.release.highlights.map((item) => <li key={item}>{item}</li>)}</ul>}
-            {refreshWarning && <p role="alert" style={{ color: '#fbbf24' }}>{refreshWarning}</p>}
-            {acknowledgeError && <p role="alert" style={{ color: '#fca5a5' }}>{acknowledgeError}</p>}
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20, flexWrap: 'wrap' }}>
+            {refreshWarning && <p role="alert" className="is-warning">{refreshWarning}</p>}
+            {acknowledgeError && <p role="alert" className="is-error">{acknowledgeError}</p>}
+            <div className="release-dialog-actions">
               {!mandatory && (
-                <button type="button" style={secondaryButtonStyle} disabled={acknowledgePending} onClick={() => { void acknowledgeWithFeedback(); }}>
+                <button
+                  type="button"
+                  className="app-button is-quiet"
+                  disabled={acknowledgePending}
+                  onClick={() => { void acknowledgeWithFeedback(); }}
+                >
                   {acknowledgePending ? '正在确认…' : '知道了'}
                 </button>
               )}
               {hasUnsavedStrategy && (
-                <button type="button" style={primaryButtonStyle} disabled={isStrategySavePending} onClick={() => { void saveAndRefresh(); }}>
+                <button
+                  type="button"
+                  className="app-button is-primary"
+                  disabled={isStrategySavePending}
+                  onClick={() => { void saveAndRefresh(); }}
+                >
                   {isStrategySavePending ? '正在保存…' : '保存策略后刷新'}
                 </button>
               )}
               {mandatory && hasUnsavedStrategy && (
-                <button type="button" style={{ ...secondaryButtonStyle, borderColor: '#b45309', color: '#fde68a' }} disabled={isStrategySavePending} onClick={() => {
-                  if (window.confirm('放弃未保存的策略修改并刷新？')) void refresh(true);
-                }}>放弃修改并刷新</button>
+                <button
+                  type="button"
+                  className="app-button is-danger"
+                  disabled={isStrategySavePending}
+                  onClick={() => {
+                    if (window.confirm('放弃未保存的策略修改并刷新？')) void refresh(true);
+                  }}
+                >
+                  放弃修改并刷新
+                </button>
               )}
               {(!hasUnsavedStrategy || !mandatory) && (
-                <button type="button" style={primaryButtonStyle} onClick={() => { void refresh(); }}>刷新使用新版本</button>
+                <button
+                  type="button"
+                  className="app-button is-primary"
+                  onClick={() => { void refresh(); }}
+                >
+                  刷新使用新版本
+                </button>
               )}
             </div>
           </section>
